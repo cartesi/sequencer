@@ -87,9 +87,10 @@ replacement directs, empty/no-op invalidation, nonzero baselines, and rollback.
 
 1. **Consumer adoption.** Bart's client follows the feed and treats cockroach
    recoveries as out of scope. A planned
-   [shared recovery tool](2026-10-shared-recovery-tool.md#clients) will produce
-   the sequencer's startup state and a canonical segment that a client applies
-   from its own checkpoint before subscribing to the new era, never across one;
+   [shared recovery tool](2026-10-shared-recovery-tool.md#the-tool-as-a-function) will produce,
+   from L1 alone, a segment of the L2 stream that the rebuilt sequencer and
+   each client run from their own state at a base block, before a client
+   subscribes to the new era, never across one;
    new client work should not build on the projection-replay path, which
    receives bug fixes only.
 2. **Deployment readiness.** Validate the private native engine and measure

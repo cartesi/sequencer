@@ -15,8 +15,9 @@ format, so they are settled with the C++ port's author
 
 Each input is a Cartesi Rollups `EvmAdvance` from the InputBox. The scheduler
 reads its `msgSender`, its `blockNumber` (the *inclusion block*), its `chainId`
-and `appContract` (the signature domain), and its `payload`. It classifies by
-sender only, never by payload content:
+and `appContract` (the signature domain), and its `payload`; passing a direct's
+input index, timestamp and prevRandao on to the application is **pending**. It
+classifies by sender only, never by payload content:
 
 - `msgSender == sequencer_address`: the payload is a **batch**.
 - Any other sender: a **direct input**, appended unchanged to the *fridge*,
@@ -33,7 +34,7 @@ and the application, which holds its executed-input count and clock. Nothing
 else carries over between inputs: no earlier batch's `safe_block` is kept
 (**pending**). The nonce and the fridge never read the application, which
 affects them only by halting the machine, so both are a function of the input
-prefix. The fridge has no size bound (**pending**).
+prefix. The fridge admits every direct and has no size bound (**pending**).
 
 ## Wire format
 
@@ -124,8 +125,9 @@ For each frame, in order:
    in this order) its sender cannot be recovered, `max_fee < frame.fee_price`,
    the application rejects it at fee `frame.fee_price`, or its `nonce` is
    `u32::MAX`, which has no successor; skipping an op the application
-   rejects for its fee balance is **pending**. Otherwise apply it with fee
-   `frame.fee_price` and clock `frame.safe_block`
+   rejects for anything but its nonce, fee balance included, is
+   **pending**. Otherwise apply it with fee `frame.fee_price` and clock
+   `frame.safe_block`
    ([`validate_and_execute_user_op`](../../sequencer-core/src/application/mod.rs)).
 
 ## Outputs and the executed-input count

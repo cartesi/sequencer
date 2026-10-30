@@ -43,7 +43,7 @@ file keeps the remaining work.
   The root is its own, so no untrusted load is involved, but the watchdog
   would have to read the consensus contract and take a root at an input index,
   often inside a block
-  ([shared recovery tool](2026-10-shared-recovery-tool.md#preconditions-the-design-must-state)).
+  ([Dave epochs](../cartesi-machine.md#rollup-host-semantics)).
 
 ## Open questions for the DEX integration
 

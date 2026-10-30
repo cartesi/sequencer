@@ -103,7 +103,7 @@ version. A stale response cannot weaken WS admission. The query proves prefix
 preservation under standard recovery's trusted local bookkeeping; it does not
 inspect client state or establish trust after a software bug. A new era requires
 the [manual projection recovery procedure](projection-replay.md#client-checkpoints),
-which the proposed [shared recovery tool](../plans/2026-10-shared-recovery-tool.md#clients)
+which the proposed [shared recovery tool](../plans/2026-10-shared-recovery-tool.md#the-tool-as-a-function)
 replaces.
 
 ### Era baseline

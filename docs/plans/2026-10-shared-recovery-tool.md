@@ -11,417 +11,363 @@ match v0.22.0); none was executed.
 
 Cockroach recovery rebuilds a sequencer that is ready for new user ops after
 an instance loses its database or its behavior cannot be trusted. The operator
-triggers it by hand, keeps that instance down and supplies a machine it
-trusts. The design takes the worst case: the submitter key is ours, but the
-instance's database, snapshots and receipts prove nothing. The canonical
-scheduler is the authority, bug for bug. The rebuilt sequencer is assumed
-correct; if it is not, fix it and rebuild again. Recovery must not depend on
-replaying the application from genesis. It runs rarely, so each of its steps
-must be simple enough to explain, practice and trust; anything a first version
-can do without waits for a need.
+triggers it by hand and keeps that instance down. The design takes the worst
+case: the submitter key is ours, but the instance's database, snapshots and
+receipts prove nothing. The canonical scheduler is the authority, bug for bug.
+The rebuilt sequencer is assumed correct; if it is not, fix it and rebuild
+again. Recovery must not depend on replaying the application from genesis.
 
-Here an *image* is the canonical machine's template: the initial machine,
-guest program included, whose root hash the on-chain application pins as
-`getTemplateHash()`. A *machine* is a stored state of it, such as a validator's
-at the end of an epoch. Images can change, but only through a new deployment:
-a deployed application keeps its image for life
-([Cartesi Machine facts](../cartesi-machine.md#versions-are-all-or-nothing)).
+Today's `setup --recovery` already rebuilds the sequencer alone. What makes
+this tool *shared* is a client: Bart's DEX backend keeps a richer state than
+the sequencer and must realign after a rebuild, from its own backup and with
+its own code. The operator of the sequencer and of that client is the same
+(Bart); only their development is split. Recovery runs rarely, so each of its
+steps must be simple enough to explain, practice and trust.
 
-As in the [data dictionary](../recovery/cockroach.md#data-dictionary), `C` is
-the stop block, `N'` the next batch nonce at its end and `K` the
-executed-input count of the rebuilt baseline, where clients subscribe. Here the
-baseline is the canonical state at the end of `C`, before its queued directs
-run ([below](#queued-directs-at-the-stop-block)), so `K` is today's less the
-queue's length.
+## Terms
 
-## The model
+- **Template**: the initial machine whose root hash the on-chain application
+  pins as `getTemplateHash()`. A deployed application keeps its template for
+  life ([Cartesi Machine facts](../cartesi-machine.md#versions-are-all-or-nothing)),
+  so a rule that changes the guest ships with a new template, which is to say
+  a new deployment. A **machine** is any stored state of the canonical
+  machine, such as a validator's at the end of an epoch or a watchdog
+  checkpoint.
+- **A base** is the end of an L1 block: the state after every input of that
+  block and of the blocks before it, and of none after. Positions are blocks
+  like this, never the app clock `last_executed_safe_block`, which every op of
+  a frame shares and which can lag the raw boundary without limit
+  ([history coordinates](../protocol/application-history.md#progress-ordering-and-acceptance)).
+- **`C`** is the stop block, a safe head fixed after the flush; **`N'`** is the
+  next batch nonce at its end; **`F`** is the InputBox index of the oldest
+  direct still queued there, or the end of `C` when none is; and **`L`** is the
+  frame-clock floor, once its gate lands: the last accepted frame's
+  `safe_block`, raised by a fridge overflow to the youngest drained direct's
+  block.
+- **Conformance vectors**:
+  [`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json),
+  frozen cases (EIP-712 hashes, signatures, SSZ bytes, fee conversions, guest
+  scenarios with their exact outputs) that every port of the scheduler must
+  reproduce ([conformance](../protocol/scheduler-semantics.md#conformance)).
+  They pin no gate edge cases yet; versioned gate vectors for the next
+  template's rules ship with it.
 
-Three kinds of state fold two streams:
+## The tool as a function
 
-| State | Folds | Holds |
+The scheduler splits into an automaton that reads no application state and
+the application it feeds. The tool needs only the automaton:
+
+```haskell
+-- One InputBox input (an EvmAdvance). Its chain id and application address,
+-- the signature domain, are deployment constants.
+data RawInput = RawInput
+  { index :: Index, block :: Block, timestamp :: Time, prevRandao :: Word256
+  , sender :: Address, payload :: Bytes }
+
+-- What the scheduler hands the application, in execution order.
+data Direct = Direct
+  { sender :: Address, index :: Index, block :: Block
+  , timestamp :: Time, prevRandao :: Word256, payload :: Bytes }
+data L2Tx
+  = UserOp { sender :: Address, nonce :: Nonce, maxFee :: Fee, fee :: Fee
+           , payload :: Bytes, safeBlock :: Block }
+  | DirectTx Direct
+
+-- The sequencing automaton: what the scheduler keeps besides the application.
+data Sched = Sched
+  { batchNonce :: Nonce          -- next batch nonce
+  , fridge     :: Queue Direct   -- admitted directs not yet executed
+  , floor      :: Block          -- L
+  }
+
+step :: Sched -> RawInput -> (Sched, [L2Tx])
+
+-- The stream, grouped by the input whose processing emitted each entry.
+segment :: Block -> Block -> ([(Block, [L2Tx])], Sched)
+segment a b = (zip (map block ins) txs, sched_b)
+  where sched_a = foldl (\s i -> fst (step s i)) initial (inputsThrough a)
+        ins = inputsIn a b
+        (sched_b, txs) = mapAccumL step sched_a ins
+```
+
+`step` accepts or rejects batches; queues, drains and overflows the fridge;
+and emits, in execution order, the directs it drains and the user ops of the
+frames it runs whose signature recovers a sender and whose `max_fee` covers
+the frame fee. It reads no application state. It does read what the template
+fixes: the sequencer address, `MAX_WAIT_BLOCKS`, the fridge bound and the
+application's stateless rule for well-formed directs, so for libdex the
+scheduler library embeds a port of Bart's rule. Signature recovery is pure,
+and the user ops it emits are *candidates*: whether each one executes, which
+reads its sender's nonce and, on today's template, its fee balance, is left to
+the application that receives the stream. The canonical machine is `step`
+followed by the guest's application, and the sequencer and every client are
+other applications over the same stream. That holds while the guest never
+answers an input with `RX_REJECTED`, as the
+[fatal conditions](../protocol/scheduler-semantics.md#fatal-conditions)
+require: the host's revert would roll the batch nonce and the fridge back with
+the application, a [question for Bart](#questions-for-bart).
+
+So `segment a b` needs an L1 connection and the scheduler library for the
+deployment's template, nothing else: no machine, no nonces, no application
+state and no application code. It reads every input since the deployment
+block, because the batch nonce and the fridge at `a` depend on all of them;
+before `a` the fold need only decode batches and check gates, recovering no
+signature. Its output is the L2 stream of the inputs in `(a, b]`, grouped by
+the block of the input whose processing emitted each entry (for a drained
+direct, the input that drained it, not its own block), and `Sched` at the end
+of `b`, which holds `N'`, the fridge (so `F`) and `L`.
+
+The stream is fed to two states at base `a`:
+
+```haskell
+sequencer = run (project m_a) txs   -- m_a: a machine at base a
+client    = run backup_a txs        -- a backup at base a
+-- run executes each tx through the shared execution boundary, as the
+-- canonical application does: a user op its state does not include is skipped
+```
+
+A candidate stream is exact only for a consumer that sits exactly at its
+start, and both do: each holds the nonces (and, on today's template, the
+balances) that decide inclusion, as the canonical machine did at `a`. Neither
+needs an InputBox index or an executed count to find its start: the base
+block fixes it. Each computes its own offsets while it runs, and the two must
+reach the same count, a cheap cross-check. A consumer at a later base `a'`
+skips the groups whose block is at most `a'`, by that tag, never by a direct's
+`block` or an op's `safeBlock`. The sequencer then imports
+its state with `N'`, `F` and `L`, and its root frame drains the queued directs
+([below](#queued-directs-at-the-stop-block)); a client subscribes to the new
+era at the sequencer's count and receives those directs as the era's first
+feed rows.
+
+### Why the tool hands out a segment
+
+The alternative is a `RichClientApp` plugin that the tool runs to produce each
+client's end state. The segment is better for four reasons:
+
+- **Data crosses the boundary, not code.** The tool depends only on the
+  scheduler, which a template fixes; a client's projection, schema and storage
+  change on their own schedule. A plugin would tie every tool release to every
+  client's code and effects.
+- **One execution boundary.** A client already runs L2 transactions through
+  the shared execution boundary, and recovery reuses it; only the driver
+  differs, since segment entries carry no offsets and a user op the client's
+  state rejects is skipped. A plugin would be a second path that runs once in
+  a deployment's life and rots.
+- **History, not only state.** Bart's client keeps trades and transfers, and
+  running the segment from its base replays that history, in canonical
+  order.
+- **Checkable and free of interpretation.** Every consumer is a fold over the
+  segment, the sequencer included, and their counts must agree; a plugin's end
+  state could only be trusted.
+
+## States at a base
+
+Both states must sit exactly at base `a`: a state that has consumed half of
+block `a`, or one input past it, would drop or repeat inputs. This is where
+the whole-block property becomes load-bearing.
+
+The sequencer's state is projected from a machine at its base. The
+projection must carry the executed-input count and clock that the consumers'
+offsets start from: the wallet's `state` inspect report holds both, and libdex
+keeps its state as a flat buffer in one of the machine's drives, which may or
+may not hold them
+([application contract](../protocol/application-contract.md#7-canonical-recovery-integration)).
+Any canonical machine the operator trusts will do, even one past a
+divergence; the tool enforces no provenance.
+
+| Machine | Base | Trust |
 |---|---|---|
-| `M`, the canonical machine | raw InputBox inputs | the application, the fridge and the next batch nonce |
-| `S`, the sequencer's application | executed L2 transactions | the application only |
-| `Cl`, a client's state | executed L2 transactions | its own projection, presumably with an `S` inside |
-
-The scheduler maps the raw stream to the executed L2 stream, and it has two
-parts with different inputs:
-
-- The **sequencing automaton** (next batch nonce and fridge) runs
-  [gates a–e](../protocol/scheduler-semantics.md#processing-an-input), the
-  frame drains, the backstop and, once the fridge is bounded, its overflow
-  drain. It reads no application state, so its state at any raw position is a
-  function of the input prefix alone. No input is ever rolled back, as long as
-  the guest halts on an application failure and never answers an input with
-  `RX_REJECTED`, as the
-  [fatal conditions](../protocol/scheduler-semantics.md#fatal-conditions)
-  require of every port. Our guest does; Bart confirms libdex never reverts,
-  and whether the rest of his guest can is a
-  [question for him](#questions-for-bart). A halt still depends on application
-  state, so anything derived without the application holds only while the
-  machine is live.
-- **Inclusion** decides which user ops execute. It reads application state:
-  the sender's nonce and fee balance.
-
-Two consequences shape the design:
-
-- The nonce and the fridge never need to be trusted or exported. Running the
-  scheduler itself over the input prefix derives both exactly, every gate and
-  the fridge bound included, with an application that executes nothing: it
-  only advances its progress once per executed input, as the scheduler
-  asserts, and, once the fridge is bounded, keeps the rule for which directs
-  are well-formed. That rule must be a pure function of the direct, or the
-  fridge would depend on application state. `scheduler_accepts` cannot do
-  this, because it omits gate d's rejections and keeps no fridge.
-- `S` and `Cl` need not share a type. They need a shared *position* and the
-  canonical executed segment between positions: the shared object is the
-  history, not a state. Snapshot-then-subscribe synchronizes states, and a
-  client whose state includes history needs history.
-
-### Positions are indices and counts, never clocks
-
-| Coordinate | Stream | Meaning |
-|---|---|---|
-| InputBox input index | raw | The only exact machine position; a Dave epoch boundary is one and can fall inside a block. |
-| End of block `X` | raw | All inputs whose inclusion block is at most `X`: the only block-shaped position. |
-| Executed-input count | L2 | A position within one history; counts derived from `M` are canonical. |
-| App clock `A` | neither | The running maximum of executed clocks; it locates nothing. |
-
-The app clock (`last_executed_safe_block`) is a clock, not a position
-([history coordinates](../protocol/application-history.md#progress-ordering-and-acceptance)):
-every op of a frame shares it, queued directs sit at or above it, and it can
-lag the raw boundary without limit. Its only positional content concerns
-directs in block `A`, which is how
-[checkpoint eligibility](../recovery/cockroach.md#checkpoint-eligibility) fails.
-
-"Finalized" has three meanings here: the Ethereum tag (the sequencer reads
-`safe`), a Dave-settled epoch, and the sequencer's `/finalized_*` routes, which
-serve its latest safe accepted checkpoint. Recovery needs only safe blocks to
-be permanent ([threat model](../threat-model/README.md#l1-chain-semantics)).
-
-## Resuming a machine
-
-A rebuild resumes the canonical program from a machine and replays the raw
-inputs after it. Two rules fix where it starts and where it stops:
-
-1. **Resume at the machine's input index.** A cursor at the app clock re-feeds
-   inputs the machine already consumed: queued directs are enqueued again and
-   execute twice, and a batch first rejected for a future nonce can now match
-   and execute, shifting `N'`. A block cursor drops or repeats the inputs of a
-   split block. Take the index from the machine's source, such as the chain
-   for Dave's machine or the name of a watchdog checkpoint; the input left in
-   the machine's receive buffer can only cross-check it
-   ([Cartesi Machine facts](../cartesi-machine.md#rollup-host-semantics)).
-2. **Fix the stop block `C` after the flush.** `C` is a safe head observed
-   after the flush settles the old instance's transactions; a stop block fixed
-   earlier lets an old batch at the next nonce land after it.
-
-## The input machine
-
-The tool starts from a stored machine the operator trusts, at a known input
-index. It enforces no provenance: choosing the machine is the operator's
-responsibility, which also lets tests start anywhere.
-
-| Machine | Position | Trust | Replay to `C` |
-|---|---|---|---|
-| Dave's last finalized machine, the default | `inputIndexLowerBound` of the current sealed epoch, possibly mid-block | its root is on chain | a week or more on mainnet |
-| A watchdog checkpoint | the end of a block (`<block>-<count>`), possibly mid-epoch | the operator's watchdog replayed it from L1 | at most the incident window |
-| The template | input index 0 | its hash is on chain | from genesis |
-
-The default gives the operator and every client one machine, which each can
-take from its own Dave node and check against L1. Dave's node, sling, keeps
-only the newest finalized machine and serves it only as files
-([Cartesi Machine facts](../cartesi-machine.md#rollup-host-semantics)). Read its
-position at the same finalized block as the root, or take both from the newest
-`EpochSealed`. That position can fall inside a block, so the replay starts at
-an input index.
+| Dave's last finalized machine, the default | its epoch can end inside a block: replay the rest of that block from its input index, read on chain with its root and checked against its receive buffer | its root is on chain |
+| A watchdog checkpoint | the end of a block (`<block>-<count>`) by construction | the operator's watchdog replayed it from L1 |
+| The template | before the first input | its hash is on chain |
 
 A matching root authenticates a machine only from a source we trust, such as
 our own Dave node: a stored machine's root comes from its stored hash tree, not
-from its contents ([hashing](../cartesi-machine.md#hashing)). v0.22.0's one
-check of the contents, `verify_hash_tree`, catches a corrupt copy but not hash
-files rewritten to match, and the emulator team asked that nothing call it;
-PR #56 runs it in the watchdog's `init` and `replay` anyway, which is
-[on the watchdog's to-do list](2026-09-watchdog-v2.md#remaining-work). An
-upcoming emulator release brings a mechanism to verify an untrusted load,
-which would let a machine from any source be checked against L1.
+from its contents ([hashing](../cartesi-machine.md#hashing)). An upcoming
+emulator release brings a mechanism to verify an untrusted load; until then,
+`verify_hash_tree` is not that mechanism and is
+[on the watchdog's to-do list](2026-09-watchdog-v2.md#remaining-work).
 
-The import takes a native bundle at `C` carrying `K`, `N'` and `F`, the
-InputBox index where the canonical fridge starts
-([below](#queued-directs-at-the-stop-block)), whether the tool exported it
-from a machine or a test built it. The sequencer's logical state is never
-richer than the canonical one
-([application contract](../protocol/application-contract.md#7-canonical-recovery-integration)),
-so a machine can always produce the bundle. A sequencer archive is not such a
-bundle: it stops at its own accepted block, below `C`, and nothing here folds
-it forward. A rebuild after a lost database therefore starts from a machine
-too, most cheaply the watchdog head.
+The client's state comes from its backups. A backup sits at base `B` only if
+it holds exactly the entries below the executed-input count `X` of an accepted
+checkpoint at block `B`, which is a whole block by construction
+([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)),
+and it is labelled with `B` and `X`. A client that follows the optimistic feed
+is already past `X` when it learns of the acceptance, so it snapshots at batch
+boundaries and keeps the snapshot whose count a checkpoint later accepts. A
+later snapshot labelled `B` would apply its soft entries again; worse, a soft
+op that never landed has already used its sender's nonce, so the client skips
+the canonical op with that nonce, and the counts still agree. After an
+incident the base must predate the divergence, at or before the watchdog's
+last agreed block: a client that followed the divergent sequencer holds no
+canonical backup past it.
 
 ## Queued directs at the stop block
 
 At the end of `C` the canonical scheduler can still hold queued directs. The
-first accepted frame at or above a direct's block drains it, or the backstop
-does `MAX_WAIT_BLOCKS` later. The rebuilt sequencer must sequence each of them
-exactly once. The fridge is always a suffix of the directs it admits (every
-direct today, the well-formed ones once the fridge is bounded), since frame
-drains, the backstop and the bound's overflow drain all pop only its front, so
-one InputBox index `F` describes it: the oldest queued direct's, or the end of
-`C` when nothing is queued. A block cannot, because after faulty sequencing a
-frame whose `safe_block` equals its inclusion block drains only part of that
-block.
+fridge is always a suffix of the directs it admits, since frame drains, the
+backstop and the bound's overflow drain all pop only its front, so `F`
+describes it. A block cannot, because after faulty sequencing a frame whose
+`safe_block` equals its inclusion block drains only part of that block.
 
-The rebuilt sequencer therefore starts from the canonical state at the end of
-`C`, with its direct floor at `F` instead of at block `C`. Its root frame, at
-`C`, executes the admitted directs in `[F, end of C)` as ordinary rows before
-any user op, as the first canonical frame drains them, and clients receive
-them through the feed with normal offsets. The sequencer keeps no fridge of
-its own: its pending directs are the admitted directs in the undrained index
-range of its input table, and setup
-already ingests every input from the deployment block, so `F` alone carries
-the canonical fridge across the rebuild. The bundle also carries the queue's
-length, which the import checks against its own count of admitted directs
-from `F`. The change is small:
-the era records `F`, and the lane drains directs from the later of `F` and the
-first input after its latest frame's `safe_block`. A cascade that tears down
-every frame
+The rebuilt sequencer therefore starts from its state at the end of `C`, with
+its direct floor at `F` instead of at block `C`. Its root frame, at `C`,
+executes the admitted directs in `[F, end of C)` as ordinary rows before any
+user op, as the first canonical frame drains them, and clients receive them
+through the feed with normal offsets. The sequencer keeps no fridge of its
+own: its pending directs are the admitted directs in the undrained index range
+of its input table, which setup already fills from the deployment block. The
+change is small: the era records `F`, and the lane drains directs from the
+later of `F` and the first input after its latest frame's `safe_block`. A
+cascade that tears down every frame
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce))
-re-roots there and drains the queued directs again. Acceptance still scans
-only blocks after `C`
-([replay boundaries](../recovery/cockroach.md#replay-boundaries)).
+re-roots there and drains them again. Acceptance still scans only blocks
+after `C` ([replay boundaries](../recovery/cockroach.md#replay-boundaries)).
 
 Today's procedure instead executes the queued directs during recovery (the
-terminal drain) and publishes the result, `S'`. `S'` is a prediction, not a
-machine state: the canonical machine reaches it only inside the post-`C` input
-that empties the fridge, often executing more there, so no comparison can
-check it. A client that applied the drained tail must roll it back if a second
-rebuild comes, and a rebuild that started from `S'` would execute those
-directs twice. With the floor, the baseline is a state the canonical machine
-actually reaches, and the root frame's drain is the ordinary drain
-attribution
-([I2](../invariants.md#i2-drain-attribution-accumulated-directs-land-in-the-clock-advanced-frame)),
-an argument normal operation already relies on and an easier one to explain.
-Track 3 kept the terminal drain because replacing it would carry pending work
-across the baseline
+terminal drain) and publishes the result. That state is a prediction: the
+canonical machine reaches it only inside the post-`C` input that empties the
+fridge, often executing more there, so no comparison can check it, a client
+that applied it must roll it back if a second rebuild comes, and a rebuild
+that started from it would execute those directs twice. Track 3 kept the
+terminal drain because replacing it would carry pending work across the
+baseline
 ([scope boundaries](2026-07-track3-feed-replay-design.md#scope-boundaries));
 that work crosses as one index.
 
-## The tool
+## The procedure
 
-The canonical machine produces the baseline: it is the state that machine
-reaches at the end of `C`, bug for bug.
-
-1. **Check the machine.** Compare its root with the chain's where it claims an
-   on-chain one, and its position with the input in its receive buffer.
+1. **Choose the bases.** Take a machine the operator trusts at the end of a
+   block; any canonical machine will do, even one past the divergence. Take
+   each client's newest backup at a base; after an incident it must be at or
+   before the agreed head in the watchdog's latch record. `a` is the earliest
+   of these bases, and each consumer skips the groups tagged with blocks up to
+   its own.
 2. **Flush, then fix `C`.** Settle the old instance's transactions, then take
    a safe head observed after they settle as `C`. The flush is best effort: it
    replaces what the provider's pool holds for the submitter account and waits
    until that is safe. It cannot rely on the old watermark, which does not
-   survive every event that calls for a rebuild, so a transaction alive only
-   outside the provider's pool may still land and freeze the rebuilt
-   instance, which then needs another rebuild. This is the only step that
-   needs the key, and only `C` must wait for it, so most of step 3 can run
-   first. Refuse if a submitter input above `C` is already ingested.
-3. **Replay to `C`.** Run the machine to the end of `C` with the watchdog's
-   engine, starting at its input index. A fixed point means the application
-   is dead: stop.
-4. **Export.** Write the machine's state-source bytes at `C` as a native
-   bundle with its count `K`. That is a byte copy where the dump is exactly
-   the comparison file, as for the wallet; any other application keeps its own
-   exporter
-   ([application contract](../protocol/application-contract.md#7-canonical-recovery-integration)).
-   Take `N'` and `F` from the scheduler run over the input prefix with an
-   application that executes nothing, and write the bundle's metadata last,
-   as its commit point.
-5. **Import and run.** Import in one transaction, with the root frame's
-   leading direct range `[F, end of C)`, then start `run` promptly. A late
-   start is safe: once the root frame ages past the danger threshold,
-   startup's [Tip repair](../recovery/README.md#open-tip-repair-without-flushing)
+   survive every event that calls for a rebuild
+   ([flush boundary](../recovery/cockroach.md#flush-and-stopping-block)). As a
+   standalone subcommand, it is the only step that needs the key. Refuse if a
+   submitter input above `C` is already ingested.
+3. **Run `segment a C`**, from L1 alone, and write the stream and `Sched` at
+   `C`, the latter last as the commit point.
+4. **Rebuild the sequencer.** Run the stream from its state projected from the
+   machine, skipping the groups up to the machine's base, and import the result
+   with `N'`, `F` and `L` in one transaction. Start `run` promptly. A late
+   start is safe: once the root frame ages past the danger threshold, startup's
+   [Tip repair](../recovery/README.md#open-tip-repair-without-flushing)
    reopens it at the current safe head, still draining from `F`.
+5. **Realign clients.** Each client runs the stream from its backup, skipping
+   the groups up to its backup's base, checks that it reaches the
+   sequencer's count, and subscribes to the new era there.
 
-The new era's first watchdog comparison then checks the result a batch later:
-a wrong `N'`, a wrong `F` or a guest compiled for another sequencer address
-shows up there as a divergence.
+The new era's first watchdog comparison checks the result a batch later: a
+wrong stream, `N'` or `F`, or a guest compiled for another sequencer address,
+shows up there as a divergence. Replaying the machine to `C` with the
+watchdog's engine checks it before `run`, at an emulated cost. The tool cannot
+see a halt, which reads application state; a consumer that reaches the halting
+transaction fails there, as the canonical machine did.
 
-The watchdog needs two changes for this: an `export-state` command that writes
-a machine's state-source bytes with its block and input count, and nothing
-application-specific; and `replay` that starts at an input index, checked
-against the input in the machine's receive buffer, where today it takes a
-block and the count from the RPC.
+## Rules for the next template
 
-## Later, when a need appears
+The owner settled these on 2026-10-29. Each changes the guest, so each needs
+Bart's agreement and ships with the next template, ours and his port's
+([register](../review/register.md#canonical-rules-open-for-the-c-port)). The
+tool needs none of them: `step` applies whatever the template applies, the
+`L` gate and the fridge bound included. Only the fridge bound puts application
+code into `step`, its well-formedness rule, which is why that rule may read
+only the direct and fixed configuration.
 
-### Clients
-
-Bart's client treats rebuilds as out of scope today, so the client side waits
-until it does not. Then the tool also produces the canonical executed segment
-from the input machine's count to `K`, and a client applies it from its own
-checkpoint:
-
-1. Restore the newest backup at a count within the segment whose logged entry
-   hashes match it and whose embedded `S` digest equals the tool's at that
-   count. With no such backup, rerun from an older machine, or from the
-   template (a replay from genesis).
-2. Apply the rest of the segment through the same path as feed entries.
-3. Require count `K` and the baseline's digest, then subscribe to the new era
-   at `K`; its first rows are the queued directs. Never subscribe across an
-   era.
-
-Only a native fold can produce that segment: the canonical machine tags no
-output with its entry and exposes state only between raw inputs, while one
-batch executes many entries. The fold starts from the input machine's state
-and must reach an equal state at `C`. An entry's hash covers its L1-derived
-fields and its offset, never its outcome or outputs, and one entry format
-should serve both the segment and the new sync's feed. When replaying a week
-from Dave's machine is too slow, the same fold also gives a fast path: replay
-canonically from a recent watchdog checkpoint instead, and let the fold from
-Dave's machine produce only the segment.
-
-A client that does not trust the operator starts from a machine from its own
-node, or, once the emulator verifies untrusted loads, from anyone's. For
-realignment after an incident, the machine must sit at or before a backup the
-client can restore, and so before the divergence. The watchdog's head stays at
-its last agreed block while the latch holds, so it serves such a client;
-`incident/canonical`, the canonical machine at the latched block, does not
-([incident runbook](../watchdog/incident-runbook.md#what-you-have)).
-
-State equality does not validate history. The wallet reaches byte-identical
-state through distinct histories of equal length: two commuting transfers, or
-two included business failures from different senders, each pair in either
-order. Entry hashes validate a backup's history within the segment; history
-before it rests on state equality alone.
-
-### The scheduler boundary
-
-A `trait Scheduler`, like `trait Application`, would let tools run Bart's
-scheduler natively. Taken at the machine's own interface,
-`M -> RawInput -> M`, it keeps a tool bug for bug with the machine: the
-harness's input decoding (u64 narrowing, the per-input signing domain, the
-compiled sequencer address), the scheduler and the engine. For libdex the
-shape is one C++ library built for RISC-V and native. The first version needs
-none of it: the canonical machine produces the baseline, and for our guest the
-scheduler that derives `N'` and `F` is the guest's own `Scheduler<A>`. Build
-the trait with Bart's library, when a native fold over libdex is needed.
-
-Sharing one gate function between the guest and the gold frontier would
-remove the self-trust exception for gate d's rejections, which PR #56's
-fee-range reject extends. It is weakest after a rebuild, since a malformed
-old-key batch that escapes the flush freezes a correct instance. But the gold
-frontier is the heart of standard recovery, the hardest part of this
-software, so it waits for a need.
-
-## Canonical rules for the next image
-
-Each rule changes the image, so it needs Bart's agreement and can ride only a
-new image, ours and his port's
-([register](../review/register.md#canonical-rules-open-for-the-c-port)). Only
-the fridge bound is settled; the others are proposals, open or deferred as the
-[decisions](#decisions) record. If
-each sequencer release supports one image, which the template tie below would
-enforce, no rule needs a switch per deployment.
-
-- **The fridge bound**, settled with the owner: only well-formed directs enter
-  the fridge, a count bounds it, and an overflow drains just enough of its
-  front to make room, so the input that overflows it carries no large drain
+- **Fridge bound.** Only well-formed directs enter the fridge, under an
+  application-defined rule that reads only the direct and fixed configuration;
+  a count bounds it; and an overflow drains just enough of its front to make
+  room, raising `L` to the youngest drained direct's block
   ([register](../review/register.md#bound-the-canonical-direct-input-fridge)).
-  The bound is protocol: the scheduler run that derives `N'` and `F` applies
-  it like every other rule. The playbook for an overflow is a manual cockroach
-  recovery.
-- **Monotone frame clocks**, the owner's proposal. Gate d orders frames only
-  within a batch, so a later batch's user ops can run below an earlier
-  input's clock. The scheduler would keep the last accepted frame's
-  `safe_block`, `L`, and reject a batch whose first frame is below it; the
-  gate must read `L`, not the app clock, which a frame that executes nothing
-  leaves behind and a drain can push above `L`.
-  A correct sequencer never builds such a batch
-  ([I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)).
-  It changes no recovery reasoning, though: its value is time the
-  application can trust. Its cost is `L` in the scheduler state, the
-  bundle, the era, the gold frontier, which must track it exactly, and an
-  assert on every transition that opens a Tip. An overflow drain can still
-  run a young direct before a later batch whose frames sit below it, so
-  clocks are monotone only between overflows; making the drain raise `L`
-  would let standard recovery repair an isolated overflow, and is deferred on
-  complexity.
-- **Under-funded user ops execute**, the owner's sanity rule. An op its sender
-  cannot fully pay for executes, and the sequencer that batched it bears the
-  fee it cannot collect; whether the sender then pays nothing or what its
-  balance covers is still open. The wallet changes too: its apply returns an
-  error on an unpayable fee, which validation keeps unreachable today and
-  which would halt the machine under this rule. Inclusion then reads only the
-  sender's nonce, which the
-  [nonce rule](../protocol/application-contract.md#user-nonces) makes a
-  function of earlier inclusions, so the executed stream becomes a function of
-  L1 while the machine is live. Recovery does not need this; making a
-  mismatched nonce an included no-op would go further, but nothing needs that
-  either. The sequencer keeps its own admission check, so its batches are
-  unchanged.
+  A direct that is not well-formed is dropped without executing. An overflow
+  is answered by a manual cockroach recovery: making standard recovery repair
+  one is deferred on complexity, since standard recovery is the hardest part
+  of this software.
+- **Monotone frame clocks.** Applications may read blocks as time: a direct's
+  inclusion block and a user op's frame `safe_block`. Gate d orders frames only
+  within a batch, so a later batch could run below an earlier input's clock.
+  The scheduler keeps `L` and rejects a batch whose first frame is below it;
+  the gate reads `L`, not the app clock, which a frame that executes nothing
+  leaves behind and a drain can push above `L`. Between overflows a correct
+  sequencer never builds such a batch
+  ([I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)),
+  but the gate makes I3 consensus-critical: every transition that opens a Tip
+  needs an assert that it starts at or above the latest valid frame, and
+  `scheduler_accepts` must track `L` from the frames it accepts, starting after
+  a rebuild from the imported `L`. It keeps no fridge, so it misses an
+  overflow's raise of `L`, which rejects batches the lane already sealed: the
+  divergence a manual rebuild answers.
+- **Authorization decides inclusion.** A user op is included exactly when its
+  sender authorized it here: its signature recovers the sender, its nonce is
+  the sender's next and has a successor, and its `max_fee` covers the frame
+  fee. An op that fails any of these has no effect on anyone. An included op
+  always advances its sender's nonce and pays the fee, capped at the balance
+  (a saturating subtraction); anything else that stops it is a business
+  failure, which still advances the nonce and charges the fee. The wallet
+  changes too: its apply returns an error on an unpayable fee, which would
+  halt the machine under this rule. The sequencer keeps checking balances at
+  admission, so its batches are unchanged.
+- **Direct inputs carry their context.** An application may read a direct's
+  input index, block timestamp and prevRandao, never a batch's. The fridge and
+  the `Direct` the scheduler applies carry them. The sequencer's input table
+  and the feed's direct rows already carry the index and timestamp, and both
+  must add prevRandao, or a client could not apply such a direct.
 - **A `scheduler` inspect query** returning the machine's input count, the
-  nonce and the fridge entries with their input indices. Read at `C`, it would
-  give `N'` and `F` from the canonical machine itself, replacing the scheduler
-  run from genesis and, on Bart's image, the reliance on our scheduler
-  matching his. It changes the image, and images already deployed still need
-  the run, so it waits until the run proves too slow or Bart's image needs
-  it.
+  batch nonce, `F` and `L`. It cross-checks `segment`'s fold from L1 against
+  the machine. One inspect report holds at most 2 MiB.
+
+Shared scheduler code serves every deployment; if each sequencer release
+supports one template, which the proposed template tie below would enforce,
+no rule needs a switch per deployment.
 
 ## Preconditions the design must state
 
-- **The old instance stays down.** Recovery is manual, and the operator keeps
-  the old instance stopped: recovery deliberately creates a second data
+- **The old instance stays down.** Recovery deliberately creates a second data
   directory pinned to the same submitter address, the old one can still run
   with the same key, and
   [the flush fences transactions, not processes](../recovery/cockroach.md#incident-playbook).
   No command that signs with the key may run against the old directory again
   ([restart policy](../watchdog/operator-deployment.md#sequencer-restart-policy)).
-  Otherwise both instances post at nonce `N'` and later, either or both can
-  freeze, and the old instance's sealed batches can still land. A sequencer
-  address that is an L1 contract forwarding batches from a hot key, which a
-  cold multisig can rotate (a separate design, out of scope), would fence at
-  L1 instead: rotating the key retires the old instance.
+  A sequencer address that is an L1 contract forwarding batches from a hot key
+  that a cold multisig rotates (a separate design, out of scope) would fence
+  at L1 instead.
 - **Key loss or compromise means a new deployment** while the submitter is an
-  account compiled into the image ([README](../../README.md#running)); the
-  forwarding contract would make it a rotation.
+  account compiled into the template ([README](../../README.md#running)).
 - **A dead canonical machine is unrecoverable.** Cockroach recovery repairs
   only the sequencer's view. PR #56 makes gate d reject an out-of-range
-  `fee_price`, so on images built from it that sequencer bug becomes a
-  divergence recovery can repair. Images built before it halt on such a batch
-  only when one of its ops reaches the wallet's fee conversion, which takes a
-  recovering sender, a `max_fee` covering the fee and the sender's next nonce;
-  otherwise they skip those ops. Any other
+  `fee_price`, so on templates built from it that sequencer bug becomes a
+  divergence recovery can repair; any other
   [fatal condition](../protocol/scheduler-semantics.md#fatal-conditions) still
   ends the application.
-- **The watchdog ties the sequencer to the deployed image.** A fix to code the
-  image shares diverges the sequencer from it, which today only the watchdog's
-  next comparison notices ([cockroach recovery](../recovery/cockroach.md)). A
-  cheap earlier tie: setup would pin the application's `getTemplateHash()`, and
-  `run` would refuse an image other than the one its release declares, which
-  also makes one image per release safe. Tying the watchdog to the validators is
+- **Consumers execute bit for bit.** The sequencer and every client run the
+  stream through the canonical validation and execution; for Bart's client
+  that means embedding libdex exactly as the guest runs it.
+- **The template tie.** A fix to code the template shares diverges the
+  sequencer from it, which today only the watchdog's next comparison notices
+  ([cockroach recovery](../recovery/cockroach.md)). Setup would pin the
+  application's `getTemplateHash()`, and `run` would refuse a template other
+  than the one its release declares. Tying the watchdog to the validators is
   [a later to-do](2026-09-watchdog-v2.md#remaining-work).
-- **Foreclosure** blocks `InputBox.addInput` in the pinned contracts, and
-  PR #56 documents stopping the sequencer for good; do not rebuild a
-  foreclosed application.
-- **Detection.** The watchdog's divergence latch is how the operator learns
-  that the sequencer disagrees with the canonical machine, after a bug or a
-  fridge overflow alike, and whether its `range` state source works with
-  Bart's image is unverified
-  ([state sources](../watchdog/README.md#state-sources)).
+- **Detection.** The watchdog's divergence latch tells the operator that the
+  sequencer disagrees with the canonical machine, after a bug or a fridge
+  overflow alike. Whether its `range` state source works with Bart's template
+  is unverified ([state sources](../watchdog/README.md#state-sources)).
 - **Users.** Revoked user ops are not cancelled
   ([cockroach recovery](../recovery/cockroach.md)); this is accepted, and
-  expiry is future work. `GET /nonce` reads 0 for senders idle since the
-  rebuild ([user nonces](../protocol/application-contract.md#user-nonces)), as
-  after today's rebuild; the baseline nonces that
-  [Track 6](2026-07-coordination-tracks.md#track-6--dump--application-api-redesign)
-  proposes would make it exact, and the first version does without them.
-- **Disaster recovery** (a lost database, no bug) is probably the commonest
-  trigger. Every client then sees an era change, and the rebuild starts from a
-  machine like any other, most cheaply the watchdog head.
+  expiry is future work.
 - **The canonical prefix stays.** Batches the faulty sequencer got accepted
   stay canonical, and recovery does not undo them.
-- **Practice.** The rebuild has no formal model, and both its drills restore
-  an honest instance's own archive through `setup --recovery`, which this
-  design replaces, after wiping its database
+- **Practice.** Both of today's rebuild drills restore an honest instance's
+  own archive through `setup --recovery`
   ([incident runbook](../watchdog/incident-runbook.md#drills)): a disaster,
-  not a bug. Starting from a machine is unpracticed, and a path run once in a
-  deployment's life rots.
+  not a bug. Rebuilding from a machine, and realigning a client, are
+  unpracticed, and a path run once in a deployment's life rots.
 
 ## Decisions
 
@@ -429,77 +375,80 @@ The owner settled these on 2026-10-29:
 
 | Decision | Choice |
 |---|---|
-| Input | A machine the operator trusts, by default Dave's last finalized one checked against L1; no enforced provenance |
+| Shape | `segment a b`, from L1 and the scheduler library alone, fed to the sequencer's and the client's states at base `a` |
+| Purpose | A stream that the sequencer and every client run, instead of a plugin per client |
+| Sequencer state at `a` | Projected from a machine the operator trusts, by default Dave's last finalized one; no enforced provenance |
 | Queued directs at `C` | An input-index direct floor, replacing the terminal drain |
-| Flush | Best effort, trusting the provider's pool view, since the old watermark cannot be relied on |
-| Fencing | An operator requirement, now in the threat model's [operator mistakes](../threat-model/README.md#operator-mistakes); a rotatable forwarding contract would fence at L1 |
-| Fridge bound | Well-formed directs only, bounded by count, an overflow draining just enough to make room; the bound is protocol |
-| Fridge overflow | A manual cockroach recovery; making the drain raise `L` is deferred on complexity |
+| Flush | Best effort, trusting the provider's pool view |
+| Fencing | An operator requirement, in the threat model's [operator mistakes](../threat-model/README.md#operator-mistakes) |
+| Next template | The fridge bound, monotone frame clocks, authorization deciding inclusion, direct context, and the `scheduler` query |
+| Fridge overflow | A manual cockroach recovery; standard recovery does not repair it |
 
 These stay open:
 
 | Decision | Recommendation |
 |---|---|
-| First version | The sequencer's baseline only: check, flush, replay, export, import; the client segment and its native fold wait for a client that handles rebuilds |
-| Scheduler state | The scheduler run over the input prefix with an application that executes nothing, replacing the checkpoint's operator-trusted nonce and today's fridge seeding from `(A, B]` ([replay boundaries](../recovery/cockroach.md#replay-boundaries)) |
-| Flush tool | A standalone subcommand for the best-effort flush, so that the rest of the tool needs no key |
-| Template tie | One image per release: setup pins `getTemplateHash()`, and `run` refuses another |
-| Frame clocks | Defer unless libdex reads a frame's `safe_block` as time |
-| Under-funded ops | The owner's rule if wanted as application sanity; recovery does not need it |
+| Client backups | Taken at exactly an accepted checkpoint's executed-input count, and labelled with its block and that count |
+| Template tie | One template per release, enforced at setup and `run` |
 | Shared gate function | Defer: it changes the gold frontier, the heart of standard recovery |
-| `scheduler` query and `trait Scheduler` | Defer until a need appears |
-| Threat-model statements | Add that key loss or compromise means a new deployment until the forwarding contract; the old-instance requirement and the Ethereum L1 scope are already there |
+| `trait Scheduler` | Defer: for libdex deployments the scheduler library is ours, with libdex's direct rule ported, held to Bart's guest by the versioned gate vectors of the next template |
+| Threat-model statement | Add that key loss or compromise means a new deployment until the forwarding contract |
 
 ## Questions for Bart
 
-- Is libdex's dump exactly its canonical range, so that a machine's state
-  loads through `from_dump`? Do the comparison bytes embed the executed count?
-- Does libdex read the block timestamp, prevRandao or input index when it
-  executes a direct input? Does it read a frame's `safe_block` as time?
+- Does libdex's drive hold only its flat buffer, or a padding tail too? Does
+  that buffer hold the executed-input count and clock, so that a state
+  projected from a machine starts at the canonical count?
+- Which of a direct's index, timestamp and prevRandao does libdex read?
 - Is your guest's compiled sequencer address the pinned submitter? Can its
   harness or scheduler answer an input with `RX_REJECTED`?
-- Does your scheduler pass `consensus_vectors_v1`, and does it reject an
+- Does your scheduler reproduce the conformance vectors, and reject an
   out-of-range `fee_price` at gate d, as ours does since PR #56?
-- Which directs are well-formed for libdex, and how large can a well-formed
-  one be? The fridge's count bound bounds memory only if each entry's size is
-  bounded too.
-- Does libdex reject a user op for reasons beyond its nonce and fee balance,
-  such as the C ABI's account binding?
-- When will your client handle a rebuild instead of treating it as out of
-  scope? It then needs the segment, and an entry hash per applied entry.
-- What are libdex's per-op guest cycles and state size? Who fixes libdex
-  during an incident?
+- Which directs are well-formed for libdex, and how large can one be? The
+  fridge's count bound bounds memory only if each entry's size is bounded.
+- Does libdex's validation refuse a user op for any reason besides its
+  signature, nonce and fee cap? Under the authorization rule, every other
+  reason becomes a business failure that still advances the nonce and charges
+  the fee.
+- Will your client keep backups at exactly an accepted checkpoint's
+  executed-input count, labelled with its block and count, and how long will
+  it keep them?
+- What are libdex's per-op cycles and state size? Who fixes libdex during an
+  incident?
 
 ## Measure before choosing
 
-- The emulated replay time of an incident window and of a week, with guest
-  cycles per wallet and per libdex batch (today one record exists: about
-  50 ms of host overhead per input on v0.21, in
-  [Cartesi Machine facts](../cartesi-machine.md#storage-sharing-and-snapshots)).
-  If a week is too slow, the default input costs too much.
-- The production deployment's Dave lag.
-- A scheduler run from genesis with an application that executes nothing,
-  which still recovers one signature per op, and setup's sync time from the
-  deployment block.
+- The fold of the automaton from the deployment block: an L1 scan of every
+  input, which need recover no signature before `a`.
+- Signature recovery and execution over a realistic `(a, C]`.
+- The production deployment's Dave lag, and replaying the rest of a block from
+  Dave's machine.
 - The guest's cost to drain a full fridge in one input, which the root frame
   after a rebuild and the first frame after an outage both do.
-- The time to recover, end to end, in a rebuild drill.
+- The time to recover, end to end, in a drill.
 
 ## Remaining work
 
-- Settle the open decisions; those that change the image wait on Bart's
-  answers.
-- Watchdog: `export-state`, and `replay` from an input index.
-- Tool: the best-effort flush, the scheduler run for `N'` and `F`, the bundle,
-  and the import with `F`. An existing rebuilt database takes `F` at the end
-  of its `C`. The floor rewrites what pins the terminal drain today: the
-  projection replay steps, the README's nonce note, the history guide's era
-  baseline, snapshot lifecycle, invariants I6, I8, I11 and I20, and the
-  rebuild drill's replica check.
-- A drill that starts from a machine, in the
+- Settle the open decisions; the template rules wait on Bart's answers.
+- Tool: `segment`, from a `step` split out of `Scheduler<A>`, and the flush
+  subcommand. Today's scheduler recovers every signature, hands an op to the
+  application in two calls (`validate_user_op`, then `apply_valid_user_op`)
+  and keeps no input index in the fridge, so an application that records what
+  it is handed cannot produce the stream.
+- Sequencer: project a machine's state, run the stream, and import with `F`
+  and `L`. An existing rebuilt database takes `F` at the end of its `C`. The
+  floor rewrites what pins the terminal drain today: the projection replay
+  steps, the README's nonce note, the history guide's era baseline, snapshot
+  lifecycle, invariants I6, I8, I11 and I20, and the rebuild drill's replica
+  check.
+- Clients: backups at an accepted checkpoint's count, labelled with its block
+  and count, and a segment driver that runs each entry through the shared
+  execution boundary and skips the user ops it rejects.
+- Watchdog: `export-state`, and `replay` from an input index, checked against
+  the machine's receive buffer, to the end of its block, for Dave's machine.
+- Drills that rebuild from a machine and realign a client, in the
   [incident runbook](../watchdog/incident-runbook.md#drills); until the tool
   lands, `setup --recovery` keeps its archive drill.
 - Then the deletions the
   [tracks board](2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
-  lists for the tool's landing, and `setup --recovery`, which the tool and the
-  import replace.
+  lists for the tool's landing, and `setup --recovery`, which the tool replaces.

@@ -26,26 +26,26 @@ growth; its workload-specific thresholds are not deployment capacity bounds.
 
 Direction, settled by the owner on 2026-10-29: only well-formed directs enter
 the fridge, under application-defined format and sender rules that read only
-the input and fixed configuration;
-a count of entries bounds it; and an overflow executes just enough of the
-oldest entries, in FIFO order, to make room, so that the input that overflows
-it carries no large drain. The bound is protocol: canonical execution,
+the input and fixed configuration, and the rest are dropped without
+executing; a count of entries bounds it; and an overflow executes just enough
+of the oldest entries, in FIFO order, to make room, so that the input that
+overflows it carries no large drain, raising the frame-clock floor to the
+youngest drained entry's block. The bound is protocol: canonical execution,
 recovery and the C++ port apply it alike, and live prediction applies the
 well-formedness rule. Live prediction cannot mirror an overflow drain, which
 can run ahead of batches the lane has already sealed, so an overflow is a
 deliberate divergence. An overflow is answered by a manual cockroach
-recovery, and the watchdog's divergence latch is what reports it. Raising the
-frame-clock floor on an overflow drain would let standard recovery repair an
-isolated overflow instead, and is deferred on complexity
-([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
+recovery, and the watchdog's divergence latch is what reports it; making
+standard recovery repair one is deferred on complexity
+([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 
 To settle with Bart:
 
-- Drop a direct that is not well-formed without executing it, and have live
-  prediction drop the same ones. Executing it when it arrives would count an
-  input at an L1 position the sequencer cannot know when it seals a batch, so
-  one `addInput` would force a divergence. Every direct counts as an executed
-  input today, so dropping one changes the history.
+- Live prediction drops the same directs as the guest. Executing one when it
+  arrives instead would count an input at an L1 position the sequencer cannot
+  know when it seals a batch, so one `addInput` would force a divergence.
+  Every direct counts as an executed input today, so dropping one changes the
+  history.
 - How large an entry can be. A count bounds memory only if each entry's size
   is bounded too, and portals accept zero-value deposits with arbitrary extra
   data, up to the 64 KiB input cap; a fixed-size record of each deposit the
@@ -63,8 +63,9 @@ To settle with Bart:
   accumulated outputs included. The five-block local frame tick is not a
   canonical drain interval.
 
-Overflow can reorder still-fresh delayed batches, which matching batch
-bytes/nonce alone does not reveal. Silent loss of valid deposits is not a
+An overflow rejects a still-fresh delayed batch whose first frame lies below
+the raised floor, and every later batch then fails the nonce gate, though live
+prediction counted them accepted. Silent loss of valid deposits is not a
 recovery strategy.
 
 Next: settle these with Bart and measure headroom, then exercise delayed fresh
@@ -293,23 +294,28 @@ evidence: the spec's links and
   [SSZ overhead](#batch-size-accounting-omits-ssz-overhead) fix; drain sealed
   batches before the switch.
 - **Frame clocks across batches** (checked 2026-10-29 at `3e92563`). Gate d
-  orders frame clocks only within a batch, so after faulty sequencing or a
-  fridge overflow a later batch's user ops can run below an earlier input's
-  clock. A gate on the last accepted frame's `safe_block` would close the
-  first case; recovery does not need it, so defer it unless libdex reads a
-  frame's `safe_block` as time
-  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
-- **Under-funded user ops** (checked 2026-10-29 at `3e92563`). The scheduler
-  skips an op the application rejects (nonce mismatch, fee balance), so which
-  ops execute, and every later offset, depends on application state.
-  Proposed by the owner: an under-funded op executes at the batching
-  sequencer's expense, so inclusion reads only the sender's nonce, which the
-  nonce rule makes a function of the input prefix
-  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#canonical-rules-for-the-next-image)).
+  orders frame clocks only within a batch, so after faulty sequencing a later
+  batch's user ops can run below an earlier input's clock, though applications
+  may read blocks as time. Settled by the owner for the next template,
+  pending Bart: a gate on the last
+  accepted frame's `safe_block`, which a fridge overflow drain also raises.
+- **Authorization decides inclusion** (checked 2026-10-29 at `3e92563`). The
+  scheduler skips an op the application rejects, fee balance included, so
+  which ops execute depends on application state. Settled by the owner for
+  the next template, pending Bart: an op is included exactly when its sender
+  authorized it (signature, nonce, fee cap); an included op advances the
+  nonce and pays the fee capped at the balance, whatever else happens.
+- **Direct input context** (checked 2026-10-29 at `3e92563`). The guest drops
+  a direct's input index, timestamp and prevRandao, and the application never
+  sees them. Settled by the owner for the next template, pending Bart: they
+  reach the application with the direct, and the sequencer stores prevRandao
+  and carries it on the feed's direct rows
+  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
-  the [fridge bound](#bound-the-canonical-direct-input-fridge), and a setup check
-  of the guest's compiled `sequencer_address`. With them come versioned gate
+  the [fridge bound](#bound-the-canonical-direct-input-fridge), a `scheduler`
+  inspect query, and a setup check of the guest's compiled
+  `sequencer_address`. With them come versioned gate
   and signature vectors, adding the unpinned `s ≥ n`, `v` from 29 to 34 and the
   fee-range reject.
 
