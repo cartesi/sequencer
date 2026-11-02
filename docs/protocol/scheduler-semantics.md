@@ -102,16 +102,17 @@ order; the first that applies decides the outcome:
 
 Ages saturate at zero. An empty batch is valid at any age, since it has no
 first frame (**pending**). Gate d rejects a batch whose frames include a
-`safe_block` above `inclusion_block`, or a `safe_block` lower than the previous
-frame's, or a `fee_price > MAX_EXPONENT`. Gate d checks all frames before
+`safe_block` above `inclusion_block` (accepting one equal to it is
+**pending**), or a `safe_block` lower than the previous frame's, or a
+`fee_price > MAX_EXPONENT`. Gate d checks all frames before
 any frame drain or user-op execution; the overdue-direct backstop still runs
 before the gates. Structural validation looks only inside the batch: a later
 batch may start below an earlier one's last `safe_block`, and its user ops then
-see the lower value. A
-stale batch keeps the nonce, so every later batch fails gate b until one
-reuses that nonce, as a batch rebuilt after sequencer recovery does. A
-rejected and a skipped batch have the same effect: no state change, nonce
-kept. The reject reason the reference reports is diagnostic.
+see the lower value (**pending**). A stale batch keeps the nonce, so every
+later batch fails gate b until one reuses that nonce, as a batch rebuilt after
+sequencer recovery does. A rejected and a skipped batch have the same effect:
+no state change, nonce kept. The reject reason the reference reports is
+diagnostic.
 
 ### Frame execution (gate f)
 

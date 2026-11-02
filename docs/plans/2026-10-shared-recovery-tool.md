@@ -1,28 +1,77 @@
 # Shared recovery tool
 
-**Status:** proposed design from the 2026-10-28 design session, revised on
-2026-10-29 with the owner's answers; nothing here is implemented.
-[Cockroach recovery](../recovery/cockroach.md) owns the current procedure. When
-this design lands, its durable parts move there and this file keeps only
-remaining work. Its claims were checked by reading the code at `3e92563`,
+**Status:** proposed; nothing here is implemented. It started in the
+2026-10-28 design session. On 2026-11-02 the owner settled the tool's
+two-phase replay and the template rules it relies on;
+[Decisions](#decisions) lists what stays open. The design needs the
+[next template's rules](#rules-for-the-next-template), so it serves only
+deployments built from that template; [cockroach recovery](../recovery/cockroach.md)
+and `setup --recovery` stay the procedure for today's. When this design lands,
+its durable parts move there and this file keeps only remaining work. Its
+claims were checked by reading the code at `3e92563`,
 [PR #56](https://github.com/cartesi/sequencer/pull/56) at `ee5c72c`, Dave at
 `dbcca7d4` and the emulator at v0.22.0-test3 (`7adfd492`, whose header and CLI
-match v0.22.0); none was executed.
+match v0.22.0), and by adversarial review; none was executed.
 
-Cockroach recovery rebuilds a sequencer that is ready for new user ops after
-an instance loses its database or its behavior cannot be trusted. The operator
+Cockroach recovery rebuilds a sequencer that is ready for new user ops after an
+instance loses its database or its behavior cannot be trusted. The operator
 triggers it by hand and keeps that instance down. The design takes the worst
 case: the submitter key is ours, but the instance's database, snapshots and
 receipts prove nothing. The canonical scheduler is the authority, bug for bug.
 The rebuilt sequencer is assumed correct; if it is not, fix it and rebuild
-again. Recovery must not depend on replaying the application from genesis.
+again. Nothing has to be replayed from genesis: the tool starts from a
+canonical machine and reads only the L1 blocks after that machine's clock.
 
-Today's `setup --recovery` already rebuilds the sequencer alone. What makes
-this tool *shared* is a client: Bart's DEX backend keeps a richer state than
-the sequencer and must realign after a rebuild, from its own backup and with
-its own code. The operator of the sequencer and of that client is the same
-(Bart); only their development is split. Recovery runs rarely, so each of its
-steps must be simple enough to explain, practice and trust.
+What makes the tool *shared* is a client: Bart's DEX backend keeps a richer
+state than the sequencer and must realign after a rebuild, from its own backup
+and with its own code. Bart operates both; only their development is split.
+Recovery runs rarely, so each step must be simple enough to explain, practice
+and trust.
+
+## The idea
+
+Every executed L2 transaction carries a block: a direct its inclusion block, a
+user op its frame's `safe_block`. Let `T` be the canonical sequence of executed
+L2 transactions, in execution order. Each application state carries its
+progress: its **effective count** `X`, how many transactions it has executed,
+and its **effective block** `E`, the block of the latest one.
+
+> A state on the canonical history with effective count `X` has executed
+> exactly `T[0..X)`. Nothing but executed transactions changes an application,
+> so the state is missing exactly `T[X..K)`, where `K` is the count at the stop
+> block `C`.
+
+Recovery hands each consumer its missing part, starting from its **base**: the
+canonical state it starts from. The rebuilt sequencer's base is a canonical
+machine at position `n_m` and count `X_m`, and it needs `T[X_m..K)`. A client's
+base is a count `X_c` at which its state is canonical, reached from its own
+backup, and it needs `T[X_c..K)`.
+
+The hard part is computing `T[X_m..K)` without scanning from genesis. The
+canonical machine makes it possible. Its application state is the sequencer's
+starting state, and three numbers that its scheduler reports under the next
+template let the tool replay the canonical scheduler from where the machine
+stopped:
+
+- its **position** `n_m`: how many InputBox inputs it has consumed;
+- its **batch nonce** `N_m`: the nonce the next batch must carry;
+- its **scheduler clock** `L_m`: the block its fridge has been drained through,
+  the latest of every accepted frame's `safe_block` and every drained direct's
+  block.
+
+The tool reads the inputs of L1 blocks `(L_m, C]` once and splits them at the
+machine's position:
+
+1. **Below `n_m`** the machine has already consumed the inputs. The tool drops
+   their batches without judging them and keeps their well-formed directs.
+   Those are exactly the machine's *fridge*: the directs it admitted but has
+   not executed yet.
+2. **From `n_m` on**, it runs the canonical scheduler from the machine's own
+   state: batch nonce `N_m`, that fridge and clock `L_m`.
+
+The tool does not know which user ops the application will include, so it hands
+the sequencer *candidates*. The sequencer executes them; the ones that execute
+form `T[X_m..K)`, and each client executes its own part of that list.
 
 ## Terms
 
@@ -33,38 +82,37 @@ steps must be simple enough to explain, practice and trust.
   a new deployment. A **machine** is any stored state of the canonical
   machine, such as a validator's at the end of an epoch or a watchdog
   checkpoint.
-- **A base** is an InputBox position: the state after every input below an
-  index and none from it. Each consumer has its own, and every source of state
-  names its own: a watchdog checkpoint by its `<block>-<input count>` name,
-  Dave's last finalized machine by the current sealed epoch's
-  `inputIndexLowerBound`, the template by zero. Positions are never the app
-  clock `last_executed_safe_block`, which every op of a frame shares and which
-  can lag the raw boundary without limit
-  ([history coordinates](../protocol/application-history.md#progress-ordering-and-acceptance)).
-- **Counts.** The *executed-input count* numbers the feed's rows (`X`, `K`); an
-  *InputBox count* numbers raw inputs and gives bases. They differ: a batch
-  envelope or a queued direct is an input but no row.
+- **Effective count `X` and effective block `E`**: an application's progress,
+  `executed_input_count` and `last_executed_safe_block` in code
+  ([application contract](../protocol/application-contract.md#3-the-safe-block-clock--last_executed_safe_block)).
+  Both follow executed transactions only: a skipped op, a rejected batch or a
+  queued direct moves neither. The count numbers the feed's rows.
+- **Position `n`**: how many InputBox inputs a state has consumed, which is
+  also the index of the next input. It differs from the effective count `X`,
+  because a batch envelope or a queued direct is an input but not a
+  transaction. The watchdog's checkpoint names, `<block>-<input count>`, hold
+  positions.
+- **Scheduler state**: the batch nonce `N`, the fridge and, under the next
+  template, the scheduler clock `L`. `L` and `E` stay separate on purpose. A
+  frame raises `L` to its `safe_block` even when it runs nothing, while `E`
+  moves only with executed transactions. The scheduler reads `L`, so it never
+  depends on which ops the application included. Merged, `E` would move when
+  nothing executed: two states at one count could then differ, and a consumer
+  that sees only executed rows could not follow `E`.
+- **`C`** is the stop block, a safe head fixed after the flush; **`N'`** and
+  **`L'`** are the batch nonce and the scheduler clock at its end.
 - **`P` and `B`**, as in the watchdog's latch record: `P` is its head, the last
   block the sequencer agreed with, or the uncompared bootstrap block before
   the first agreement, and `B` the block of the comparison that failed.
-- **`C`** is the stop block, a safe head fixed after the flush; **`N'`** is the
-  next batch nonce at its end; **`F`** is the InputBox index of the oldest
-  direct still queued there, or the end of `C` when none is; and **`L`** is the
-  frame-clock floor, once its gate lands: the last accepted frame's
-  `safe_block`, raised by a fridge overflow to the youngest drained direct's
-  block.
 - **Conformance vectors**:
   [`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json),
   frozen cases (EIP-712 hashes, signatures, SSZ bytes, fee conversions, guest
   scenarios with their exact outputs) that every port of the scheduler must
   reproduce ([conformance](../protocol/scheduler-semantics.md#conformance)).
-  They pin no gate edge cases yet; versioned gate vectors for the next
-  template's rules ship with it.
 
 ## The tool as a function
 
-The scheduler splits into an automaton that reads no application state and
-the application it feeds. The tool needs only the automaton. In ML notation:
+In ML notation:
 
 ```ocaml
 (* One InputBox input. Its chain id and application address, the signature
@@ -80,149 +128,194 @@ type tx =
                  payload : bytes; safe_block : block }
   | Direct of direct
 
-(* The automaton: what the scheduler keeps besides the application. *)
-type sched = { batch_nonce : nonce;     (* the next batch nonce *)
+(* The scheduler's state. It reads nothing from the application. *)
+type sched = { nonce : nonce;           (* N: the next batch's nonce *)
                fridge : direct queue;   (* admitted directs not yet executed *)
-               floor : block }          (* L *)
+               clock : block }          (* L *)
 
 val step : sched -> raw_input -> sched * tx list
 
-(* The tool. Both fold step over every input since the deployment block;
-   segment keeps what the inputs from index base to the end of stop emit. *)
-val segment : base:index -> stop:block -> tx list
-val sched : stop:block -> sched   (* at the end of stop *)
+(* What the base machine reports through its scheduler query. *)
+type base = { position : index; nonce : nonce; clock : block }  (* n, N, L *)
+
+(* Candidates from the base's position through the end of stop, and the
+   scheduler state there. *)
+val tool : gateway -> base -> stop:block -> tx list * sched
 ```
 
-`step` accepts or rejects batches; queues, drains and overflows the fridge;
-and emits, in execution order, the directs it drains and the user ops of the
-frames it runs whose signature recovers a sender and whose `max_fee` covers
-the frame fee. It reads no application state. It does read what the template
-fixes: the sequencer address, `MAX_WAIT_BLOCKS`, the fridge bound and the
-application's stateless rule for well-formed directs, so for libdex the
-scheduler library embeds a port of Bart's rule. Signature recovery is pure,
-and the user ops it emits are *candidates*: whether each one executes, which
-reads its sender's nonce and, on today's template, its fee balance, is left to
-the application that receives the segment. The canonical machine is `step`
-followed by the guest's application, and the sequencer and every client are
-other applications over the same entries. That holds while the guest never
-answers an input with `RX_REJECTED`, as the
-[fatal conditions](../protocol/scheduler-semantics.md#fatal-conditions)
-require: the host's revert would roll the batch nonce and the fridge back with
-the application, a [question for Bart](#questions-for-bart).
-
-So the tool needs an L1 connection and the scheduler library for the
-deployment's template, nothing else: no machine, no nonces, no application
-state, and no application code beyond the template's rule for well-formed
-directs. It reads every input since the deployment block, because the batch
-nonce and the fridge at a base depend on all of them; before the earliest base
-the fold need only decode batches and check gates, recovering no signature.
-`segment ~base` keeps exactly the entries emitted by the inputs from index
-`base` on. A direct that such an input drains is kept even if it arrived
-earlier, and a user op belongs to its batch's input, never to its frame's
-`safe_block`. One fold serves every base: the tool computes the entries from
-the earliest base and slices them per consumer, as `/historical-l1-inputs`
-slices by `next_input_index`. Each consumer receives its own list and never
-applies that rule itself. No base lies past the end of `C`.
-
-The consumers:
+In code:
 
 ```ocaml
-(* Runs each tx through the shared execution boundary, as the canonical
-   application does: a user op its state does not authorize is skipped. *)
-val run : state -> tx list -> state
-
-(* m: a canonical machine that has consumed the inputs below index n *)
-let sequencer m n c =
-  import (run (project m) (segment ~base:n ~stop:c)) (sched ~stop:c)
-
-(* s: a client state restored to the count X that the watchdog logged with
-   an agreement at input count n *)
-let client s n c = run s (segment ~base:n ~stop:c)
+let tool gateway m ~stop =
+  let inputs = read gateway ~after:m.clock ~through:stop in
+  let before, after = List.partition (fun i -> i.index < m.position) inputs in
+  (* Phase 1: the fridge. Batches the machine consumed are not judged again. *)
+  let fridge = List.filter (fun i -> is_direct i && well_formed i) before in
+  (* Phase 2: the canonical scheduler, from the machine's own state. *)
+  run_steps { nonce = m.nonce; fridge; clock = m.clock } after
 ```
 
-A segment is exact only for a consumer that sits exactly at its base: each
-holds the nonces (and, on today's template, the balances) that decide
-inclusion, as the canonical machine did there. Only the sequencer receives
-`sched`. It imports `N'`, `F` and `L`, and its root frame drains the queued
-directs ([below](#queued-directs-at-the-stop-block)); a client receives those
-directs as the new era's first feed rows, like any other row, and never holds
-scheduler state. Today's client procedure instead restores scheduler
-continuation metadata and repeats the terminal drain
-([projection replay](../protocol/projection-replay.md)).
+**Why the split is exact.** Under the next template every scheduler state keeps
+one invariant: *every admitted direct at or below `L` has executed, and every
+one above `L` is still in the fridge.* Every drain empties the fridge's front
+through some block, oldest first:
 
-### Why the tool hands out a segment
+- a frame drains every direct up to its `safe_block`, which lies strictly below
+  its batch's block, so all of them have arrived, and it raises `L` to that
+  `safe_block` even when it drains nothing;
+- the backstop drains every direct at least `MAX_WAIT_BLOCKS` old;
+- an overflow drains whole blocks older than the current input's;
+
+and the backstop and an overflow raise `L` to the last block they took. So `L`
+stays below the current input's block. A newly admitted direct therefore lands
+above `L`, and so does every input from `n_m` on: the scan `(L_m, C]` holds all
+of phase 2. And the machine's fridge is exactly the well-formed directs above
+`L_m` with index below `n_m`. Three template rules make this hold
+([rules](#rules-for-the-next-template)). Without them a block can be split
+between executed and queued directs, the scan could miss the rest of the
+machine's last block, and the tool would need the fridge's first index as a
+fourth value.
+
+**Why batches before `n_m` are not judged again.** The machine already judged
+them, and a second judgment can differ. A faulty submitter lands batch nonce 10
+at block 200, with a frame at 190; the canonical scheduler expects 9 and
+rejects it. Batch 9 lands at block 201, with its one frame at 185, and runs. So
+a machine at the end of block 201 has `N_m = 10` and `L_m = 185`, and its scan
+`(185, C]` includes block 200. A replay that judged the block-200 batch again
+would find the expected nonce and a first frame at or above `L_m`, accept it,
+run ops the canonical machine never ran, and then reject the real batch 10.
+
+**Why each value is needed.**
+
+- **The position.** The batch nonce cannot replace it, as the example shows,
+  and neither can a block. A machine can stop inside a block: Dave's last
+  finalized machine does when an input lands after the sealing transaction in
+  the same block. Even at a block's end, the machine cannot know whether its
+  last block held more inputs. Each input carries its index on L1, so the tool
+  still queries by block range and splits by index.
+- **The batch nonce**, for the nonce gate.
+- **The clock**, for the floor gate. A batch whose frame at 100 runs ops and
+  whose frame at 140 runs nothing leaves `L = 140` and `E = 100`. A later batch
+  starting at 120 is rejected canonically; a replay floored at `E` would accept
+  it.
+
+**What the tool reads besides L1.** `step` reads no application state. It does
+read what the template fixes: the sequencer address, `MAX_WAIT_BLOCKS`, the
+fridge bound and the application's stateless rule for well-formed directs, so
+for libdex the scheduler library embeds a port of Bart's rule. Signature
+recovery is pure, so `step` does it. The user ops it emits are *candidates*:
+the application that executes them decides which ones execute, from its
+senders' nonces (and, without the
+[authorization rule](#rules-for-the-next-template), their fee balances). The
+canonical machine is `step` followed by the guest's application. That holds
+while the guest never answers an input with `RX_REJECTED`, as the
+[fatal conditions](../protocol/scheduler-semantics.md#fatal-conditions) require:
+the host's revert would roll the scheduler state back with the application, a
+[question for Bart](#questions-for-bart).
+
+**Cost.** The scan reads blocks `(L_m, C]`. While well-formed directs keep
+arriving, the backstop keeps `L` within `MAX_WAIT_BLOCKS` (about 4 hours) of the
+latest input. After a quiet stretch `L_m` can trail further, but a quiet
+stretch carries few inputs. For the default machine the range also spans
+Dave's settlement lag, [still to be measured](#measure-before-choosing).
+
+**Completeness.** A provider that drops a log would drop a direct from the
+fridge or a batch from the replay. The tool reads the InputBox's input count at
+blocks `L_m` and `C`, checks that the indices it reads run without gaps from
+the first count to the second, and refuses a base whose position lies outside
+those two counts. The count at `L_m` needs an RPC with state at that block, an
+archive node for an old base, as the watchdog's `init` does
+([commands](../watchdog/README.md#commands)).
+
+## The consumers
+
+```ocaml
+(* Executes each tx through the shared execution boundary, as the canonical
+   application does: a user op its state does not authorize is skipped.
+   Returns the new state and the transactions it executed, with their counts. *)
+val execute : state -> tx list -> state * (count * tx) list
+
+let sequencer m ~stop =
+  let candidates, sched = tool gateway (scheduler_query m) ~stop in
+  let state, executed = execute (project m) candidates in    (* T[X_m..K) *)
+  (import state sched, executed)
+
+(* s: a client state restored to its base, a count between X_m and K. *)
+let client s executed = fst (execute s (from_count (count s) executed))
+```
+
+Only the sequencer executes candidates, because only its state sits at the
+machine's position. It holds the nonces (and, without the authorization rule,
+the balances) that decided inclusion there. This yields `T[X_m..K)` with each
+transaction's count, and the sequencer writes that list for the clients. A
+client executes the part from its own base `X_c`, which needs
+`X_m <= X_c <= K`: the machine must be no newer than any client's base.
+
+Only the sequencer receives `sched`. It imports `N'` and `L'`, and its root
+frame drains the queued directs ([below](#queued-directs-at-the-stop-block)). A
+client receives those directs as the new era's first feed rows, like any other
+row, and never holds scheduler state.
+
+### Why a list and not a plugin
 
 The alternative is a `RichClientApp` plugin that the tool runs to produce each
-client's end state. The segment is better for three reasons:
+client's end state. The list is better for three reasons:
 
 - **Data crosses the boundary, not code.** The tool depends only on the
   scheduler, which a template fixes; a client's projection, schema and storage
-  change on their own schedule. A plugin would tie every tool release to every
-  client's code and effects.
-- **One execution boundary.** A client already runs L2 transactions through
-  the shared execution boundary, and recovery reuses it; only the driver
-  differs. An entry carries what the canonical application reads, so no
-  offset, no batch nonce (a direct the backstop drains belongs to no batch)
-  and no transaction hash, and a user op the client's state rejects is
-  skipped. A plugin would be a second path that runs once in a deployment's
-  life and rots.
+  change on their own schedule.
+- **One execution boundary.** A client already executes L2 transactions
+  through the shared execution boundary, and recovery reuses it. An entry
+  carries its count (the feed's offset) and what the canonical application
+  reads; it carries no batch nonce (a direct the backstop drains belongs to no
+  batch) and no transaction hash. A plugin would be a second path that runs
+  once in a deployment's life and rots.
 - **History, not only state.** Bart's client keeps trades and transfers, and
-  running the segment from its base replays that history, in canonical
-  order.
+  executing its part of the list replays that history, in canonical order.
 
 ### What the count is for
 
-The tool positions everything by InputBox index and block and never reads the
-executed-input count, the application's count of executed directs and
-included user ops, which numbers the feed's rows. The consumers use it three
-ways:
+The tool positions the machine by its input position and never reads a count.
+The consumers use the count three ways:
 
-- **Locating a client's base.** Feed rows do not carry the InputBox index of
-  the input that emitted them: a direct row's index and block are its own
-  arrival's, and a row's batch nonce is the sequencer's own attribution, which
-  no comparison checks. So a watchdog agreement, an InputBox count paired with
-  the count `X` that the sequencer reported there, is the map from a base to a
-  position in the client's history that a comparison vouches for
-  ([the client's base](#the-clients-base)).
-- **Joining the new era.** The era serves rows from `K`, the sequencer's count
-  at the end of `C`, which `/history` reports as `available_from`. After its
-  segment, a client compares its count with `K` and subscribes there. The
-  comparison must be explicit: the feed refuses a count below `K` but serves
-  one above it. Equal totals are a weak check: a client whose state holds a
-  soft user op past `X` that never landed skips any canonical op with the same
-  sender and nonce, so the extra row and the skip cancel and it still ends at
-  `K`. Restoring exactly `X` ([below](#the-clients-base)) rules this out.
+- **Positioning a client.** A client has no input position, only its count, so
+  its part of the list is cut by count.
+- **Joining the new era.** The era serves rows from `K`, which `/history`
+  reports as `available_from`. After its part of the list, a client compares
+  its count with `K` and subscribes there. The comparison must be explicit: the
+  feed refuses a count below `K` but serves one above it.
 - **Matching the machine.** The wallet's comparison bytes embed the count, so
   the sequencer's `K` must equal the machine's, and the projection from a
   machine must carry it.
 
-The watchdog's checkpoint names, `<block>-<input count>`, and its latch
-record's `agreed.input_count` hold InputBox counts: bases, not executed counts.
-
 ## States at a base
 
-Each consumer's state must sit exactly at its base: a state that has consumed
-one input fewer or more would drop or repeat entries. The bases may differ, and
-each consumer gets its own segment.
+Each consumer's state must sit exactly at its base: a state one transaction
+short or past it would drop or repeat one.
 
 ### The sequencer's base
 
-The sequencer's state is projected from a machine at its base. The
-projection must carry the executed-input count and clock that the consumers'
-offsets start from: the wallet's `state` inspect report holds both, and libdex
-keeps its state as a flat buffer in one of the machine's drives, which may or
-may not hold them
+The sequencer's state is projected from a machine. The projection must carry
+the effective count and block that the consumers' counts start from: the
+wallet's `state` inspect report holds both, and libdex keeps its state as a
+flat buffer in one of the machine's drives, which may or may not hold them
 ([application contract](../protocol/application-contract.md#7-canonical-recovery-integration)).
-Any canonical machine the operator trusts will do, even one past a
-divergence, since it was computed from L1 and not from the sequencer's
-history; the tool enforces no provenance.
+The three values come from the machine's `scheduler` inspect query, a rule for
+the next template. Any canonical machine the operator trusts will do if it is
+no newer than any client's base; the tool enforces no provenance. After a
+divergence every client's base lies at or before the watchdog's head `P`,
+which rules out a machine past it.
 
-| Machine | Base | Trust |
+| Machine | Position | Trust |
 |---|---|---|
-| Dave's last finalized machine, the default | the current sealed epoch's `inputIndexLowerBound`, read on chain with its root and checked against its receive buffer; it can lie inside a block | its root is on chain |
-| The watchdog's head | the input count in its name, at the end of a block | the operator's watchdog replayed it from L1; before its first agreement, the operator trusted it at `init` |
-| `incident/canonical` after a `state_mismatch`, or a `replay --out` machine | the InputBox count at the end of the latched block `B`, or of the block it was replayed to | the operator's watchdog replayed it from L1 |
-| The template | zero | its hash is on chain |
+| Dave's last finalized machine, the default | the current sealed epoch's `inputIndexLowerBound`, inside a block when an input lands after the sealing transaction in the same block; the scheduler query reports it too | its root is on chain |
+| The watchdog's head | the input count in its name | the operator's watchdog replayed it from L1; before its first agreement, the operator trusted it at `init` |
+| A `replay --out` machine | the input count at the end of the block it was replayed to | the operator's watchdog replayed it from L1 |
+| `incident/canonical`, only for a deployment without clients | the input count at the end of the latched block `B`, past every client's base | the operator's watchdog replayed it from L1 |
+| The template | zero, with nonce and clock zero; the tool then reads every input since the deployment block | its hash is on chain |
+
+A client whose base is older than the default machine needs an older machine:
+`replay --out` derives one from an archived checkpoint or the template.
 
 A matching root authenticates a machine only from a source we trust, such as
 our own Dave node: a stored machine's root comes from its stored hash tree, not
@@ -233,123 +326,88 @@ emulator release brings a mechanism to verify an untrusted load; until then,
 
 ### The client's base
 
-A client's base must be a point where the watchdog compared the sequencer:
-the sequencer's accepted checkpoint there gives the count `X` that locates
-the base in the client's history, and the comparison vouches for the state.
-An accepted checkpoint alone means only that our batch landed and passed a
-partial gate check, which skips gate d
+A client's base is a count `X_c` at which its state is canonical. A watchdog
+agreement vouches for one, since the sequencer reports its count with each
+comparison. It vouches for the state, not for the client's rows before it
+([after an incident](#after-an-incident)). An accepted checkpoint alone does
+not: accepted means only that our batch landed and passed a partial gate check,
+which skips gate d
 ([I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)),
 so `/history` keeps advancing past a divergence that only the watchdog sees.
-Once the fridge bound lands, a comparison also keeps the base at the end of
-its block, provided the compared bytes embed the count: an overflow later in
-the accepted block drains directs that the accepted checkpoint lacks
-([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)),
-each of which advances the count even when it changes nothing else, and the
-watchdog compares at the block's end. The wallet's bytes embed the count, so
-its comparison pins `X` and the whole block; for libdex both depend on Bart's
-answer.
+For the wallet the comparison pins the count, since its bytes embed it; for
+libdex that depends on Bart's answer.
 
-The sequencer's digest response already carries `X`, but the watchdog parses
-only the block and the digest, and deletes each checkpoint once a newer one
-agrees. So it must append each agreement's block, InputBox count, `X`, and the
-era and generation `X` was read under to a log, whose last line is its head;
-the digest response adds the era and generation. A client then takes the
-newest logged agreement on its own history, normally the head, without asking
-a sequencer that may be gone or wrong: one at or below its count, from its own
-era and its own or an earlier generation, since standard recovery never cuts
-an accepted row. A newer generation's agreement can lie past a cut the client
-missed while offline, which nobody can measure once the sequencer is gone.
-Before the first agreement the log is empty and the head is the bootstrap,
-which nobody compared. A client's base is then count zero: its initial state,
-which needs no comparison, so its segment replays its whole history. That
-window closes at the first tick that agrees with a checkpoint the sequencer
-accepted after the bootstrap block, normally one batch after each `init`.
+The sequencer's digest response already carries its count, but the watchdog
+parses only the block and the digest, and deletes each checkpoint once a newer
+one agrees. So it must append each agreement to a log kept outside its state
+directory, which a re-`init` wipes: the agreement's block, the sequencer's
+count, and the era and generation that count was read under, which the digest
+response must add.
 
-A client that follows the optimistic feed is past `X` by the time the
-watchdog compares. Snapshotting at every batch end would cover every `X`, but
-few backups can snapshot that often, so three rules make restorable, with any
-backup, any `X` on the client's history:
+A client reads its base from that log, not from a sequencer, which may be gone
+or wrong. It takes the newest agreement on its own history, normally the head.
+An agreement is on the client's history when its count is at or below the
+client's and either:
 
-1. **Every commit is a boundary and keeps its rows.** Apply each feed row, or
-   each run of rows, in one SQLite transaction that also writes the count, era
-   and generation and stores the rows themselves. Any consistent copy of the
-   database is then at an input boundary, says which, and holds every row
-   before it.
-2. **A cut discards later snapshots.** When a standard recovery cuts the
-   history at its preserved count
-   ([checkpoint compatibility](../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)),
-   or a rebuild at the client's base, the client, once realigned, deletes
-   every snapshot past the cut and stops snapshotting its old live database:
-   the new line replaces those rows and reuses their counts. After a rebuild
-   it does this between its commit at `K` and its snapshot there. Every
-   remaining snapshot then lies on the current history.
+- its era is the client's and its generation is the client's or an earlier
+  one, since standard recovery never cuts an accepted row; or
+- its era is one the client left at a rebuild, and its count is at or below
+  the base the client crossed each later rebuild from.
+
+So a client that just realigned keeps the base it crossed from until its new
+era logs an agreement, which is also the comparison that checks the rebuild.
+Before a deployment's first agreement the log is empty, and a client's base is
+count zero, its initial state.
+
+A client that follows the optimistic feed is past its base by the time the
+watchdog compares, and its database can hold terabytes. Three rules make any
+count on its history restorable, with any backup:
+
+1. **Every commit is a boundary and keeps its rows.** Apply each row, from the
+   feed or from the executed list, or each run of rows, in one SQLite
+   transaction that also writes the count, era and generation and stores the
+   rows themselves. Any consistent copy of the database is then at a
+   transaction boundary, says which, and holds every row before it.
+2. **A cut discards later snapshots.** A standard recovery cuts the history at
+   its preserved count
+   ([checkpoint compatibility](../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery));
+   a rebuild cuts it at the client's base. The new history replaces the rows
+   past the cut and reuses their counts. So once realigned, the client deletes
+   every snapshot past the cut and stops snapshotting its old live database.
 3. **Snapshot anywhere.** Take snapshots when convenient; none needs to line up
    with a checkpoint.
 
-To reach `X`, restore the newest snapshot whose count is at most `X`, replay
-the rows after it, read from the live database or a newer snapshot, to exactly
-`X` through the client's normal apply, and check the count. A snapshot past
-`X` is never used, which removes the trap of applying soft rows twice. Replay
-is exact only if applying a row reads nothing but the database and the row. A
-rebuilt sequencer serves only its own era, so the client keeps its old live
-database until it has realigned: with the newer snapshots, it is the only copy
-of the old era's rows up to `X`. After a rebuild the client snapshots at `K`,
-since the rows before it reached it through a segment, and keeps that segment
-with its base.
-
-Notes on snapshotting a large SQLite database, from the SQLite, Litestream,
-OpenZFS and AWS documentation as of 2026-10-29:
-
-- Volume or filesystem snapshots (ZFS, LVM thin, EBS) are the cheap choice at
-  terabyte scale: atomic and incremental. A ZFS snapshot holds every completed
-  write, so SQLite recovers it to its last committed transaction. An EBS
-  snapshot holds only what reached the volume, as a power cut would: with
-  `synchronous` NORMAL or FULL that only moves its count back, but with OFF it
-  can be corrupt. The database and its `-wal` file must be in the same
-  snapshot. Restore by cloning a snapshot, never by rolling back the live
-  volume, whose rows the replay reads.
-- Litestream suits gigabytes rather than terabytes: by default it uploads a
-  full snapshot every 24 hours and keeps 24 hours. It restores only to the
-  end of one of its own files (`-txid`, `-timestamp`), which can batch many
-  transactions, so pick one at or below `X` and let the rows in the live
-  database cover the rest. It deletes only by age, so it cannot discard the
-  restore points past a cut (rule 2): at a cut, replicate to a new path, and
-  restore from the old path only at or below the cut.
-- The backup API and `VACUUM INTO` copy every page on every run. On a busy
-  database a copy either restarts after each write from another connection or
-  holds one read transaction, which stops WAL checkpoints until it ends.
-- Every SQLite engine that opens a WAL database needs 3.51.3 or later (or the
-  3.44.6 or 3.50.7 backport) once two connections, in threads or processes,
-  can write or checkpoint at once: earlier versions can corrupt it. Litestream
-  checkpoints with its own embedded engine, fixed from v0.5.17. WAL mode fixes
-  the page size, so choose it at creation.
-- Retention is by position, not age: always keep the newest snapshot at or
-  below the client's base, the `X` of the newest logged agreement on its
-  history, and every newer one on the current history. The head stays put
-  while the watchdog is latched, idle or stopped, so an age window, such as
-  Litestream's default of 24 hours, can delete the only usable base. A bug in
-  the client, or a sequencer fault diagnosed before the head, needs a snapshot
-  older than it, which only a longer retention covers.
+To reach `X_c`, restore the newest snapshot at or below `X_c`. Then replay the
+rows from that snapshot up to `X_c` through the client's normal apply, and
+check the count. The rows can come from the live database or from any newer
+snapshot, since each holds every row before it. Never restore a snapshot past
+`X_c`: its state includes rows past the base, which may not be canonical.
+Replay is exact only if applying a row reads nothing but the database and the
+row. A rebuilt sequencer serves only its own era, so the client keeps its old
+live database until it has realigned.
+[Notes on snapshotting](#notes-on-snapshotting-a-large-sqlite-database) cover
+the storage side.
 
 ### After an incident
 
-The sequencer may start from any canonical machine. After a sequencer
-incident a client starts from the newest logged agreement on its history,
-normally the watchdog's head. An agreement vouches for the sequencer's state,
-not for the order of the rows before it: rows that commute reach the same
-state in either order, so a matching state does not validate the client's
-history
+The sequencer may start from any canonical machine no newer than every
+client's base. After a sequencer incident a client starts from the newest
+logged agreement on its history, normally the watchdog's head. An agreement
+vouches for the sequencer's state, not for the order of the rows before it:
+rows that commute reach the same state in either order, so a matching state
+does not validate the client's history
 ([reader state](../recovery/cockroach.md#application-specific-reader-state)).
 If diagnosis finds the fault began before that agreement, the client starts
-from an older logged agreement that predates it.
+from an older logged agreement that predates it, and the sequencer then needs
+a machine no newer than that, which `replay --out` derives.
 
 - **The watchdog latched a `state_mismatch`.** Its head stays at `P`, which
-  need not be the block before `B`. A tick compares only the
-  newest accepted checkpoint, so the accepted checkpoints in `(P, B)` were
-  never compared, and the compared state can first differ anywhere in
-  `(P, B]` ([incident runbook](../watchdog/incident-runbook.md)). The client
-  followed the faulty sequencer through all of them. The other latches call
-  for no rebuild: a dead canonical machine ends the application
+  need not be the block before `B`. A tick compares only the newest accepted
+  checkpoint, so the accepted checkpoints in `(P, B)` were never compared, and
+  the compared state can first differ anywhere in `(P, B]`
+  ([incident runbook](../watchdog/incident-runbook.md)). The client followed
+  the faulty sequencer through all of them. The other latches call for no
+  rebuild: a dead canonical machine ends the application
   ([preconditions](#preconditions-the-design-must-state)), and a regression is
   an operator error
   ([runbook](../watchdog/incident-runbook.md#inclusion_block_regressed)).
@@ -359,53 +417,48 @@ from an older logged agreement that predates it.
   watchdog, so its head stays at the last comparison before the trip.
 - **The client has a bug.** This is the client's own repair, not a rebuild: it
   restores a snapshot older than the bug's first effect and replays its rows
-  with the fixed code. To cross a rebuild, it replays to that rebuild's base
-  and runs the segment it kept from it. It then deletes every snapshot newer
-  than the one it restored, since they carry the bug's state, and snapshots
-  again at each `K` it crossed.
+  with the fixed code, across any rebuild, since the executed list's entries
+  are rows in its database. It then deletes every snapshot newer than the one
+  it restored, since they carry the bug's state.
 
 ## Queued directs at the stop block
 
-At the end of `C` the canonical scheduler can still hold queued directs. The
-fridge is always a suffix of the directs it admits, since frame drains, the
-backstop and the bound's overflow drain all pop only its front, so `F`
-describes it. A block cannot, because after faulty sequencing a frame whose
-`safe_block` equals its inclusion block drains only part of that block.
+At the end of `C` the canonical scheduler can still hold queued directs. By the
+invariant above, they are exactly the well-formed directs in blocks `(L', C]`.
 
-The rebuilt sequencer therefore starts from its state at the end of `C`, with
-its direct floor at `F` instead of at block `C`. Its root frame, at `C`,
-executes the admitted directs in `[F, end of C)` as ordinary rows before any
-user op, as the first canonical frame drains them, and clients receive them
-through the feed with normal offsets. The sequencer keeps no fridge of its
-own: its pending directs are the admitted directs in the undrained index range
-of its input table, which setup already fills from the deployment block. The
-change is small: the era records `F`, and the lane drains directs from the
-later of `F` and the first input after its latest frame's `safe_block`. A
-cascade that tears down every frame
+The rebuilt sequencer starts from the scheduler state at the end of `C`. It
+keeps no fridge: its input table, which setup fills from the deployment block,
+already holds every direct. Today the lane drains directs from the first input
+after the later of a floor block and its latest frame's `safe_block`, and a
+rebuild puts that floor at `C`. The change is that the floor becomes `L'`, which
+the era records. So the root frame, at `C`, first executes the queued directs,
+as the first canonical frame drains them, before any user op, and clients
+receive them as ordinary feed rows. A cascade that invalidates every frame
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce))
-re-roots there and drains them again. Acceptance still scans only blocks
-after `C` ([replay boundaries](../recovery/cockroach.md#replay-boundaries)).
+opens a new root, which drains above `L'` again. Acceptance still scans only
+blocks after `C` ([replay boundaries](../recovery/cockroach.md#replay-boundaries)).
 
 Today's procedure instead executes the queued directs during recovery (the
-terminal drain) and publishes the result. That state is a prediction: the
-canonical machine reaches it only inside the post-`C` input that empties the
-fridge, often executing more there, so no comparison can check it, a client
-that applied it must roll it back if a second rebuild comes, and a rebuild
-that started from it would execute those directs twice. Track 3 kept the
-terminal drain because replacing it would carry pending work across the
-baseline
+terminal drain) and publishes the result, and each client repeats that drain
+after restoring the scheduler's queue and nonce
+([projection replay](../protocol/projection-replay.md)). That state is a
+prediction: the canonical machine reaches it only inside the post-`C` input
+that drains the last of the queued directs, often executing more there, so no
+comparison can check it, a client that applied it must roll it back if a
+second rebuild comes, and a rebuild that started from it would execute those
+directs twice. Track 3 kept the terminal drain because replacing it would carry
+pending work across the baseline
 ([scope boundaries](2026-07-track3-feed-replay-design.md#scope-boundaries));
-that work crosses as one index.
+that work crosses as one block, `L'`.
 
 ## The procedure
 
 1. **Choose the bases.** Each client restores its state to the newest logged
    agreement on its history that precedes any fault the diagnosis found
-   ([the client's base](#the-clients-base)).
-   The sequencer takes a canonical machine: by default Dave's last finalized
-   one, or the watchdog's head, `incident/canonical` at `B` or a `replay --out`
-   machine ([the sequencer's base](#the-sequencers-base)). Each base is an
-   InputBox count.
+   ([the client's base](#the-clients-base)). The sequencer then takes a
+   canonical machine no newer than any of them: by default Dave's last
+   finalized one, else the watchdog's head or a `replay --out` machine
+   ([the sequencer's base](#the-sequencers-base)).
 2. **Flush, then fix `C`.** Settle the old instance's transactions, then take
    a safe head observed after they settle as `C`. The flush is best effort: it
    replaces what the provider's pool holds for the submitter account and waits
@@ -414,61 +467,86 @@ that work crosses as one index.
    ([flush boundary](../recovery/cockroach.md#flush-and-stopping-block)). As a
    standalone subcommand, it is the only step that needs the key. Refuse if a
    submitter input above `C` is already ingested.
-3. **Run the tool** for `C` and each base, from L1 alone. It refuses a base
-   past the end of `C`, writes one segment per base, and writes `sched` at `C`
-   last, as the commit point.
-4. **Rebuild the sequencer.** Run its segment from its state projected from
-   the machine, and import the result with `N'`, `F` and `L` in one
-   transaction. Start `run` promptly. A late start is safe: once the root
-   frame ages past the danger threshold, startup's
-   [Tip repair](../recovery/README.md#open-tip-repair-without-flushing)
-   reopens it at the current safe head, still draining from `F`.
-5. **Realign clients.** Each client runs its segment from its restored state,
-   reads `/history`, checks that its count equals `available_from`, records
-   the returned era and generation with that count in one commit, deletes
-   every snapshot past its base, takes a snapshot, keeps its segment, and
-   subscribes with that claim.
+3. **Run the tool.** Read the machine's position, batch nonce and clock with
+   its scheduler query. The tool refuses a position below the InputBox count at
+   `L_m` or past the end of `C`, reads blocks `(L_m, C]`, and writes the
+   candidates and the scheduler state at `C`, the latter last as the commit
+   point.
+4. **Rebuild the sequencer.** Execute the candidates from the state projected
+   from the machine, write the executed list for the clients, and import the
+   result with `N'` and `L'` in one transaction. Then start the sequencer with
+   `run` promptly. A late start is safe: once the root frame ages past the
+   danger threshold, startup's
+   [Tip repair](../recovery/README.md#open-tip-repair-without-flushing) reopens
+   it at the current safe head, still draining above `L'`.
+5. **Realign clients.** Each client:
+   1. reads `/history` for the new era and generation;
+   2. executes its part of the executed list, committing its entries as rows
+      under that era and generation (rule 1);
+   3. checks that its count equals `available_from`, and records with it the
+      base it crossed the rebuild from;
+   4. deletes every snapshot past its base (rule 2), then takes a snapshot;
+   5. subscribes at its count with that era and generation.
 
 The new era's first watchdog comparison checks the result a batch later: a
-wrong segment, `N'` or `F`, or a guest compiled for another sequencer address,
+wrong list, `N'` or `L'`, or a guest compiled for another sequencer address,
 shows up there as a divergence. Replaying the watchdog's head to `C` with
 `replay`, which starts only at the end of a block, checks it before `run`, at
-an emulated cost. The tool cannot
-see a halt, which reads application state; a consumer that reaches the halting
-transaction fails there, as the canonical machine did.
+an emulated cost. The tool cannot see a halt, which reads application state; a
+consumer that reaches the halting transaction fails there, as the canonical
+machine did.
 
 ## Rules for the next template
 
-The owner settled these on 2026-10-29. Each changes the guest, so each needs
-Bart's agreement and ships with the next template, ours and his port's
-([register](../review/register.md#canonical-rules-open-for-the-c-port)). The
-tool needs none of them: `step` applies whatever the template applies, the
-`L` gate and the fridge bound included. Only the fridge bound puts application
-code into `step`, its well-formedness rule, which is why that rule may read
-only the direct and fixed configuration.
+The owner settled these on 2026-10-29 and 2026-11-02. Each changes the guest,
+so each needs Bart's agreement and ships with the next template, ours and his
+port's ([register](../review/register.md#canonical-rules-open-for-the-c-port)).
+The tool relies on three of them: whole-block overflow, strict frame clocks and
+the scheduler clock. They keep `L` below the current input's block, which makes
+phase 1 exact and puts every input from the position on inside the scan. Phase
+2 then replays whatever the template applies. The tool runs `step` without
+application state; the only application code inside `step` is the fridge's
+well-formedness rule, so that rule may read only the direct and fixed
+configuration.
 
 - **Fridge bound.** Only well-formed directs enter the fridge, under an
-  application-defined rule that reads only the direct and fixed configuration;
-  a count bounds it; and an overflow drains just enough of its front to make
-  room, raising `L` to the youngest drained direct's block
+  application-defined rule that reads only the direct and fixed configuration,
+  and a count bounds it
   ([register](../review/register.md#bound-the-canonical-direct-input-fridge)).
   A direct that is not well-formed is dropped without executing. An overflow
-  is answered by a manual cockroach recovery: making standard recovery repair
-  one is deferred on complexity, since standard recovery is the hardest part
-  of this software.
-- **Monotone frame clocks.** Applications may read blocks as time: a direct's
-  inclusion block and a user op's frame `safe_block`. Gate d orders frames only
-  within a batch, so a later batch could run below an earlier input's clock.
-  The scheduler keeps `L` and rejects a batch whose first frame is below it;
-  the gate reads `L`, not the app clock, which a frame that executes nothing
-  leaves behind and a drain can push above `L`. Between overflows a correct
-  sequencer never builds such a batch
-  ([I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)),
-  but the gate makes I3 consensus-critical: every transition that opens a Tip
-  needs an assert that it starts at or above the latest valid frame, and
-  `scheduler_accepts` must track `L` from the frames it accepts, starting after
-  a rebuild from the imported `L`. It keeps no fridge, so it misses an
-  overflow's raise of `L`, which rejects batches the lane already sealed: the
+  drains whole blocks from the front, oldest first, until there is room. The
+  bound must hold every direct one block can carry, about 1,500 to 2,000 at
+  today's 60M gas limit, for the deployment's life. Then an overflow never
+  needs the current input's block, and it drains at most one block more than
+  it must. The sequencer cannot mirror an overflow, so the batches it already
+  sealed diverge, and a manual cockroach recovery answers that. Making
+  standard recovery repair one is deferred on complexity, since standard
+  recovery is the hardest part of this software.
+- **Strict frame clocks.** A frame's `safe_block` must lie strictly below its
+  batch's inclusion block; gate d accepts equality today. A correct sequencer
+  never posts equality, since its frames take the L1 safe head and its batch
+  lands later. Equality lets a frame drain only part of its own block. The
+  frozen conformance vectors post such a frame in 18 of their 19 guest
+  scenarios, so this rule ships with v2 vectors.
+- **The scheduler clock and floor gate.** The scheduler keeps `L`: the latest
+  of every accepted frame's `safe_block` and every drained direct's block. A
+  new gate, placed after gate e, rejects a batch whose first frame lies below
+  `L`; empty batches stop at gate c and never reach it. It reads `L`, never `E`
+  ([terms](#terms)). Applications may then read blocks as time: a direct's
+  inclusion block and a user op's frame `safe_block` never go backwards along
+  `T`. Raising `L` on a backstop drain changes no gate outcome, not even a
+  report: the backstop drains only directs at least `MAX_WAIT_BLOCKS` old, so
+  any batch whose first frame lies below one is stale and stops at gate e.
+  Recovery still needs that raise: without it, the directs the backstop
+  executed would sit above `L_m`, and the tool would queue and execute them
+  again. On the sequencer side, the gate makes
+  [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
+  consensus-critical: every transition that opens a Tip needs an assert that it
+  starts at or above the latest valid frame. `scheduler_accepts` leaves the
+  floor out, as it leaves out gate d
+  ([I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)):
+  those asserts keep the sequencer's own batches at or above it, and an
+  overflow's raise, which rejects batches the lane already sealed, is the
   divergence a manual rebuild answers.
 - **Authorization decides inclusion.** A user op is included exactly when its
   sender authorized it here: its signature recovers the sender, its nonce is
@@ -485,10 +563,9 @@ only the direct and fixed configuration.
   the `Direct` the scheduler applies carry them. The sequencer's input table
   and the feed's direct rows already carry the index and timestamp, and both
   must add prevRandao, or a client could not apply such a direct.
-- **A `scheduler` inspect query** returning the machine's InputBox count, the
-  batch nonce, `F` and `L`. It cross-checks `sched` and the number of inputs
-  the tool's fold read from L1 against the machine at the same block. One
-  inspect report holds at most 2 MiB.
+- **A `scheduler` inspect query** returning the machine's position, batch
+  nonce and clock: the tool's input. The position is the last input's index
+  plus one, batches included, or zero for the template.
 
 Shared scheduler code serves every deployment; if each sequencer release
 supports one template, which the proposed template tie below would enforce,
@@ -513,9 +590,10 @@ no rule needs a switch per deployment.
   divergence recovery can repair; any other
   [fatal condition](../protocol/scheduler-semantics.md#fatal-conditions) still
   ends the application.
-- **Consumers execute bit for bit.** The sequencer and every client run the
-  segment through the canonical validation and execution; for Bart's client
-  that means embedding libdex exactly as the guest runs it.
+- **Consumers execute bit for bit.** The sequencer executes the candidates, and
+  every client its part of the executed list, through the canonical validation
+  and execution; for Bart's client that means embedding libdex exactly as the
+  guest runs it.
 - **The template tie.** A fix to code the template shares diverges the
   sequencer from it, which today only the watchdog's next comparison notices
   ([cockroach recovery](../recovery/cockroach.md)). Setup would pin the
@@ -539,27 +617,29 @@ no rule needs a switch per deployment.
 
 ## Decisions
 
-The owner settled these on 2026-10-29:
+The owner settled these on 2026-10-29 and 2026-11-02:
 
 | Decision | Choice |
 |---|---|
-| Shape | From L1 and the scheduler library alone: a segment per consumer, from its own base, and `sched` at `C` for the sequencer only |
-| Purpose | Segments that the sequencer and every client run, instead of a plugin per client |
+| Shape | From L1, the scheduler library and three values the base machine reports (position, batch nonce, clock): candidates from the machine's position and the scheduler state at `C`. No fold from genesis to reach the machine |
+| Phases | Blocks `(L_m, C]` read once: below the machine's position, directs only, and batches never judged again; from it, the canonical scheduler |
+| Clients | Each executes its part of the sequencer's executed list, from its own count, instead of a plugin per client; the machine is no newer than any client's base |
 | Sequencer's state | Projected from a machine the operator trusts, by default Dave's last finalized one; no enforced provenance |
-| Bases | Each consumer has its own; the tool slices one fold per base |
-| Queued directs at `C` | An input-index direct floor, replacing the terminal drain |
+| Clocks | `E` (the application's, from executed transactions) and `L` (the scheduler's, from accepted frames and drains) stay separate |
+| Queued directs at `C` | A direct floor, replacing the terminal drain |
 | Flush | Best effort, trusting the provider's pool view |
 | Fencing | An operator requirement, in the threat model's [operator mistakes](../threat-model/README.md#operator-mistakes) |
-| Next template | The fridge bound, monotone frame clocks, authorization deciding inclusion, direct context, and the `scheduler` query |
+| Next template | The fridge bound with whole-block overflow, strict frame clocks, the scheduler clock and floor gate, authorization deciding inclusion, direct context, and the `scheduler` query |
 | Fridge overflow | A manual cockroach recovery; standard recovery does not repair it |
 
 These stay open:
 
 | Decision | Recommendation |
 |---|---|
-| Positions | InputBox counts, which every source of state names, instead of block ends, so Dave's machine needs no replay to the end of its block |
-| Client's base | The newest agreement on its history, from a log in which the watchdog records each agreement with the sequencer's count `X`, era and generation |
-| Client backups | Every commit writes the count and keeps its rows; a cut discards later snapshots; snapshots taken anywhere and replayed to `X` |
+| Direct floor | The block `L'`, in place of the index `F` the owner chose on 2026-10-29: under the next template's rules both name the same directs, the lane already drains above a block, and the sequencer imports `L'` anyway |
+| Client's base | The newest agreement on its history, from a log in which the watchdog records each agreement with the sequencer's count, era and generation. The alternative, a hash chained over executed transactions that the guest keeps in its state, would check a client's whole history, order included, and drop the log and the cut rule, at the cost of a template change |
+| Client backups | Every commit writes the count and keeps its rows, the executed list's included; a cut discards later snapshots; snapshots taken anywhere and replayed to the base |
+| Executed list's delivery | A file the rebuild writes when it executes the candidates (step 4), before `run` starts. Serving it as the new era's first feed rows instead needs an immutable store for rows before `K` and a batch nonce for directs the backstop drained |
 | Template tie | One template per release, enforced at setup and `run` |
 | Shared gate function | Defer: it changes the gold frontier, the heart of standard recovery |
 | `trait Scheduler` | Defer: for libdex deployments the scheduler library is ours, with libdex's direct rule ported, held to Bart's guest by the versioned gate vectors of the next template |
@@ -568,16 +648,19 @@ These stay open:
 ## Questions for Bart
 
 - Does libdex's drive hold only its flat buffer, or a padding tail too? Does
-  that buffer hold the executed-input count and clock, so that a state
-  projected from a machine starts at the canonical count and a comparison pins
-  it?
+  that buffer hold the effective count and block, so that a state projected
+  from a machine starts at the canonical count and a comparison pins it?
+- Can your guest answer the `scheduler` query: its position, batch nonce and
+  clock?
 - Which of a direct's index, timestamp and prevRandao does libdex read?
 - Is your guest's compiled sequencer address the pinned submitter? Can its
   harness or scheduler answer an input with `RX_REJECTED`?
 - Does your scheduler reproduce the conformance vectors, and reject an
-  out-of-range `fee_price` at gate d, as ours does since PR #56?
+  out-of-range `fee_price` at gate d, as ours does since PR #56? Will it adopt
+  strict frame clocks with the v2 vectors?
 - Which directs are well-formed for libdex, and how large can one be? The
-  fridge's count bound bounds memory only if each entry's size is bounded.
+  fridge's count bound bounds memory only if each entry's size is bounded, and
+  it must hold every direct one block can carry.
 - Does libdex's validation refuse a user op for any reason besides its
   signature, nonce and fee cap? Under the authorization rule, every other
   reason becomes a business failure that still advances the nonce and charges
@@ -585,50 +668,88 @@ These stay open:
 - Can your client follow [the backup rules](#the-clients-base): the count in
   every commit with its rows, and snapshots discarded past a cut? How large is
   its database, which SQLite version does it link, and does applying a row
-  read anything besides the database and what a segment entry carries, such
-  as the row's batch nonce or a direct's transaction hash?
+  read anything besides the database and what a list entry carries, such as
+  the row's batch nonce or a direct's transaction hash?
 - What are libdex's per-op cycles and state size? Who fixes libdex during an
   incident?
 
 ## Measure before choosing
 
-- The fold of the automaton from the deployment block: an L1 scan of every
-  input, which need recover no signature before the earliest base.
-- Signature recovery and execution from a realistic earliest base to `C`.
-- The production deployment's Dave lag, which sets how long the default
-  machine's segment is.
+- The scan of blocks `(L_m, C]`, and signature recovery and execution over it,
+  at the production deployment's Dave lag, which sets how long the default
+  machine's list is.
 - The guest's cost to drain a full fridge in one input, which the root frame
-  after a rebuild and the first frame after an outage both do.
-- A client's replay, from its newest snapshot at or below the head's `X` to
-  that `X`.
+  after a rebuild and the first frame after an outage both do, and one
+  overflow's drain of a full block.
+- A client's replay, from its newest snapshot at or below its base to that
+  base.
 - The time to recover, end to end, in a drill.
+
+## Notes on snapshotting a large SQLite database
+
+From the SQLite, Litestream, OpenZFS and AWS documentation as of 2026-10-29:
+
+- Volume or filesystem snapshots (ZFS, LVM thin, EBS) are the cheap choice at
+  terabyte scale: atomic and incremental. A ZFS snapshot holds every completed
+  write, so SQLite recovers it to its last committed transaction. An EBS
+  snapshot holds only what reached the volume, as a power cut would: with
+  `synchronous` NORMAL or FULL that only moves its count back, but with OFF it
+  can be corrupt. The database and its `-wal` file must be in the same
+  snapshot. Restore by cloning a snapshot, never by rolling back the live
+  volume, whose rows the replay reads.
+- Litestream suits gigabytes rather than terabytes: by default it uploads a
+  full snapshot every 24 hours and keeps 24 hours. It restores only to the
+  end of one of its own files (`-txid`, `-timestamp`), which can batch many
+  transactions, so pick one at or below the base and let the rows in the live
+  database cover the rest. It deletes only by age, so it cannot discard the
+  restore points past a cut (rule 2): at a cut, replicate to a new path, and
+  restore from the old path only at or below the cut.
+- The backup API and `VACUUM INTO` copy every page on every run. On a busy
+  database a copy either restarts after each write from another connection or
+  holds one read transaction, which stops WAL checkpoints until it ends.
+- Every SQLite engine that opens a WAL database needs 3.51.3 or later (or the
+  3.44.6 or 3.50.7 backport) once two connections, in threads or processes,
+  can write or checkpoint at once: earlier versions can corrupt it. Litestream
+  checkpoints with its own embedded engine, fixed from v0.5.17. WAL mode fixes
+  the page size, so choose it at creation.
+- Retention is by position, not age: always keep the newest snapshot at or
+  below the client's base and every newer one on the current history. The
+  watchdog's head stays put while it is latched, idle or stopped, so an age
+  window, such as Litestream's default of 24 hours, can delete the only usable
+  base. A bug in the client, or a sequencer fault diagnosed before the head,
+  needs a snapshot older than it, which only a longer retention covers.
 
 ## Remaining work
 
 - Settle the open decisions; the template rules wait on Bart's answers.
-- Tool: `segment` per base from one fold, and `sched`, from a `step` split
-  out of `Scheduler<A>`; and the flush subcommand. Today's scheduler recovers
-  every signature, hands an op to the application in two calls
-  (`validate_user_op`, then `apply_valid_user_op`) and keeps no input index in
-  the fridge, so an application that records what it is handed cannot produce
-  the entries.
-- Sequencer: project a machine's state, run its segment, and import with `F`
-  and `L`. An existing rebuilt database takes `F` at the end of its `C`. The
-  floor rewrites what pins the terminal drain today: the projection replay
-  steps, the README's nonce note, the history guide's era baseline, snapshot
-  lifecycle, invariants I6, I8, I11 and I20, and the rebuild drill's replica
-  check.
-- Clients: the backup rules, and a segment driver that runs each entry
-  through the shared execution boundary and skips the user ops it rejects.
-- Watchdog: parse the executed-input count, era and generation from the
-  digest response, which must add the latter two, and append each agreement's
-  block, InputBox count and those to a log; and `export-state`, which writes a
-  machine's state-source bytes and nothing application-specific, for the
-  sequencer's projection.
+- Tool: the two-phase replay from the three values, from a `step` split out of
+  `Scheduler<A>`, with the scan's completeness check; and the flush
+  subcommand. Today's scheduler recovers every signature, hands an op to the
+  application in two calls (`validate_user_op`, then `apply_valid_user_op`)
+  and keeps no input index in the fridge, so an application that records what
+  it is handed cannot produce the candidates.
+- Guest, for the next template: the rules above, the `scheduler` query, and
+  v2 conformance vectors.
+- Sequencer: project a machine's state, execute the candidates, write the
+  executed list, import `N'` and `L'`, and drain directs above `L'`. A database
+  that today's procedure already rebuilt has executed its queued directs in
+  the terminal drain, so its floor stays at its `C`. Draining above `L'`
+  replaces the terminal drain, so rewrite what pins that drain today: the
+  projection replay steps, the README's nonce note, the history guide's era
+  baseline, snapshot lifecycle, invariants I6, I8, I11 and I20, and the
+  rebuild drill's replica check. I1's documented omissions add the floor gate.
+- Clients: the backup rules, and a driver that executes a part of the executed
+  list through the shared execution boundary and commits its entries as rows.
+- Watchdog: parse the count, era and generation from the digest response,
+  which must add the latter two, and append each agreement to a log that
+  survives a re-`init`; and `export-state`, which writes a machine's
+  state-source bytes for the sequencer's projection, and the position, batch
+  nonce and clock its `scheduler` query reports for the tool, and nothing
+  application-specific.
 - Dave's machine: read the last finalized root and the sealed epoch's
   `inputIndexLowerBound` from the consensus contract, which nothing in this
-  repository reads yet, and check the index against the machine's receive
-  buffer.
+  repository reads yet, and check the index against the scheduler query's
+  position.
 - Drills that rebuild from a machine and realign a client, in the
   [incident runbook](../watchdog/incident-runbook.md#drills); until the tool
   lands, `setup --recovery` keeps its archive drill.

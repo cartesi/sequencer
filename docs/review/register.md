@@ -27,11 +27,18 @@ growth; its workload-specific thresholds are not deployment capacity bounds.
 Direction, settled by the owner on 2026-10-29: only well-formed directs enter
 the fridge, under application-defined format and sender rules that read only
 the input and fixed configuration, and the rest are dropped without
-executing; a count of entries bounds it; and an overflow executes just enough
-of the oldest entries, in FIFO order, to make room, so that the input that
-overflows it carries no large drain, raising the frame-clock floor to the
-youngest drained entry's block. The bound is protocol: canonical execution,
-recovery and the C++ port apply it alike, and live prediction applies the
+executing; and a count of entries bounds it. Refined on 2026-11-02: an
+overflow executes whole blocks of the oldest entries, in FIFO order, until
+there is room, raising the scheduler clock to the last drained block. The
+bound holds every direct one block can carry, so an overflow never splits a
+block and drains at most one block more than it must. Whole blocks and strict
+frame clocks keep one invariant: every admitted direct at or below the
+scheduler clock has executed, and every one above it is queued. Recovery then
+rebuilds the fridge from L1 and the machine's position and clock, without
+reading the fridge itself
+([plan](../plans/2026-10-shared-recovery-tool.md#the-tool-as-a-function)). The
+bound is protocol: canonical execution, recovery and the C++ port apply it
+alike, and live prediction applies the
 well-formedness rule. Live prediction cannot mirror an overflow drain, which
 can run ahead of batches the lane has already sealed, so an overflow is a
 deliberate divergence. An overflow is answered by a manual cockroach
@@ -54,9 +61,11 @@ To settle with Bart:
   2 million zero-value deposits at mainnet's 60M gas limit today (30-40k gas
   each when a contract batches them; measure it on the pinned contracts),
   overflow cannot happen at all; the image fixes the bound for the
-  deployment's life, so leave headroom for higher gas limits. A smaller count still makes
-  overflow costly, and its consequence is a manual rebuild, not a dead
-  application.
+  deployment's life, so leave headroom for higher gas limits. A smaller count
+  still makes overflow costly, and its consequence is a manual rebuild, not a
+  dead application. Whatever the count, it must hold every direct one
+  block can carry, about 1,500 to 2,000 at today's gas limit, for the
+  deployment's life.
 - The largest drain. The first frame after an outage and the root frame after
   a rebuild both drain a full fridge in one input, so the bound must fit that
   drain in the guest's budget, temporary allocations, execution and
@@ -297,8 +306,17 @@ evidence: the spec's links and
   orders frame clocks only within a batch, so after faulty sequencing a later
   batch's user ops can run below an earlier input's clock, though applications
   may read blocks as time. Settled by the owner for the next template,
-  pending Bart: a gate on the last
-  accepted frame's `safe_block`, which a fridge overflow drain also raises.
+  pending Bart: a gate on the scheduler clock, the latest of every accepted
+  frame's `safe_block` and every drained direct's block. Raising it on a
+  backstop drain changes no gate outcome, since gate e already skips any batch
+  that raise would reject, but recovery needs it: a direct the backstop
+  executed must not sit above the clock.
+- **Strict frame clocks** (checked 2026-11-02 at `3e92563`). Gate d accepts a
+  frame whose `safe_block` equals its batch's inclusion block, which lets the
+  frame drain only part of its own block. Settled by the owner for the next
+  template, pending Bart: strictly below. A correct sequencer never posts
+  equality, but the frozen conformance vectors post such a frame in 18 of their
+  19 guest scenarios, so the rule ships with v2 vectors.
 - **Authorization decides inclusion** (checked 2026-10-29 at `3e92563`). The
   scheduler skips an op the application rejects, fee balance included, so
   which ops execute depends on application state. Settled by the owner for
