@@ -3,7 +3,9 @@
 **Status:** proposed; nothing here is implemented. It started in the
 2026-10-28 design session. On 2026-11-02 the owner settled the tool's
 two-phase replay and the template rules it relies on;
-[Decisions](#decisions) lists what stays open. The design needs the
+[Decisions](#decisions) lists what stays open. A simpler candidate that would
+replace this plan is [recovery from a canonical machine](2026-11-recovery-from-a-machine.md).
+The design needs the
 [next template's rules](#rules-for-the-next-template), so it serves only
 deployments built from that template; [cockroach recovery](../recovery/cockroach.md)
 and `setup --recovery` stay the procedure for today's. When this design lands,
@@ -430,10 +432,12 @@ The rebuilt sequencer starts from the scheduler state at the end of `C`. It
 keeps no fridge: its input table, which setup fills from the deployment block,
 already holds every direct. Today the lane drains directs from the first input
 after the later of a floor block and its latest frame's `safe_block`, and a
-rebuild puts that floor at `C`. The change is that the floor becomes `L'`, which
-the era records. So the root frame, at `C`, first executes the queued directs,
-as the first canonical frame drains them, before any user op, and clients
-receive them as ordinary feed rows. A cascade that invalidates every frame
+rebuild puts that floor at `C`. The change is that the floor becomes `L'`, in an
+era field of its own: `base_safe_block` stays `C`, since it also serves as
+`/history`'s `l1_stop_block` and the end of historical inputs. So the root
+frame, at `C`, first executes the queued directs, as the first canonical frame
+drains them, before any user op, and clients receive them as ordinary feed
+rows. A cascade that invalidates every frame
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce))
 opens a new root, which drains above `L'` again. Acceptance still scans only
 blocks after `C` ([replay boundaries](../recovery/cockroach.md#replay-boundaries)).
@@ -626,7 +630,7 @@ The owner settled these on 2026-10-29 and 2026-11-02:
 | Clients | Each executes its part of the sequencer's executed list, from its own count, instead of a plugin per client; the machine is no newer than any client's base |
 | Sequencer's state | Projected from a machine the operator trusts, by default Dave's last finalized one; no enforced provenance |
 | Clocks | `E` (the application's, from executed transactions) and `L` (the scheduler's, from accepted frames and drains) stay separate |
-| Queued directs at `C` | A direct floor, replacing the terminal drain |
+| Queued directs at `C` | A direct floor at the block `L'`, replacing the terminal drain. It applies the tool's phase-1 rule (every queued direct lies above the clock), the lane's floor is already a block, and a database today's procedure rebuilt keeps its floor at its `C`. Settled on 2026-11-02, in place of the index `F` chosen on 2026-10-29 |
 | Flush | Best effort, trusting the provider's pool view |
 | Fencing | An operator requirement, in the threat model's [operator mistakes](../threat-model/README.md#operator-mistakes) |
 | Next template | The fridge bound with whole-block overflow, strict frame clocks, the scheduler clock and floor gate, authorization deciding inclusion, direct context, and the `scheduler` query |
@@ -636,7 +640,6 @@ These stay open:
 
 | Decision | Recommendation |
 |---|---|
-| Direct floor | The block `L'`, in place of the index `F` the owner chose on 2026-10-29: under the next template's rules both name the same directs, the lane already drains above a block, and the sequencer imports `L'` anyway |
 | Client's base | The newest agreement on its history, from a log in which the watchdog records each agreement with the sequencer's count, era and generation. The alternative, a hash chained over executed transactions that the guest keeps in its state, would check a client's whole history, order included, and drop the log and the cut rule, at the cost of a template change |
 | Client backups | Every commit writes the count and keeps its rows, the executed list's included; a cut discards later snapshots; snapshots taken anywhere and replayed to the base |
 | Executed list's delivery | A file the rebuild writes when it executes the candidates (step 4), before `run` starts. Serving it as the new era's first feed rows instead needs an immutable store for rows before `K` and a batch nonce for directs the backstop drained |
