@@ -37,13 +37,15 @@ scheduler clock has executed, and every one above it is queued. Recovery then
 rebuilds the fridge from L1 and the machine's position and clock, without
 reading the fridge itself
 ([plan](../plans/2026-10-shared-recovery-tool.md#the-tool-as-a-function)). The
-bound is protocol: canonical execution, recovery and the C++ port apply it
-alike, and live prediction applies the
-well-formedness rule. Live prediction cannot mirror an overflow drain, which
-can run ahead of batches the lane has already sealed, so an overflow is a
-deliberate divergence. An overflow is answered by a manual cockroach
-recovery, and the watchdog's divergence latch is what reports it; making
-standard recovery repair one is deferred on complexity
+[sequencer recovery plan](../plans/2026-11-sequencer-recovery/template.md),
+proposed on 2026-11-03, reads the fridge from the machine instead and returns
+to the just-enough overflow of 2026-10-29. The bound is protocol: canonical
+execution, recovery and the C++ port apply it alike, and live prediction
+applies the well-formedness rule. Live prediction cannot mirror an overflow
+drain, which can run ahead of batches the lane has already sealed, so an
+overflow is a deliberate divergence. An overflow is answered by a manual
+cockroach recovery, and the watchdog's divergence latch is what reports it;
+making standard recovery repair one is deferred on complexity
 ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 
 To settle with Bart:
@@ -292,6 +294,13 @@ its own, after draining sealed batches and before the first production deploy;
 the rest ship in the port's image. Checked 2026-10-14 at `32bf8de`;
 evidence: the spec's links and
 [`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json).
+
+The [sequencer recovery plan](../plans/2026-11-sequencer-recovery/README.md),
+proposed on 2026-11-03, reads the scheduler state from the machine instead of
+rebuilding it from L1. It would drop strict frame clocks and the clock raised
+by backstop drains, and reopen the floor gate, the authorization rule and
+prevRandao in the direct context; its
+[template rules](../plans/2026-11-sequencer-recovery/template.md) say why.
 
 - **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
   and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`

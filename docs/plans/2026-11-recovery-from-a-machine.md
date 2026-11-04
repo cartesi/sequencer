@@ -1,7 +1,9 @@
 # Recovery from a canonical machine
 
 **Status:** candidate, proposed on 2026-11-03; nothing here is implemented or
-settled. It simplifies the [shared recovery tool](2026-10-shared-recovery-tool.md)
+settled. The owner's review of it led to a third plan,
+[sequencer recovery](2026-11-sequencer-recovery/README.md), which would replace
+it. This candidate simplifies the [shared recovery tool](2026-10-shared-recovery-tool.md)
 plan after a re-evaluation of every decision in it; if the owner adopts it, it
 replaces that plan. [What changes](#what-changes-from-the-current-plan) lists
 each difference and marks the decisions it reopens. Like that plan, it needs

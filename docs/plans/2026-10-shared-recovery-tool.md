@@ -3,9 +3,10 @@
 **Status:** proposed; nothing here is implemented. It started in the
 2026-10-28 design session. On 2026-11-02 the owner settled the tool's
 two-phase replay and the template rules it relies on;
-[Decisions](#decisions) lists what stays open. A simpler candidate that would
-replace this plan is [recovery from a canonical machine](2026-11-recovery-from-a-machine.md).
-The design needs the
+[Decisions](#decisions) lists what stays open. Two simpler plans followed: a
+[candidate](2026-11-recovery-from-a-machine.md), then
+[sequencer recovery](2026-11-sequencer-recovery/README.md), which would replace
+both. The design needs the
 [next template's rules](#rules-for-the-next-template), so it serves only
 deployments built from that template; [cockroach recovery](../recovery/cockroach.md)
 and `setup --recovery` stay the procedure for today's. When this design lands,
