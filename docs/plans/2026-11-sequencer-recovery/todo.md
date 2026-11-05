@@ -21,10 +21,6 @@ is easy to miss. An item leaves this list when it lands.
   canonical shows only at the watchdog's first comparison. A client state that
   is wrong below its count shows only in the client's own row comparison
   ([what can go wrong](operations.md#what-can-go-wrong)).
-- **A direct row's `batch_nonce` becomes optional on the feed.** A direct the
-  backstop or an overflow drained belongs to no batch. Every feed consumer
-  changes with it: the OpenAPI spec, the SDK and Bart's client
-  ([the feed](sequencer.md#the-era-and-the-feed)).
 - **Each queued direct keeps its input index**, in the guest and in the
   `fridge` export. The feed takes a direct's transaction hash and timestamp
   from the input table by that index, and the lane starts draining at the first
@@ -43,8 +39,10 @@ is easy to miss. An item leaves this list when it lands.
   changes with it ([frame execution](scheduler.md#frame-execution)).
 - **Setup becomes one procedure.** `--recovery` and its dump directory go;
   plain setup's refusal on submitter activity goes, and its post-flush escape
-  check stays; setup takes the submitter key; genesis is a base like any other
-  ([operations](operations.md#one-setup-from-any-base)).
+  check stays; setup takes the submitter key; genesis is a base like any other.
+  Plain setup's no-op on a completed directory becomes a refusal, so the root
+  README's "run once; idempotent" changes, and a setup unit must not run on
+  every boot ([operations](operations.md#what-setup-does)).
 
 ## Promote to real docs
 

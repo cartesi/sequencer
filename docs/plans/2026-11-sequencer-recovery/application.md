@@ -19,19 +19,21 @@ only for its own state, in an encoding it chooses.
 
 | Query | Answered by | Returns |
 |---|---|---|
+| `state`, the literal bytes or an empty payload | The application | The whole comparison bytes in one report, unchanged from today |
 | `scheduler` | The harness | The counts, the next batch nonce, the clock and the fridge's length |
 | `fridge`, with a start and a count | The harness | A page of fridge entries, oldest first |
-| `state`, with a page | The application | A page of the application's export |
+| `state_page`, with a page | The application | A page of the comparison bytes |
 
 An outline in Rust; the names and the encoding are proposals. SSZ, as batches
 use, would do:
 
 ```rust
-/// An inspect request's payload.
+/// An export request's payload. Neither the literal `state` nor an empty
+/// payload decodes as one, so today's query keeps its meaning.
 pub enum ExportQuery {
     Scheduler,
     Fridge { start: u64, count: u32 },
-    State { page: u32 },
+    StatePage { page: u32 },
 }
 
 pub struct SchedulerExport {
@@ -64,11 +66,12 @@ pub struct StatePage {
   fridge and the state come in pages. A `fridge` reply holds as many of the
   asked entries as fit, and the reader continues after the last one. An entry
   can carry nearly 64 KiB, the InputBox's cap on an encoded input.
-- **The export is the comparison bytes.** Today the `state` query returns the
-  bytes the watchdog hashes, whole, in one report
-  ([`inspect_state`](../../../sequencer-core/src/scheduler/mod.rs)). The same
-  bytes, paged, are what the native side builds from, so one method serves
-  both.
+- **The export is the comparison bytes.** The literal `state` query returns
+  them whole, as today
+  ([`inspect_state`](../../../sequencer-core/src/scheduler/mod.rs)), and the
+  watchdog's inspect source keeps hashing that report. `state_page` returns the
+  same bytes in pages, for setup, so one method serves both. A state larger
+  than one report uses the watchdog's range source, as today.
 - **The application chooses its encoding.** The wallet exports its SSZ
   snapshot; libdex could export the flat buffer its drive holds, as it is.
 - **An unknown query gets a report saying so**, never a halt, as today.
@@ -88,7 +91,7 @@ engines and gets the same additions.
 | `apply_direct_input` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
 | `progress` | Report the L2 tx count; **New:** the count alone, without today's clock |
 | `create_dump`, `from_dump`, `state_file_in_dump` | Write a durable dump, load it back to the same state, and name the file that holds the comparison bytes |
-| `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns; **New:** paged |
+| `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns whole; **New:** `state_page` returns them in pages |
 | **New:** the direct filter | Say whether a direct is well formed, from the direct and the application's fixed configuration alone |
 | **New:** the projection | Build a native instance from a machine's export |
 

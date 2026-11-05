@@ -21,8 +21,11 @@ depends only on its state and the inputs
 ([scheduler](scheduler.md#the-schedulers-interface)). What it hands out, in
 order, is one of:
 
-- **a direct**, with the batch nonce of the frame that drained it, or none when
-  the backstop or an overflow drained it;
+- **a direct**, with a batch nonce: the batch whose frame drained it, or, when
+  the backstop or an overflow drained it, the scheduler's next batch nonce at
+  that moment. Unless the sequencer diverged, that next batch is the one the
+  live lane put the direct in, so a rebuilt row matches the row the live feed
+  served;
 - **a user op**, with its sender, nonce, fee, data, safe block and batch nonce.
 
 Today's `Scheduler<A>` executes as it schedules, so it splits into the
@@ -58,9 +61,8 @@ The new era records:
 
 The feed serves the executed rows from the base count: from the rebuilt history
 table up to its end, then from the live table. A direct row takes its timestamp
-and transaction hash from the input table, by input index. Its `batch_nonce`
-becomes optional, since a direct the backstop or an overflow drained belongs to
-no batch.
+and transaction hash from the input table, by input index, and its batch
+nonce from the rebuild ([above](#the-rebuild)).
 
 ## The lane and the predicate
 

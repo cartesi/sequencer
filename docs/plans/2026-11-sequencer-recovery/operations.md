@@ -66,6 +66,10 @@ end.
 
 ### What setup does
 
+Setup refuses a data directory whose setup has completed, whatever the base.
+Over an incomplete one it starts again from step 1, keeping the input table and
+clearing the rebuilt history table.
+
 1. **Reads the base.** For a machine, setup loads it, runs its
    [export queries](application.md#the-state-export), and builds the
    sequencer's application from the export. For genesis, it starts empty.
@@ -88,11 +92,13 @@ end.
    transactions, through the shared execution boundary. A direct always
    executes; a user op executes or is skipped
    ([what counts](scheduler.md#what-counts)). An application error stops setup
-   there: the canonical machine halts on the same transaction.
+   there. If the canonical machine halts on the same transaction, the
+   application is dead on chain; otherwise the fault is in the native engine or
+   the projection ([what can go wrong](#what-can-go-wrong)).
 6. **Publishes the new era**, in one transaction. It opens no root frame.
 
-Nothing is published until step 6, so a failed setup leaves a directory to
-discard and run again.
+Nothing is published until step 6, so a failed setup can run again over the
+same directory.
 
 ### After setup
 
@@ -102,7 +108,7 @@ discard and run again.
 - **The watchdog compares the baseline.** The application's state at the end
   of the stop block is the canonical state there, so the sequencer serves it
   as the era's first comparison checkpoint, and the watchdog compares it on
-  its next tick.
+  its next tick, once no divergence latch holds it.
 - **The feed serves the new era from the base count**: the rebuilt history
   first, then the live rows.
 
@@ -130,8 +136,11 @@ discard and run again.
 4. **Run `sequencer setup --base <machine>`** in a fresh data directory.
 5. **Run `sequencer run`.**
 6. **Tell each client to realign** at its own count.
-7. **Watch the new era's first watchdog comparison.** A mismatch means the
-   base machine was not canonical.
+7. **Clear the watchdog's latch, then watch its next comparison.** If a
+   divergence latched it, clear it once `run` has started
+   (`sequencer-watchdog clear --block <B> --reason ...`, as in the
+   [incident runbook](../../watchdog/incident-runbook.md)). A mismatch on the
+   new era's first comparison means the base machine was not canonical.
 
 ## The client's playbook
 
@@ -159,4 +168,5 @@ discard and run again.
 | A client's state is wrong below its count | Only the client's own checks, such as the row comparison | The client restores an older state |
 | A transaction escaped the flush, or the old instance runs | Setup's escape check | Stop the old instance and run setup again |
 | The base machine is not canonical | The new era's first watchdog comparison | Recover from a trusted machine |
-| The application errors while executing the history | Setup stops | None: the canonical machine halts there too |
+| An I/O error while executing the history | Setup stops | Fix the host and run setup again |
+| The application fails on a transaction of the history | Setup stops | Replay a trusted machine to that input: if it halts there too, the application is dead; if not, fix the native engine or the projection |
