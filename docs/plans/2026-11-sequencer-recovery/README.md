@@ -3,7 +3,7 @@
 **Status:** proposed on 2026-11-03 from the owner's procedure and revised on
 2026-11-05; nothing here is implemented. A read-only design review on
 2026-11-05 (33 agents) left four minor findings, all folded in: rebuilt
-direct rows keep a batch nonce, setup refuses a completed directory, the
+direct rows keep a batch nonce, setup refuses a non-empty directory, the
 watchdog's `state` query stays as it is, and the playbook clears the watchdog
 latch and tells a native fault from a canonical halt. It supersedes two
 [archived plans](../../recovery/history/README.md#superseded-cockroach-recovery-plans).

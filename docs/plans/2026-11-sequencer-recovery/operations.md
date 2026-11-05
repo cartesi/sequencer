@@ -38,7 +38,7 @@ included, though a rebuild from genesis takes longer as the deployment ages.
 |---|---|
 | A base machine | Optional, genesis without it; setup trusts it, and the operator checks it ([before anything](#before-anything)) |
 | The submitter key | Setup flushes the old instance's transactions with it |
-| A fresh data directory | Setup never reuses the old instance's directory |
+| An empty data directory | Setup refuses one that holds anything |
 | Today's setup configuration | The RPC endpoint, chain, application address and fee source |
 
 Setup takes no client count; each client checks its own count
@@ -66,9 +66,9 @@ end.
 
 ### What setup does
 
-Setup refuses a data directory whose setup has completed, whatever the base.
-Over an incomplete one it starts again from step 1, keeping the input table and
-clearing the rebuilt history table.
+Setup needs an empty data directory. It refuses one that holds anything, a
+completed setup or a failed one, loudly and without touching it: nothing there
+can be trusted to fit this run.
 
 1. **Reads the base.** For a machine, setup loads it, runs its
    [export queries](application.md#the-state-export), and builds the
@@ -97,8 +97,8 @@ clearing the rebuilt history table.
    the projection ([what can go wrong](#what-can-go-wrong)).
 6. **Publishes the new era**, in one transaction. It opens no root frame.
 
-Nothing is published until step 6, so a failed setup can run again over the
-same directory.
+Nothing is published until step 6. A failed setup leaves a directory to
+discard; run setup again in an empty one.
 
 ### After setup
 
@@ -133,7 +133,7 @@ same directory.
    that is the count of a backup he knows is right.
 3. **Pick a base** at or below every client's count: a machine, or genesis.
    `setup --base <machine> --dry-run` prints its counts.
-4. **Run `sequencer setup --base <machine>`** in a fresh data directory.
+4. **Run `sequencer setup --base <machine>`** in an empty data directory.
 5. **Run `sequencer run`.**
 6. **Tell each client to realign** at its own count.
 7. **Clear the watchdog's latch, then watch its next comparison.** If a

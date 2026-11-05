@@ -40,9 +40,13 @@ is easy to miss. An item leaves this list when it lands.
 - **Setup becomes one procedure.** `--recovery` and its dump directory go;
   plain setup's refusal on submitter activity goes, and its post-flush escape
   check stays; setup takes the submitter key; genesis is a base like any other.
-  Plain setup's no-op on a completed directory becomes a refusal, so the root
+  Setup refuses any data directory that holds anything, so plain setup's no-op
+  on a completed directory and today's retry in place both go: the root
   README's "run once; idempotent" changes, and a setup unit must not run on
-  every boot ([operations](operations.md#what-setup-does)).
+  every boot. A new deployment's setup exits 20 until the L1 safe head reaches
+  the deployment block, so it must check that before writing anything, or
+  build in a staging directory and rename it into place when it publishes, so
+  a retry finds the directory empty ([operations](operations.md#what-setup-does)).
 
 ## Promote to real docs
 
