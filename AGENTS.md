@@ -94,7 +94,8 @@ so invalidation cascades through the suffix, open batch included
   ([automatic recovery](docs/recovery/README.md)).
 - **Cockroach recovery** (`setup --recovery`) rebuilds a fresh data directory from
   a trusted canonical checkpoint and L1 history, including after a sequencer bug
-  ([cockroach recovery](docs/recovery/cockroach.md)).
+  ([cockroach recovery](docs/recovery/cockroach.md)). Its successor for the
+  next template is proposed in [sequencer recovery](docs/plans/2026-11-sequencer-recovery/README.md).
 
 ## Threat Model (brief)
 

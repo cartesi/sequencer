@@ -1,9 +1,21 @@
 # Recovery Design History
 
-This directory preserves the **historical optimistic recovery design** and its
-counterexample. It is not the production recovery procedure. The
+This directory preserves recovery designs that production does not use: the
+**historical optimistic recovery design** and its counterexample, and two
+superseded cockroach-recovery plans. None is a production procedure. The
 [current recovery guide](../README.md) owns automatic recovery; the
-[cockroach guide](../cockroach.md) owns manual rebuilding.
+[cockroach guide](../cockroach.md) owns manual rebuilding, and
+[sequencer recovery](../../plans/2026-11-sequencer-recovery/README.md) is its
+proposed successor.
+
+## Superseded cockroach-recovery plans
+
+Archived on 2026-11-05. Each opens with what it was checked against.
+
+| Plan | What it proposed | Why it was superseded |
+|---|---|---|
+| [Shared recovery tool](2026-10-shared-recovery-tool.md) | A tool that rebuilds the scheduler's history from L1, starting from three values a machine reports, shared by the sequencer and its clients | Reading the whole scheduler state from the machine needs no replay from L1 and no shared tool |
+| [Recovery from a canonical machine](2026-11-recovery-from-a-machine.md) | The rebuild folded into setup, from four values a machine reports | The owner's review led to exporting the whole scheduler state, fridge included |
 
 ## The optimistic alternative
 

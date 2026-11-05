@@ -29,24 +29,23 @@ the fridge, under application-defined format and sender rules that read only
 the input and fixed configuration, and the rest are dropped without
 executing; and a count of entries bounds it. Refined on 2026-11-02: an
 overflow executes whole blocks of the oldest entries, in FIFO order, until
-there is room, raising the scheduler clock to the last drained block. The
-bound holds every direct one block can carry, so an overflow never splits a
-block and drains at most one block more than it must. Whole blocks and strict
+there is room, raising the scheduler clock to the last drained block. An
+overflow never splits a block and drains at most one block more than it
+must. Whole blocks and strict
 frame clocks keep one invariant: every admitted direct at or below the
-scheduler clock has executed, and every one above it is queued. Recovery then
-rebuilds the fridge from L1 and the machine's position and clock, without
-reading the fridge itself
-([plan](../plans/2026-10-shared-recovery-tool.md#the-tool-as-a-function)). The
-[sequencer recovery plan](../plans/2026-11-sequencer-recovery/template.md),
-proposed on 2026-11-03, reads the fridge from the machine instead and returns
-to the just-enough overflow of 2026-10-29. The bound is protocol: canonical
+scheduler clock has executed, and every one above it is queued. The
+[sequencer recovery plan](../plans/2026-11-sequencer-recovery/scheduler.md#the-fridge)
+reads the fridge from the machine, so recovery no longer needs the invariant;
+on 2026-11-05 the owner kept whole blocks for its own sake, and a direct that
+arrives when only its own block is left joins over the bound. The bound is
+protocol: canonical
 execution, recovery and the C++ port apply it alike, and live prediction
 applies the well-formedness rule. Live prediction cannot mirror an overflow
 drain, which can run ahead of batches the lane has already sealed, so an
 overflow is a deliberate divergence. An overflow is answered by a manual
 cockroach recovery, and the watchdog's divergence latch is what reports it;
 making standard recovery repair one is deferred on complexity
-([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
+([shared recovery tool](../recovery/history/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 
 To settle with Bart:
 
@@ -65,9 +64,8 @@ To settle with Bart:
   overflow cannot happen at all; the image fixes the bound for the
   deployment's life, so leave headroom for higher gas limits. A smaller count
   still makes overflow costly, and its consequence is a manual rebuild, not a
-  dead application. Whatever the count, it must hold every direct one
-  block can carry, about 1,500 to 2,000 at today's gas limit, for the
-  deployment's life.
+  dead application. One block can carry about 1,500 to 2,000 directs at
+  today's gas limit; a block that fills the bound alone joins over it.
 - The largest drain. The first frame after an outage and the root frame after
   a rebuild both drain a full fridge in one input, so the bound must fit that
   drain in the guest's budget, temporary allocations, execution and
@@ -295,12 +293,12 @@ the rest ship in the port's image. Checked 2026-10-14 at `32bf8de`;
 evidence: the spec's links and
 [`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json).
 
-The [sequencer recovery plan](../plans/2026-11-sequencer-recovery/README.md),
-proposed on 2026-11-03, reads the scheduler state from the machine instead of
-rebuilding it from L1. It would drop strict frame clocks and the clock raised
-by backstop drains, and reopen the floor gate, the authorization rule and
-prevRandao in the direct context; its
-[template rules](../plans/2026-11-sequencer-recovery/template.md) say why.
+The [sequencer recovery plan](../plans/2026-11-sequencer-recovery/scheduler.md)
+restates every rule for the next template, with these marked. It reads the
+scheduler state from the machine, so recovery needs none of them; on
+2026-11-05 the owner kept the scheduler clock, strict frame clocks and the
+authorization rule for their own sake. The plan leaves prevRandao to a stated
+need.
 
 - **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
   and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`
@@ -331,13 +329,15 @@ prevRandao in the direct context; its
   which ops execute depends on application state. Settled by the owner for
   the next template, pending Bart: an op is included exactly when its sender
   authorized it (signature, nonce, fee cap); an included op advances the
-  nonce and pays the fee capped at the balance, whatever else happens.
+  nonce and pays the fee capped at the balance, whatever else happens. On
+  2026-11-05 the owner left the charge to the application, recommending the
+  capped fee.
 - **Direct input context** (checked 2026-10-29 at `3e92563`). The guest drops
   a direct's input index, timestamp and prevRandao, and the application never
   sees them. Settled by the owner for the next template, pending Bart: they
   reach the application with the direct, and the sequencer stores prevRandao
   and carries it on the feed's direct rows
-  ([shared recovery tool](../plans/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
+  ([shared recovery tool](../recovery/history/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
   the [fridge bound](#bound-the-canonical-direct-input-fridge), a `scheduler`

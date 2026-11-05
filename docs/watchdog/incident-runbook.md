@@ -192,7 +192,7 @@ gas estimation, and every recovery cycle sends a few no-op flush transactions.
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
 | Sequencer wrong: the rebuild | `setup_recovery_round_trip_test` (and its C-host twin) in `just test-rollups-e2e` | `setup --recovery` from a sequencer archive, resumed sequencing, and a watchdog comparison after the new era's first accepted batch |
-| Sequencer wrong: export and readers | none yet; the [shared recovery tool](../plans/2026-10-shared-recovery-tool.md) plans them | a rebuild that starts from a machine, and reader realignment |
+| Sequencer wrong: export and readers | none yet; [sequencer recovery](../plans/2026-11-sequencer-recovery/todo.md#build) plans them | a rebuild that starts from a machine, and reader realignment |
 | Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 

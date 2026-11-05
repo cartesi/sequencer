@@ -1,15 +1,10 @@
 # Recovery from a canonical machine
 
-**Status:** candidate, proposed on 2026-11-03; nothing here is implemented or
-settled. The owner's review of it led to a third plan,
-[sequencer recovery](2026-11-sequencer-recovery/README.md), which would replace
-it. This candidate simplifies the [shared recovery tool](2026-10-shared-recovery-tool.md)
-plan after a re-evaluation of every decision in it; if the owner adopts it, it
-replaces that plan. [What changes](#what-changes-from-the-current-plan) lists
-each difference and marks the decisions it reopens. Like that plan, it needs
-the [next template's rules](#rules-for-the-next-template), so today's
-deployments keep [cockroach recovery](../recovery/cockroach.md) and
-`setup --recovery`. Its claims were checked by reading the code at `4e7b34b`
+**Status:** archived on 2026-11-05, never implemented. A candidate of
+2026-11-03 that simplified the [shared recovery tool](2026-10-shared-recovery-tool.md);
+the owner's review of it led to
+[sequencer recovery](../../plans/2026-11-sequencer-recovery/README.md), which
+supersedes both. Its claims were checked by reading the code at `4e7b34b`
 (main with PR #56), Dave at `dbcca7d4` and the emulator at v0.22.0-test3, and by
 adversarial review; none was executed.
 
@@ -67,7 +62,7 @@ list of transactions, not a tool.
 
 - **Template**: the initial machine whose root hash the on-chain application
   pins as `getTemplateHash()`. A deployed application keeps its template for
-  life ([Cartesi Machine facts](../cartesi-machine.md#versions-are-all-or-nothing)),
+  life ([Cartesi Machine facts](../../cartesi-machine.md#versions-are-all-or-nothing)),
   so a rule that changes the guest ships with a new template, which is to say
   a new deployment. A **machine** is any stored state of the canonical
   machine.
@@ -88,7 +83,7 @@ list of transactions, not a tool.
   user op's frame `safe_block`.
 - **Comparison digest**: the SHA-256 of an application's comparison bytes, the
   state the watchdog already compares
-  ([application contract §6](../protocol/application-contract.md#6-checkpoint-lifecycle)).
+  ([application contract §6](../../protocol/application-contract.md#6-checkpoint-lifecycle)).
 - **`C`** is the stop block, a safe head fixed after the flush. **`N'`**,
   **`F'`** and **`L'`** are the batch nonce, fridge start and scheduler clock at
   its end; `F'` is the first input after `C` when nothing is queued.
@@ -152,7 +147,7 @@ batch 10.
 **Where the inputs come from.** The rebuild runs in the fresh data directory.
 Setup fills its input table from the deployment block to a safe head at or
 past `C`, and the L1 reader proves the table complete
-([I6](../invariants.md#i6-the-frame-clock-accounts-for-a-complete-l1-interval)):
+([I6](../../invariants.md#i6-the-frame-clock-accounts-for-a-complete-l1-interval)):
 indices contiguous from zero, and the InputBox count checked at the safe head
 it commits. So the rebuild reads nothing from L1 itself and needs no archive
 node, and the sequencer's lane later drains the queued directs from the same
@@ -173,7 +168,7 @@ last input. It only checks well-formedness, so it recovers no signatures and
 executes nothing. Phase 2 recovers signatures and executes from the position
 to `C`, so the cost is the base's age at `C`.
 
-**How close today's code is.** [`fold_replay`](../../sequencer-core/src/scheduler/fold.rs)
+**How close today's code is.** [`fold_replay`](../../../sequencer-core/src/scheduler/fold.rs)
 already seeds a fridge from a range with batches dropped unjudged, then
 replays the rest from a batch nonce. The rebuild changes its seed range to
 `F_m` up to `n_m`, adds the clock to `Scheduler::resume_at`, carries each
@@ -186,7 +181,7 @@ scheduler followed by its application. The rebuild runs our scheduler with the
 same application. It reproduces the machine while our scheduler agrees with
 the guest's on every gate and drain, which the template's conformance vectors
 test, and while the guest never answers an input with `RX_REJECTED`, as the
-[fatal conditions](../protocol/scheduler-semantics.md#fatal-conditions)
+[fatal conditions](../../protocol/scheduler-semantics.md#fatal-conditions)
 require. A rebuild that reaches a halting transaction fails there, as the
 canonical machine did.
 
@@ -210,7 +205,7 @@ the default is [open](#decisions-for-the-owner).
 
 A matching root authenticates a machine only from a source we trust, such as
 our own Dave node: a stored machine's root comes from its stored hash tree, not
-from its contents ([hashing](../cartesi-machine.md#hashing)). An upcoming
+from its contents ([hashing](../../cartesi-machine.md#hashing)). An upcoming
 emulator release brings a mechanism to verify an untrusted load.
 
 **The sequencer** projects its state from the machine. The projection must
@@ -233,13 +228,13 @@ the machine's.
 A match says nothing about the client's own records before `X_m`: which rows
 it holds, their order, or what it derived from them. Different rows can reach
 the same state
-([reader state](../recovery/cockroach.md#application-specific-reader-state)).
+([reader state](../cockroach.md#application-specific-reader-state)).
 Those records are canonical only if the feed the client followed was. That is
 why the base must predate any fault the diagnosis found. After a
 `state_mismatch` latch that means at or before `P`, unless diagnosis places the
 fault later: a tick compares only the newest accepted checkpoint, so the
 compared state can first differ anywhere in `(P, B]`
-([incident runbook](../watchdog/incident-runbook.md)).
+([incident runbook](../../watchdog/incident-runbook.md)).
 
 The check needs the client to produce the comparison bytes exactly as the
 canonical machine holds them. For libdex that is its state `M` as the guest's
@@ -282,7 +277,7 @@ it:
    then at a transaction boundary, says which, and holds every row before it.
 2. **A cut discards later snapshots.** A standard recovery cuts the history at
    its preserved count
-   ([checkpoint compatibility](../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery));
+   ([checkpoint compatibility](../../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery));
    a rebuild cuts it at `X_m`. The new history replaces the rows past the cut
    and reuses their counts. So once realigned, the client deletes every
    snapshot past the cut and stops snapshotting its old live database.
@@ -314,7 +309,7 @@ has realigned.
    1. flushes the old instance's transactions and fixes `C` as a safe head
       observed after they settle. The flush is best effort: it replaces what
       the provider's pool holds for the submitter account and waits until that
-      is safe ([flush boundary](../recovery/cockroach.md#flush-and-stopping-block));
+      is safe ([flush boundary](../cockroach.md#flush-and-stopping-block));
    2. syncs the input table to a safe head at or past `C`;
    3. applies genesis setup's detection gate at `C`. Before publishing
       anything, it refuses if the submitter's wallet nonce is unsettled or a
@@ -358,7 +353,7 @@ procedure, drains from the first input after its `base_safe_block`, as today.
 
 `base_safe_block` stays `C`. The baseline has judged every batch through `C`,
 so acceptance scans only blocks after it
-([replay boundaries](../recovery/cockroach.md#replay-boundaries)), and no batch
+([replay boundaries](../cockroach.md#replay-boundaries)), and no batch
 at or below `C` is judged again. The directs from `F'` are not yet executed;
 the floor covers them.
 
@@ -372,7 +367,7 @@ marks it.
 
 Today's procedure instead executes the queued directs during recovery (the
 terminal drain) and publishes the result, and each client repeats that drain
-([projection replay](../protocol/projection-replay.md)). That state is a
+([projection replay](../../protocol/projection-replay.md)). That state is a
 prediction: the canonical machine reaches it only inside the post-`C` input
 that drains the last of the queued directs, so no comparison can check it, and
 a rebuild that started from it would execute those directs twice.
@@ -381,7 +376,7 @@ a rebuild that started from it would execute those directs twice.
 
 Each changes the guest, so each needs Bart's agreement and ships with the next
 template, ours and his port's
-([register](../review/register.md#canonical-rules-open-for-the-c-port)). The
+([register](../../review/register.md#canonical-rules-open-for-the-c-port)). The
 rebuild relies on the `scheduler` query and on a fridge that only pops its
 front, as today's does. The floor gate serves applications, not recovery.
 
@@ -400,11 +395,11 @@ front, as today's does. The floor gate serves applications, not recovery.
   rejects a batch whose first frame lies below `L`; empty batches stop at gate
   c and never reach it. So a transaction's block never goes backwards along
   `T`, and applications may read blocks as time. The gate makes
-  [I3](../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
+  [I3](../../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine)
   consensus-critical: every transition that opens a Tip, the sequencer's open
   batch, must assert that it starts at or above the latest valid frame.
   `scheduler_accepts` leaves the floor out, as it leaves out gate d
-  ([I1](../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)).
+  ([I1](../../invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)).
 - **A `scheduler` inspect query** returning the machine's position, batch
   nonce, fridge start and clock. The position is the last input's index plus
   one, batches included, or zero for the template. The fridge start is the
@@ -434,9 +429,9 @@ so it includes exactly what the canonical machine included.
 - **The old instance stays down.** Recovery deliberately creates a second data
   directory pinned to the same submitter address, the old one can still run
   with the same key, and
-  [the flush fences transactions, not processes](../recovery/cockroach.md#incident-playbook).
+  [the flush fences transactions, not processes](../cockroach.md#incident-playbook).
   No command that signs with the key may run against the old directory again
-  ([restart policy](../watchdog/operator-deployment.md#sequencer-restart-policy)).
+  ([restart policy](../../watchdog/operator-deployment.md#sequencer-restart-policy)).
 - **The submitter key survives.** The rebuild signs the flush and `run` submits,
   so a lost or leaked key means a new deployment while the submitter is an
   account compiled into the template.
@@ -602,9 +597,9 @@ From the SQLite, Litestream, OpenZFS and AWS documentation as of 2026-10-29:
   its sender's nonce is unused, and an application that wants expiry checks a
   deadline in the payload against the op's `safe_block`.
 - Drills that rebuild from a machine with directs queued at `C` and realign a
-  toy-wallet client, in the [incident runbook](../watchdog/incident-runbook.md#drills),
+  toy-wallet client, in the [incident runbook](../../watchdog/incident-runbook.md#drills),
   on the devnet in CI. A path run once in a deployment's life rots.
 - Then the deletions the
-  [tracks board](2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
+  [tracks board](../../plans/2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
   lists for the tool's landing, plus `/history`'s baseline and accepted
   checkpoint, which nothing reads in this design, and `setup --recovery`.

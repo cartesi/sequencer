@@ -97,7 +97,7 @@ vectors pass unchanged (W3b).
      [batch-scoped replay protection](../plans/2026-10-batch-scoped-replay-protection.md).
 3. **N8 typed signing: deferred.** Out of the current scope.
 4. **Recovery-tool shape: a later dedicated session**, held on 2026-10-28. The
-   [shared recovery tool plan](../plans/2026-10-shared-recovery-tool.md) owns
+   [shared recovery tool plan](../recovery/history/2026-10-shared-recovery-tool.md) owns
    the proposed design and its open decisions.
 
 ### W1: correctness and safety (about 18 small patches, no decisions)

@@ -147,14 +147,14 @@ alarm can return the faulty newer state. The
 describes retention; the application runbook supplies the tested conversion.
 Use its rehearsed earlier-checkpoint/genesis fallback when the preferred source
 is unavailable. The proposed
-[shared recovery tool](../plans/2026-10-shared-recovery-tool.md#states-at-a-base)
-starts instead from a machine the operator trusts, by default Dave's last
-finalized one.
+[sequencer recovery](../plans/2026-11-sequencer-recovery/operations.md)
+starts instead from a canonical machine the operator trusts, by default one
+from a validator node at a settled epoch.
 
 ### Application-specific reader state
 
 Bart's client currently treats rebuilds as out of scope, and the proposed
-[shared recovery tool](../plans/2026-10-shared-recovery-tool.md#the-tool-as-a-function)
+[sequencer recovery](../plans/2026-11-sequencer-recovery/operations.md#the-clients-playbook)
 replaces this procedure; until then it receives bug fixes only.
 
 A reader such as Bart's indexer owns more state than the sequencer application.

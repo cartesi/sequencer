@@ -9,7 +9,9 @@ disagreement. The [application contract](application-contract.md) owns what
 the application does with each input. Rules marked **pending** describe the
 reference today; changing one changes the canonical machine image or its wire
 format, so they are settled with the C++ port's author
-([register](../review/register.md#canonical-rules-open-for-the-c-port)).
+([register](../review/register.md#canonical-rules-open-for-the-c-port)). A
+[proposal for the next template](../plans/2026-11-sequencer-recovery/scheduler.md)
+restates every rule with its changes marked.
 
 ## The one stream, the one classification
 

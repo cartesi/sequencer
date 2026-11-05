@@ -86,12 +86,10 @@ replacement directs, empty/no-op invalidation, nonzero baselines, and rollback.
 ### Follow-up sequence
 
 1. **Consumer adoption.** Bart's client follows the feed and treats cockroach
-   recoveries as out of scope. A planned
-   [shared recovery tool](2026-10-shared-recovery-tool.md#the-tool-as-a-function)
-   will replay the canonical scheduler over L1 from a canonical machine's
-   scheduler state. The rebuilt sequencer executes its candidates, and each
-   client executes its part of the sequencer's executed list from its own
-   count, before it subscribes to the new era, never across one;
+   recoveries as out of scope. The proposed
+   [sequencer recovery](2026-11-sequencer-recovery/README.md) rebuilds the
+   sequencer from a canonical machine's exported state, and each client
+   realigns through the feed from its own count;
    new client work should not build on the projection-replay path, which
    receives bug fixes only.
 2. **Deployment readiness.** Validate the private native engine and measure
