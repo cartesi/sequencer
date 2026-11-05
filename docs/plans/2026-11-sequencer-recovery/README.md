@@ -1,11 +1,6 @@
 # Sequencer recovery
 
-**Status:** proposed on 2026-11-03 from the owner's procedure and revised on
-2026-11-05; nothing here is implemented. A read-only design review on
-2026-11-05 (33 agents) left four minor findings, all folded in: rebuilt
-direct rows keep a batch nonce, setup refuses a non-empty directory, the
-watchdog's `state` query stays as it is, and the playbook clears the watchdog
-latch and tells a native fault from a canonical halt. It supersedes two
+**Status:** proposed; nothing here is implemented. It supersedes two
 [archived plans](../../recovery/history/README.md#superseded-cockroach-recovery-plans).
 It needs the next template, so today's deployments keep
 [cockroach recovery](../../recovery/cockroach.md) and today's
@@ -72,39 +67,3 @@ Each file becomes a real doc when the plan lands:
 | scheduled transaction | A transaction the scheduler hands the application; a user op may still be skipped |
 | executed transaction | A scheduled transaction the application executed; it has an L2 tx count |
 | first queued input | The InputBox index of the oldest direct still queued at the end of the stop block |
-
-## Decisions
-
-The owner settled these on 2026-11-03:
-
-| Decision | Choice |
-|---|---|
-| Interface | Setup takes a machine and extracts everything from it |
-| Scheduler state | The machine exports it, the fridge included, through paged inspect queries |
-| History | Rebuilt by the scheduler alone, stored in a new table, then executed by the application during setup |
-| Clients | Realign through the existing feed, from their own count |
-| The shared tool | Gone; only setup remains |
-| A client's count | Not an input to setup |
-| Machine sourcing | The operator's job, by default from a validator node; a separate task |
-
-And these on 2026-11-05:
-
-| Decision | Choice |
-|---|---|
-| Setup | One procedure from any base, genesis included; it never refuses on intent |
-| An underfunded user op | Executes and counts; the application decides what it charges |
-| Blocks | Monotone along the L2 sequence: a scheduler clock, a gate on it, and strict frames |
-| Overflow | Drains whole older blocks; a direct joins over the bound when only its own block is left |
-| State export | Generic inspect queries; the application's part through the trait |
-| The scheduler's interface | Designed later with Bart, as the application's trait and C binding were |
-| Sharing | The repository, which Bart's team clones |
-
-These stay open:
-
-| Decision | Recommendation |
-|---|---|
-| Which of a direct's index, timestamp and prevRandao reach the application | Index and timestamp; prevRandao only on a stated need |
-| The fridge bound, an entry's largest size and the largest drain | Settle with Bart and measure |
-| Checking a client's count against the rebuilt history end | Client-side for now; revisit in the egress redesign |
-| How setup loads a machine | Link the emulator, as `sdk/guest/testsi` does |
-| The rules already open with the C++ port | Settle with Bart ([register](../../review/register.md#canonical-rules-open-for-the-c-port)) |
