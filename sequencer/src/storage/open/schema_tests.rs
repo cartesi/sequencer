@@ -724,9 +724,7 @@ fn schema_rejects_safe_input_update_and_delete() {
 
     assert_eq!(storage.safe_input_end_exclusive().expect("end"), 2);
     assert_eq!(
-        storage
-            .safe_inputs_in_block_range(9, 10)
-            .expect("read back"),
-        inputs
+        storage.safe_input_count_through_block(10).expect("count"),
+        2
     );
 }

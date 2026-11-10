@@ -1,0 +1,29 @@
+[package]
+name = "c-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The reference scheduler exported through the proposed scheduler.h C API"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+authors.workspace = true
+
+[lib]
+# `staticlib` is what a C or C++ guest links; `rlib` is what this crate's tests link, calling the
+# exported functions through the header's own declarations.
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+# Generates the records from scheduler.h, the same pin as c-app-engine so both read one layout.
+bindgen = "0.72"
+
+[dependencies]
+sequencer-core = { path = "../../sequencer-core" }
+alloy-primitives = { workspace = true }
+
+[dev-dependencies]
+sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
+alloy-sol-types = { workspace = true }
+k256 = { workspace = true }
+ssz = { workspace = true }

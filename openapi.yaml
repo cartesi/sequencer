@@ -172,7 +172,10 @@ paths:
       description: |
         `next_nonce` is one past the sender's latest included op, or 0 if it
         has none. It counts soft-confirmed ops. The value is a hint, not a
-        reservation: it can go down after automatic recovery.
+        reservation: it can go down after automatic recovery. It reads only
+        the era's live ops, so after a setup a sender whose last op lies in
+        the rebuilt history or below the base count reads 0; the `422`
+        bad-nonce message names the expected nonce.
         `4294967295` means the account is exhausted.
 
         Keep one op in flight per sender: sign `next_nonce`, submit, and
@@ -339,12 +342,20 @@ paths:
     get:
       tags: [history]
       operationId: getHistory
-      summary: Deployment, history, baseline, and accepted-checkpoint metadata
+      summary: Deployment, history, era baseline, and accepted-checkpoint metadata
       description: |
-        One coherent view. `compatibility` is `null` unless `from_generation`
-        is supplied together with `era_id`. Unknown query fields are rejected.
-        An era mismatch (`409`) takes precedence over the `from_generation`
-        bound (`400`).
+        One coherent view. `history.available_from` is the era's base count;
+        the feed serves the rebuilt history from there up to
+        `baseline.rebuilt_history_end`, then the live rows. `compatibility`
+        is `null` unless `from_generation` is supplied together with
+        `era_id`. Unknown query fields are rejected. An era mismatch (`409`)
+        takes precedence over the `from_generation` bound (`400`).
+
+        A client holding state from an older era at count `X` adopts this
+        era when `available_from <= X <= baseline.rebuilt_history_end`: it
+        subscribes with `history.version` and `next_input = X`. Below the
+        range the era's base is newer than its state; above it, its state
+        holds rows that never landed by the stop block.
       parameters:
         - name: era_id
           in: query
@@ -382,7 +393,11 @@ paths:
                   l1_stop_block: 1240
                   l1_end_input_index: 8
                   next_batch_nonce: 2
-                accepted_checkpoint: null
+                  rebuilt_history_end: 7
+                accepted_checkpoint:
+                  inclusion_block: 1240
+                  executed_input_count: 7
+                  next_batch_nonce: 2
                 compatibility: null
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -497,7 +512,8 @@ paths:
         "200":
           description: |
             The accepted checkpoint's L1 inclusion block and executed
-            application input count. Block `0` is the genesis checkpoint.
+            application input count. Until a batch of the era is accepted,
+            it is the era baseline at the stop block.
           content:
             application/json:
               schema:
@@ -633,7 +649,7 @@ paths:
       description: |
         Streams the accepted snapshot as a tar archive, adding a
         `checkpoint.toml` receipt with its L1 inclusion block and next batch
-        nonce for trusted recovery. The download holds a GC lease until the
+        nonce: an operator backup, which no command consumes. The download holds a GC lease until the
         response ends or the client disconnects. The body has no
         `Content-Length`; a failure after the headers aborts the transfer, so
         treat an incomplete body as a failed download.
@@ -824,7 +840,7 @@ components:
       format: uuid
       pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
       description: |
-        Hyphenated UUIDv4 identifying one setup/rebuild era. The server
+        Hyphenated UUIDv4 identifying the era one setup published. The server
         emits lowercase and accepts hex digits in either case.
 
     UserOp:
@@ -976,7 +992,7 @@ components:
         available_from:
           allOf:
             - $ref: "#/components/schemas/U64"
-          description: Baseline application count; entries `[available_from, head)` are available through WS.
+          description: The era's base count; entries `[available_from, head)` are available through WS.
         head:
           $ref: "#/components/schemas/U64"
 
@@ -1002,20 +1018,37 @@ components:
 
     HistoryBaseline:
       type: object
-      required: [l1_stop_block, l1_end_input_index, next_batch_nonce]
+      required: [l1_stop_block, l1_end_input_index, next_batch_nonce, rebuilt_history_end]
+      description: |
+        Where setup's rebuild of the era ended. Fixed for the era's lifetime.
       properties:
         l1_stop_block:
-          $ref: "#/components/schemas/U64"
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: The safe block setup pinned after flushing the submitter's wallet; the rebuilt history ends with it.
         l1_end_input_index:
           allOf:
             - $ref: "#/components/schemas/U64"
           description: Exclusive end of the per-application InputBox prefix through the stop block.
         next_batch_nonce:
-          $ref: "#/components/schemas/U64"
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: The scheduler's next batch nonce at the end of the stop block; the era's first batch carries it.
+        rebuilt_history_end:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: |
+            The application count at the end of the stop block: the rebuilt
+            history covers `[available_from, rebuilt_history_end)` and the
+            live rows follow.
 
     AcceptedCheckpoint:
       type: object
       required: [inclusion_block, executed_input_count, next_batch_nonce]
+      description: |
+        The latest accepted batch's checkpoint. Until a batch of the era is
+        accepted, it is the era baseline: the stop block, the rebuilt
+        history end, and the baseline's next batch nonce.
       properties:
         inclusion_block:
           $ref: "#/components/schemas/U64"
@@ -1075,10 +1108,11 @@ components:
       type: object
       required: [code, current]
       description: |
-        The claimed era is not the current era. Old-era results cannot be
-        resumed or spliced into the new era: a replica rebootstraps from a
-        current snapshot, and a projection re-establishes correspondence with
-        the new baseline.
+        The claimed era is not the current era. A client holding state at
+        count `X` adopts the current era when
+        `available_from <= X <= baseline.rebuilt_history_end` (`GET /history`)
+        and subscribes with `current` at `X`. Otherwise it needs another
+        starting state: a replica rebootstraps from a current snapshot.
       properties:
         code:
           type: string

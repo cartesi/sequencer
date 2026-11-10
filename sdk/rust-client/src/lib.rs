@@ -5,8 +5,8 @@ mod errors;
 mod history;
 
 pub use errors::{
-    ClientBuildError, HistoryReadError, QueryError, SnapshotError, SubmitRejected, SubmitTxError,
-    SubscribeError,
+    AdoptEraError, ClientBuildError, HistoryReadError, QueryError, SnapshotError, SubmitRejected,
+    SubmitTxError, SubscribeError,
 };
 
 pub use sequencer_core::history::{
@@ -14,8 +14,8 @@ pub use sequencer_core::history::{
     RecoveryGeneration,
 };
 pub use sequencer_core::history_api::{
-    AcceptedCheckpoint, HistoricalL1Input, HistoricalL1InputStart, HistoricalL1InputsPage,
-    HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
+    AcceptedCheckpoint, AdoptError, HistoricalL1Input, HistoricalL1InputStart,
+    HistoricalL1InputsPage, HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
 };
 
 use alloy_primitives::Address;
@@ -130,8 +130,10 @@ impl SequencerClient {
         self.get_json("/fee", "").await
     }
 
-    /// The nonce `sender` signs next. A hint for one op in flight: re-query
-    /// after a `422` bad-nonce rejection, since recovery can lower it.
+    /// The nonce `sender` signs next. A hint for one op in flight: recovery
+    /// can lower it, and after a cockroach recovery it is stale for a sender
+    /// whose last op predates the new era's live rows. A `422` bad-nonce
+    /// rejection names the `expected` nonce, which corrects it.
     pub async fn get_nonce(&self, sender: Address) -> Result<NonceResponse, QueryError> {
         self.get_json("/nonce", &format!("?sender={sender:#x}"))
             .await
@@ -223,7 +225,8 @@ impl SequencerClient {
 
     /// Bounds the handshake by the request timeout; callers own the stream.
     /// The feed is plain `ws://`: a client built from an `https://` endpoint
-    /// cannot subscribe.
+    /// cannot subscribe. A claim refused with `ERA_CHANGED` can resume
+    /// through [`Self::adopt_current_era`].
     pub async fn subscribe(&self, claim: HistoryClaim) -> Result<SubscribeStream, SubscribeError> {
         let url = self.ws_subscribe_url(claim);
         let (stream, _response) =

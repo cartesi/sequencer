@@ -3,10 +3,12 @@
 What to do when the watchdog latches a divergence: `tick` exits 2 and
 `cartesi_watchdog_status{state="failed"}` is 1. Every step names the command
 that performs it, and each scenario has a drill that practices it before an
-incident does. The exception is resolving **Sequencer wrong**: its export and
-its reader realignment are application-specific, and neither has a drill yet
-([Drills](#drills)). The [watchdog README](README.md) owns how the latch and its
-evidence are produced.
+incident does. Resolving **Sequencer wrong** is not drilled yet: the drills
+for the rebuild and a toy-wallet client's realignment are written but have not
+run ([register](../review/register.md#sequencer-recovery-follow-ups)), and
+clearing the latch around them and an application's own readers have none
+([Drills](#drills)). The
+[watchdog README](README.md) owns how the latch and its evidence are produced.
 
 ## What you have
 
@@ -84,7 +86,8 @@ finish, so the stop can take as long as the download; a supervisor that kills
 the sequencer first leaves `sequencer_bytes_missing: transient: …`. Do not
 wait for the file: step 2's verdict comes from `replay`. To end the download
 now, kill the collecting watchdog tick. Preserve the sequencer's data
-directory before any restart (cockroach recovery, step 1).
+directory before anything is rebuilt
+([before anything](../recovery/cockroach.md#before-anything)).
 
 ## 2. Find the faulty side
 
@@ -141,24 +144,25 @@ regression; the watchdog idles.
 
 **Sequencer wrong.** Make sure the old instance never runs again with the
 submitter key ([restart policy](operator-deployment.md#sequencer-restart-policy)),
-and fix the bug. Then rebuild the sequencer with
-[cockroach recovery](../recovery/cockroach.md) from a trusted canonical
-machine: `incident/canonical` at B (or step 2's `replay --out` directory
-when `incident/canonical` is absent), or the head at P. This build has no
-rebuild command; it arrives with `setup --base`
-([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)),
-and until then the sequencer stays stopped and the latch stays. After the
-rebuild, resume the sequencer, realign affected readers
-([reader state](../recovery/cockroach.md#application-specific-reader-state)),
-then clear the latch:
+and fix the bug. Then rebuild the sequencer in a new data directory with
+`setup --base`, following
+[the operator's playbook](../recovery/cockroach.md#the-operators-playbook).
+Its base is a trusted canonical machine at or below every client's trusted
+count: `incident/canonical` at B (or step 2's `replay --out` directory when
+`incident/canonical` is absent), the head at P, or an older checkpoint. Start
+`run` on the new directory, then clear the latch:
 
 ```bash
-sequencer-watchdog clear --block <B> --reason "sequencer fixed: <ticket>"
+sequencer-watchdog clear --block <B> --reason "sequencer rebuilt: <ticket>"
 ```
 
 The watchdog keeps its head at P: recovering the sequencer does not change
-canonical history, so the next tick replays to the new accepted block and
-compares.
+canonical history. Until a batch of the new era is accepted, the sequencer
+serves the era's baseline as its comparison checkpoint at the stop block, so
+the next tick replays from P to the stop block and compares the baseline. A
+mismatch there means the base machine was not canonical: rebuild again from a
+trusted one. Realign affected clients at their own counts
+([the client's playbook](../recovery/cockroach.md#the-clients-playbook)).
 
 **Watchdog wrong.** Copy `incident/` somewhere for the record, fix the cause
 (configuration, bootstrap machine, image), wipe the state directory, run
@@ -190,7 +194,10 @@ gas estimation, and every recovery cycle sends a few no-op flush transactions.
 | Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong non-genesis bootstrap latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
-| Sequencer wrong: the rebuild and readers | none yet; [sequencer recovery](../plans/2026-11-sequencer-recovery/todo.md#build) plans them | a rebuild that starts from a machine, resumed sequencing, a watchdog comparison after the new era's first accepted batch, and reader realignment |
+| Sequencer wrong: the rebuild from genesis (written, not yet run) | `recovery_from_genesis_round_trip_test` in `just test-rollups-e2e`, for the Rust and C hosts | the dry run, `setup` in a new directory with a direct queued at the stop block, `run` draining it first, and a toy-wallet client refused with `ERA_CHANGED`, adopting the new era at its count, and checking its rows |
+| Sequencer wrong: the rebuild from a machine (written, not yet run) | `recovery_from_stored_machine_round_trip_test` in `just test-recovery-round-trip`, ignored in the default e2e run | the same from a machine `replay` stored, and a fresh watchdog agreeing with the new era's baseline at the stop block |
+| Sequencer wrong: setup refusing a set-up directory (written, not yet run) | `setup_refuses_a_set_up_data_directory_test` in `just test-rollups-e2e`, for the Rust and C hosts | exit 30, and the directory left as it was |
+| Sequencer wrong: the latch and an application's readers | none yet | clearing a latch around a rebuild, and realigning a reader other than the toy wallet |
 | Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 

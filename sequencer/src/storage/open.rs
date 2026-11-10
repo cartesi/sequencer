@@ -71,8 +71,8 @@ impl Storage {
         })
     }
 
-    /// Create the schema for setup or rebuild in one migration transaction.
-    /// The complete history baseline is published later. On
+    /// Create the schema for setup in one migration transaction. The era
+    /// record is published later, with setup's completion. On
     /// an already-migrated database the hook does not run; callers must
     /// inspect the existing facts.
     pub(crate) fn initialize_for_command(
@@ -80,14 +80,25 @@ impl Storage {
         command: LifecycleCommand,
     ) -> Result<Self, StorageOpenError> {
         assert!(
-            matches!(command, LifecycleCommand::Setup | LifecycleCommand::Rebuild),
-            "an uninitialized lifecycle may begin only with setup or rebuild"
+            matches!(command, LifecycleCommand::Setup),
+            "an uninitialized lifecycle may begin only with setup"
         );
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn, Some(command))?;
         Ok(Self {
             conn,
             path: path.to_string(),
+        })
+    }
+
+    /// A private in-memory database with setup's schema, for questions the
+    /// schema answers before setup may create its database file.
+    pub(crate) fn schema_only() -> Result<Self, StorageOpenError> {
+        let mut conn = Connection::open_in_memory()?;
+        run_migrations(&mut conn, Some(LifecycleCommand::Setup))?;
+        Ok(Self {
+            conn,
+            path: ":memory:".to_owned(),
         })
     }
 
@@ -198,11 +209,7 @@ fn baseline_migration(
 ) -> M<'static> {
     M::up_with_hook(MIGRATION_0001_SCHEMA, move |tx: &Transaction<'_>| {
         if initial_command.is_none() {
-            super::history::initialize_history_in(
-                tx,
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-            )?;
+            super::history::initialize_history_in(tx, &super::EraRecord::EMPTY_GENESIS)?;
         }
         if let Some(hook) = post_initial_metadata {
             hook(tx)?;
@@ -266,47 +273,28 @@ mod tests {
     #[test]
     fn setup_registers_history_only_with_complete_baseline() {
         let setup_dir = tempfile::tempdir().unwrap();
-        let setup_path = setup_dir.path().join("setup.sqlite");
-        let mut setup =
-            Storage::initialize_for_command(setup_path.to_str().unwrap(), LifecycleCommand::Setup)
+        let mut eras = Vec::new();
+        for (name, era) in [
+            ("genesis.sqlite", super::super::EraRecord::EMPTY_GENESIS),
+            ("machine.sqlite", super::super::test_helpers::era(8, 8, 100)),
+        ] {
+            let path = setup_dir.path().join(name);
+            let mut setup =
+                Storage::initialize_for_command(path.to_str().unwrap(), LifecycleCommand::Setup)
+                    .unwrap();
+            assert!(matches!(
+                setup.history_state(),
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            ));
+            setup
+                .write(|tx| super::super::history::initialize_history_in(tx, &era))
                 .unwrap();
-        assert!(matches!(
-            setup.history_state(),
-            Err(rusqlite::Error::QueryReturnedNoRows)
-        ));
-        setup
-            .write(|tx| {
-                super::super::history::initialize_history_in(
-                    tx,
-                    sequencer_core::history::ExecutedInputCount::ZERO,
-                    0,
-                )
-            })
-            .unwrap();
-        let a = setup.history_state().unwrap();
-        let rebuild_path = setup_dir.path().join("rebuild.sqlite");
-        let mut rebuild = Storage::initialize_for_command(
-            rebuild_path.to_str().unwrap(),
-            LifecycleCommand::Rebuild,
-        )
-        .unwrap();
-        assert!(matches!(
-            rebuild.history_state(),
-            Err(rusqlite::Error::QueryReturnedNoRows)
-        ));
-        rebuild
-            .write(|tx| {
-                super::super::history::initialize_history_in(
-                    tx,
-                    sequencer_core::history::ExecutedInputCount::new(8),
-                    100,
-                )
-            })
-            .unwrap();
-        let b = rebuild.history_state().unwrap();
-        assert_ne!(a.version.era_id, b.version.era_id);
-        assert_eq!(b.base_executed_input_count, 8);
-        assert_eq!(b.base_safe_block, 100);
+            eras.push(setup.history_state().unwrap());
+        }
+        assert_ne!(eras[0].version.era_id, eras[1].version.era_id);
+        assert_eq!(eras[1].base_executed_input_count, 8);
+        assert_eq!(eras[1].base_safe_block, 100);
+        assert_eq!(eras[1].rebuilt_history_end, 8);
     }
 }
 

@@ -1448,6 +1448,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "c-scheduler"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "bindgen",
+ "ethereum_ssz",
+ "k256",
+ "sequencer-core",
+]
+
+[[package]]
 name = "c-wallet-engine"
 version = "0.1.0"
 dependencies = [
@@ -1491,9 +1503,11 @@ dependencies = [
  "ethereum_ssz",
  "k256",
  "rollups-types",
+ "sequencer",
  "sequencer-core",
  "serde",
  "serde_json",
+ "tempfile",
  "testsi",
 ]
 
@@ -4412,6 +4426,7 @@ dependencies = [
  "app-core",
  "async-trait",
  "axum",
+ "cartesi-machine",
  "cartesi-rollups-contracts",
  "clap",
  "ethereum_ssz",

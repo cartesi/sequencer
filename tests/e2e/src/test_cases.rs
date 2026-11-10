@@ -15,7 +15,7 @@ use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
 
-const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
 /// Default log_recommended_fee exponent (0 + 296 + 20 + 419 + 621 = 1356).
 const DEFAULT_FRAME_FEE: u16 = 1356;
@@ -26,7 +26,7 @@ const DEFAULT_MAX_FEE: u16 = 2500;
 /// Self-transfers that force the inclusion lane to seal a batch by size, so a
 /// finalized "gold" snapshot promotes for a watchdog compare — independent of
 /// the batch-open timer.
-const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
+pub(crate) const TRANSFERS_TO_FORCE_BATCH_CLOSE: usize = 150;
 
 /// Poll budget for [`mine_until_finalized_advances`]: mine + recheck the
 /// finalized snapshot up to this many times before timing out. With
@@ -147,6 +147,7 @@ fn rust(name: &'static str, run: ScenarioFn) -> Scenario {
         host: Host::Rust,
         run,
         configure: no_overrides,
+        ignored: false,
     }
 }
 
@@ -156,6 +157,7 @@ fn c_host(name: &'static str, run: ScenarioFn) -> Scenario {
         host: Host::C,
         run,
         configure: no_overrides,
+        ignored: false,
     }
 }
 
@@ -399,6 +401,44 @@ pub fn test_cases() -> Vec<Scenario> {
             Box::pin(run_watchdog_divergence_drill_test(runtime))
         })
         .with(real_clock),
+        rust("setup_refuses_a_set_up_data_directory_test", |runtime| {
+            Box::pin(
+                crate::recovery_round_trip::run_setup_refuses_a_set_up_data_directory_test(runtime),
+            )
+        }),
+        c_host(
+            "c_host_setup_refuses_a_set_up_data_directory_test",
+            |runtime| {
+                Box::pin(
+                    crate::recovery_round_trip::run_setup_refuses_a_set_up_data_directory_test(
+                        runtime,
+                    ),
+                )
+            },
+        ),
+        rust("recovery_from_genesis_round_trip_test", |runtime| {
+            Box::pin(crate::recovery_round_trip::run_recovery_from_genesis_round_trip_test(runtime))
+        })
+        .with(real_clock),
+        // The rebuild's execute pass, the baseline dump and the feed of a
+        // rebuilt era, through the C engine.
+        c_host("c_host_recovery_from_genesis_round_trip_test", |runtime| {
+            Box::pin(crate::recovery_round_trip::run_recovery_from_genesis_round_trip_test(runtime))
+        })
+        .with(real_clock),
+        // Ignored until it runs in CI: it needs `cartesi-machine` and the
+        // watchdog's Lua dependencies on the path, and the devnet machine image
+        // (whose template already answers the `scheduler` query); run it with
+        // `just test-recovery-round-trip`.
+        rust("recovery_from_stored_machine_round_trip_test", |runtime| {
+            Box::pin(
+                crate::recovery_round_trip::run_recovery_from_stored_machine_round_trip_test(
+                    runtime,
+                ),
+            )
+        })
+        .with(real_clock)
+        .ignored(),
     ]
 }
 
@@ -477,7 +517,7 @@ async fn prepare_non_genesis_watchdog_state(runtime: &mut ManagedSequencer) -> S
 /// time, so the submitter and promoter get to run without synthesizing a future
 /// L1 clock; returns the new inclusion block, or times out loudly. Robust
 /// against CI jitter — it waits exactly as long as promotion takes, no more.
-async fn mine_until_finalized_advances(
+pub(crate) async fn mine_until_finalized_advances(
     runtime: &ManagedSequencer,
     floor: u64,
 ) -> ScenarioResult<u64> {
@@ -991,7 +1031,19 @@ async fn run_unsupported_token_deposit_noop_test(
     Ok(())
 }
 
-async fn apply_reconciled_supported_deposit(
+/// Setup reads L1 before its first write, so a refusal there leaves the data
+/// directory empty but for the lock file, and a retry may run in it.
+pub(crate) fn assert_data_dir_holds_at_most_the_lock(
+    runtime: &ManagedSequencer,
+) -> ScenarioResult<()> {
+    let entries = runtime.data_dir_entries()?;
+    if entries.iter().any(|entry| entry != "sequencer.lock") {
+        return Err(format!("a setup refused before writing left {entries:?}").into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn apply_reconciled_supported_deposit(
     runtime: &ManagedSequencer,
     ws: &mut WsClient,
     replay: &mut ReplayWalletApp,
@@ -3631,20 +3683,18 @@ async fn run_provider_outage_input_reader_retries_after_reconnect_test(
 // deployment identity, those reads have no fallback and the boot fails before
 // recovery logic runs.
 //
-// The harness simulates "no deployment identity" by `reset_database()` after
-// a normal boot has populated it (truly first-ever boot would also lack
-// a pinned identity, but the failure mode is identical: the bootstrap
-// step has nothing to fall back to).
+// The harness simulates "no deployment identity" by moving to a new data
+// directory after a normal boot (a truly first-ever boot also lacks a pinned
+// identity, and the failure mode is identical: the bootstrap step has nothing
+// to fall back to).
 async fn run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    // Baseline boot to ensure the schema is fully migrated. We then
-    // reset the DB to mimic a first-ever boot.
     {
         let _ws = runtime.ws(0).await?;
     }
     runtime.stop().await?;
-    runtime.reset_database()?;
+    runtime.discard_data_dir();
 
     // Route through a disconnected proxy so setup's first L1 read (the chain
     // id) fails with a provider error.
@@ -3657,9 +3707,12 @@ async fn run_first_boot_no_identity_l1_unreachable_refuses_boot_test(
         respawn_result.is_err(),
         "first boot with no deployment identity + L1 unreachable must refuse boot, got {respawn_result:?}",
     );
+    // Setup reads L1 before its first write, so the refusal leaves the
+    // directory empty (the lock file aside) and a retry may set it up.
+    assert_data_dir_holds_at_most_the_lock(runtime)?;
 
-    // Verify reversibility: reconnect proxy, respawn, this time the
-    // bootstrap step succeeds and pins the deployment identity.
+    // Verify reversibility: reconnect proxy, respawn in the same directory,
+    // this time the bootstrap step succeeds and pins the deployment identity.
     proxy.reconnect();
     runtime.respawn().await?;
 
@@ -3696,9 +3749,9 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
     }
     runtime.stop().await?;
 
-    // Reset the DB so the live RPC path runs (otherwise the identity-fallback
-    // path would catch the mismatch first).
-    runtime.reset_database()?;
+    // A new data directory, so setup's live RPC path runs (otherwise the
+    // identity-fallback path would catch the mismatch first).
+    runtime.discard_data_dir();
 
     // Configure a mismatched chain id and respawn. The bootstrap-time
     // RPC check returns the actual chain id (31337), compares it with
@@ -3709,9 +3762,10 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
         respawn_result.is_err(),
         "chain-id mismatch via live RPC must refuse boot, got {respawn_result:?}",
     );
+    assert_data_dir_holds_at_most_the_lock(runtime)?;
 
-    // Reset to the correct chain id. Respawn must succeed — proves the
-    // failed attempt didn't poison the cache or other DB state.
+    // Reset to the correct chain id. Respawn in the same directory must
+    // succeed — proves the failed attempt wrote nothing.
     runtime.set_chain_id_override(None);
     runtime.respawn().await?;
 

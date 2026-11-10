@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Operator-only comparison files and complete restore/recovery archives.
+//! Operator-only comparison files and complete restore archives.
 //! Snapshot selection, history metadata, and leases are one SQLite transaction.
 
 use std::future::Future;

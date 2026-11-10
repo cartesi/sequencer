@@ -413,6 +413,15 @@ match it. The harness answers the `scheduler` query for every application. Any
 other query, or an application failure while encoding its state, gets a report
 saying so, never a halt.
 
+`setup --base` reads a stored machine's export through these two queries
+([`sequencer::machine`](../../sequencer/src/machine.rs)), checks it against
+its input table, and resumes the scheduler from it
+([what setup does](../recovery/cockroach.md#what-setup-does)).
+A C or C++ guest reaches the reference scheduler through
+[`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h), whose
+`scheduler_state` returns the same fields but the L2 tx count, which the
+application reports.
+
 ## Constants
 
 | Constant | Value | Home |

@@ -1,7 +1,9 @@
 # The interfaces
 
-**Status:** the Rust side and `application-engine.h` are code in this tree;
-`scheduler.h` is a proposal to settle with Bart. The signatures of the two
+**Status:** the Rust side, `application-engine.h` and `scheduler.h` with its
+reference export are code in this tree; whether a guest links that export or
+a port implements the header is to settle with Bart
+([todo](todo.md#build)). The signatures of the two
 components, in Rust and in C. The [scheduler](scheduler.md) owns the rules
 they carry out, and [application](application.md) owns the trait's
 obligations and the machine's export. Where this page and the code differ,
@@ -25,7 +27,7 @@ There are four interfaces, each component in Rust and in C:
 | Interface | Implemented by | Called by |
 |---|---|---|
 | `Scheduler`, a Rust struct in `sequencer-core` | The reference scheduler | The guest harness, through `CanonicalRunner`, and setup |
-| `scheduler.h` (proposed) | The reference scheduler's C export, or a port | A C or C++ guest, and a Rust adapter |
+| `scheduler.h` | The reference scheduler's C export, or a port | A C or C++ guest; no Rust adapter exists yet |
 | `Application`, a Rust trait | An application, and the adapter over `application-engine.h` | The executor, the lane and setup |
 | `application-engine.h` | A native engine | The Rust adapter |
 
@@ -211,16 +213,20 @@ pub struct SchedulerExport {
   panics in Rust and returns a fatal status in C.
 
 In C, the transaction records are the application's own, so a guest passes
-them straight on:
+them straight on. The header and its reference export are
+[`bindings/c-scheduler`](../../../bindings/c-scheduler/include/scheduler.h),
+which states each call's statuses and lifetimes:
 
 ```c
 typedef struct Scheduler Scheduler;
 
 typedef enum SchedulerStatus {
     SCHEDULER_STATUS_OK = 0,
-    SCHEDULER_STATUS_DONE = 1,          /* next_tx: the input has no more */
-    SCHEDULER_STATUS_MISUSE = -1,       /* a call out of order, or a bad resume */
-    SCHEDULER_STATUS_NO_SUCCESSOR = -2, /* the batch nonce is exhausted: halt */
+    SCHEDULER_STATUS_DONE = 1,            /* next_tx: the input has no more */
+    SCHEDULER_STATUS_MISUSE = -1,         /* out of order, a bad argument, a dead handle */
+    SCHEDULER_STATUS_NO_SUCCESSOR = -2,   /* a counter is exhausted: halt */
+    SCHEDULER_STATUS_RESUME_REFUSED = -3, /* the state and the queued range disagree */
+    SCHEDULER_STATUS_INTERNAL_ERROR = -4, /* an impossible state */
 } SchedulerStatus;
 
 typedef enum SchedulerTxKind {
@@ -228,22 +234,26 @@ typedef enum SchedulerTxKind {
     SCHEDULER_TX_USER_OP = 1,
 } SchedulerTxKind;
 
+typedef union SchedulerTxValues {
+    ApplicationEngineDirectInput direct;
+    ApplicationEngineUserOpTx user_op;
+} SchedulerTxValues;
+
 typedef struct SchedulerTx {
     SchedulerTxKind kind;
     uint64_t batch_nonce;
-    union {
-        ApplicationEngineDirectInput direct;
-        ApplicationEngineUserOpTx user_op;
-    } values; /* borrowed until the next call on this scheduler */
+    SchedulerTxValues values; /* spans borrowed until the next next_tx, feed or destroy */
 } SchedulerTx;
 
+uint32_t scheduler_abi_version(void);
+const char *scheduler_get_last_error_message(void);
 SchedulerStatus scheduler_create(const SchedulerConfig *config, Scheduler **out);
+/* The queued range, from first_queued_input up to l1_input_count, in one call. */
 SchedulerStatus scheduler_resume(const SchedulerConfig *config,
-    const SchedulerState *state, Scheduler **out);
-/* After a resume and before the first feed: each input of the queued range. */
-SchedulerStatus scheduler_requeue(Scheduler *scheduler, const SchedulerInput *input);
+    const SchedulerState *state, const SchedulerInput *queued, uint64_t queued_count,
+    Scheduler **out);
 void scheduler_destroy(Scheduler *scheduler);
-void scheduler_state(const Scheduler *scheduler, SchedulerState *out);
+SchedulerStatus scheduler_state(const Scheduler *scheduler, SchedulerState *out);
 SchedulerStatus scheduler_feed(Scheduler *scheduler, const SchedulerInput *input,
     SchedulerInputOutcome *out);
 SchedulerStatus scheduler_next_tx(Scheduler *scheduler, SchedulerTx *out);
@@ -252,6 +262,19 @@ SchedulerStatus scheduler_next_tx(Scheduler *scheduler, SchedulerTx *out);
 `SchedulerConfig`, `SchedulerInput`, `SchedulerState` and
 `SchedulerInputOutcome` mirror the Rust records, with fixed widths and no
 `size_t`, as the engine's header does.
+
+- **Resume is one call.** It takes the whole queued range, as the Rust
+  `resume` does, so a refused range never yields a handle and no handle is
+  ever half resumed. It refuses a state whose `first_queued_input` is past its
+  `l1_input_count` before it reads any input, and a range that does not match
+  the state.
+- **A failure kills the handle.** Where Rust panics, C returns a negative
+  status, and after a negative status from `feed` or `next_tx` every call but
+  `destroy` is a misuse. No port then has to prove which failures left its
+  state whole, which is also why `scheduler_state` returns a status.
+- **A feed waits for `DONE`.** Rust lets a feed follow an input whose
+  transactions ran out unseen; C asks for the `DONE` the canonical loop always
+  reads, so the export names every misuse before calling in.
 
 ## The executor
 

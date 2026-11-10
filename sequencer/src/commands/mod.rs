@@ -12,7 +12,7 @@ pub mod flush;
 pub mod run;
 pub mod setup;
 
-pub use error::{BootstrapError, CommandError, IdentityError, SetupRefuse, WorkerExit};
+pub use error::{BootstrapError, CommandError, IdentityError, SetupError, SetupRefuse, WorkerExit};
 
 use std::time::Duration;
 
@@ -85,7 +85,17 @@ pub(crate) fn record_terminal_fault_best_effort(
     command: LifecycleCommand,
     result: &Result<(), CommandError>,
 ) {
-    let Err(error) = result else { return };
+    if let Err(error) = result {
+        record_terminal_error_best_effort(db_path, command, error);
+    }
+}
+
+/// [`record_terminal_fault_best_effort`] for an error the caller still owns.
+pub(crate) fn record_terminal_error_best_effort(
+    db_path: &str,
+    command: LifecycleCommand,
+    error: &CommandError,
+) {
     if !error.failure_verdict().is_terminal() {
         return;
     }

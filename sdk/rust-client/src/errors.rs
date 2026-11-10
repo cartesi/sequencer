@@ -109,3 +109,14 @@ pub enum HistoryReadError {
     #[error("invalid history response: {0}")]
     Decode(#[from] serde_json::Error),
 }
+
+/// Why a client could not adopt the sequencer's current era at its count.
+#[derive(Debug, Error)]
+pub enum AdoptEraError {
+    #[error(transparent)]
+    Read(#[from] HistoryReadError),
+    /// The count lies outside the era's adoptable range; the client needs
+    /// another starting state, not a retry.
+    #[error(transparent)]
+    Adopt(#[from] sequencer_core::history_api::AdoptError),
+}

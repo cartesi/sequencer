@@ -9,7 +9,7 @@ use cartesi_machine::{
 use rollups_types::alloy_primitives::{Address, U256};
 use std::{
     ops::ControlFlow,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -205,6 +205,14 @@ impl Machine {
             });
         }
         Ok(reports)
+    }
+
+    /// Stores the machine at `dir`, which must not exist, as a node stores
+    /// one between inputs. The store is not synced to disk.
+    pub fn store(&mut self, dir: &Path) -> Result<()> {
+        expect_awaiting_input(&mut self.cartesi_machine)?;
+        self.cartesi_machine.store(dir)?;
+        Ok(())
     }
 }
 

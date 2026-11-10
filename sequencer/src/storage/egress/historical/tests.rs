@@ -6,21 +6,26 @@ use std::path::Path;
 use super::*;
 use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
+    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, era as era_record,
+    local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
+    DirectInputExecution, EraRecord, FrontierMode, IngestedSafeInput, LifecycleCommand,
+    SafeInputRange,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 fn fixture(name: &str, stop: u64, count: u64, nonce: u64) -> (TestDb, Storage) {
     let db = temp_db(name);
-    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     pin_test_deployment_identity(&mut storage, SENDER_A);
+    let record = EraRecord {
+        next_batch_nonce: nonce,
+        ..era_record(count, count, stop)
+    };
     storage
-        .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(count), stop))
+        .write(|tx| initialize_history_in(tx, &record))
         .unwrap();
-    storage.set_batch_tree_anchor(nonce).unwrap();
     storage
         .insert_baseline_snapshot(
             Path::new("/snapshot/baseline"),
@@ -80,7 +85,8 @@ fn genesis_history_has_an_empty_raw_prefix_even_after_live_inputs_arrive() {
         HistoryBaseline {
             l1_stop_block: 0,
             l1_end_input_index: 0,
-            next_batch_nonce: 0
+            next_batch_nonce: 0,
+            rebuilt_history_end: ExecutedInputCount::ZERO,
         }
     );
     assert_eq!(
@@ -120,7 +126,19 @@ fn rebuilt_history_preserves_raw_payloads_metadata_and_its_fixed_prefix() {
     assert_eq!(info.baseline.l1_stop_block, 20);
     assert_eq!(info.baseline.l1_end_input_index, 3);
     assert_eq!(info.baseline.next_batch_nonce, 7);
-    assert_eq!(info.accepted_checkpoint, None);
+    assert_eq!(
+        info.baseline.rebuilt_history_end,
+        ExecutedInputCount::new(41)
+    );
+    // The baseline is canonical at the stop block: the first comparison checkpoint.
+    assert_eq!(
+        info.accepted_checkpoint,
+        Some(AcceptedCheckpoint {
+            inclusion_block: 20,
+            executed_input_count: ExecutedInputCount::new(41),
+            next_batch_nonce: 7,
+        })
+    );
 
     let first = page(&mut storage, 0, 2);
     assert_eq!((first.end_input_index, first.next_input_index), (3, 2));

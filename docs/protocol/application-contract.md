@@ -122,11 +122,13 @@ sender's next nonce from the user ops it persisted, without asking the engine.
   nonce.
 
 Under this rule a sender's next nonce is one past its latest included op. The
-exception is a sender with no surviving op since the era baseline. A genesis
-baseline puts it at 0, but a [rebuilt baseline](application-history.md#era-baseline)
-carries nonces the rebuilt database has no ops for, so `GET /nonce` reads 0
-until that sender's first op, and again if a later recovery invalidates all of
-its post-rebuild ops. An engine outside the rule (gapped or keyed nonces, a
+exception is a sender with no surviving live op. `GET /nonce` counts only the
+era's live rows, and every setup, genesis base included, rebuilds the history
+up to its stop block first ([era baseline](application-history.md#era-baseline)),
+so a sender whose last op lies in the rebuilt history or below the base count
+reads 0 until its first live op, and again if a later recovery invalidates all
+of its live ops. The lane's refusal names the expected nonce, which corrects
+the client. An engine outside the rule (gapped or keyed nonces, a
 deposit that resets one) makes `GET /nonce` quote nonces the lane refuses.
 
 The rule keeps every account's nonce in state forever. A batch-scoped
@@ -269,8 +271,9 @@ also stays on the concrete application.
 
 Every supported production application must rebuild its native instance from
 a trusted canonical machine. `from_canonical_state(state_file, count)` builds
-an instance from the machine's comparison bytes, read through the deployment's
-state source, at the machine's executed-input count, which the machine's
+an instance from the machine's comparison bytes, which setup reads from the
+machine's `state` inspect report, at the machine's executed-input count, which
+the machine's
 `scheduler` report carries with the rest of the scheduler's state
 ([state export](scheduler-semantics.md#state-export)). A dump of the result
 holds the same comparison bytes. The count is passed in because an
@@ -284,10 +287,16 @@ For the native DEX integration, the comparison bytes are the designated
 canonical machine drive or memory region; the integration pins its location
 and layout for each supported image.
 
-The sequencer's recovery from a canonical machine arrives with `setup --base`
-([recovery plan](../plans/2026-11-sequencer-recovery/README.md)). Until then,
-each integration's conformance tests check the projection, and no end-to-end
-test recovers a sequencer from a machine.
+`setup --base <MACHINE_DIR>` is the sequencer's recovery from a canonical
+machine ([what setup does](../recovery/cockroach.md#what-setup-does)): it loads
+the stored machine, answers its `scheduler` and `state` inspect queries, and
+builds the instance with `from_canonical_state`. The `state` report must fit
+one 2 MiB report; a read through the labeled range, as the watchdog does, is
+not built yet ([register](../review/register.md#sequencer-recovery-follow-ups)).
+Each integration's conformance tests check the projection; setup's own tests
+hand it a machine's export and state bytes directly, and the devnet round trip
+from a stored machine (`recovery_from_stored_machine_round_trip_test`) is
+written but ignored until it runs in CI.
 The runtime `Application` trait stays independent of machine image layouts and
 host tooling: reading the state source and the `scheduler` report is the
 host's work.

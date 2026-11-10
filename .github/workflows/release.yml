@@ -44,14 +44,20 @@ env:
 jobs:
   build-wallet-sequencer:
     name: Build wallet-sequencer (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
+    # Each arch builds natively on its own runner, the way CI builds: the
+    # sequencer links the pinned emulator's static archive, which the
+    # cartesi-machine .deb ships only for the host's arch and which links only
+    # against GCC 14's libstdc++.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - arch: arm64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
     steps:
@@ -66,17 +72,27 @@ jobs:
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
 
+      # libclang for the emulator bindings' bindgen; cmake for aws-lc-sys; the
+      # .deb's libcartesi.a references libslirp.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             ca-certificates \
-            lua5.4 \
-            liblua5.4-dev \
-            libslirp-dev \
             build-essential \
-            pkg-config \
-            libssl-dev
+            cmake \
+            libclang-dev \
+            libslirp-dev \
+            pkg-config
+
+      # Exports LIBCARTESI_PATH / INCLUDECARTESI_PATH; the binary links the
+      # archive statically, so the release host needs no emulator install.
+      - name: Install cartesi-machine
+        uses: ./.github/actions/install-cartesi-machine
+        with:
+          version: ${{ env.CARTESI_MACHINE_VERSION }}
+          sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       # rust-toolchain.toml is the only Rust pin.
       - name: Install Rust toolchain
@@ -85,15 +101,26 @@ jobs:
           rustup toolchain install
           rustup target add ${{ matrix.target }}
 
-      - name: Install cross
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cross@${{ env.CROSS_VERSION }}
-
       # `sequencer` is a library crate; the runnable reference binary is the
       # `wallet-sequencer` example app (sequencer lib + the placeholder wallet).
       - name: Build (release)
-        run: cross build -p wallet-sequencer --release --locked --target ${{ matrix.target }}
+        run: cargo build -p wallet-sequencer --release --locked --target ${{ matrix.target }}
+
+      # The runner has libcartesi.so installed, so loading proves little on its
+      # own: the binary must not name it, or release hosts would need the .deb.
+      - name: Check the binary's shared libraries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/wallet-sequencer"
+          needed="$(readelf -d "${bin}" | grep NEEDED)"
+          echo "${needed}"
+          if grep -q libcartesi <<< "${needed}"; then
+            echo "::error::wallet-sequencer links libcartesi dynamically"
+            exit 1
+          fi
+          "${bin}" setup --help > /dev/null
 
       - name: Package
         env:
@@ -114,22 +141,77 @@ jobs:
           cat > "package/wallet-sequencer-${TAG}-linux-${ARCH}/RUNNING.md" <<'EOF'
           ## Running
 
-          Required environment variables:
+          `wallet-sequencer` is the reference sequencer: the sequencer library with the
+          placeholder wallet. A data directory is set up once with `setup`, then served
+          with `run`.
 
-          - `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`
-          - `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
-          - `CARTESI_SEQUENCER_APP_ADDRESS`
-          - `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`)
+          ### Host
 
-          Example:
+          The binary links the Cartesi Machine emulator statically (the version is
+          `toolchain.cartesi_machine` in RELEASE.json), so the emulator need not be
+          installed. The binary is built on Ubuntu 24.04 and the emulator's archive
+          with GCC 14, so the host needs that glibc and GCC 14's libstdc++: Ubuntu
+          24.04, Debian 13, or a newer release. At run time it loads libslirp, libgomp
+          and libstdc++, and its
+          L1 client reads the system's CA certificates:
 
           ```bash
-          CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
+          apt-get install ca-certificates libgomp1 libslirp0 libstdc++6
+          ```
+
+          ### setup
+
+          `setup` starts an era in an empty data directory. It pins the deployment
+          identity, flushes the batch submitter's wallet with its key, which pins the
+          stop block, syncs L1, rebuilds the history from its base through the stop
+          block, and publishes the era.
+
+          - The base is genesis by default. `--base <MACHINE_DIR>` starts from a stored
+            canonical machine of the deployment's template, stopped between inputs and
+            stored by the emulator version this binary links.
+          - `--dry-run` prints the base's counts, the submitter's activity past it and
+            the rebuild's size, then exits. It needs no key and never touches the data
+            directory.
+          - It needs `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`,
+            `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`,
+            `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS` and, unless `--dry-run`, the
+            submitter's key, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or
+            `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (whose first line is the key),
+            which must sign for that address. Chains other than Ethereum mainnet and
+            Sepolia also need a fee-oracle source, such as
+            `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE`.
+
+          Setup refuses a data directory that holds anything (exit 30), so it runs once
+          per directory; never run it on every boot. Its retryable L1 checks run before
+          it writes anything, so retry an exit 20 in the same directory; if the retry
+          is refused because the directory is not empty, or setup failed any other
+          way, discard the directory and run setup again. Exit 40 means the old
+          instance's submitter landed an input past the stop block or still has a
+          transaction pending: stop the old instance, discard this data directory,
+          run setup again.
+
+          ### run
+
+          `run` serves a directory that setup completed, reading the identity from it.
+          It needs `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` and the same key.
+
+          ### Example
+
+          ```bash
+          export CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545
+          export CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE=/run/secrets/submitter-key
+          export CARTESI_SEQUENCER_DATA_DIR=/var/lib/sequencer
+
           CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
           CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-          CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-          ./wallet-sequencer
+          CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xa0Ee7A142d267C1f36714E4a8F75612F20a79720 \
+          CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE=0 \
+          ./wallet-sequencer setup            # or: setup --base ./canonical-machine
+
+          ./wallet-sequencer run
           ```
+
+          Each subcommand's `--help` lists every option and its environment variable.
           EOF
 
           tar -C package -czf "dist/wallet-sequencer-${TAG}-linux-${ARCH}.tar.gz" "wallet-sequencer-${TAG}-linux-${ARCH}"

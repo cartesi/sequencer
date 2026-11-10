@@ -2,33 +2,46 @@
 
 A reader may maintain transfers, orders, or other application-specific history
 absent from the latest application state. It owns that projection and its
-checkpoints. The sequencer supplies raw scheduler inputs for the immutable era
-baseline, then application inputs for the optimistic suffix. The canonical
-scheduler remains the ordering authority. The [README API](../../README.md#history-metadata-and-historical-l1-inputs-internal-only)
+checkpoints. The feed serves the era's history from its base count: the
+rows setup rebuilt from L1, then the live rows. Below the base count, the
+sequencer supplies the raw L1 inputs, which the reader runs through the
+canonical scheduler itself. The canonical scheduler remains the ordering
+authority. The [README API](../../README.md#history-metadata-and-historical-l1-inputs-internal-only)
 owns routes, fields, limits, and refusals; the
-[history contract](application-history.md) owns application coordinates.
+[history contract](application-history.md) owns application coordinates and
+the era record.
 
-The planned shared recovery tool supersedes this workflow, so it gets bug fixes
-only; new client work should not build on it
+The raw-input route and this workflow are to be deleted when the
+[sequencer recovery](../plans/2026-11-sequencer-recovery/README.md) plan
+lands, so they get bug fixes only; new client work should not build on them
 ([Track 3](../plans/2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)).
 
 ## Bootstrap and handoff
 
-1. Read `/history`. Pin the deployment identity and era, baseline application
-   count `K`, L1 stop block `C`, exclusive raw end `R`, and next scheduler nonce.
-   Use the deployment's application/genesis configuration and scheduler release,
-   including its batch codec, wait bound, and signing-domain name/version.
+A reader needs history from count zero. An era whose base is genesis has base
+count `K = 0`, so the feed already serves all of it: subscribe at 0 and skip
+the rest of this section. An era whose base is a stored machine has `K > 0`,
+and the rows below `K` exist only on L1.
+
+1. Read `/history`. Pin the deployment identity and era, the base count `K`
+   (`available_from`), the stop block `C`, the exclusive raw end `R`
+   (`l1_end_input_index`), the rebuilt history end `E`, and the next batch
+   nonce. Use the deployment's application/genesis configuration and scheduler
+   release, including its batch codec, wait bound, payload cap, and
+   signing-domain name/version.
 2. From trusted genesis, request historical records from raw index 0 and process
-   every record, with its index and timestamp, through the scheduler. Preserve
-   InputBox order, including within blocks. Malformed/rejected batch payloads still reach the scheduler: its
-   overdue-direct backstop runs before batch decoding.
-3. Continue using the returned raw cursor until it equals `R`; page length and
-   block changes are not EOF. Drain the remaining directs through `C`, reproducing
-   the recovery terminal drain. Verify resulting count `K` and next nonce.
-4. Refresh `/history?era_id=<selected-era>` for the current generation, confirm
-   the baseline association, and subscribe at application count `K`. The feed
-   contains entries `[K,head)` and then future entries. It does not redeliver the
-   inputs already included in the baseline.
+   every record, with its index and timestamp, through the canonical scheduler
+   and then the application, input by input. Preserve InputBox order, including
+   within blocks. Malformed or rejected batch payloads still reach the
+   scheduler: its overdue-direct backstop runs before batch decoding.
+3. Continue with the returned raw cursor until it equals `R`; page length and
+   block changes are not EOF. Process nothing more: the inputs through `C` are
+   the ones setup's rebuild fed, and the directs still queued at `C` belong to
+   the era's first live frame. The application's count must now equal `E`, and
+   the scheduler's next batch nonce the baseline's.
+4. Refresh `/history?era_id=<selected-era>` for the current generation and
+   subscribe at count `E`. The feed contains entries `[K,head)`, then future
+   entries; from `E` on it serves only what the reader has not executed.
 
 Raw records carry original inner payloads and authenticated sender/block context,
 not the complete machine transport envelope. The signing domain uses the pinned
@@ -37,22 +50,24 @@ timestamp are scheduler inputs, which reach the application with each direct
 ([direct context](scheduler-semantics.md#direct-context)); transaction hashes
 are provenance.
 
-An ordinary generation change leaves `C/R/K/nonce` and historical pages intact.
-If it occurs before subscription, refresh the same era's metadata and retry the
-claim. An era change requires establishing correspondence with the new baseline;
-never silently splice its pages into an earlier replay. Count/nonce equality is
-a consistency check, not independent proof that a client computed correct state.
+An ordinary generation change leaves `K`, `C`, `R`, `E`, the nonce and the
+historical pages intact. If it occurs before subscription, refresh the same
+era's metadata and retry the claim. An era change before subscription is what
+any client of an older era meets: the reader adopts the new era at its own
+count when the [adopt rule](application-history.md#adopting-a-new-era) allows,
+and otherwise starts again against the new era. Count and nonce equality is a
+consistency check, not independent proof that the reader computed correct
+state.
 
-The terminal-drained baseline need not equal canonical state at block `C`:
-young directs may execute preemptively. A later accepted batch provides the
-canonical comparison boundary. Keep that distinction when validating recovery.
+The era's baseline is the application's state at the end of block `C`, which
+the canonical machine reaches too, so the state the reader holds after step 3
+is canonical at `C` and is the era's first comparison checkpoint.
 
 ## Client checkpoints
 
 Save core application state, projection, and their actual `HistoryClaim`
-consistently. An exact era-baseline checkpoint can be rebound to the current
-generation after confirming the same immutable era/baseline. For suffix
-checkpoints, query `/history?era_id=<saved-era>&from_generation=<saved-generation>`
+consistently. For a checkpoint within the era, query
+`/history?era_id=<saved-era>&from_generation=<saved-generation>`
 and require `K <= saved_count <= compatibility.preserved_input_count`. Query each
 candidate using its own generation and choose the newest eligible backup.
 Restore the complete application/projection checkpoint, persist the returned
@@ -85,14 +100,16 @@ user operations `U*` in this raw order:
 
 The malformed input executes three overdue directs without consuming a batch
 nonce. Batch 1's frame drains `D4`, whose block is its safe block, so nothing
-stays queued and, for a rebuilt stop `C=1240`, the terminal drain executes
-nothing. The resulting baseline is `K=7`, next nonce 2 and raw end `R=8`.
-Subscribe at application offset 7; the next raw index is independently 8.
+stays queued at stop block `C = 1240`: the first queued input is 8. The era
+has `E = 7`, next nonce 2 and raw end `R = 8`. Subscribe at offset 7; the next
+raw index is independently 8.
 
 The [reference integration test](../../sequencer/src/integration_tests/historical_bootstrap.rs)
-replays this trace from genesis through one-record HTTP pages fetched with the
-SDK, checks the scheduler's state against the baseline, and joins the real WS
-feed at nonzero `K`, where the next direct arrives with its index and
-timestamp. It checks full wallet state and explicit projection order against
-uninterrupted execution. It uses controlled storage fixtures; it does not
-establish canonical-machine export conformance.
+publishes the era a setup from a machine stopped at the stop block would, so
+`K = E = 7`. It replays this trace from genesis through one-record HTTP pages
+fetched with the SDK, checks the scheduler's export and the application's
+state against the reference run and the era, and joins the real WS feed at
+`E`, where the next direct arrives with its index and timestamp. It checks the
+transfer history against uninterrupted execution. It uses controlled storage
+fixtures; it does not run setup or establish canonical-machine export
+conformance.

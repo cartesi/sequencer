@@ -14,7 +14,6 @@ use super::convert::{i64_to_u64, now_unix_ms};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleCommand {
     Setup,
-    Rebuild,
     Run,
     MaintenanceFlush,
 }
@@ -23,7 +22,6 @@ impl LifecycleCommand {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Setup => "setup",
-            Self::Rebuild => "rebuild",
             Self::Run => "run",
             Self::MaintenanceFlush => "maintenance_flush",
         }
@@ -32,7 +30,6 @@ impl LifecycleCommand {
     fn parse(value: &str) -> Result<Self, LifecycleError> {
         match value {
             "setup" => Ok(Self::Setup),
-            "rebuild" => Ok(Self::Rebuild),
             "run" => Ok(Self::Run),
             "maintenance_flush" => Ok(Self::MaintenanceFlush),
             other => Err(LifecycleError::Malformed(format!(
@@ -77,35 +74,34 @@ pub enum LifecycleError {
 }
 
 impl Storage {
-    /// Publish a durable setup dump and its complete baseline atomically.
-    /// `recovery` roots the batch tree at a rebuilt baseline; no command takes
-    /// it until `setup --base` reuses it, so its tests are that command's spec.
-    pub(crate) fn complete_baseline_setup(
+    /// Publish the new era with its durable baseline dump, in one transaction:
+    /// the era record, the anchor, the baseline snapshot at the rebuilt
+    /// history's end and the setup-complete marker. Setup opens no Tip;
+    /// `run`'s startup roots the batch tree at the anchor.
+    pub(crate) fn publish_era(
         &mut self,
-        prefix: &std::path::Path,
-        count: sequencer_core::history::ExecutedInputCount,
-        safe_block: u64,
-        next_batch_nonce: u64,
-        recovery: bool,
+        baseline_prefix: &std::path::Path,
+        era: &super::EraRecord,
     ) -> Result<(), LifecycleError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         refuse_on_canonical_divergence(&tx)?;
-        require_command_fits_completion(
-            &tx,
-            if recovery {
-                LifecycleCommand::Rebuild
-            } else {
-                LifecycleCommand::Setup
-            },
-        )?;
-        super::history::initialize_history_in(&tx, count, safe_block)?;
-        super::mutations::set_batch_tree_anchor_in(&tx, next_batch_nonce)?;
-        if recovery {
-            super::ingress::open_recovery_tip_in_tx(&tx, safe_block)?;
+        require_command_fits_completion(&tx, LifecycleCommand::Setup)?;
+        let has_batch: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM batches)", [], |row| {
+            row.get(0)
+        })?;
+        if has_batch {
+            return Err(LifecycleError::Malformed(
+                "an era is published before any batch exists".to_string(),
+            ));
         }
-        super::snapshot_dumps::insert_baseline_snapshot_in(&tx, prefix, count)?;
+        super::history::initialize_history_in(&tx, era)?;
+        super::snapshot_dumps::insert_baseline_snapshot_in(
+            &tx,
+            baseline_prefix,
+            era.rebuilt_history_end,
+        )?;
         tx.execute(
             "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, ?1)",
             [now_unix_ms()],
@@ -207,19 +203,18 @@ impl Storage {
     }
 }
 
-/// The two-sided completion rule — the one command-ordering fact:
-/// setup/rebuild never restart over a completed setup (completion is
-/// once-per-database), run and maintenance never start before one exists.
-/// Run and maintenance reach it through `preflight_lifecycle_command`;
-/// setup and rebuild inside `complete_baseline_setup`'s transaction, after
-/// `crate::commands::setup` has checked the same fact up front.
+/// The two-sided completion rule — the one command-ordering fact: setup
+/// never restarts over a completed setup (completion is once per database),
+/// run and maintenance never start before one exists. Run and maintenance
+/// reach it through `preflight_lifecycle_command`; setup inside
+/// `publish_era`'s transaction.
 fn require_command_fits_completion(
     conn: &rusqlite::Connection,
     command: LifecycleCommand,
 ) -> Result<(), LifecycleError> {
     let setup_complete = setup_complete_exists(conn)?;
     let (fits, reason) = match command {
-        LifecycleCommand::Setup | LifecycleCommand::Rebuild => (
+        LifecycleCommand::Setup => (
             !setup_complete,
             "setup is already complete for this data directory",
         ),
@@ -275,12 +270,9 @@ mod tests {
 
     fn complete_seeded_setup(storage: &mut Storage) {
         storage
-            .complete_baseline_setup(
+            .publish_era(
                 std::path::Path::new("/tmp/facts-genesis"),
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-                0,
-                false,
+                &crate::storage::EraRecord::EMPTY_GENESIS,
             )
             .expect("complete setup");
     }
@@ -312,8 +304,8 @@ mod tests {
 
     #[test]
     fn completion_rule_is_two_sided() {
-        let (_db, mut storage) = seeded(LifecycleCommand::Rebuild);
-        // Before completion: run and maintenance refuse; rebuild may retry.
+        let (_db, mut storage) = seeded(LifecycleCommand::Setup);
+        // Before completion: run and maintenance refuse; setup may proceed.
         assert!(matches!(
             storage.preflight_lifecycle_command(LifecycleCommand::Run),
             Err(LifecycleError::NotAdmissible { .. })
@@ -323,17 +315,13 @@ mod tests {
             Err(LifecycleError::NotAdmissible { .. })
         ));
         storage
-            .preflight_lifecycle_command(LifecycleCommand::Rebuild)
-            .expect("rebuild retry over its incomplete database");
+            .preflight_lifecycle_command(LifecycleCommand::Setup)
+            .expect("setup over its incomplete database");
 
         complete_seeded_setup(&mut storage);
-        // After completion: setup/rebuild refuse; run and maintenance pass.
+        // After completion: setup refuses; run and maintenance pass.
         assert!(matches!(
             storage.preflight_lifecycle_command(LifecycleCommand::Setup),
-            Err(LifecycleError::NotAdmissible { .. })
-        ));
-        assert!(matches!(
-            storage.preflight_lifecycle_command(LifecycleCommand::Rebuild),
             Err(LifecycleError::NotAdmissible { .. })
         ));
         storage
@@ -352,7 +340,6 @@ mod tests {
 
         for command in [
             LifecycleCommand::Setup,
-            LifecycleCommand::Rebuild,
             LifecycleCommand::Run,
             LifecycleCommand::MaintenanceFlush,
         ] {
@@ -362,15 +349,91 @@ mod tests {
             ));
         }
         assert!(matches!(
-            storage.complete_baseline_setup(
+            storage.publish_era(
                 std::path::Path::new("/tmp/facts-genesis"),
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-                0,
-                false,
+                &crate::storage::EraRecord::EMPTY_GENESIS,
             ),
             Err(LifecycleError::CanonicalDivergence { nonce: 7 })
         ));
+    }
+
+    #[test]
+    fn publish_era_is_atomic_and_one_shot() {
+        use crate::storage::EraRecord;
+        use crate::storage::test_helpers::era;
+        let (_db, mut storage) = seeded(LifecycleCommand::Setup);
+        let prefix = std::path::Path::new("/tmp/era-baseline");
+        let unspanned = EraRecord {
+            next_batch_nonce: 5,
+            ..era(3, 4, 0)
+        };
+        assert!(matches!(
+            storage.publish_era(prefix, &unspanned),
+            Err(LifecycleError::Storage(_))
+        ));
+        // Nothing of the refused era survives: no record, anchor, snapshot or marker.
+        assert!(storage.history_state().is_err());
+        assert_eq!(storage.batch_tree_anchor().unwrap(), 0);
+        assert!(storage.list_dump_rows().unwrap().is_empty());
+        assert_eq!(storage.setup_completed_at_ms().unwrap(), None);
+
+        let published = EraRecord {
+            next_batch_nonce: 5,
+            ..era(3, 3, 0)
+        };
+        storage.publish_era(prefix, &published).expect("publish");
+        let state = storage.history_state().unwrap();
+        assert_eq!(
+            (
+                state.base_executed_input_count,
+                state.rebuilt_history_end,
+                state.base_safe_block,
+                state.first_queued_input
+            ),
+            (3, 3, 0, 0)
+        );
+        assert_eq!(storage.batch_tree_anchor().unwrap(), 5);
+        assert_eq!(
+            storage
+                .latest_snapshot()
+                .unwrap()
+                .unwrap()
+                .executed_input_count,
+            sequencer_core::history::ExecutedInputCount::new(3)
+        );
+        assert!(
+            storage.open_state().unwrap().is_none(),
+            "setup opens no Tip"
+        );
+        assert!(matches!(
+            storage.publish_era(prefix, &published),
+            Err(LifecycleError::NotAdmissible {
+                requested: LifecycleCommand::Setup,
+                ..
+            })
+        ));
+        assert_eq!(storage.history_state().unwrap(), state);
+    }
+
+    #[test]
+    fn publish_era_refuses_a_directory_with_a_batch() {
+        let (_db, mut storage) = seeded(LifecycleCommand::Setup);
+        storage
+            .conn
+            .execute(
+                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+                 VALUES (0, NULL, 0, 0)",
+                [],
+            )
+            .expect("seed a batch");
+        assert!(matches!(
+            storage.publish_era(
+                std::path::Path::new("/tmp/era-baseline"),
+                &crate::storage::EraRecord::EMPTY_GENESIS
+            ),
+            Err(LifecycleError::Malformed(_))
+        ));
+        assert_eq!(storage.setup_completed_at_ms().unwrap(), None);
     }
 
     #[test]

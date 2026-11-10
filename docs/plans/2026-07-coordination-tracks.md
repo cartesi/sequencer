@@ -18,8 +18,8 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. The proposed [sequencer recovery](2026-11-sequencer-recovery/README.md) rebuilds the sequencer from a canonical machine's exported state, and each client realigns through the feed from its own count. Until it lands, `setup --recovery`, `fold.rs` and the cockroach reader seams get bug fixes only.
-2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. [Sequencer recovery](2026-11-sequencer-recovery/README.md) is built: `setup --base <MACHINE_DIR>` rebuilds the sequencer from a canonical machine's exported state through `from_canonical_state` ([cockroach recovery](../recovery/cockroach.md#what-setup-does)), and each client realigns through the feed from its own count. Its devnet round-trip drills are written but not yet run, and the rest is in its [to do](2026-11-sequencer-recovery/todo.md).
+2. Application integrators/operators validate the private engine, its `from_canonical_state` and the recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
 Full restore archives now support file and directory application prefixes.
@@ -76,24 +76,21 @@ table with Bart and ship it with the other guest-image changes.
 The [Application contract](../protocol/application-contract.md) owns execution,
 engine progress, and checkpoint semantics. The [C binding guide](../protocol/c-application-binding.md)
 maps that contract to native engines. Its reference conformance suite and C-host
-process scenarios cover snapshot-to-live bootstrap, restart, standard recovery,
-and fresh-era rebuild with canonical comparison. Reference bridge conformance
-cannot establish private-engine correctness.
+process scenarios cover snapshot-to-live bootstrap, restart and standard
+recovery; the C host's rebuild from genesis is written but not yet run.
+Reference bridge conformance cannot establish private-engine correctness.
 
 Remaining checks need the actual consumer:
 
-- Supply the application's versioned canonical-machine-to-native recovery
-  exporter and completed operator runbook. Require the
-  [non-genesis recovery drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
-  for production readiness: the old native state is unavailable, the exported
-  bundle restores correctly, and execution after rebuild matches the canonical
-  machine. For the DEX, pin the designated state drive/memory region and derive
-  resume metadata from canonical execution. The exporter must check
-  [pending-direct eligibility](../recovery/cockroach.md#checkpoint-eligibility)
-  and the drill must exercise refusal and earlier-checkpoint fallback, alongside
-  eligible pending-queue recovery. Add the integration check to the
-  release validation once the actual artifacts are available; no generic trait
-  or deployment gate currently enforces this requirement.
+- Supply the application's `from_canonical_state` and its `state` inspect
+  answer, and the completed operator runbook. Require a recovery drill from a
+  stored machine for production readiness: the old native state is
+  unavailable, `setup --base` builds the engine from the machine's state, and
+  execution after the rebuild matches the canonical machine, with directs
+  queued at the stop block. For the DEX, pin the designated state drive/memory
+  region. Add the integration check to the release validation once the actual
+  artifacts are available; no generic trait or deployment gate currently
+  enforces this requirement.
 - Repeat snapshot-to-live bootstrap and canonical comparison with the private
   engine's genesis and meaningful accepted/rejected inputs. The reference
   `c_host_` scenarios supply the lifecycle pattern; compare canonical state

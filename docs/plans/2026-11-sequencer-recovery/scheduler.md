@@ -1,11 +1,13 @@
 # The scheduler, for the next template
 
-**Status:** proposed on 2026-11-05 for the next template, to settle with Bart;
-nothing here is implemented. Today's rules are in
-[scheduler semantics](../../protocol/scheduler-semantics.md), which this page
-replaces when the template ships. It states every rule, not a diff. **New**
-marks a rule that changes; **Open** marks one still to settle with the port's
-author ([register](../../review/register.md#canonical-rules-open-for-the-c-port)).
+**Status:** implemented. The reference
+[`Scheduler`](../../../sequencer-core/src/scheduler/mod.rs) runs these rules,
+and [scheduler semantics](../../protocol/scheduler-semantics.md) is now their
+contract; read that page for the rules in force. This page stays until its
+**Open** items settle with the port's author
+([register](../../review/register.md#canonical-rules-open-for-the-c-port)),
+then shrinks to what remains ([todo](todo.md#promote-to-real-docs)). **New**
+marks a rule that changed from the earlier template.
 
 The canonical scheduler turns an application's L1 inputs, in L1 order, into
 one sequence of L2 transactions, and the application executes them. Every
@@ -124,7 +126,7 @@ depend on it, since setup takes the first queued input from the machine
 
 - **Setup checks it.** Among the inputs a base machine consumed, the admitted
   directs above its clock must be exactly the queued ones its export names
-  ([operations](operations.md#what-setup-does)).
+  ([setup](../../recovery/cockroach.md#what-setup-does)).
 - **The conformance vectors assert it** after every input, through the
   `scheduler` report ([conformance](#conformance)).
 

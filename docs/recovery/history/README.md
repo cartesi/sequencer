@@ -4,13 +4,14 @@ This directory preserves recovery designs that production does not use: the
 **historical optimistic recovery design** and its counterexample, and two
 superseded cockroach-recovery plans. None is a production procedure. The
 [current recovery guide](../README.md) owns automatic recovery; the
-[cockroach guide](../cockroach.md) owns manual rebuilding, and
-[sequencer recovery](../../plans/2026-11-sequencer-recovery/README.md) is its
-proposed successor.
+[cockroach guide](../cockroach.md) owns manual rebuilding, which now
+describes the implemented [sequencer recovery](../../plans/2026-11-sequencer-recovery/README.md).
 
 ## Superseded cockroach-recovery plans
 
-Archived on 2026-11-05. Each opens with what it was checked against.
+Archived on 2026-11-05. Each opens with the commit it was checked against,
+and its links point at the code and docs of that commit: some name headings
+and files that later changes removed, so read them at that commit.
 
 | Plan | What it proposed | Why it was superseded |
 |---|---|---|

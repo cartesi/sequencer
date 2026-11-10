@@ -1,9 +1,11 @@
 # Cartesi Machine Facts We Rely On
 
 The canonical application runs inside the Cartesi Machine (CM). The watchdog
-drives it, the canonical guest is built for it, and cockroach recovery, which
-arrives with `setup --base`, will read its `state` and `scheduler` inspect
-reports. This page records the CM behavior those components depend on,
+drives it, the canonical guest is built for it, and setup reads a base
+machine's `state` and `scheduler` inspect reports when it rebuilds from one
+([cockroach recovery](recovery/cockroach.md);
+[reading a stored machine's export](#reading-a-stored-machines-export)).
+This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
 [`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
@@ -220,6 +222,51 @@ NVRAM, 768 MiB of it non-zero:
 Every revert in that run restored exactly the recorded pre-input root hash. On
 a filesystem without reflinks, each clone is a full sparse copy of the
 machine.
+
+## Reading a stored machine's export
+
+Setup reads a base through `sequencer::machine::read_machine_export`
+([`sequencer/src/machine.rs`](../sequencer/src/machine.rs)), which links the
+emulator through the same `cartesi-machine` bindings as `sdk/guest/testsi`.
+`canonical-test`'s `export` cases run it against the built image and against
+a machine advanced and stored by testsi.
+
+- **Load privately, and the directory stays as it was.** `Machine::load` is
+  `SHARING_NONE`: the queries run on a copy-on-write image in memory, which is
+  dropped. A machine that another process runs in place (`SHARING_ALL`, as
+  sling does) holds an exclusive lock and cannot be loaded meanwhile; read a
+  clone.
+- **A stored machine is between inputs only at an `RX_ACCEPTED` manual
+  yield.** The image recipe stores one there, and so does a node. Check it as
+  the step does (`iflags.H`, `iflags.Y`, then tohost's device, command and
+  reason) before sending anything.
+- **What to send.** An inspect is `send_cmio_response` with the
+  inspect-state reason, the query bytes, and no revert root hash: the
+  emulator refuses one on any response but an advance. An undeliverable
+  response is a silent no-op, so check that `iflags.Y` cleared.
+- **What the machine yields.** Each report is an automatic `TX_REPORT`
+  yield, and `run` returns at each one; the next `run` resumes. The guest
+  then ends at `RX_ACCEPTED` again, so one load answers both queries in turn.
+  The query moves the in-memory root hash (the RX buffer now holds it), which
+  matters only to a host that keeps the machine. Our guest answers each query
+  with exactly one report; it emits no outputs and never rejects.
+- **The bindings panic on some yields.** `receive_cmio_request` panics on an
+  automatic yield with an unknown reason, so classify a yield from the tohost
+  registers first and read its data only for a report or an exception.
+- **The loader bounds each query itself.** It runs to a fixed mcycle target,
+  2^36 cycles past the query, and fails there, so a guest that never answers
+  fails setup instead of hanging it.
+- **A report is at most 2 MiB.** libcmt copies a report's bytes raw into the
+  TX buffer (2^21 bytes) and refuses a longer one with `-ENOBUFS`; the guest
+  halts on that error, so the loader sees a halt, not a state. The wallet's
+  `state` report holds 52 bytes per balance and 24 per nonce, so it fits up
+  to roughly 27,000 accounts that have both. A larger application state
+  needs another state source, such as a labeled memory range read with
+  `read_memory` ([memory ranges](#memory-ranges-for-application-state)), or a
+  guest that splits its answer over several reports.
+- **The `state` report is whatever the guest answered.** A guest whose
+  encode fails answers `inspect failed: …` instead, which the loader writes
+  as the state; the application's `from_canonical_state` refuses those bytes.
 
 ## Memory ranges for application state
 

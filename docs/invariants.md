@@ -58,11 +58,11 @@ by writer and are write-once (`0001_schema.sql`).
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
-| history metadata (setup/recovery) | `history_state` — complete era/application-count/L1-block baseline and generation; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades |
+| recovery (startup) | the era's root Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
+| history metadata (setup/recovery) | `history_state` — the era record (base count, stop block, rebuilt history end, first queued input), written once by setup, and the generation, advanced by recovery; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
-| setup | `deployment_identity` (pinned once), `batch_tree_anchor` (the root nonce, frozen once setup completes), the initial `dumps` + `snapshots` rows and rebuild root `batches`/`frames` (atomic with the complete history baseline), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), `batch_tree_anchor` (the root nonce, frozen once setup completes), the baseline `dumps` + `snapshots` rows (atomic with the era record, the anchor and completion; no `batches` or `frames`), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
 | snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete `snapshots` and unreferenced `dumps` row deletion (`gc_unreferenced_dumps`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
@@ -137,10 +137,15 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I6. The frame clock accounts for a complete L1 interval
 
-- **Holds:** the surviving latest frame clock, floored by baseline block `C`,
-  identifies the completely accounted L1 prefix. Reconciliation executes all
+- **Holds:** the surviving latest frame clock, floored by the era's stop block
+  `C`, identifies the completely accounted L1 prefix. Reconciliation executes all
   external directs within the payload cap in the newly safe interval before
   committing its next frame and application rows. Envelopes-only intervals advance the clock with no rows.
+  With no valid frame in the era, the next undrained input is the era's first
+  queued input: the era's baseline accounts for every input through `C`
+  except the directs still queued there, so the root frame, and a cascade that
+  tears every batch of the era, drains from it
+  (`next_undrained_safe_input_index_in`, `storage/ingress.rs`).
 - **Enforced by:** complete-block ingestion: every committed `safe_inputs` /
   `l1_safe_head` pair holds every input through its head, witnessed by index
   contiguity plus the InputBox count at that head (`l1/reader.rs`), above a
@@ -160,11 +165,17 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I8. A rollback-safe snapshot and valid Tip exist before the lane starts
 
-- **Holds:** setup publishes the complete durable baseline before completion;
-  recovery retains the newest accepted snapshot, or that baseline until first
-  acceptance. A rebuilt baseline is a restore point, not a comparison at `C`.
-- **Enforced by:** `complete_baseline_setup`, recovery admission, atomic Tip
-  reopen, and `PreparedRuntime::prepare` artifact checks.
+- **Holds:** setup publishes the durable era baseline, at the rebuilt history
+  end `E`, before completion; recovery retains the newest accepted snapshot, or
+  that baseline until first acceptance. The baseline is the application's
+  state at the end of stop block `C`, which the canonical machine reaches too,
+  so until a batch of the era is accepted it is the comparison checkpoint
+  (inclusion block `C`, count `E`, the anchor nonce), genesis base or not.
+  Setup opens no Tip; `run`'s startup recovery opens the era's root before the
+  lane starts.
+- **Enforced by:** `publish_era`, `finalized_dump_in`'s assertion that the
+  baseline sits at `E`, recovery admission, atomic Tip reopen, and
+  `PreparedRuntime::prepare` artifact checks.
 - **Depended on by:** unconditional snapshot restore and catch-up.
 - **Breaks:** startup fails loud instead of inventing state.
 
@@ -196,9 +207,10 @@ by writer and are write-once (`0001_schema.sql`).
   refusal whose remedy is cockroach recovery.
 - **Completeness boundary:** the check completely enforces the accepted-batch
   identity predicate above; it is intentionally not a general canonical/application
-  divergence oracle. The entire L1 prefix through baseline block `C` is opaque,
-  including previously rejected future-nonce batches; the check trusts the
-  checkpoint state and continuation nonce instead of reinterpreting that prefix.
+  divergence oracle. The entire L1 prefix through stop block `C` is opaque to
+  it, including previously rejected future-nonce batches: setup's rebuild
+  judged the inputs past its base with the scheduler, and the check trusts the
+  base, that rebuild and the anchor nonce instead of reinterpreting them.
   It shares `scheduler_accepts` (including its documented self-trust omissions),
   and does not independently detect bugs in
   direct-input/user-op execution. Absence of the marker therefore does not
@@ -214,10 +226,13 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I10. Replay uses an inclusive application-history boundary
 
-- **Holds:** `ExecutedInputCount = X` means input `X` executes next. Current
-  rows cover `[K, H)`; snapshots at `X` replay with `offset >= X`. `H` waits.
-- **Enforced by:** integer primary key, contiguous insertion, coherent versioned
-  pages, and pre-execution catch-up count checks.
+- **Holds:** `ExecutedInputCount = X` means input `X` executes next. The
+  executed rebuilt rows cover `[K, E)` and the live rows `[E, H)`; a snapshot
+  is never below `E`, so native restart replays only live rows with
+  `offset >= X`. `H` waits.
+- **Enforced by:** integer primary key, contiguous insertion from `E`
+  (`trg_application_inputs_contiguous`), the rebuilt-count triggers, coherent
+  versioned pages spanning the seam, and pre-execution catch-up count checks.
 - **Depended on by:** restart and replica resume without skipping or duplication.
 
 ### I11. Batch envelopes remain outside application history
@@ -229,10 +244,11 @@ by writer and are write-once (`0001_schema.sql`).
 - **Enforced by:** append-only `safe_inputs` triggers; classified direct reads
   and complete receipt validation at append. Standard startup recovery
   attributes undrained directs to the new Tip; lane catch-up executes them
-  before processing queued user operations. A baseline holds the prefix
-  through `C` in its snapshot, with no application-history rows for that
+  before processing queued user operations. Setup's rebuild selects the same
+  directs (`rebuilt_history` refuses a submitter input as a direct), and the
+  era's baseline holds their effects through `C`, with no live rows for that
   prefix. Replay and WS need no
-  envelope filter because every row executes.
+  envelope filter because every served row executes.
 - **Depended on by:** application replay and replicated state correctness.
 
 ### I12. Safe head advances only on real observation; `synced_at_ms` is genuine progress time
@@ -327,18 +343,21 @@ by writer and are write-once (`0001_schema.sql`).
 - **Breaks:** silent permanent scheduler/sequencer divergence, the
   theft-equivalent failure.
 - **Baseline-aware frontier:** accepted-batch scanning starts strictly after
-  the immutable baseline L1 block `C`, seeded with anchor nonce `N'`; the
-  prefix through `C` is opaque
+  the era's stop block `C`, seeded with anchor nonce `N'`; the prefix through
+  `C` is opaque
   ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
-  Later scans resume after the last acceptance. Rebuild defers the projection
-  until the complete baseline and anchor are published.
+  Later scans resume after the last acceptance. Every setup sync, genesis
+  included, runs with `FrontierMode::DeferUntilAnchorSet`: before the era
+  exists the old instance's batches would read as `Foreign` and falsely
+  freeze the frontier. `run`'s first sync populates it.
 
 ### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
 
 - **Holds:** every batch's nonce is
   `parent.nonce + 1`, except the single parentless root, which carries the
-  `batch_tree_anchor` nonce — `0`, the only anchor setup writes in this build
-  (recovery from a canonical machine arrives with `setup --base`). The first
+  `batch_tree_anchor` nonce — the scheduler's next batch nonce at the end of
+  the era's stop block, which setup's rebuild ends with and publishes with the
+  era. The first
   Tip is that root (there is no separate sentinel batch): setup leaves its
   creation to startup recovery. A fully-torn cascade re-roots parentless at the
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
@@ -387,29 +406,43 @@ by writer and are write-once (`0001_schema.sql`).
   simplify the lane, but is an independent benchmarked change rather than part
   of the lane-reconciliation cutover.
 
-### I18. History identity is published with the complete baseline
+### I18. History identity is published with the era
 
-- **Holds:** file-first setup publishes `(EraId, generation=0, K, C, N')`, the
-  baseline snapshot, any recovery root, and setup completion in one FULL
-  transaction. The history row is absent before this boundary. `K` and `C`
-  remain immutable even after baseline artifact GC or recovery-root invalidation.
+- **Holds:** file-first setup publishes the era record
+  `(EraId, generation=0, K, C, E, first queued input)`, the anchor `N'`, the
+  baseline snapshot at `E`, and setup completion in one `IMMEDIATE`
+  transaction (`publish_era`), with no batch in the database. The history row
+  is absent before this boundary. The record's fields remain immutable even
+  after baseline artifact GC or root invalidation.
+- **Rebuilt history:** `rebuilt_history` gains rows, in scheduling order, and
+  their counts, once each, contiguous in row order, only while the history row
+  is absent; no row is ever deleted. The era's `K` and `E` are exactly the
+  span of the counted rows, its first queued input is at most the input count
+  through `C`, and the live rows continue at `E`. A client of an older era
+  adopts this one only at a count in `[K, E]`
+  ([adopting a new era](protocol/application-history.md#adopting-a-new-era)).
 - **Standard recovery:** one generation increment iff a valid batch is
   invalidated, with an immutable cut at the count after suffix deletion and
   before replacement directs. The entire transition commits in the cascade
   transaction. Clean restart changes neither token. Every intervening cut is
   required to authorize reusing a checkpoint from an older generation.
-- **Enforced by:** `complete_baseline_setup`, immutable baseline and
-  `history_generation_cuts` triggers, the exact-`+1` generation trigger requiring
+- **Enforced by:** `publish_era`, the write-once era and
+  `history_generation_cuts` triggers, `trg_history_state_era_fits`, the
+  `trg_rebuilt_history_*` triggers, the exact-`+1` generation trigger requiring
   its cut, and `cascade_and_reopen`. `preserved_input_count_in` asserts that
   every intervening generation has a cut before computing compatibility.
-- **Depended on by:** mandatory snapshot-derived WS claims and `/history`
-  checkpoint compatibility across standard recoveries. Identity is validated
+- **Depended on by:** mandatory snapshot-derived WS claims, `/history`
+  checkpoint compatibility across standard recoveries, the adopt rule, and the
+  feed's pages across the rebuilt/live seam. Identity is validated
   before the requested count, including for empty history. Cuts remain available
   for the era's lifetime; their absence must never authorize a partial minimum.
 - **Breaks:** a client silently resumes a replaced suffix or inaccessible prefix.
-- **Operational boundary:** setup uses a fresh data directory, and the
-  baseline it publishes is trusted; neither clone detection nor distributed
-  fencing is implied.
+- **Operational boundary:** setup refuses a data directory that holds anything
+  but its lock file (exit 30) before writing anything, and runs every L1 check
+  that can fail retryably first, so a retry finds the directory empty; a setup
+  that fails later leaves a directory to discard. `publish_era` refuses a
+  completed database or one holding a batch. The base it starts from is
+  trusted; neither clone detection nor distributed fencing is implied.
 
 ### I19. Application progress follows the shared execution contract
 
@@ -441,7 +474,9 @@ by writer and are write-once (`0001_schema.sql`).
   mandatory pre-execution count. A direct over the cap never executes and has
   no row; one SQL predicate (`DIRECT_EXECUTES_SQL`, `storage/queries.rs`)
   selects the directs to execute in every query. Its source reference, owning batch/frame, and payload tables reconstruct replay.
-  There are no entries for batch envelopes or the opaque baseline prefix.
+  There are no entries for batch envelopes, and none below the rebuilt
+  history end `E`: the era's rows before it are `rebuilt_history`'s
+  ([I18](#i18-history-identity-is-published-with-the-era)).
 - **Creation atomicity:** user-op source rows and application rows commit in the
   same FULL chunk transaction that authorizes acknowledgements. Direct inputs
   commit with the complete frame rotation, after checking all execution receipts.

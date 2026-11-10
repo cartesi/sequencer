@@ -32,7 +32,7 @@ SQLite separates artifact ownership from snapshot boundaries:
 |---|---|
 | `dumps` | Artifact path and active reader lease count |
 | `snapshots` | Artifact's immutable application count and local batch identity |
-| Baseline snapshot (`batch_index IS NULL`) | State from which this era starts |
+| Baseline snapshot (`batch_index IS NULL`) | The application at the end of the era's stop block, at its rebuilt history end |
 | `safe_accepted_batches` | Scheduler-accepted, content-matched local batch landings |
 
 The application count is the next canonical input position, never a physical
@@ -49,9 +49,13 @@ Creation runs on the lane, so user ops queued behind a close wait for it. Each
 close logs the creation time as `snapshot_ms`, at DEBUG, or at WARN once it
 reaches half the `POST /tx` acknowledgement budget.
 
-Setup similarly makes the baseline artifact durable before publishing the
-complete era baseline, recovery root when applicable, and setup-completion
-facts atomically.
+Setup similarly makes the baseline artifact durable before one transaction
+publishes the era, registers the baseline snapshot and marks setup complete;
+it opens no root frame, which `run`'s startup does
+([cockroach recovery](../recovery/cockroach.md#what-setup-does)). The rows of
+the era's rebuilt history, from its base count to the baseline, have no
+snapshots: they live in `rebuilt_history`, which the feed serves and restart
+never replays.
 
 Restart requires the newest valid closed batch's snapshot, or the baseline
 when no valid closed batch exists. A missing required snapshot fails loud.
@@ -64,7 +68,12 @@ same valid-batch relation used elsewhere.
 
 The newest accepted batch determines the comparison checkpoint. Its snapshot
 must exist; storage refuses a missing required row instead of falling back to an
-older snapshot. Acceptance already includes scheduler validation and local
+older snapshot. Before the era's first accepted batch, the baseline is the
+comparison checkpoint: the application's state at the end of the stop block is
+the canonical machine's state there, whatever the base, so it is served with
+the stop block as its inclusion block, the rebuilt history end as its count,
+and the anchor as its next batch nonce. After a recovery, this is the
+watchdog's first comparison of the new era. Acceptance already includes scheduler validation and local
 content identity, so merely observing an own-sender L1 input is insufficient.
 
 A persisted canonical-divergence marker refuses accepted-checkpoint selection,
@@ -76,9 +85,6 @@ conditional cache headers; they do not fall back to an older artifact.
 This selection is independent of the lane's L1 reconciliation cursor. A crash
 between reader ingestion and lane reconciliation cannot miss a promotion or
 repeat one: acceptance is already durable, and the query derives the result.
-
-The genesis baseline is known canonical at block zero, the only baseline setup
-writes in this build.
 
 The current watchdog compares at the selected accepted batch's **L1 block
 boundary**. Every batch has a snapshot, and reader ingestion accounts for a
@@ -119,8 +125,8 @@ consumer a coherent snapshot-plus-suffix starting point.
 **Operator backup:** `/finalized_snapshot` exports an accepted checkpoint with
 its receipt, without modifying local files. A bare local `dumps/<id>/`
 directory is only a restore artifact and has no acceptance receipt. No command
-in this build consumes the archive: recovery from a canonical machine arrives
-with `setup --base`.
+consumes the archive: a recovery rebuilds from a canonical machine, never from
+a sequencer artifact ([cockroach recovery](../recovery/cockroach.md)).
 
 ## Retention, leases, and crash safety
 
@@ -133,7 +139,8 @@ Garbage collection retains:
 
 Older accepted artifacts and invalidated branch artifacts are collectible.
 The baseline artifact can be retired after an accepted checkpoint replaces its
-rollback role; the era's immutable baseline metadata remains in SQLite.
+rollback role; the era's immutable baseline metadata and its rebuilt history
+remain in SQLite.
 
 Selection, lease acquisition, and GC serialize through SQLite write
 transactions. A lease release guard is armed only after its increment commits.

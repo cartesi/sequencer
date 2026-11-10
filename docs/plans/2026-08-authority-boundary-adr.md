@@ -121,7 +121,8 @@ admission check are owned by
 SQLite is the durable coordination boundary between components. The input
 reader atomically commits `safe_inputs`, `l1_safe_head`,
 `safe_accepted_batches`, and any `canonical_divergence` fact in one sync
-transaction (a `setup --recovery` interim sync defers the frontier half);
+transaction (every setup sync defers the frontier half until the era's
+anchor is published);
 the lane reads that durable projection and receives no in-memory cursor
 from the reader. The one deliberate
 exception is HTTP ingress ↔ inclusion lane (bounded MPSC + oneshot), because

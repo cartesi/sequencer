@@ -17,6 +17,7 @@ mod lifecycle;
 mod mutations;
 mod open;
 mod queries;
+mod rebuilt_history;
 mod recovery;
 mod safe_accepted_batches;
 mod snapshot_dumps;
@@ -32,10 +33,12 @@ use thiserror::Error;
 pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
 pub(crate) use history::ApplicationInputRow;
-pub use history::{DirectInputExecution, HistoryState};
+pub use history::{DirectInputExecution, EraRecord, HistoryState};
 pub(crate) use history::{HistoryReadError, L2TxContext};
+pub use l1_inputs::AdmittedDirects;
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;
+pub use rebuilt_history::{RebuiltKey, RebuiltRow};
 pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
@@ -67,18 +70,18 @@ pub(crate) struct IngestedSafeInput {
 /// Whether a sync also maintains the scheduler-accepted gold frontier
 /// (`safe_accepted_batches`).
 ///
-/// Every normal sync uses [`FrontierMode::Populate`]. A setup that rebuilds
-/// the batch tree after its sync uses [`FrontierMode::DeferUntilAnchorSet`] for
-/// its interim syncs: populating the frontier against the empty tree would mark
-/// every L1 batch `Foreign` and falsely freeze it. `run`'s first sync populates
-/// it once the anchor is set. See the anchor-aware-frontier note on I15. No
-/// command rebuilds until `setup --base`, which reuses this mode.
+/// Every normal sync uses [`FrontierMode::Populate`]. Setup's syncs, genesis
+/// included, use [`FrontierMode::DeferUntilAnchorSet`]: before the era exists
+/// there is no anchor or stop block, and populating the frontier against the
+/// empty tree would mark the old instance's batches `Foreign` and falsely
+/// freeze it. `run`'s first sync populates it once the era is published. See
+/// the anchor-aware-frontier note on I15.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontierMode {
     /// Maintain `safe_accepted_batches` as part of the sync (the default).
     Populate,
-    /// Skip frontier maintenance — the tree is rebuilt and the anchor set
-    /// afterwards, and the next normal sync will populate it correctly.
+    /// Skip frontier maintenance: setup's syncs run before the era, its stop
+    /// block and anchor, exists; `run`'s first sync populates it.
     DeferUntilAnchorSet,
 }
 
@@ -240,9 +243,9 @@ pub enum StorageOpenError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Migration(#[from] rusqlite_migration::Error),
-    /// No database file at the given path. Databases are only created by an
-    /// owning command (`setup` / `rebuild`); a missing file at `open` time is
-    /// a deployment mistake, never a cue to create one.
+    /// No database file at the given path. Databases are only created by the
+    /// owning command, `setup`; a missing file at `open` time is a deployment
+    /// mistake, never a cue to create one.
     #[error(
         "no database at {path} — this data directory was never initialized; run `setup` (or check --data-dir)"
     )]

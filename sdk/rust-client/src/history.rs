@@ -2,11 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use crate::{
-    EraId, HistoricalL1InputStart, HistoricalL1InputsPage, HistoryInfo, HistoryPolicyError,
-    HistoryReadError, RecoveryGeneration, SequencerClient,
+    AdoptEraError, EraId, ExecutedInputCount, HistoricalL1InputStart, HistoricalL1InputsPage,
+    HistoryClaim, HistoryInfo, HistoryPolicyError, HistoryReadError, RecoveryGeneration,
+    SequencerClient,
 };
 
 impl SequencerClient {
+    /// The claim that resumes the current era at a client's own count, after
+    /// a cockroach recovery replaced the client's era (its claim was refused
+    /// with `ERA_CHANGED`). Below the era's base count the base is newer than
+    /// the client's state; past its rebuilt history's end the state holds
+    /// rows that never landed. Both refusals need another starting state, and
+    /// neither check sees a state that is wrong below its count.
+    pub async fn adopt_current_era(
+        &self,
+        count: ExecutedInputCount,
+    ) -> Result<HistoryClaim, AdoptEraError> {
+        Ok(self.history(None, None).await?.adopt_claim(count)?)
+    }
+
     /// Discover history, optionally requiring the era selected for bootstrap.
     /// A compatibility query supplies both the checkpoint's era and its generation.
     pub async fn history(
@@ -149,7 +163,8 @@ mod tests {
             "baseline": {
                 "l1_stop_block": 1240,
                 "l1_end_input_index": 8,
-                "next_batch_nonce": 2
+                "next_batch_nonce": 2,
+                "rebuilt_history_end": 9
             },
             "accepted_checkpoint": {
                 "inclusion_block": 1250,
@@ -188,6 +203,7 @@ mod tests {
             assert_eq!(info.history.head.get(), 12);
             assert_eq!(info.history.version.era_id.to_string(), ERA);
             assert_eq!(info.baseline.l1_stop_block, 1240);
+            assert_eq!(info.baseline.rebuilt_history_end.get(), 9);
             assert!(info.compatibility.is_none());
             let url = request_url(&server.await.unwrap());
             assert_eq!(url.path(), "/history");
@@ -225,6 +241,55 @@ mod tests {
                 ("from_generation".into(), "1".into())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn adoption_claims_the_current_era_only_from_the_base_through_the_rebuilt_end() {
+        let adopt = |count| async move {
+            let (client, server) = serve_once(200, history_body()).await;
+            let result = client
+                .adopt_current_era(ExecutedInputCount::new(count))
+                .await;
+            let url = request_url(&server.await.unwrap());
+            assert_eq!(url.path(), "/history");
+            assert!(url.query().is_none(), "adoption reads the current era");
+            result
+        };
+        for count in [7, 8, 9] {
+            let claim = adopt(count).await.unwrap();
+            assert_eq!(claim.version.era_id.to_string(), ERA);
+            assert_eq!(claim.version.recovery_generation.get(), 2);
+            assert_eq!(claim.next_input.get(), count);
+        }
+        for count in [0, 6] {
+            assert!(matches!(
+                adopt(count).await,
+                Err(AdoptEraError::Adopt(crate::AdoptError::BelowBase { available_from }))
+                    if available_from.get() == 7
+            ));
+        }
+        // Rows the old instance served past the rebuilt end never landed,
+        // even though the new era's head is already past them.
+        for count in [10, 12] {
+            assert!(matches!(
+                adopt(count).await,
+                Err(AdoptEraError::Adopt(crate::AdoptError::PastRebuiltEnd { rebuilt_history_end }))
+                    if rebuilt_history_end.get() == 9
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn adoption_reports_a_failed_history_read() {
+        let (client, server) = serve_once(503, "unavailable".into()).await;
+        assert!(matches!(
+            client.adopt_current_era(ExecutedInputCount::new(7)).await,
+            Err(AdoptEraError::Read(HistoryReadError::Http {
+                status: 503,
+                ..
+            }))
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

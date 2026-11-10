@@ -12,6 +12,7 @@ pub mod harness;
 pub mod http;
 pub mod ingress;
 pub mod l1;
+pub mod machine;
 pub mod recovery;
 pub mod runtime;
 pub mod storage;

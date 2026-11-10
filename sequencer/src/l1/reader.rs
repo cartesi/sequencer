@@ -171,8 +171,8 @@ pub struct InputReader {
     /// every safe-input write.
     timing: ProtocolTiming,
     /// Whether each sync also populates the scheduler-accepted frontier
-    /// ([`FrontierMode::Populate`] normally; a sync into an empty batch tree
-    /// defers it — see [`Self::set_frontier_mode`]).
+    /// ([`FrontierMode::Populate`] normally; setup's syncs defer it, see
+    /// [`Self::set_frontier_mode`]).
     frontier_mode: FrontierMode,
     /// Set once the provider's chain id has been verified against
     /// [`InputReaderConfig::expected_chain_id`] on a successful RPC contact.
@@ -260,10 +260,11 @@ impl InputReader {
     }
 
     /// Set whether subsequent syncs populate the scheduler-accepted frontier.
-    /// A setup that rebuilds the batch tree after its sync sets
-    /// [`FrontierMode::DeferUntilAnchorSet`], so the content-identity check
-    /// does not see every L1 batch as foreign before the anchor is set. The
-    /// first such setup is `setup --base`; no command calls this today.
+    /// Every setup sets [`FrontierMode::DeferUntilAnchorSet`]: until setup
+    /// publishes the era there is no stop block or anchor to judge batches by,
+    /// so a populating sync would see every L1 batch as foreign and freeze the
+    /// frontier. `run`'s startup sync populates it, scanning past the stop
+    /// block from the anchor, before the root opens.
     pub fn set_frontier_mode(&mut self, mode: FrontierMode) {
         self.frontier_mode = mode;
     }
@@ -380,8 +381,8 @@ impl InputReader {
     /// count at `safe` as its completeness witness: a commit at a lower head
     /// would rest on index contiguity alone, which a dropped tail input passes
     /// (I6). In `run` the span stays under about `l1_read_stale_after_blocks`,
-    /// since the danger detector stops `run` first; setup, rebuild and startup
-    /// syncs read the whole gap, from the app's deployment on a fresh database.
+    /// since the danger detector stops `run` first; setup and startup syncs
+    /// read the whole gap, from the app's deployment on a fresh database.
     /// Bounding those is a known optimization in `docs/review/register.md`.
     async fn read_safe_inputs(
         &mut self,

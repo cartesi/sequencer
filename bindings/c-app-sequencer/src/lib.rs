@@ -20,12 +20,16 @@ use tracing_subscriber::EnvFilter;
     version,
     about = "Rollup sequencer host for a C application.\n\n\
              Runs the application engine linked in at build time, the one implementing the \
-             application-engine C API. The subcommands come from the sequencer library.\n\n\
+             application-engine C API. The subcommands come from the sequencer library. \
+             `--state-file` gives the genesis state, which only a setup without `--base` \
+             reads.\n\n\
              All options can also be set via environment variables (shown in brackets)."
 )]
 struct Cli {
-    /// Genesis dump used only when plain setup needs its initial snapshot.
-    /// Created by the application's genesis tool
+    /// The application's genesis state, written by its genesis tool. Read only
+    /// by a setup without `--base`, which starts the history from it; a setup
+    /// from a stored machine takes the state from the machine, and `run` never
+    /// reads this.
     #[arg(long, env = "CARTESI_SEQUENCER_STATE_FILE", value_name = "PATH")]
     state_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -47,11 +51,12 @@ pub async fn run() -> ExitCode {
         )
         .init();
 
+    // The library calls this only for a setup from genesis.
     sequencer::run_command(command, move || {
         let state_file = state_file.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "plain setup requires --state-file or CARTESI_SEQUENCER_STATE_FILE",
+                "setup without --base requires --state-file or CARTESI_SEQUENCER_STATE_FILE",
             )
         })?;
         EngineApp::from_dump(&state_file)

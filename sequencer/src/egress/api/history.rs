@@ -254,6 +254,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_reports_a_rebuilt_eras_base_and_rebuilt_end() {
+        use crate::egress::test_era;
+
+        let db = crate::test_support::temp_db("history-rebuilt-era");
+        let mut storage =
+            test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
+        test_era::append_live_user_op(&mut storage, 2);
+        drop(storage);
+        let state = Arc::new(HistoryState {
+            db_path: db.path.clone(),
+            shutdown: RuntimeScope::default(),
+            responses: Arc::new(Semaphore::new(1)),
+        });
+        let response = history(
+            State(state),
+            Query::try_from_uri(&"/history".parse().unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // The era starts at the base count; the head is past the queued
+        // direct and the live op.
+        assert_eq!(info["history"]["available_from"], test_era::BASE);
+        assert_eq!(info["history"]["head"], test_era::REBUILT_END + 2);
+        assert_eq!(
+            info["baseline"],
+            serde_json::json!({
+                "l1_stop_block": test_era::STOP_BLOCK,
+                "l1_end_input_index": test_era::FIRST_QUEUED_INPUT + 1,
+                "next_batch_nonce": test_era::NEXT_BATCH_NONCE,
+                "rebuilt_history_end": test_era::REBUILT_END,
+            })
+        );
+        // With no accepted batch yet, the era's baseline is the checkpoint.
+        assert_eq!(
+            info["accepted_checkpoint"],
+            serde_json::json!({
+                "inclusion_block": test_era::STOP_BLOCK,
+                "executed_input_count": test_era::REBUILT_END,
+                "next_batch_nonce": test_era::NEXT_BATCH_NONCE,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn response_body_holds_admission_until_consumed_or_dropped() {
         let permits = Arc::new(Semaphore::new(1));
         for consume in [false, true] {

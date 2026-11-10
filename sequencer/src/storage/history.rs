@@ -18,9 +18,40 @@ pub(crate) use canonical::{HistoryReadError, L2TxContext};
 pub struct HistoryState {
     pub version: HistoryVersion,
     pub era_created_at_ms: u64,
+    /// The base's L2 tx count, where the era's history starts.
     pub base_executed_input_count: u64,
-    /// L1 prefix already accounted for by the era's initial application state.
+    /// The stop block: the L1 prefix the era's baseline accounts for.
     pub base_safe_block: u64,
+    /// The L2 tx count at the end of the stop block, where live rows start.
+    pub rebuilt_history_end: u64,
+    /// The oldest direct still queued at the stop block, or the input count
+    /// through it when none is: where the era's first frame drains from.
+    pub first_queued_input: u64,
+}
+
+/// What setup publishes about the new era, written once with its baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EraRecord {
+    /// The base's L2 tx count.
+    pub base_count: ExecutedInputCount,
+    /// The L2 tx count after the rebuilt history: the baseline's count.
+    pub rebuilt_history_end: ExecutedInputCount,
+    pub stop_block: u64,
+    pub first_queued_input: u64,
+    /// The scheduler's next batch nonce at the stop block: the anchor.
+    pub next_batch_nonce: u64,
+}
+
+impl EraRecord {
+    /// An era at genesis that rebuilt nothing, with stop block 0: what the
+    /// command-less fixture open path and seeded harnesses publish.
+    pub const EMPTY_GENESIS: Self = Self {
+        base_count: ExecutedInputCount::ZERO,
+        rebuilt_history_end: ExecutedInputCount::ZERO,
+        stop_block: 0,
+        first_queued_input: 0,
+        next_batch_nonce: 0,
+    };
 }
 
 /// One direct a drained range executed, at its history offset. A drained
@@ -41,7 +72,8 @@ impl Storage {
 pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
     conn.query_row(
         "SELECT era_id, era_created_at_ms, recovery_generation,
-                base_executed_input_count, base_safe_block
+                base_executed_input_count, base_safe_block,
+                rebuilt_history_end, first_queued_input
            FROM history_state WHERE singleton_id = 0",
         [],
         |row| {
@@ -57,46 +89,54 @@ pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
                 era_created_at_ms: i64_to_u64(row.get(1)?),
                 base_executed_input_count: i64_to_u64(row.get(3)?),
                 base_safe_block: i64_to_u64(row.get(4)?),
+                rebuilt_history_end: i64_to_u64(row.get(5)?),
+                first_queued_input: i64_to_u64(row.get(6)?),
             })
         },
     )
 }
 
-pub(super) fn initialize_history_in(
-    tx: &Transaction<'_>,
-    base: ExecutedInputCount,
-    base_safe_block: u64,
-) -> Result<()> {
+/// Write the era record and its anchor under a fresh era id. The schema
+/// checks the counts against the executed rebuilt rows and seals them.
+pub(super) fn initialize_history_in(tx: &Transaction<'_>, era: &EraRecord) -> Result<()> {
     let mut bytes: [u8; EraId::BYTE_LEN] =
         tx.query_row("SELECT randomblob(16)", [], |row| row.get(0))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let era = EraId::from_bytes(bytes).expect("UUID bits were set above");
+    let era_id = EraId::from_bytes(bytes).expect("UUID bits were set above");
     tx.execute(
         "INSERT INTO history_state
          (singleton_id, era_id, era_created_at_ms, recovery_generation,
-          base_executed_input_count, base_safe_block) VALUES (0, ?1, ?2, 0, ?3, ?4)",
+          base_executed_input_count, base_safe_block, rebuilt_history_end,
+          first_queued_input) VALUES (0, ?1, ?2, 0, ?3, ?4, ?5, ?6)",
         params![
-            era.as_bytes().as_slice(),
+            era_id.as_bytes().as_slice(),
             now_unix_ms(),
-            u64_to_i64(base.get()),
-            u64_to_i64(base_safe_block)
+            u64_to_i64(era.base_count.get()),
+            u64_to_i64(era.stop_block),
+            u64_to_i64(era.rebuilt_history_end.get()),
+            u64_to_i64(era.first_queued_input),
         ],
     )?;
-    Ok(())
+    super::mutations::set_batch_tree_anchor_in(tx, era.next_batch_nonce)
 }
 
+/// The next history offset: one past the last live row, or the rebuilt
+/// history's end before the era has any.
 pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<ExecutedInputCount> {
-    let base = query_history_state(conn)?.base_executed_input_count;
+    let rebuilt_end = query_history_state(conn)?.rebuilt_history_end;
     let greatest: Option<i64> =
         conn.query_row("SELECT MAX(offset) FROM application_inputs", [], |row| {
             row.get(0)
         })?;
-    Ok(ExecutedInputCount::new(greatest.map_or(base, |offset| {
-        i64_to_u64(offset)
-            .checked_add(1)
-            .expect("application input count overflow")
-    })))
+    Ok(ExecutedInputCount::new(greatest.map_or(
+        rebuilt_end,
+        |offset| {
+            i64_to_u64(offset)
+                .checked_add(1)
+                .expect("application input count overflow")
+        },
+    )))
 }
 
 /// Called after suffix deletion and before the replacement Tip attributes directs.
@@ -155,23 +195,59 @@ pub(super) fn preserved_input_count_in(
 mod tests {
     use super::*;
     use crate::storage::LifecycleCommand;
+    use crate::storage::test_helpers::era;
     use crate::test_support::temp_db;
 
     #[test]
     fn complete_baseline_is_immutable_and_survives_restart() {
         let db = temp_db("history-baseline");
         let mut storage =
-            Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
         assert!(matches!(
             storage.history_state(),
             Err(rusqlite::Error::QueryReturnedNoRows)
         ));
+        let mismatched = storage
+            .write(|tx| initialize_history_in(tx, &era(41, 42, 70)))
+            .expect_err("an empty rebuild cannot end past its base");
+        assert_eq!(
+            mismatched.to_string(),
+            "the era must span exactly its executed rebuilt rows"
+        );
+        let past_stop = storage
+            .write(|tx| {
+                initialize_history_in(
+                    tx,
+                    &EraRecord {
+                        first_queued_input: 1,
+                        ..era(41, 41, 70)
+                    },
+                )
+            })
+            .expect_err("no input exists through the stop block");
+        assert_eq!(
+            past_stop.to_string(),
+            "the first queued input lies past the stop block"
+        );
         storage
-            .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 70))
+            .write(|tx| {
+                initialize_history_in(
+                    tx,
+                    &EraRecord {
+                        next_batch_nonce: 9,
+                        ..era(41, 41, 70)
+                    },
+                )
+            })
             .unwrap();
         let state = storage.history_state().unwrap();
+        assert_eq!(
+            (state.rebuilt_history_end, state.first_queued_input),
+            (41, 0)
+        );
+        assert_eq!(storage.batch_tree_anchor().unwrap(), 9);
         let duplicate = storage
-            .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 70))
+            .write(|tx| initialize_history_in(tx, &era(41, 41, 70)))
             .expect_err("even identical baseline values cannot initialize another era");
         assert_eq!(
             duplicate.to_string(),
@@ -188,6 +264,14 @@ mod tests {
             ),
             (
                 "UPDATE history_state SET base_safe_block = 71",
+                "history baseline is immutable",
+            ),
+            (
+                "UPDATE history_state SET rebuilt_history_end = 42",
+                "history baseline is immutable",
+            ),
+            (
+                "UPDATE history_state SET first_queued_input = 1",
                 "history baseline is immutable",
             ),
             (

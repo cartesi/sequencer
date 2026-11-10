@@ -65,10 +65,10 @@ pub const EXIT_RESTART_EXPECT_RECOVERY: u8 = 10;
 pub const EXIT_RESTART_TRANSIENT: u8 = 20;
 /// Do not restart; page an operator.
 pub const EXIT_TERMINAL: u8 = 30;
-/// Do not restart: a previous instance left work past the checkpoint, so a
-/// genesis setup would diverge. Recovery from a canonical machine arrives with
-/// `setup --base`.
-pub const EXIT_SETUP_NEEDS_RECOVERY: u8 = 40;
+/// Do not restart: setup's escape check found the old instance's work past
+/// the stop block. Stop the old instance, discard the data directory and run
+/// setup again.
+pub const EXIT_SETUP_ESCAPE: u8 = 40;
 /// Unclassified operational failure; restart with backoff.
 pub const EXIT_UNCLASSIFIED: u8 = 1;
 
@@ -82,7 +82,7 @@ pub(crate) enum CommandFailureVerdict {
     ExpectedRecovery,
     Retryable,
     Terminal,
-    SetupRecoveryRequired,
+    SetupEscape,
     Unclassified,
 }
 
@@ -106,8 +106,8 @@ impl CommandFailureVerdict {
             Self::ExpectedRecovery => "restart; a recovery boot follows",
             Self::Retryable => "restart with backoff; alert if it persists",
             Self::Terminal => "do not restart; page an operator",
-            Self::SetupRecoveryRequired => {
-                "do not restart; recovery from a canonical machine arrives with setup --base"
+            Self::SetupEscape => {
+                "do not restart; stop the old instance, discard this data directory, run setup again"
             }
             Self::Unclassified => "restart with backoff",
         }
@@ -118,7 +118,7 @@ impl CommandFailureVerdict {
             Self::ExpectedRecovery => EXIT_RESTART_EXPECT_RECOVERY,
             Self::Retryable => EXIT_RESTART_TRANSIENT,
             Self::Terminal => EXIT_TERMINAL,
-            Self::SetupRecoveryRequired => EXIT_SETUP_NEEDS_RECOVERY,
+            Self::SetupEscape => EXIT_SETUP_ESCAPE,
             Self::Unclassified => EXIT_UNCLASSIFIED,
         }
     }
@@ -265,7 +265,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::Identity(
             IdentityError::FirstBootRequiresL1 | IdentityError::DeploymentNotYetSafe { .. },
         )
-        | BootstrapError::DetectionWalletNonceRead { .. }
+        | BootstrapError::WalletNonceRead { .. }
         | BootstrapError::DataDirLocked { .. }
         | BootstrapError::FeeOracleTransient { .. }
         | BootstrapError::Flush(_) => CommandFailureVerdict::Retryable,
@@ -280,12 +280,12 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::FeeOracleFatal { .. }
         | BootstrapError::SignerMisconfig { .. }
         | BootstrapError::SetupNotComplete { .. }
-        | BootstrapError::CheckpointBeforeAppDeployment { .. }
+        | BootstrapError::Setup(_)
         | BootstrapError::Identity(IdentityError::Mismatch { .. } | IdentityError::OrphanedState) => {
             CommandFailureVerdict::Terminal
         }
 
-        BootstrapError::SetupRefuse(_) => CommandFailureVerdict::SetupRecoveryRequired,
+        BootstrapError::SetupRefuse(_) => CommandFailureVerdict::SetupEscape,
         BootstrapError::OpenStorage(_) | BootstrapError::KeyFile { .. } => {
             CommandFailureVerdict::Unclassified
         }
@@ -395,64 +395,123 @@ pub enum BootstrapError {
     /// The `flush-mempool` subcommand's flush failed (provider/transport).
     #[error("mempool flush failed: {0}")]
     Flush(#[from] crate::recovery::FlushError),
-    /// `setup`'s detection gate could not read the batch-submitter wallet
-    /// nonce from L1 (the one live RPC the gate makes). Transient — the
-    /// operator retries once the provider recovers; the prior sync already
-    /// proved L1 reachable, so this is a hiccup, not a misconfig.
-    #[error("setup detection: could not read submitter wallet nonce from RPC: {message}")]
-    DetectionWalletNonceRead { message: String },
-    /// `setup`'s read-only detection gate found a previous instance left work
-    /// this checkpoint cannot account for. Sticky: a plain `setup` restart
-    /// re-detects and re-refuses; recovery from a canonical machine arrives
-    /// with `setup --base`.
+    /// `setup` could not read the batch-submitter wallet nonce for its escape
+    /// check. The sync before it proved L1 reachable, so this is a hiccup; but
+    /// the data directory already holds the sync, so the operator discards it
+    /// and runs setup again.
+    #[error("setup could not read the submitter wallet nonce from RPC: {message}")]
+    WalletNonceRead { message: String },
+    /// `setup`'s escape check found the old instance's work past the stop
+    /// block. A restart cannot clear it.
     #[error(transparent)]
     SetupRefuse(#[from] SetupRefuse),
-    /// `setup --checkpoint-block` predates the application's deployment block:
-    /// a promotion cannot have landed before the application contract existed.
-    /// Operator misconfig; restarting cannot self-heal.
+    /// `setup` refused its directory, its base, or the history it rebuilt.
+    #[error(transparent)]
+    Setup(Box<SetupError>),
+}
+
+/// `setup`'s escape check, after the flush and the sync through the stop
+/// block: either finding means a transaction escaped the flush or the old
+/// instance still runs, so the history setup would publish may be wrong. Exit
+/// [`EXIT_SETUP_ESCAPE`]: stop the old instance and run setup again in an
+/// empty directory.
+#[derive(Debug, Error)]
+pub enum SetupRefuse {
+    /// The submitter's wallet nonce is not settled at the synced safe block
+    /// (`pending > safe`) on the local provider. Local view only: a zombie
+    /// transaction dropped from this provider's pool evades it.
     #[error(
-        "checkpoint block {checkpoint_block} predates the application \
-         deployment block {app_deployment_block}"
+        "the submitter's wallet is still unsettled after the flush (pending nonce {pending} > \
+         safe nonce {safe}); stop the old instance, discard this data directory, run setup again"
     )]
-    CheckpointBeforeAppDeployment {
-        checkpoint_block: u64,
-        app_deployment_block: u64,
+    WalletUnsettledAfterFlush { pending: u64, safe: u64 },
+    /// A submitter input landed past the stop block.
+    #[error(
+        "a submitter input (index {safe_input_index}, block {found_block}) landed past the stop \
+         block {stop_block}; stop the old instance, discard this data directory, run setup again"
+    )]
+    SubmitterInputPastStop {
+        stop_block: u64,
+        found_block: u64,
+        safe_input_index: u64,
     },
 }
 
-/// `setup`'s read-only detection gate: the reasons a
-/// fresh `setup` refuses because a *previous* instance left work past the
-/// checkpoint. The gate runs before baseline publication and leaves setup
-/// incomplete. A plain `setup` restart re-detects and re-refuses (hence
-/// [`EXIT_SETUP_NEEDS_RECOVERY`], not auto-recovery class 10); recovery from a
-/// canonical machine arrives with `setup --base`.
-///
-/// Both variants carry diagnostic fields for the refusal log line.
+/// Why `setup` refuses, each terminal: the operator fixes the cause and runs
+/// setup again in an empty directory.
 #[derive(Debug, Error)]
-pub enum SetupRefuse {
-    /// Step 1: the batch-submitter wallet nonce is not settled
-    /// (`pending > safe`) on the local provider — a previous instance left
-    /// pending or mined-but-unsafe batch txs. Local-view only: a
-    /// zombie tx dropped from this provider's pool but alive elsewhere evades
-    /// this check; bounded at runtime by the content-identity check.
+pub enum SetupError {
+    /// Setup starts only in an empty directory: nothing already there can be
+    /// trusted to fit this run, a completed setup or a failed one.
     #[error(
-        "batch-submitter wallet nonce not settled (pending {pending} > safe \
-         {safe}) — a previous instance left in-flight batch txs; recovery from \
-         a canonical machine arrives with `setup --base`"
+        "data directory {path} is not empty (it holds {entry}); setup runs only in an empty \
+         directory"
     )]
-    WalletNonceUnsettled { pending: u64, safe: u64 },
-    /// Step 2: a batch-submitter tx exists in `(checkpoint_block, safe]` — a
-    /// previous instance already wrote batches past this checkpoint, so a
-    /// genesis-style bootstrap would silently diverge from canonical state.
+    DataDirNotEmpty { path: String, entry: String },
+    #[error("cannot read the base machine at {path}: {source}")]
+    BaseMachine {
+        path: std::path::PathBuf,
+        #[source]
+        source: crate::machine::MachineExportError,
+    },
+    #[error("cannot build the application from the base machine's state at {path}: {source}")]
+    BaseApplication {
+        path: std::path::PathBuf,
+        #[source]
+        source: AppError,
+    },
+    /// The base consumed inputs past the stop block, so its state is not at
+    /// or below the era's.
     #[error(
-        "batch-submitter input found at block {found_block} past checkpoint \
-         block {checkpoint_block} (safe_input_index {safe_input_index}) — \
-         recovery from a canonical machine arrives with `setup --base`"
+        "the base consumed {l1_input_count} L1 inputs, but only {inputs_through_stop} lie at or \
+         below the stop block {stop_block}"
     )]
-    BatchPastCheckpoint {
-        checkpoint_block: u64,
-        found_block: u64,
-        safe_input_index: u64,
+    BaseAheadOfStop {
+        l1_input_count: u64,
+        inputs_through_stop: u64,
+        stop_block: u64,
+    },
+    /// The export's queued directs are not the admitted directs above its
+    /// clock: the machine is not canonical, or its scheduler drained wrongly.
+    #[error(
+        "the base's export disagrees with L1: among its {l1_input_count} inputs, {admitted} \
+         admitted directs lie above its clock {clock}, the first at {first_admitted:?}, but it \
+         queues {fridge_len} from input {first_queued_input}"
+    )]
+    ExportDisagrees {
+        l1_input_count: u64,
+        clock: u64,
+        fridge_len: u64,
+        first_queued_input: u64,
+        admitted: u64,
+        first_admitted: Option<u64>,
+    },
+    /// The scheduler refused the export with its queued range from L1.
+    #[error("the base's export disagrees with L1: {0}")]
+    ResumeRefused(#[from] sequencer_core::scheduler::ResumeError),
+    #[error("the rebuilt scheduler's clock {clock} is past the stop block {stop_block}")]
+    ClockPastStop { clock: u64, stop_block: u64 },
+    /// The safe head the sync reached is below the stop block the flush saw:
+    /// a provider behind its own earlier answer.
+    #[error(
+        "the sync reached safe block {synced_safe_block}, below the stop block {stop_block}; \
+         discard this data directory and run setup again"
+    )]
+    SyncBehindStopBlock {
+        synced_safe_block: u64,
+        stop_block: u64,
+    },
+    /// The application failed on a rebuilt transaction. Replaying a trusted
+    /// machine to that input says whether the application is dead on chain.
+    #[error(
+        "the application failed on the rebuilt transaction at input {l1_input_index}, \
+         position {position}: {source}"
+    )]
+    HistoryExecution {
+        l1_input_index: u64,
+        position: u64,
+        #[source]
+        source: AppError,
     },
 }
 
@@ -686,6 +745,12 @@ impl From<SetupRefuse> for CommandError {
     }
 }
 
+impl From<SetupError> for CommandError {
+    fn from(e: SetupError) -> Self {
+        CommandError::Bootstrap(BootstrapError::Setup(Box::new(e)))
+    }
+}
+
 impl From<FeeOracleError> for CommandError {
     fn from(error: FeeOracleError) -> Self {
         match error {
@@ -854,6 +919,12 @@ mod tests {
                     },
                 )),
                 "a setup before the deployment is safe",
+            ),
+            (
+                CommandError::Bootstrap(BootstrapError::WalletNonceRead {
+                    message: "provider unavailable".into(),
+                }),
+                "the escape check's wallet nonce read failing",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::ChainIdRpc {
@@ -1105,14 +1176,71 @@ mod tests {
                 })),
                 "a pinned-identity mismatch",
             ),
-            // A checkpoint predating genesis is operator misconfig — terminal
-            // (30), not a recovery trigger (40).
+            // Setup's refusals of its directory, base and rebuild are
+            // terminal (30), never the escape class (40): a fresh setup in
+            // another directory does not clear them.
             (
-                CommandError::Bootstrap(BootstrapError::CheckpointBeforeAppDeployment {
-                    checkpoint_block: 5,
-                    app_deployment_block: 10,
+                CommandError::from(SetupError::DataDirNotEmpty {
+                    path: "/data".into(),
+                    entry: "sequencer.db".into(),
                 }),
-                "a checkpoint predating genesis",
+                "a setup in a data directory that holds anything",
+            ),
+            (
+                CommandError::from(SetupError::BaseApplication {
+                    path: "/machines/base".into(),
+                    source: AppError::Internal {
+                        reason: "count mismatch".into(),
+                    },
+                }),
+                "an application that cannot be built from the base's state",
+            ),
+            (
+                CommandError::from(SetupError::BaseAheadOfStop {
+                    l1_input_count: 9,
+                    inputs_through_stop: 8,
+                    stop_block: 100,
+                }),
+                "a base past the stop block",
+            ),
+            (
+                CommandError::from(SetupError::ExportDisagrees {
+                    l1_input_count: 9,
+                    clock: 40,
+                    fridge_len: 2,
+                    first_queued_input: 5,
+                    admitted: 1,
+                    first_admitted: Some(6),
+                }),
+                "an export that disagrees with L1",
+            ),
+            (
+                CommandError::from(SetupError::ResumeRefused(
+                    sequencer_core::scheduler::ResumeError::FirstQueuedNotADirect { index: 5 },
+                )),
+                "an export whose queued range the scheduler refuses",
+            ),
+            (
+                CommandError::from(SetupError::ClockPastStop {
+                    clock: 101,
+                    stop_block: 100,
+                }),
+                "a rebuilt clock past the stop block",
+            ),
+            (
+                CommandError::from(SetupError::SyncBehindStopBlock {
+                    synced_safe_block: 99,
+                    stop_block: 100,
+                }),
+                "a sync that fell behind the flush's stop block",
+            ),
+            (
+                CommandError::from(SetupError::HistoryExecution {
+                    l1_input_index: 7,
+                    position: 2,
+                    source: AppError::Io(std::io::Error::other("disk unavailable")),
+                }),
+                "an application failure on the rebuilt history",
             ),
             // Reader-level chain-id mismatch (warm-boot backstop) is terminal,
             // like the boot-time BootstrapError::ChainIdMismatch.
@@ -1189,25 +1317,25 @@ mod tests {
         rows
     }
 
-    /// Class 40: sticky setup refusals. A plain restart would re-detect and
-    /// re-refuse, so they get a dedicated code, distinct from the
-    /// auto-recovery class (10).
-    fn setup_needs_recovery() -> Vec<Row> {
+    /// Class 40: the escape check. The old instance must be stopped before
+    /// a setup in a fresh directory can succeed, so it gets a dedicated code,
+    /// distinct from the auto-recovery class (10).
+    fn setup_escape() -> Vec<Row> {
         vec![
             (
-                CommandError::from(SetupRefuse::WalletNonceUnsettled {
+                CommandError::from(SetupRefuse::WalletUnsettledAfterFlush {
                     pending: 14,
                     safe: 13,
                 }),
-                "an unsettled wallet nonce past the checkpoint",
+                "a wallet still unsettled after the flush",
             ),
             (
-                CommandError::from(SetupRefuse::BatchPastCheckpoint {
-                    checkpoint_block: 100,
+                CommandError::from(SetupRefuse::SubmitterInputPastStop {
+                    stop_block: 100,
                     found_block: 250,
                     safe_input_index: 7,
                 }),
-                "a batch past the checkpoint",
+                "a submitter input past the stop block",
             ),
         ]
     }
@@ -1298,7 +1426,7 @@ mod tests {
             (EXIT_RESTART_EXPECT_RECOVERY, expect_recovery()),
             (EXIT_RESTART_TRANSIENT, transient()),
             (EXIT_TERMINAL, terminal()),
-            (EXIT_SETUP_NEEDS_RECOVERY, setup_needs_recovery()),
+            (EXIT_SETUP_ESCAPE, setup_escape()),
             (EXIT_UNCLASSIFIED, unclassified()),
         ];
         for (code, rows) in table {
@@ -1341,13 +1469,13 @@ mod tests {
         use CommandFailureVerdict::*;
         let at_error = |verdict: CommandFailureVerdict| match verdict {
             Terminal | Unclassified => true,
-            ExpectedRecovery | Retryable | SetupRecoveryRequired => false,
+            ExpectedRecovery | Retryable | SetupEscape => false,
         };
         let all = [
             ExpectedRecovery,
             Retryable,
             Terminal,
-            SetupRecoveryRequired,
+            SetupEscape,
             Unclassified,
         ];
         for verdict in all {
@@ -1373,7 +1501,7 @@ mod tests {
                 ExpectedRecovery => 10,
                 Retryable => 20,
                 Terminal => 30,
-                SetupRecoveryRequired => 40,
+                SetupEscape => 40,
                 Unclassified => 1,
             }
         };
@@ -1381,7 +1509,7 @@ mod tests {
             ExpectedRecovery,
             Retryable,
             Terminal,
-            SetupRecoveryRequired,
+            SetupEscape,
             Unclassified,
         ];
         for verdict in all {

@@ -19,10 +19,10 @@ use tokio::process::Command;
 
 use crate::ScenarioResult;
 
-const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
+pub(crate) const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
 const SEPOLIA_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image-sepolia";
 
-fn require_cartesi_machine() {
+pub(crate) fn require_cartesi_machine() {
     assert!(
         std::process::Command::new("cartesi-machine")
             .arg("--version")
@@ -34,7 +34,7 @@ fn require_cartesi_machine() {
     );
 }
 
-fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
+pub(crate) fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
     let image = paths::workspace_root().join(relative);
     if !image.is_dir() {
         return Err(format!(
@@ -48,14 +48,14 @@ fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
 
 /// One watchdog state directory, bootstrapped from `image` at `block`, driven
 /// through the production `sequencer-watchdog` wrapper.
-struct Watchdog {
+pub(crate) struct Watchdog {
     state_dir: PathBuf,
     image: PathBuf,
     block: u64,
 }
 
 impl Watchdog {
-    fn new(image: PathBuf, block: u64) -> ScenarioResult<Self> {
+    pub(crate) fn new(image: PathBuf, block: u64) -> ScenarioResult<Self> {
         let state_dir = tempfile::tempdir()
             .map_err(|err| format!("temp watchdog state dir: {err}"))?
             .keep();
@@ -122,7 +122,7 @@ impl Watchdog {
     }
 
     /// Run a command that must exit with `code`; returns its stdout.
-    async fn expect(
+    pub(crate) async fn expect(
         &self,
         runtime: &ManagedSequencer,
         args: &[&str],
@@ -140,7 +140,10 @@ impl Watchdog {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn status(&self, runtime: &ManagedSequencer) -> ScenarioResult<serde_json::Value> {
+    pub(crate) async fn status(
+        &self,
+        runtime: &ManagedSequencer,
+    ) -> ScenarioResult<serde_json::Value> {
         let stdout = self.expect(runtime, &["status"], 0).await?;
         serde_json::from_str(&stdout).map_err(|err| format!("status JSON: {err}: {stdout}").into())
     }
@@ -176,7 +179,7 @@ async fn sequencer_digest(runtime: &ManagedSequencer) -> ScenarioResult<(u64, St
     Ok((block, sha256))
 }
 
-fn head_block(status: &serde_json::Value) -> Option<u64> {
+pub(crate) fn head_block(status: &serde_json::Value) -> Option<u64> {
     status["head"]["block"].as_u64()
 }
 

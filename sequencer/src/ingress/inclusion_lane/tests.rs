@@ -2038,3 +2038,94 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
     .expect("catch up over the dropped direct");
     assert_eq!(restarted.replayed, vec![at_cap, after_dropped, later]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
+    use crate::egress::test_era;
+
+    let db = temp_db("lane-rebuilt-era");
+    let config = default_test_config();
+    let baseline = config.dumps_dir.join("era-baseline");
+    super::dump_info::create_dump_dir_with_info(
+        &mut StubApp::with_progress(test_era::REBUILT_END),
+        &baseline,
+        &super::dump_info::DumpInfo::at_baseline(test_era::NEXT_BATCH_NONCE),
+    )
+    .expect("create the era's baseline dump");
+    let mut storage = test_era::publish_rebuilt_era(&db.path, &baseline);
+    // Input 3 sits at the stop block but is still queued, so the drain starts
+    // there, not after the stop block's last input.
+    assert_eq!(
+        storage.next_undrained_safe_input_index().unwrap(),
+        test_era::FIRST_QUEUED_INPUT
+    );
+    // `run`'s startup: the root frame drains the queued direct.
+    storage.ensure_open_tip().expect("open the root frame");
+    assert_eq!(
+        storage.next_undrained_safe_input_index().unwrap(),
+        test_era::FIRST_QUEUED_INPUT + 1
+    );
+
+    let shutdown = RuntimeScope::default();
+    let (_tx, handle) = InclusionLane::<StubApp>::start(16, shutdown.clone(), storage, config);
+    let later = IngestedSafeInput {
+        sender: test_era::DIRECT_SENDER,
+        payload: vec![0xb4],
+        block_number: test_era::STOP_BLOCK + 6,
+        block_timestamp: 1_016,
+        transaction_hash: B256::repeat_byte(0xb4),
+    };
+    Storage::open(&db.path)
+        .expect("open feeder storage")
+        .append_ingested_safe_inputs_with_timestamp(
+            test_era::STOP_BLOCK + 6,
+            1_016,
+            &[later],
+            test_era::SUBMITTER,
+            &default_protocol_timing(),
+            FrontierMode::Populate,
+        )
+        .expect("land a direct after the root frame");
+    let head = |db_path: &str| {
+        Storage::open_read_only(db_path)
+            .unwrap()
+            .history_bounds()
+            .unwrap()
+            .head
+            .get()
+    };
+    let drained = wait_until(Duration::from_secs(2), || {
+        head(&db.path) == test_era::REBUILT_END + 2
+    })
+    .await;
+    // A clean stop means catch-up replayed the queued direct onto the
+    // baseline, so the lane's own direct executed at the next count.
+    shutdown_lane(&shutdown, handle).await;
+    assert!(drained, "the lane must drain the later direct");
+
+    let mut storage = Storage::open_read_only(&db.path).unwrap();
+    let bounds = storage.history_bounds().unwrap();
+    let live: Vec<_> = storage
+        .canonical_history_page(
+            sequencer_core::history::HistoryClaim {
+                version: bounds.version,
+                next_input: ExecutedInputCount::new(test_era::REBUILT_END),
+            },
+            16,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| match row.context {
+            L2TxContext::Direct { tx, .. } => (row.offset.get(), tx.input_index),
+            L2TxContext::UserOp { .. } => panic!("no user op was submitted"),
+        })
+        .collect();
+    assert_eq!(
+        live,
+        vec![
+            (test_era::REBUILT_END, test_era::FIRST_QUEUED_INPUT),
+            (test_era::REBUILT_END + 1, test_era::FIRST_QUEUED_INPUT + 1),
+        ]
+    );
+}

@@ -50,10 +50,10 @@ cargo run -p c-wallet-sequencer -- run
 cargo test -p c-wallet-engine --test conformance
 ```
 
-The ordinary setup/run environment configuration is still required. The genesis
-path is required only when plain `setup` needs its first snapshot; completed
-setup, warm startup, and `flush-mempool` use the sequencer's durable
-checkpoints.
+The ordinary setup/run environment configuration is still required. Only a
+setup without `--base` reads the genesis path; `setup --base` builds the
+engine from the machine's state, and completed setup, warm startup, and
+`flush-mempool` use the sequencer's durable checkpoints.
 
 The host adds `--state-file` through its own parser and passes the parsed command
 to `sequencer::run_command`. This shares `run_main`'s command lifecycle and exit
@@ -121,8 +121,10 @@ devnet genesis, delete that source before startup, and exercise ordinary executi
 clean restart, and stale-batch recovery. Independent `EngineApp` replicas restore
 HTTP archives, discard the downloaded sources, follow backlog and live WS inputs,
 and check history identity across recovery. Ordinary execution and stale-batch
-recovery also compare the host against the canonical machine. Recovery from a
-canonical machine arrives with `setup --base`. Run them with:
+recovery also compare the host against the canonical machine.
+`c_host_recovery_from_genesis_round_trip_test` runs setup's rebuild through the
+engine; recovery from a stored canonical machine is `setup --base`, which no
+`c_host_` scenario runs yet. Run them with:
 
 ```sh
 just setup

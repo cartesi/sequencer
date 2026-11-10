@@ -93,6 +93,24 @@ pub(super) fn query_latest_safe_input_index_exclusive(conn: &Connection) -> Resu
     })
 }
 
+/// How many safe inputs lie at or below `block`: the exclusive index bound
+/// through it, since InputBox order never lowers the block.
+pub(super) fn safe_input_count_through_block_in(conn: &Connection, block: u64) -> Result<u64> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT safe_input_index FROM safe_inputs WHERE block_number <= ?1 \
+             ORDER BY block_number DESC, safe_input_index DESC LIMIT 1",
+            [super::convert::saturating_query_bound(block)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(last.map_or(0, |index| {
+        i64_to_u64(index)
+            .checked_add(1)
+            .expect("safe input index overflow")
+    }))
+}
+
 pub(super) fn current_safe_block(conn: &Connection) -> Result<Option<u64>> {
     let value: Option<i64> = conn
         .query_row(

@@ -1,7 +1,10 @@
 # The application and its machine
 
-**Status:** proposed on 2026-11-05 for the next template, to settle with Bart;
-nothing here is implemented. **New** marks what changes.
+**Status:** implemented in this tree, except that setup reads the
+application's state only through the `state` inspect report, not the labeled
+range ([register](../../review/register.md#sequencer-recovery-follow-ups)).
+The [questions for Bart](todo.md#questions-for-bart) stay open. **New** marks
+what changed from the earlier template.
 
 An application lives in two places: natively, inside the sequencer and its
 clients, and in the canonical machine, the template every validator runs. A
@@ -19,7 +22,7 @@ and the application answers only for its own state, in an encoding it chooses.
 
 | What | How setup reads it | Answered by |
 |---|---|---|
-| The application's state | Through the deployment's state source, as the watchdog does: the `state` inspect report, or the labeled range | The application |
+| The application's state | The `state` inspect report; a read through the labeled range, as the watchdog can, is not built ([todo](todo.md#build)) | The application |
 | The scheduler's state and the counts | The `scheduler` inspect query | The harness |
 
 The `scheduler` report is six little-endian `u64`s, in this order:
@@ -40,15 +43,15 @@ pub struct SchedulerExport {
 }
 ```
 
-- **The application's state is the comparison bytes**, read the way the
-  watchdog reads them ([state sources](../../watchdog/README.md#state-sources)).
-  It needs no new query: a state too large for one report already uses the
-  range source.
+- **The application's state is the comparison bytes**, the same bytes the
+  watchdog compares ([state sources](../../watchdog/README.md#state-sources)).
+  Setup reads them only through the `state` report, so today they must fit one
+  2 MiB report.
 - **The fridge is named, not exported.** It holds the admitted directs from the
   first queued input up to the L1 input count
   ([scheduler](scheduler.md#the-schedulers-state)). Setup reads them from its
   own input table and checks the export against it
-  ([operations](operations.md#what-setup-does)).
+  ([what setup does](../../recovery/cockroach.md#what-setup-does)).
 - **The application chooses its encoding.** The wallet exports its SSZ
   snapshot; libdex could export the flat buffer its drive holds, as it is.
 - **The `state` query keeps its meaning.** The literal bytes or an empty
@@ -69,10 +72,10 @@ engines and gets the same changes.
 |---|---|
 | `max_method_payload_bytes` | A fixed cap on a user op's payload, which only the lane enforces |
 | **New:** `user_nonce` | Report a sender's next nonce, which the shared executor compares with the op's |
-| `admit_user_op`, today's `validate_user_op` | Say, without changing state, whether the operator wants an op; **New:** it no longer checks the nonce, and only the lane calls it |
-| `apply_user_op`, today's `apply_valid_user_op` | Advance the sender's nonce and the L2 tx count by exactly one, business failures included; **New:** never fail, even on a fee the sender cannot pay |
-| `apply_direct`, today's `apply_direct_input` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
-| `l2_tx_count`, today's `progress` | Report the L2 tx count; **New:** the count alone, without today's clock |
+| `admit_user_op` | Say, without changing state, whether the operator wants an op; **New:** it no longer checks the nonce, and only the lane calls it |
+| `apply_user_op` | Advance the sender's nonce and the L2 tx count by exactly one, business failures included; **New:** never fail, even on a fee the sender cannot pay |
+| `apply_direct` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
+| `executed_input_count`, to be renamed `l2_tx_count` | Report the L2 tx count; **New:** the count alone, without the clock |
 | `create_dump`, `from_dump`, `state_file_in_dump` | Write a durable dump, load it back to the same state, and name the file that holds the comparison bytes |
 | `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns whole |
 | **New:** `from_canonical_state` | Build a native instance from a machine's comparison bytes, at the machine's L2 tx count |

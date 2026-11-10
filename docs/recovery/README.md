@@ -7,10 +7,8 @@ existing SQLite database and assumes the sequencer's own code and accepted
 local history are correct.
 
 For lost or unusable local state, including after a sequencer bug, the remedy
-is [cockroach recovery](cockroach.md): fix the bug, then rebuild in a fresh
-data directory from a trusted canonical machine and L1. This build has no
-rebuild command; it arrives with `setup --base`
-([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)).
+is [cockroach recovery](cockroach.md): fix the bug, then rebuild in a new
+data directory from a trusted canonical machine and L1 with `setup --base`.
 Automatic recovery does not establish trust in a corrupted application state.
 
 This page owns the automatic procedure and its rationale. Start with the
@@ -40,8 +38,8 @@ Keep three identities separate:
 | Scheduler batch nonce | Ordering identity; derived when storage creates the batch. A replacement branch reuses the invalidated suffix's nonces. |
 | L1 wallet nonce | Transaction slot; a batch transaction and a flush no-op may compete for it. Covered slots must be consumed at safe depth before post-flush repair. |
 
-A parentless root uses the deployment's immutable anchor nonce: zero, the only
-anchor setup writes in this build. Production needs no
+A parentless root uses the era's immutable anchor nonce: the scheduler's next
+batch nonce at the stop block, which setup writes. Production needs no
 accepted ancestor or submitted sentinel to repair a fully invalidated branch
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
 
@@ -70,7 +68,7 @@ checkpoint. After initial sync, one consistent `RecoveryInspection` selects:
 | Local fact | Action |
 |---|---|
 | `Safe` + open Tip | Ready for runtime preparation. |
-| `Safe` + no Tip | `EnsureOpenTip`: create it under a transaction guard. |
+| `Safe` + no Tip | `EnsureOpenTip`: create it under a transaction guard; the first `run` after setup opens the era's root this way. |
 | `TipInDanger(N)` | `RecoverTip { N }`: invalidate that Tip and reopen, without flushing. |
 | `ClosedBatchInDanger(N)` | Flush → sync → guarded post-flush cascade. |
 | `L1ViewStale` | Retry; the persisted view or clock cannot authorize serving. |
@@ -245,9 +243,12 @@ records no transition.
 
 The new Tip follows the latest surviving batch, or uses the immutable root
 anchor if none survives. It attributes direct inputs after the surviving
-frame's drain boundary, with the era baseline block as a floor. Storage records
-those application entries; the launched lane executes them during catch-up.
-This prevents a restored prefix's directs from being executed twice.
+frame's drain boundary, with the era's stop block as a floor; with no
+surviving frame, it drains from the era's first queued input, the oldest
+direct still queued at the stop block
+([after setup](cockroach.md#after-setup)). Storage records those application
+entries; the launched lane executes them during catch-up. This prevents a
+restored prefix's directs from being executed twice.
 
 Recovery requires the latest accepted batch snapshot, or the era baseline
 before any local batch is accepted. A newer surviving optimistic snapshot can

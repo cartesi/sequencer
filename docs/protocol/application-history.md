@@ -28,10 +28,13 @@ an application count. The count substitutes for neither the L1 accounting
 boundary nor the acceptance facts.
 
 `safe_inputs` retains all InputBox observations, including batch envelopes.
-`application_inputs` contains only the current ordered application sequence;
-each row has a mandatory pre-execution offset, an owning batch/frame, and
-exactly one reference to a user op or external direct input. Payloads remain
-in those source tables. Included business failures, underfunded ops and
+An era's history lives in two tables, joined at its
+[rebuilt history end](#era-baseline). `rebuilt_history` holds what setup
+rebuilt from L1, from the base count up to that end; `application_inputs`
+holds the live rows after it. Each live row has a mandatory pre-execution
+offset, an owning batch/frame, and exactly one reference to a user op or
+external direct input. Payloads remain in those source tables. Included
+business failures, underfunded ops and
 malformed-direct no-ops advance the count; refusals and envelopes do not. A
 direct whose payload is over the application's cap never executes, as in the
 [canonical fridge](scheduler-semantics.md#the-fridge), so it gets no row and no
@@ -51,21 +54,22 @@ shared executor.
 
 A `HistoryClaim` combines:
 
-- **Era**: a UUIDv4 created by setup/rebuild, identifying one local history.
+- **Era**: a UUIDv4 created by setup, identifying one local history.
 - **Recovery generation**: a revision within that era, advanced atomically
   whenever automatic recovery invalidates at least one valid batch.
 - **Next input**: the application's actual executed-input count.
 
-If the era baseline count is `K` and the current head is `H`, available entries
+If the era's base count is `K` and the current head is `H`, available entries
 occupy `[K, H)`. A claim at `H` waits for future entries; a claim below `K` or
-above `H` is refused. Identity is checked before position. Equal counts cannot
-authorize resuming a different era or generation, even if the consumer believes
-its state precedes the replaced suffix. The compatibility query below can
-authorize rebinding a surviving checkpoint to the current version; WS itself
-continues to require exact identity.
+above `H` is refused. Identity is checked before position. Equal counts do not
+by themselves authorize resuming a different era or generation. Two lookups
+can rebind a saved state to the current version: the compatibility query
+below, within an era, and the [adopt rule](#adopting-a-new-era), across eras.
+WS itself requires exact identity.
 
-Automatic recovery invalidates a batch suffix, removes its current application
+Automatic recovery invalidates a batch suffix, removes its live application
 rows, advances the generation, and opens the replacement Tip in one transaction.
+It never reaches the rebuilt history, which comes from safe blocks.
 Replacement inputs reuse suffix offsets under the new generation. Original L1,
 batch, frame, and user-op source records remain; the invalidated flattened
 sequence is not separately retained. A repair that invalidates nothing leaves
@@ -88,8 +92,9 @@ at generation `G`, head `H`, and preserved count:
 P = min(H, cut[g+1], ..., cut[G])
 ```
 
-For `g = G`, `P = H`. A checkpoint at count `X` is eligible to resume under the
-returned version exactly when `K <= X <= P`. Check each saved checkpoint using
+For `g = G`, `P = H`. Every cut is at or past the rebuilt history end, since
+recovery removes only live rows. A checkpoint at count `X` is eligible to
+resume under the returned version exactly when `K <= X <= P`. Check each saved checkpoint using
 its own era and generation, then choose the newest eligible one. For cuts
 `0 -> 1: 3` and `1 -> 2: 5`, a generation-0 checkpoint at 4 is invalid, while a
 generation-1 checkpoint at 4 is eligible. Looking only at the latest cut would
@@ -103,32 +108,102 @@ persist the new version with the restored checkpoint before continuing. If
 another recovery wins the race with subscription, query again using that saved
 version. A stale response cannot weaken WS admission. The query proves prefix
 preservation under standard recovery's trusted local bookkeeping; it does not
-inspect client state or establish trust after a software bug. A new era requires
-a [bootstrap from the era's L1 prefix](projection-replay.md#bootstrap-and-handoff),
-which the proposed [sequencer recovery](../plans/2026-11-sequencer-recovery/operations.md#the-clients-playbook)
-replaces.
+inspect client state or establish trust after a software bug. A new era is
+crossed by the [adopt rule](#adopting-a-new-era) instead.
 
 ### Era baseline
 
-Setup publishes a complete baseline only after its artifact is durable:
-application count `K`, accounted L1 stop block `C`, starting batch nonce, and
-history identity. Ordinary direct ordering and accepted-batch scanning begin
-after `C`. The baseline's metadata survives root invalidation and artifact GC;
-no padding inputs or separate mutable processing cursor represent its prefix.
+Every setup starts from a base, genesis or a stored canonical machine, and
+rebuilds the history from L1 through a stop block it pins after flushing the
+submitter's wallet
+([what setup does](../recovery/cockroach.md#what-setup-does)).
+Once the baseline's artifact is durable, setup publishes the era in one
+transaction, and nothing of it changes afterwards except the generation:
 
-Plain setup publishes the genesis baseline: count 0, stop block 0 and batch
-nonce 0, and genesis supplies the trusted block-zero comparison state. A
-baseline at a later stop block is a rebuilt one, which a recovery from a
-canonical machine publishes; that recovery arrives with `setup --base`.
+| Field | Value |
+|---|---|
+| Base count `K` | The base's L2 tx count, where the era's history starts; `/history` reports it as `available_from` |
+| Stop block `C` | The safe block setup pinned after the flush; `/history` reports it as `l1_stop_block` |
+| Rebuilt history end `E` | The L2 tx count at the end of block `C`, where the live rows start; `/history` reports it as `rebuilt_history_end` |
+| Anchor `N'` | The scheduler's next batch nonce at the end of block `C`, which the era's first batch carries; `/history` reports it as `next_batch_nonce` |
+| First queued input | The InputBox index of the oldest direct still queued at the end of block `C`, or the input count through `C` when none is; not on the wire |
+| Baseline snapshot | The application's state at count `E` |
+
+A genesis base has `K = 0` and still runs the rebuild, so a deployment whose
+L1 history executed transactions before its stop block starts with `E > 0`. The baseline is
+the application's state at the end of block `C`, which the canonical machine
+reaches too, so until a batch of the era is accepted the sequencer serves it
+as the comparison checkpoint: inclusion block `C`, count `E`, next nonce `N'`.
+
+Setup opens no batch. `run`'s first frame drains the directs still queued at
+`C`, from the first queued input on, as the canonical scheduler's next frame
+does; a cascade that tears every batch of the era drains from there again.
+Accepted-batch scanning begins after `C`. The era record survives root
+invalidation and baseline artifact GC.
+
+### The rebuilt history
+
+`rebuilt_history` holds one row per transaction the scheduler handed out
+while setup fed it the inputs from the base's position through the last input
+at or below `C`
+([what setup does](../recovery/cockroach.md#what-setup-does)).
+A direct row keeps its input index, and the feed takes its sender, payload,
+block, timestamp and transaction hash from `safe_inputs`. A user op row keeps
+its sender, nonce, fee, data and safe block. Each row keeps the scheduler's
+next batch nonce when it handed the row out: the batch whose frame holds or
+drained it, or the next batch to come. An executed row has its
+count; a skipped user op stays in the table without one and is never served.
+
+Setup is the table's only writer, and only before it publishes the era: the
+schema refuses an insert or a count after that, a deletion at any time, and a
+count out of row order or with a gap. The era's `K` and `E` are exactly the
+span of the counted rows.
+
+### Adopting a new era
+
+A cockroach recovery replaces the era, so a client's claim from the old one
+is refused with `ERA_CHANGED`. A client holding state at count `X` adopts the
+new era at that count when
+
+```text
+K <= X <= E
+```
+
+and then subscribes with the current version and `next_input = X`.
+[`HistoryInfo::adopt_claim`](../../sequencer-core/src/history_api.rs) is the
+check, and the [Rust SDK](../../sdk/rust-client/src/history.rs)'s
+`adopt_current_era` reads `/history` and applies it. The server adds no check
+of its own: the adopted claim carries the current version, which the feed
+admits like any other.
+
+| Refusal | Meaning | Remedy |
+|---|---|---|
+| `BelowBase` (`X < K`) | The era's base is newer than the client's state | The operator recovers again from an older base, or the client starts over from a current snapshot |
+| `PastRebuiltEnd` (`X > E`) | The client's state holds rows the old instance served that never landed by `C` | The client restores an older state |
+
+Rows past `E` are the new era's live rows, served after the stop block, so an
+old-era state there is not canonical even when the head has passed `X`.
+
+### What the count checks miss
+
+The adopt rule compares counts, not rows. Two faults pass it:
+
+- **A base machine that is not canonical.** Setup trusts its base. The
+  watchdog's first comparison of the era's baseline exposes it.
+- **A client state that is wrong below its count**, such as one built on rows
+  the old instance served below `E` that the rebuild replaced. Only the
+  client's own check exposes it: subscribe from `K` and compare each row up to
+  `X` with the one it stored
+  ([the client's playbook](../recovery/cockroach.md#the-clients-playbook)).
 
 ## Consumers of checkpoints
 
 | Consumer | Starting point and continuation |
 |---|---|
-| Native restart | Load the newest surviving batch snapshot, or baseline, check the engine's count against its row, then replay current application inputs. |
+| Native restart | Load the newest surviving batch snapshot, or the era baseline at `E`, check the engine's count against its row, then replay the live rows after it. |
 | Sequencer replica | Download `/latest_snapshot`, restore its application state, and subscribe using the matching history claim. This follows optimistic execution. |
 | Watchdog | Start from independently trusted canonical machine state and replay L1. Compare at the sequencer's accepted checkpoint; the replica feed does not establish independent trust. |
-| Application projection | Reconstruct additional transfer/order history using the era's historical L1 prefix, then join the application feed at the immutable baseline. The [projection replay contract](projection-replay.md) owns its checkpoint preparation and handoff. |
+| Application projection | Follow the feed from the base count; history below it is rebuilt from the era's historical L1 prefix. The [projection replay contract](projection-replay.md) owns its checkpoint preparation and handoff. |
 
 A batch-close snapshot is identified by its local batch identity, not just its
 count or nonce. Recovery can reuse a nonce and empty batches can repeat a count.
@@ -149,8 +224,9 @@ explains block-boundary comparison and rollback retention. The
    complete subscription claim.
 3. Subscribe with the matching era, generation, and next-input count. Snapshot
    selection, headers, and lease share one transaction; recovery during the
-   download can still invalidate the claim before subscription. Rebootstrap
-   if the server refuses that old era; within the same era, a compatible saved
+   download can still invalidate the claim before subscription. If the server
+   refuses that old era, [adopt](#adopting-a-new-era) the new one at the
+   restored count, or rebootstrap; within the same era, a compatible saved
    checkpoint can instead be selected through `/history`.
 4. Require each entry's offset to equal the application's current count, then
    execute it through the shared execution boundary. Successful application
@@ -158,19 +234,23 @@ explains block-boundary comparison and rollback retention. The
    state so that a later resume cannot combine different histories.
 5. After an ordinary disconnect, reconnect with that saved identity and the
    actual count. A generation mismatch permits the compatibility procedure
-   above. An unavailable prefix or lack of a compatible checkpoint requires a
-   current snapshot. A count ahead of the server's head is an invalid claim to correct.
+   above, and an era mismatch the adopt rule. An unavailable prefix or lack of
+   a compatible checkpoint requires a current snapshot. A count ahead of the
+   server's head is an invalid claim to correct.
 
 The [Rust SDK](../../sdk/rust-client/src/lib.rs) returns a `HistoryClaim` with
 its snapshot response and requires an explicit claim for subscriptions. The
 consumer owns restore, persistence, and reconnect. Fetching fresh identity
 metadata alone cannot authorize old application state; an explicit compatibility
-result can authorize a saved prefix within the same era.
+result can authorize a saved prefix within the same era, and `adopt_current_era`
+one from an older era.
 
 One durable page reader handles both backlog and live delivery, so there is no
-separate cursor to switch at the live boundary. Each page reads identity,
-bounds, and rows in one SQLite transaction. Interior gaps and invalid source
-context fail loudly. Page size and send queues bound memory; available backlog
+separate cursor to switch at the live boundary. It serves the executed rebuilt
+rows in count order up to `E`, then the live rows, and a page may span that
+seam. Each page reads identity, bounds, and rows in one SQLite transaction.
+Interior gaps, a missing rebuilt count below `E`, and invalid source context
+fail loudly. Page size and send queues bound memory; available backlog
 has no total replay cap. The [API contract](../../README.md#api) owns exact
 resource limits and handshake errors.
 
@@ -185,7 +265,9 @@ writers become supported.
 | Boundary | Code and tests |
 |---|---|
 | Coordinates and claim ordering | [`sequencer-core/src/history.rs`](../../sequencer-core/src/history.rs) — identity before position, inclusive head, checked counts. |
-| Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
+| Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, the rebuilt/live seam, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
+| Rebuilt history | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs) and its tests — ordered insertion, counts set once and contiguous, sealing at publication; [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs) — the export check, the rebuild and its execution. |
+| Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
 | Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/historical_bootstrap/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |

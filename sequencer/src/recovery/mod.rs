@@ -677,13 +677,7 @@ mod tests {
             .expect("seed fresh safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .complete_baseline_setup(
-                &prefix,
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-                0,
-                false,
-            )
+            .publish_era(&prefix, &crate::storage::EraRecord::EMPTY_GENESIS)
             .expect("seed recovery checkpoint");
         if has_open_tip {
             storage

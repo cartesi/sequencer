@@ -61,7 +61,7 @@ pub(super) fn insert_new_batch(
 fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
     match parent_batch_index {
         // A parentless root carries the deployment's batch-tree anchor nonce:
-        // 0 for a genesis deployment, N' for a cockroach-recovered one. Mirrored by
+        // the era's next batch nonce at its stop block. Mirrored by
         // `trg_enforce_nonce_contiguity`'s parentless arm.
         None => batch_tree_anchor_in(tx),
         Some(parent_bi) => {
@@ -125,8 +125,8 @@ pub(super) fn insert_open_frame(
 }
 
 /// Set the batch-tree anchor nonce — the nonce the single parentless root
-/// carries (0 for genesis, `N'` for a cockroach-recovered deployment). Composes
-/// inside the recovery-fill transaction. `trg_batch_tree_anchor_write_once`
+/// carries: the era's next batch nonce at its stop block. Composes inside
+/// `publish_era`'s transaction. `trg_batch_tree_anchor_write_once`
 /// rejects this once `setup_complete` exists, so it is callable only during
 /// setup, before its atomic completion.
 pub(super) fn set_batch_tree_anchor_in(tx: &Transaction<'_>, nonce: u64) -> Result<()> {

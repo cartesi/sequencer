@@ -43,15 +43,15 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// "expected next" cursor.
 ///
 /// Returns `latest_accepted.nonce + 1` if any batch has been accepted, else the
-/// deployment anchor (`0` for genesis, `N'` after rebuild).
+/// deployment anchor (the era's next batch nonce at its stop block, `N'`).
 /// Equivalently, the nonce that the very next valid closed batch (the cascade
 /// pivot, when one exists) will carry, by the contiguity invariant on the
 /// valid path (`trg_enforce_nonce_contiguity`).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     match query_latest_safe_accepted_batch(conn)? {
         Some(row) => Ok(next_expected_nonce(i64_to_u64(row.nonce))),
-        // Empty accepted table ⇒ the frontier sits at the batch-tree anchor: 0
-        // for a genesis deployment, N' for a cockroach-recovered one. Reading
+        // Empty accepted table ⇒ the frontier sits at the batch-tree anchor
+        // N', the era's next batch nonce at its stop block. Reading
         // the anchor (not a hard-coded 0) keeps this in step with
         // `populate_safe_accepted_batches`, which seeds `expected` from the same
         // anchor. Without it, a freshly recovered deployment — whose frontier
@@ -98,9 +98,9 @@ pub(super) fn populate_safe_accepted_batches(
         return Ok(());
     }
 
-    // The recovered prefix is opaque. Replaying it with the final nonce N'
-    // could accept an old future-nonce submission that the scheduler rejected
-    // at its original position. Only inputs after the baseline belong here.
+    // The prefix through the stop block is the baseline's. Replaying it from
+    // the anchor could accept an old future-nonce submission the scheduler
+    // rejected at its original position. Only inputs after it belong here.
     let base_safe_block: Option<i64> = conn
         .query_row(
             "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
@@ -116,8 +116,7 @@ pub(super) fn populate_safe_accepted_batches(
                     row.get(0)
                 })?;
             assert!(!setup_complete, "completed setup has no history baseline");
-            // Plain setup detects prior activity before installing genesis.
-            // Rebuild ingestion defers this projection until its baseline exists.
+            // Setup's syncs defer this projection until the era exists.
             0
         }
     };
@@ -345,8 +344,8 @@ mod tests {
         // it was rejected there and must not become accepted after the rebuild.
         for old_future_block in [20, 30] {
             let db = temp_db("accepted-recovered-prefix");
-            let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
-                .expect("initialize rebuild");
+            let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
+                .expect("initialize setup");
             let submitter = Address::repeat_byte(0x99);
             let timing = default_protocol_timing();
             pin_test_deployment_identity(&mut storage, submitter);
@@ -413,13 +412,17 @@ mod tests {
                 .write(|tx| {
                     super::super::history::initialize_history_in(
                         tx,
-                        ExecutedInputCount::new(41),
-                        30,
-                    )?;
-                    super::super::mutations::set_batch_tree_anchor_in(tx, 1)?;
-                    super::super::ingress::open_recovery_tip_in_tx(tx, 30)
+                        &crate::storage::EraRecord {
+                            base_count: ExecutedInputCount::new(41),
+                            rebuilt_history_end: ExecutedInputCount::new(41),
+                            stop_block: 30,
+                            first_queued_input: 2,
+                            next_batch_nonce: 1,
+                        },
+                    )
                 })
                 .expect("install recovered baseline");
+            storage.ensure_open_tip().expect("run opens the root");
             let mut head = storage.open_state().expect("read root").expect("root");
             storage
                 .close_frame_and_batch(&mut head, 30)

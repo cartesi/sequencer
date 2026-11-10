@@ -37,9 +37,9 @@ curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/digest"
 ```
 
-Both answer JSON once the sequencer has a comparable checkpoint and 404 before
-that: genesis is comparable at block zero, while a rebuilt baseline waits for
-its next accepted batch
+Both answer JSON once the sequencer has a comparable checkpoint, which a
+completed setup always provides: the era's baseline at its stop block, until
+an accepted batch replaces it
 ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
 They answer 503 while the sequencer's own divergence marker is set.
 
@@ -196,9 +196,10 @@ but checkpoints.
 A retained checkpoint is a trusted machine at a known block. It can bootstrap
 a new state directory ([initialize](#initialize)), serve as the trusted source
 for `replay` in the [runbook](incident-runbook.md#2-find-the-faulty-side), and
-be the base machine of cockroach recovery, which arrives with `setup --base`
-([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)).
-It is not a sequencer restore archive; that is `/finalized_snapshot`
+be the base of `setup --base` in a
+[cockroach recovery](../recovery/cockroach.md). Its name counts InputBox
+inputs, not L2 transactions; `setup --base <dir> --dry-run` prints its L2 tx
+count. It is not a sequencer restore archive; that is `/finalized_snapshot`
 ([recovery exports](../snapshots/lifecycle.md#http-and-recovery-exports)).
 
 ## Deployment facts
@@ -393,11 +394,27 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   only exit 30 and SIGABRT, or scale its Kubernetes Deployment to zero. Never
   again run a command that signs with the submitter key, `run` or
   `flush-mempool`, against its data directory.
+- **Setup runs once per data directory, never on every boot.** It refuses a
+  directory that holds anything, a completed setup included, with exit 30, so
+  a setup unit or init container that runs before each `run` pages on the
+  second boot. Run it as a one-off Job or unit against a new directory.
+- **Setup takes the submitter key**, from the same variables as `run`, because
+  it flushes the submitter's wallet; mount the key for the setup Job too.
+  `--dry-run` takes none.
 - **A fresh deployment needs a setup retry budget.** `setup` exits 20 until
   the L1 safe head reaches the application's deployment block, about one to
   two epochs on Ethereum (6.4–12.8 min); give a setup Job or unit a longer
   retry budget (a Kubernetes Job's default backoffLimit 6 allows about
-  10.5 min).
+  10.5 min). This and every other exit 20 from setup's checks before it
+  writes leave the directory empty, so a retry in place is safe. A setup that
+  fails after it begins writing leaves a directory to discard, whatever its
+  exit code, and a retry in place exits 30
+  ([what setup does](../recovery/cockroach.md#what-setup-does)).
+- **The sequencer binary links the Cartesi Machine emulator**, statically, to
+  read a base machine. The host needs no emulator install, but it needs the
+  C++ runtime the emulator was built against: Ubuntu 24.04, Debian 13 or newer,
+  with `libgomp1`, `libslirp0`, `libstdc++6` and `ca-certificates`. Each
+  release archive's `RUNNING.md` lists them.
 - **After an unclean death (OOM, node reboot, SIGKILL) no action is
   needed**: the next start re-derives everything from facts. For
   postmortems, the `terminal_faults` table records the cause of every
@@ -412,9 +429,9 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
   A watchdog state mismatch independently signals application-state
   disagreement ([incident runbook](incident-runbook.md)). Diagnose the cause
-  and follow the [incident runbook](incident-runbook.md#3-resolve); a
-  fresh-directory rebuild arrives with `setup --base`, and standard recovery
-  does not repair bugs.
+  and follow the [incident runbook](incident-runbook.md#3-resolve), which
+  rebuilds in a new directory with `setup --base`; standard recovery does not
+  repair bugs.
 
 ## Troubleshooting (live deployments)
 
@@ -439,9 +456,9 @@ and failure class, as in
 | `<dir> was initialized for another deployment or state source; wipe it to re-initialize` | The `init` environment names another chain, application, or state source than the directory holds |
 | `no input precedes block <N>, so the machine at <dir> must be the application's template, but its root hash differs from the on-chain template hash` | The image is not this application's template: another chain's image, another build, or another application |
 | `L1 RPC: eth_call: …` during `init` | The RPC has no state at the bootstrap block; use an archive node |
-| `sequencer /finalized_state/inclusion_block: HTTP 404` | No comparable checkpoint yet, or the URL reaches the wrong listener |
+| `sequencer /finalized_state/inclusion_block: HTTP 404` | The URL reaches the wrong listener: a set-up sequencer always has a comparable checkpoint |
 | `sequencer /finalized_state/digest: HTTP 404` while `inclusion_block` answers | A proxy does not forward the digest route, or the sequencer comes from another release |
-| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#incident-playbook) |
+| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#the-operators-playbook) |
 | `L1 RPC safe head <N> is behind target block <B>` | The RPC lags the sequencer's L1 view; the next tick retries |
 | `InputBox counts <N> inputs at block <B> but the scan reached index <M>`, or `InputBox index <N> where <M> was expected: the L1 view is incomplete` | The provider returned incomplete logs, so switch providers; if it persists across them, a safe block below the head may have been replaced ([L1 chain semantics](../threat-model/README.md#l1-chain-semantics)), so confirm with `replay` from a trusted machine at a finalized block, then wipe the state directory and `init` from one |
 | `the L1 RPC does not serve chain <N>` | The RPC endpoint belongs to another chain |

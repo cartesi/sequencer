@@ -1,12 +1,14 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
+use crate::egress::test_era;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
@@ -133,6 +135,75 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
         assert_eq!(event.offset(), expected);
     }
     subscription.finish().await.unwrap();
+}
+
+/// Subscribe from `from` and read every row through `end`, one feed per call
+/// so each page size starts a fresh cursor.
+async fn read_feed(db_path: &str, from: u64, end: u64, page_size: usize) -> Vec<serde_json::Value> {
+    let feed = L2TxFeed::new(
+        db_path.to_string(),
+        RuntimeScope::default(),
+        L2TxFeedConfig {
+            idle_poll_interval: Duration::from_millis(2),
+            page_size,
+        },
+    );
+    let mut subscription = feed.subscribe_from(claim(db_path, from)).await.unwrap();
+    let mut messages = Vec::new();
+    for _ in from..end {
+        let message = tokio::time::timeout(Duration::from_secs(2), subscription.recv())
+            .await
+            .expect("wait for a feed row")
+            .expect("the feed is open");
+        messages.push(serde_json::to_value(message).unwrap());
+    }
+    subscription.finish().await.unwrap();
+    messages
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_serves_the_rebuilt_history_then_the_live_rows_across_the_seam() {
+    let db = temp_db("feed-rebuilt-era");
+    let mut storage = test_era::seed_rebuilt_era(&db.path, Path::new("/unused/baseline"));
+    let mut expected: Vec<_> = (test_era::BASE..=test_era::REBUILT_END)
+        .map(test_era::expected_feed_message)
+        .collect();
+    expected.push(test_era::append_live_user_op(&mut storage, 2));
+    expected.push(test_era::append_live_user_op(&mut storage, 3));
+    drop(storage);
+    let head = test_era::BASE + expected.len() as u64;
+    assert_eq!(head, 48);
+
+    // From the base, the middle of the rebuilt range, its last row, its end
+    // (the first live row) and past it, with page sizes that split the seam.
+    for from in [41, 43, 44, 45, 46] {
+        for page_size in [1, 2, 3, 64] {
+            let messages = read_feed(&db.path, from, head, page_size).await;
+            let skip = usize::try_from(from - test_era::BASE).unwrap();
+            assert_eq!(
+                messages,
+                expected[skip..],
+                "from {from}, page size {page_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_refuses_a_claim_below_the_rebuilt_eras_base() {
+    let db = temp_db("feed-rebuilt-era-below-base");
+    drop(test_era::seed_rebuilt_era(
+        &db.path,
+        Path::new("/unused/baseline"),
+    ));
+    let feed = test_feed(&db.path, RuntimeScope::default());
+    for next in [0, test_era::BASE - 1] {
+        assert!(matches!(
+            feed.subscribe_from(claim(&db.path, next)).await,
+            Err(SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
+                if available_from.get() == test_era::BASE
+        ));
+    }
 }
 
 #[test]

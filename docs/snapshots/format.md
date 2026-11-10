@@ -50,7 +50,7 @@ metadata come from the sequencer; see [application history](../protocol/applicat
 
 The wallet holds no clock. The safe-block clock belongs to the scheduler and
 travels in its export, not in the application's bytes
-([the scheduler clock](../plans/2026-11-sequencer-recovery/scheduler.md#the-scheduler-clock)).
+([the scheduler clock](../protocol/scheduler-semantics.md#the-scheduler-clock)).
 
 ### Determinism
 

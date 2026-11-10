@@ -11,8 +11,8 @@
 //! nonce is the executor's check ([`crate::application::execute`]);
 //! [`driver::CanonicalRunner`] joins the two for the guest and the tests.
 //!
-//! The rules are those of the recovery plan's scheduler page
-//! (docs/plans/2026-11-sequencer-recovery/scheduler.md), in its order.
+//! The rules are those of the scheduler contract
+//! (docs/protocol/scheduler-semantics.md), in its order.
 
 pub mod driver;
 

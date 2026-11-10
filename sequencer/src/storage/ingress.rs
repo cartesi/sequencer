@@ -23,7 +23,7 @@ use super::mutations::{
 };
 use super::queries::{
     DIRECT_EXECUTES_SQL, current_safe_block_required, load_current_write_head, query_batch_policy,
-    query_latest_safe_input_index_exclusive,
+    query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::safe_accepted_batches::canonical_divergence_in;
 use super::snapshot_dumps::insert_batch_snapshot_in;
@@ -40,8 +40,8 @@ const LAST_VALID_USER_NONCE_SQL: &str = "SELECT u.nonce FROM user_ops u
      LIMIT 1";
 
 impl Storage {
-    /// First L1 input beyond the latest surviving frame's accounted block,
-    /// bounded below by the immutable era prefix.
+    /// First L1 input beyond the latest surviving frame's accounted block, or
+    /// the era's first queued input while no frame of the era survives.
     pub fn next_undrained_safe_input_index(&mut self) -> Result<u64> {
         self.read(next_undrained_safe_input_index_in)
     }
@@ -65,7 +65,9 @@ impl Storage {
 
     /// The nonce `sender` must sign next: one past its latest user op in a
     /// valid batch, or 0 without one. Exact under the application contract's
-    /// nonce rule, except that a sender idle since a rebuilt baseline reads 0.
+    /// nonce rule, except for a sender whose last op predates the era's live
+    /// rows (in its rebuilt history or below its base): that sender reads a
+    /// stale value, and the 422's `expected` nonce corrects the client.
     ///
     /// Invalidated batches keep their rows, and resubmission after a cascade
     /// reuses their nonces, so the validity filter is load-bearing.
@@ -241,8 +243,8 @@ impl Storage {
 }
 
 /// Insert the Tip and its first frame. Callers separately attach the complete
-/// leading application range, except for a recovery baseline's empty root.
-/// Returns its local identity; callers load `WriteHead` through the shared reader.
+/// leading application range. Returns its local identity; callers load
+/// `WriteHead` through the shared reader.
 pub(super) fn insert_tip_rows(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
@@ -327,36 +329,12 @@ fn insert_draining_tip_with_executions(
     Ok(())
 }
 
-/// The rebuilt prefix is represented by the baseline, so the root contains no
-/// replay entries for it. Inputs beyond the stop block remain unaccounted.
-/// Reached only through a rebuild's baseline, which `setup --base` reuses.
-pub(super) fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
-    assert!(
-        load_current_write_head(tx)?.is_none(),
-        "recovery tip already exists"
-    );
-    insert_tip_rows(tx, Some(0), None, stop_block)?;
-    Ok(())
-}
-
-fn safe_input_index_exclusive_through_block_in(tx: &Transaction<'_>, block: u64) -> Result<u64> {
-    let last: Option<i64> = tx
-        .query_row(
-            "SELECT safe_input_index FROM safe_inputs WHERE block_number <= ?1
-         ORDER BY block_number DESC, safe_input_index DESC LIMIT 1",
-            [saturating_query_bound(block)],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(last.map_or(0, |index| {
-        i64_to_u64(index)
-            .checked_add(1)
-            .expect("safe input index overflow")
-    }))
-}
-
+/// The era's baseline accounts for the inputs through the stop block except
+/// the directs still queued there, which the era's first frame drains: from
+/// the first queued input, past submitter and over-cap inputs that never
+/// execute. A cascade that tears every batch of the era drains from there too.
 fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
-    let floor = query_history_state(tx)?.base_safe_block;
+    let era = query_history_state(tx)?;
     let latest_frame: Option<i64> = tx
         .query_row(
             "SELECT safe_block FROM frames
@@ -366,7 +344,12 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
             |row| row.get(0),
         )
         .optional()?;
-    safe_input_index_exclusive_through_block_in(tx, floor.max(latest_frame.map_or(0, i64_to_u64)))
+    match latest_frame {
+        Some(frame_block) => {
+            safe_input_count_through_block_in(tx, era.base_safe_block.max(i64_to_u64(frame_block)))
+        }
+        None => Ok(era.first_queued_input),
+    }
 }
 
 /// Seal the current Tip and open the successor batch's first frame, in `tx`.
@@ -429,7 +412,7 @@ fn close_frame_in(
         leading_direct_range,
         SafeInputRange::new(
             next_undrained_safe_input_index_in(tx)?,
-            safe_input_index_exclusive_through_block_in(tx, next_safe_block)?,
+            safe_input_count_through_block_in(tx, next_safe_block)?,
         ),
         "frame advancement must account for its complete L1 interval"
     );
@@ -929,7 +912,7 @@ mod tests {
             .expect("append safe input");
 
         let boundary = storage
-            .read(|tx| super::safe_input_index_exclusive_through_block_in(tx, u64::MAX))
+            .read(|tx| super::safe_input_count_through_block_in(tx, u64::MAX))
             .expect("query upper bound above SQLite range");
         assert_eq!(
             boundary, 1,
@@ -1079,6 +1062,85 @@ mod tests {
                 .expect("derived cursor"),
             2
         );
+    }
+
+    /// The era's root frame drains the directs still queued at the stop
+    /// block, from the first queued input, and a cascade that tears every
+    /// batch of the era drains from there again.
+    #[test]
+    fn the_era_root_drains_from_its_first_queued_input() {
+        use crate::storage::test_helpers::{RecoveryFixture, all_ordered_l2_txs, era};
+        let db = temp_db("era-root-drain");
+        let mut storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let input = |sender, payload: Vec<u8>, block_number| StoredSafeInput {
+            sender,
+            payload,
+            block_number,
+        };
+        let direct = Address::repeat_byte(0x22);
+        storage
+            .append_safe_inputs_with_timestamp(
+                12,
+                12,
+                &[
+                    // Executed before the base.
+                    input(direct, vec![0], 5),
+                    // Queued at the stop block 10, from input 1.
+                    input(direct, vec![1], 8),
+                    input(SENDER_A, vec![0xff], 8),
+                    input(
+                        direct,
+                        vec![2; TEST_MAX_DIRECT_PAYLOAD_BYTES as usize + 1],
+                        9,
+                    ),
+                    input(direct, vec![4], 10),
+                    // Past the stop block.
+                    input(direct, vec![5], 12),
+                ],
+                SENDER_A,
+                &default_protocol_timing(),
+                FrontierMode::DeferUntilAnchorSet,
+            )
+            .unwrap();
+        storage
+            .publish_era(
+                std::path::Path::new("/snapshot/era"),
+                &crate::storage::EraRecord {
+                    first_queued_input: 1,
+                    next_batch_nonce: 6,
+                    ..era(1, 1, 10)
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
+
+        let drained_directs = |storage: &mut Storage| -> Vec<u64> {
+            all_ordered_l2_txs(storage)
+                .into_iter()
+                .map(|tx| match tx {
+                    L2Tx::Direct(direct) => direct.input_index,
+                    other => panic!("expected a direct, got {other:?}"),
+                })
+                .collect()
+        };
+        storage.ensure_open_tip().unwrap();
+        let root = storage.open_state().unwrap().unwrap();
+        assert_eq!(root.safe_block, 12);
+        assert_eq!(drained_directs(&mut storage), vec![1, 4, 5]);
+        assert_eq!(storage.next_executed_input_count().unwrap().get(), 4);
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
+
+        storage.advance_safe_head(40);
+        assert_eq!(
+            storage.recover_aging_tip(10).unwrap(),
+            vec![root.batch_index]
+        );
+        let reopened = storage.open_state().unwrap().unwrap();
+        assert_ne!(reopened.batch_index, root.batch_index);
+        assert_eq!(drained_directs(&mut storage), vec![1, 4, 5]);
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
     }
 
     #[test]
@@ -1257,7 +1319,7 @@ mod tests {
     fn application_rows_require_initialized_baseline_and_a_live_tip() {
         let db = temp_db("application-history-baseline-required");
         let mut storage =
-            Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();
@@ -1268,7 +1330,10 @@ mod tests {
         );
         storage
             .write(|tx| {
-                super::super::history::initialize_history_in(tx, ExecutedInputCount::ZERO, 0)
+                super::super::history::initialize_history_in(
+                    tx,
+                    &crate::storage::EraRecord::EMPTY_GENESIS,
+                )
             })
             .unwrap();
         storage

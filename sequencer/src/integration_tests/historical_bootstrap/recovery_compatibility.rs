@@ -213,7 +213,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     pin_test_deployment_identity(&mut storage, SUBMITTER);
     storage
-        .complete_baseline_setup(&baseline, ExecutedInputCount::ZERO, 0, 0, false)
+        .publish_era(&baseline, &crate::storage::EraRecord::EMPTY_GENESIS)
         .unwrap();
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))

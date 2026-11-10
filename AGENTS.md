@@ -92,10 +92,11 @@ so invalidation cascades through the suffix, open batch included
   danger detector stops the process at a threshold before staleness, and startup
   settles outstanding submissions and replaces the invalid suffix
   ([automatic recovery](docs/recovery/README.md)).
-- **Cockroach recovery** rebuilds a fresh data directory from a trusted
-  canonical machine and L1 history, including after a sequencer bug. This
-  build has no manual rebuild: it arrives with `setup --base`, designed in
-  [sequencer recovery](docs/plans/2026-11-sequencer-recovery/operations.md).
+- **Cockroach recovery** rebuilds a new data directory from a trusted
+  canonical machine and L1 history, including after a sequencer bug:
+  `setup --base <machine>` rebuilds the history through a stop block with the
+  scheduler alone, executes it, and publishes a new era
+  ([cockroach recovery](docs/recovery/cockroach.md)).
 
 ## Threat Model (brief)
 
@@ -122,6 +123,7 @@ signing, and SSZ batch encoding.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
 - `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
 - `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
+- `bindings/c-scheduler/` — `scheduler.h`, the canonical scheduler's C API, and its reference export: sequencer-core's `Scheduler` behind the C functions, for C guests.
 - `examples/c-wallet-engine/` — reference wallet engine exporting the C ABI, plus its genesis tool and conformance tests.
 - `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.
@@ -136,7 +138,8 @@ signing, and SSZ batch encoding.
 Paths below are relative to `sequencer/src/`:
 
 - `lib.rs` and `harness.rs` — public API and shared CLI harness; app binaries supply their genesis-app constructor.
-- `commands/` — `setup`, `run` (including worker supervision), and `flush`, with command configuration and exit-code classification.
+- `commands/` — `setup` (its base, rebuild and publication under `commands/setup/`), `run` (including worker supervision), and `flush`, with command configuration and exit-code classification.
+- `machine.rs` — reads a stored canonical machine's export through the Cartesi Machine emulator, which the crate links statically; setup's base comes through it.
 - `runtime/` — exclusive process ownership and runtime scope/shutdown.
 - `ingress/` — public HTTP handlers and the single inclusion lane.
 - `egress/` — internal HTTP/WS API and DB-backed application-input feed.
@@ -154,6 +157,7 @@ Paths below are relative to `sequencer/src/`:
 - **Inclusion lane** — the single ordering lane ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
 - **Snapshot** — immutable artifact registered at every batch close; acceptance selects the comparison and recovery checkpoint ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
+- **Era** — the history one setup publishes: it starts at its base's L2 tx count, holds the history setup rebuilt from L1 through the stop block (`rebuilt_history`), then the live rows; the baseline at the stop block is its first comparison checkpoint ([cockroach recovery](docs/recovery/cockroach.md)).
 
 ## Domain Truths
 
@@ -190,10 +194,13 @@ same patch. CI lints it; run `direnv exec . redocly lint openapi.yaml` locally.
 
 ## Command Configuration
 
-Plain `setup` is L1-read-only and never signs; `run` and `flush-mempool` take the
-signing key and read the pinned identity from the database. [Running](README.md#running)
-owns invocation and why the submitter address must be dedicated (the devnet uses
-Anvil account 9). [`commands/config.rs`](sequencer/src/commands/config.rs) owns
+Every command takes the signing key: `setup` flushes the submitter's wallet
+(its `--dry-run` takes none), and `run` and `flush-mempool` submit. `setup`
+runs once, in an empty data directory, from genesis or a stored machine
+(`--base`); it is not idempotent and refuses a directory that holds anything.
+`run` and `flush-mempool` read the pinned identity from the database.
+[Running](README.md#running) owns invocation and why the submitter address must
+be dedicated (the devnet uses Anvil account 9). [`commands/config.rs`](sequencer/src/commands/config.rs) owns
 every variable name, default, and validation; check it before documenting or
 changing configuration.
 
@@ -253,9 +260,11 @@ fixture trait, divergence markers); cross-crate signing helpers live in
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a
 clear message if `anvil` is not on PATH. Use the configured Nix/direnv environment
-or install Foundry. `canonical-test` additionally needs the Cartesi Machine
-library named by `LIBCARTESI_PATH`/`INCLUDECARTESI_PATH` (the devshell exports
-both) and libslirp.
+or install Foundry. The `sequencer` crate links the Cartesi Machine emulator's
+static library, so building it, and every crate built on it, needs
+`LIBCARTESI_PATH`/`INCLUDECARTESI_PATH` (the devshell exports both) and
+libslirp; so does `canonical-test`. Setup's tests supply a base's export
+through a seam (`ReadMachineExport`) and never run the emulator.
 
 ## Shell and Commands
 
@@ -336,7 +345,7 @@ work reaches another boundary.
 | Inclusion lane, storage writes, or runtime concurrency | [Invariant register](docs/invariants.md) — enforcement and consumers; [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md) — ownership, acknowledgement, admission, and terminal stop. |
 | Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
 | Automatic recovery or danger detection | [Automatic recovery](docs/recovery/README.md), then [preemptive.tla](docs/recovery/preemptive.tla) and [admission.tla](docs/recovery/admission.tla) — repair ordering and the models' bounded guarantees. |
-| Manual rebuild after lost state or a sequencer bug | [Sequencer recovery operations](docs/plans/2026-11-sequencer-recovery/operations.md) — the planned `setup --base`; this build has none. |
+| Setup, or a manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — one setup from any base, the rebuild, the era it publishes, the playbooks, and a code map; [sequencer recovery plan](docs/plans/2026-11-sequencer-recovery/README.md) for what remains. |
 | API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |

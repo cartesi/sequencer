@@ -1,10 +1,10 @@
 # Sequencer recovery
 
-**Status:** proposed; nothing here is implemented. It supersedes two
-[archived plans](../../recovery/history/README.md#superseded-cockroach-recovery-plans).
-It needs the next template, so today's deployments keep
-[cockroach recovery](../../recovery/cockroach.md) and today's
-`setup --recovery`.
+**Status:** implemented in this tree: the free-standing scheduler and its C
+export, the `Application` trait, the state export,
+`sequencer setup [--base <machine>] [--dry-run]`, the rebuilt history and
+the feed's realignment. [todo.md](todo.md) holds what remains. It supersedes
+two [archived plans](../../recovery/history/README.md#superseded-cockroach-recovery-plans).
 
 ## The scenario
 
@@ -40,20 +40,20 @@ instance kept down.
 
 ## What to read
 
-Three layers, each readable on its own:
+The real docs hold what the code does:
 
-| Layer | For | Files |
-|---|---|---|
-| 1. The shared software | Whoever writes the guest or ports the scheduler | [scheduler.md](scheduler.md), every check and gate; [application.md](application.md), the state export and the `Application` trait; [interfaces.md](interfaces.md), both components' signatures in Rust and C |
-| 2. Operations | Whoever runs the sequencer or a client | [operations.md](operations.md), the interface and the playbooks; [client-backups.md](client-backups.md) |
-| 3. The design | Whoever builds or reviews the sequencer's side | [sequencer.md](sequencer.md), the rebuild, the history table and the feed; [todo.md](todo.md) |
+| For | Read |
+|---|---|
+| Whoever writes the guest or ports the scheduler | [Scheduler semantics](../../protocol/scheduler-semantics.md), every check and gate and the state export; the [application contract](../../protocol/application-contract.md) and its [C binding](../../protocol/c-application-binding.md); [`scheduler.h`](../../../bindings/c-scheduler/include/scheduler.h) |
+| Whoever runs the sequencer or a client | [Cockroach recovery](../../recovery/cockroach.md), the procedure and the playbooks; the [incident runbook](../../watchdog/incident-runbook.md) |
+| Whoever builds or reviews the sequencer's side | The [history contract](../../protocol/application-history.md#era-baseline), the era, the rebuilt history and the adopt rule; the [invariants](../../invariants.md) |
 
-Each file becomes a real doc when the plan lands:
-[scheduler semantics](../../protocol/scheduler-semantics.md), the
-[application contract](../../protocol/application-contract.md) and its
-[C binding](../../protocol/c-application-binding.md), and
-[cockroach recovery](../../recovery/cockroach.md) with the
-[incident runbook](../../watchdog/incident-runbook.md).
+This directory keeps the design's reasons and what remains:
+[scheduler.md](scheduler.md), [application.md](application.md) and
+[interfaces.md](interfaces.md) for the shared software;
+[operations.md](operations.md), [sequencer.md](sequencer.md) and
+[client-backups.md](client-backups.md) for the rest; [todo.md](todo.md) for
+the work left.
 
 ## Names
 

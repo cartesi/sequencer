@@ -7,7 +7,6 @@
 //! cannot drift. The setup/run phase split is in README "Running".
 
 use alloy_primitives::Address;
-use clap::builder::{FalseyValueParser, TypedValueParser};
 use clap::{ArgGroup, Args};
 
 use crate::commands::error::BootstrapError;
@@ -219,8 +218,8 @@ impl FeeOracleArgs {
 }
 
 /// Batch-submitter signing-key source, shared by `run` and `flush-mempool`
-/// (both sign L1 transactions). `setup` does NOT use this — it takes the
-/// submitter address directly and never signs.
+/// (both sign L1 transactions). `setup` takes the same two sources through
+/// [`SetupKeyArgs`], where `--dry-run` may leave both out.
 #[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("batch_submitter_key_source")
@@ -251,22 +250,55 @@ pub struct KeyArgs {
 impl KeyArgs {
     /// Resolve the batch submitter private key from either the inline value or a key file.
     pub fn resolve(&self) -> Result<SubmitterKey, BootstrapError> {
-        let Some(file) = &self.batch_submitter_private_key_file else {
-            return Ok(self
-                .batch_submitter_private_key
-                .clone()
-                .expect("batch submitter private key is required by CLI arg group"));
-        };
-        // The error carries the path, never the contents: a key file's
-        // bytes must not reach a log line even when the read fails.
-        let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
-            path: std::path::PathBuf::from(file),
-            source,
-        })?;
-        Ok(SubmitterKey::new(
-            contents.lines().next().unwrap_or("").trim().to_string(),
-        ))
+        resolve_key_source(
+            &self.batch_submitter_private_key,
+            &self.batch_submitter_private_key_file,
+        )
+        .map(|key| key.expect("batch submitter private key is required by CLI arg group"))
     }
+}
+
+/// `setup`'s signing-key source: the same arguments as [`KeyArgs`], required
+/// unless `--dry-run`, which flushes nothing.
+#[derive(Debug, Clone, Args)]
+pub struct SetupKeyArgs {
+    /// Hex-encoded private key for the batch submitter.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
+        hide_env_values = true,
+        conflicts_with = "batch_submitter_private_key_file",
+        required_unless_present_any = ["batch_submitter_private_key_file", "dry_run"],
+        value_parser = parse_submitter_key
+    )]
+    batch_submitter_private_key: Option<SubmitterKey>,
+    /// Path to a file whose first line contains the batch submitter private key.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
+        hide_env_values = true,
+        required_unless_present_any = ["batch_submitter_private_key", "dry_run"]
+    )]
+    batch_submitter_private_key_file: Option<String>,
+}
+
+/// The key from the file when one is named, otherwise the inline value. The
+/// error carries the path, never the contents: a key file's bytes must not
+/// reach a log line even when the read fails.
+fn resolve_key_source(
+    inline: &Option<SubmitterKey>,
+    file: &Option<String>,
+) -> Result<Option<SubmitterKey>, BootstrapError> {
+    let Some(file) = file else {
+        return Ok(inline.clone());
+    };
+    let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
+        path: std::path::PathBuf::from(file),
+        source,
+    })?;
+    Ok(Some(SubmitterKey::new(
+        contents.lines().next().unwrap_or("").trim().to_string(),
+    )))
 }
 
 /// Whether a key-file read failure is deterministic operator
@@ -295,10 +327,11 @@ pub(crate) fn key_file_io_is_terminal(source: &std::io::Error) -> bool {
     )
 }
 
-/// `setup` — establish the deployment's timeless state: pin identity, do the
-/// initial L1 sync, register the genesis finalized snapshot, and atomically
-/// complete setup. L1-read-only: takes the batch-submitter address, not the
-/// signing key.
+/// `setup` — start a new era in an empty data directory: pin identity, flush
+/// the submitter's wallet to pin the stop block, sync L1, rebuild the history
+/// from the base (genesis, or a stored canonical machine) through the stop
+/// block, and publish the era. `docs/recovery/cockroach.md` ("What setup does")
+/// has the procedure.
 #[derive(Debug, Clone, Args)]
 pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
@@ -311,59 +344,40 @@ pub struct SetupConfig {
     /// Application (EIP-712 verifying contract) address.
     #[arg(long, env = "CARTESI_SEQUENCER_APP_ADDRESS", value_parser = parse_address)]
     pub app_address: Address,
-    /// Address that submits batches. Pinned into the deployment identity.
-    /// `setup` never signs, so it takes the address (derivable from the key
-    /// without the secret) rather than the key itself.
+    /// Address that submits batches, pinned into the deployment identity.
+    /// The key must sign for it: setup's flush settles this account.
     #[arg(long, env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS", value_parser = parse_address)]
     pub batch_submitter_address: Address,
-    /// L1 inclusion block `B` of the trusted checkpoint this setup boots from;
-    /// `0` is genesis. Plain `setup` uses `B` only as the lower bound of its
-    /// read-only detection scan: work a previous instance left past `B`, or an
-    /// unsettled wallet nonce, refuses with exit 40.
-    #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_BLOCK", default_value_t = 0)]
-    pub checkpoint_block: u64,
-    /// The removed recovery mode, kept hidden so that its flag or environment
-    /// variable refuses setup instead of letting a deployment that still sets
-    /// it run a genesis setup. A false value is what plain setup always meant.
-    #[arg(
-        long = "recovery",
-        env = "CARTESI_SEQUENCER_RECOVERY",
-        hide = true,
-        value_parser = FalseyValueParser::new().try_map(refuse_removed_recovery_mode)
-    )]
-    _removed_recovery: bool,
-    /// The removed recovery mode's checkpoint dump, refused like the mode.
-    #[arg(
-        long = "checkpoint-dump-dir",
-        env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR",
-        hide = true,
-        value_parser = refuse_removed_checkpoint_dump_dir
-    )]
-    _removed_checkpoint_dump_dir: Option<String>,
+    /// A stored canonical machine of the deployment's template, stopped
+    /// between inputs, to rebuild from. Without it the base is genesis.
+    #[arg(long, value_name = "MACHINE_DIR")]
+    pub base: Option<std::path::PathBuf>,
+    /// Report the base's counts, the submitter's activity past it and the
+    /// rebuild's size, then exit. Needs no key and never touches the data
+    /// directory.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+    #[command(flatten)]
+    key: SetupKeyArgs,
     #[command(flatten)]
     pub timing: TimingArgs,
     #[command(flatten)]
     pub fee_oracle: FeeOracleArgs,
 }
 
-const REMOVED_RECOVERY_MODE: &str = "setup --recovery was removed; recovery from a canonical \
-                                     machine arrives with `setup --base`";
-
-fn refuse_removed_recovery_mode(recovery: bool) -> Result<bool, &'static str> {
-    if recovery {
-        Err(REMOVED_RECOVERY_MODE)
-    } else {
-        Ok(false)
-    }
-}
-
-fn refuse_removed_checkpoint_dump_dir(_: &str) -> Result<String, &'static str> {
-    Err(REMOVED_RECOVERY_MODE)
-}
-
 impl SetupConfig {
     pub fn db_path(&self) -> String {
         db_path_in(&self.data_dir)
+    }
+
+    /// The submitter key. Clap requires one unless `--dry-run`, which never
+    /// asks for it.
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, BootstrapError> {
+        resolve_key_source(
+            &self.key.batch_submitter_private_key,
+            &self.key.batch_submitter_private_key_file,
+        )
+        .map(|key| key.expect("setup requires a batch submitter key unless --dry-run"))
     }
 }
 
@@ -526,7 +540,7 @@ mod tests {
 
     // Parse a full subcommand line through the top-level `Cli`, since the
     // per-subcommand configs derive `Args` (embeddable) not `Parser`.
-    const SETUP_ARGS: [&str; 10] = [
+    const SETUP_ARGS_WITHOUT_KEY: [&str; 10] = [
         "sequencer",
         "setup",
         "--eth-rpc-url",
@@ -538,6 +552,12 @@ mod tests {
         "--batch-submitter-address",
         "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
     ];
+
+    fn setup_args() -> Vec<&'static str> {
+        let mut args = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        args.extend(["--batch-submitter-private-key", TEST_KEY]);
+        args
+    }
 
     const RUN_ARGS: [&str; 5] = [
         "sequencer",
@@ -564,7 +584,7 @@ mod tests {
     }
 
     fn setup_config_from(extra: &[&str]) -> SetupConfig {
-        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
+        let mut args = setup_args();
         args.extend_from_slice(extra);
         match Cli::try_parse_from(args).expect("parse setup").command {
             crate::harness::Command::Setup(c) => *c,
@@ -573,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_requires_address_not_key() {
+    fn setup_takes_the_address_and_the_key() {
         let cfg = setup_config();
         assert_eq!(cfg.chain_id, 31337);
         assert_eq!(
@@ -582,93 +602,75 @@ mod tests {
                 .parse::<Address>()
                 .unwrap()
         );
+        assert_eq!(cfg.resolve_private_key().unwrap().expose_secret(), TEST_KEY);
+        assert_eq!(cfg.base, None);
+        assert!(!cfg.dry_run);
         // The default db path lives under the default data dir.
         assert!(cfg.db_path().ends_with("sequencer.db"));
     }
 
+    /// Setup flushes with the key, so it needs one; the dry run flushes
+    /// nothing and needs none. Both sources together are refused.
     #[test]
-    fn setup_checkpoint_block_defaults_to_genesis_and_parses() {
-        // Default = 0 (genesis bootstrap) when the flag is absent.
-        assert_eq!(setup_config().checkpoint_block, 0);
-        // Explicit value parses.
-        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
-        args.push("--checkpoint-block");
-        args.push("4200");
-        let cfg = match Cli::try_parse_from(args).expect("parse setup").command {
-            crate::harness::Command::Setup(c) => *c,
-            other => panic!("expected setup subcommand, got {other:?}"),
-        };
-        assert_eq!(cfg.checkpoint_block, 4200);
-    }
-
-    #[test]
-    fn setup_rejects_a_signing_key() {
-        // `setup` never signs, so it has no key argument at all.
-        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
-        args.extend_from_slice(&["--batch-submitter-private-key", TEST_KEY]);
+    fn setup_requires_the_key_unless_dry_run() {
         assert!(
-            Cli::try_parse_from(args).is_err(),
-            "setup must reject a signing key"
+            Cli::try_parse_from(SETUP_ARGS_WITHOUT_KEY).is_err(),
+            "setup without a key must not parse"
         );
+        let mut dry_run = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        dry_run.push("--dry-run");
+        let crate::harness::Command::Setup(cfg) = Cli::try_parse_from(dry_run)
+            .expect("a dry run needs no key")
+            .command
+        else {
+            panic!("expected setup subcommand");
+        };
+        assert!(cfg.dry_run);
+
+        let mut both = setup_args();
+        both.extend(["--batch-submitter-private-key-file", "/run/secrets/key"]);
+        assert!(
+            Cli::try_parse_from(both).is_err(),
+            "two key sources must not parse"
+        );
+
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), format!("{TEST_KEY}\n")).expect("write key");
+        let mut from_file = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        let path = key_file.path().to_str().expect("utf8 path");
+        from_file.extend(["--batch-submitter-private-key-file", path]);
+        let crate::harness::Command::Setup(cfg) = Cli::try_parse_from(from_file)
+            .expect("a key file parses")
+            .command
+        else {
+            panic!("expected setup subcommand");
+        };
+        assert_eq!(cfg.resolve_private_key().unwrap().expose_secret(), TEST_KEY);
     }
 
     #[test]
-    fn setup_has_no_recovery_mode() {
-        // Recovery from a canonical machine arrives with `setup --base`; the
-        // old checkpoint flags must not parse into a plain setup.
+    fn setup_parses_a_base_machine() {
+        let cfg = setup_config_from(&["--base", "/machines/epoch-41", "--dry-run"]);
+        assert_eq!(
+            cfg.base.as_deref(),
+            Some(std::path::Path::new("/machines/epoch-41"))
+        );
+        assert!(cfg.dry_run);
+    }
+
+    /// The checkpoint options of the removed recovery mode are gone: the base
+    /// machine names the position.
+    #[test]
+    fn setup_has_no_checkpoint_options() {
         for extra in [
             &["--recovery"][..],
             &["--checkpoint-dump-dir", "/tmp/dump"][..],
+            &["--checkpoint-block", "4200"][..],
         ] {
-            let mut args: Vec<&str> = SETUP_ARGS.to_vec();
+            let mut args = setup_args();
             args.extend_from_slice(extra);
-            let err = Cli::try_parse_from(args).expect_err("a removed option must not parse");
-            assert!(err.to_string().contains("setup --base"), "{err}");
+            Cli::try_parse_from(args).expect_err("a removed option must not parse");
         }
-    }
-
-    /// The environment spellings go through the same parsers as the flags,
-    /// so a deployment that still sets them is refused, not run as genesis.
-    #[test]
-    fn setup_refuses_the_removed_recovery_environment() {
-        use clap::CommandFactory;
-        let cli = Cli::command();
-        let setup = cli.find_subcommand("setup").expect("setup subcommand");
-        // Clap hands an environment value to the argument's own parser; a
-        // probe command feeds it the same value through a plain option.
-        let parse = |id: &str, env: &str, value: &str| {
-            let arg = setup
-                .get_arguments()
-                .find(|arg| arg.get_id() == id)
-                .unwrap_or_else(|| panic!("{id} is still declared"));
-            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
-            assert!(arg.is_hide_set());
-            let probe = arg
-                .clone()
-                .long("probe")
-                .action(clap::ArgAction::Set)
-                .num_args(1);
-            clap::Command::new("probe")
-                .arg(probe)
-                .try_get_matches_from(["probe", "--probe", value])
-                .map(|_| ())
-        };
-        for truthy in ["true", "1", "yes"] {
-            let err = parse("_removed_recovery", "CARTESI_SEQUENCER_RECOVERY", truthy)
-                .expect_err("a set recovery mode refuses");
-            assert!(err.to_string().contains("setup --base"), "{err}");
-        }
-        for falsy in ["false", "0", ""] {
-            parse("_removed_recovery", "CARTESI_SEQUENCER_RECOVERY", falsy)
-                .expect("an unset recovery mode is plain setup");
-        }
-        let err = parse(
-            "_removed_checkpoint_dump_dir",
-            "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR",
-            "/ckpt",
-        )
-        .expect_err("a checkpoint dump refuses");
-        assert!(err.to_string().contains("setup --base"), "{err}");
     }
 
     #[test]
@@ -1087,11 +1089,10 @@ mod tests {
                 !help.contains("SECRET_TOKEN_XYZ"),
                 "{subcmd} --help must not print the RPC URL (may contain API tokens)"
             );
-            // `setup` never signs, so only the signing commands name the key.
-            assert_eq!(
+            // Every command signs, setup's flush included, so each names the key.
+            assert!(
                 help.contains("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY"),
-                subcmd != "setup",
-                "{subcmd} --help names the key env var exactly when it takes a key"
+                "{subcmd} --help names the key env var"
             );
         }
     }

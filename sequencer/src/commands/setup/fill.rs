@@ -1,41 +1,50 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! File-first baseline creation for setup. The complete baseline and the
-//! setup-complete fact become visible in one transaction.
+//! Step 7 of setup: write the baseline dump of the application at the end of
+//! the stop block, then publish the era with it in one transaction. Setup
+//! opens no root frame; `run`'s startup does.
+
+use std::path::{Path, PathBuf};
+
+use sequencer_core::application::Application;
+use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::scheduler::SchedulerState;
 
 use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{
     self, CreateDumpDirError, create_dump_dir_with_info,
 };
-use sequencer_core::application::Application;
+use crate::storage::{EraRecord, Storage};
 
-pub(crate) fn register_genesis_baseline<A: Application + 'static>(
-    mut initial_app: A,
-    storage: &mut crate::storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<(), CommandError> {
-    let count = initial_app.executed_input_count();
-    if count.get() != 0 {
-        return Err(CommandError::AppBootstrap(
-            sequencer_core::application::AppError::Internal {
-                reason: format!(
-                    "a genesis application must start at executed_input_count = 0, got {}",
-                    count.get()
-                ),
-            },
-        ));
-    }
-    let prefix = write_baseline_dump(&mut initial_app, 0, dumps_dir)?;
-    storage.complete_baseline_setup(&prefix, count, 0, 0, false)?;
-    Ok(())
+/// Publish the era: `app` has executed the whole rebuilt history, and
+/// `scheduler` is the scheduler at the end of the stop block. Every rebuilt
+/// row must already carry its count: publishing seals the table.
+pub(crate) fn publish<A: Application>(
+    app: &mut A,
+    storage: &mut Storage,
+    dumps_dir: &Path,
+    base_count: ExecutedInputCount,
+    stop_block: u64,
+    scheduler: SchedulerState,
+) -> Result<EraRecord, CommandError> {
+    let era = EraRecord {
+        base_count,
+        rebuilt_history_end: app.executed_input_count(),
+        stop_block,
+        first_queued_input: scheduler.first_queued_input,
+        next_batch_nonce: scheduler.next_batch_nonce,
+    };
+    let prefix = write_baseline_dump(app, era.next_batch_nonce, dumps_dir)?;
+    storage.publish_era(&prefix, &era)?;
+    Ok(era)
 }
 
 fn write_baseline_dump<A: Application>(
     app: &mut A,
     next_batch_nonce: u64,
-    dumps_dir: &std::path::Path,
-) -> Result<std::path::PathBuf, CommandError> {
+    dumps_dir: &Path,
+) -> Result<PathBuf, CommandError> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?
@@ -61,16 +70,16 @@ mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
-    use crate::storage::{LifecycleCommand, Storage};
+    use crate::storage::test_helpers::{TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing};
+    use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use crate::test_support::{shutdown_lane, wait_until};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
     use sequencer_core::application::{Admission, AppError, AppOutputs, SchedulerLimits};
-    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::history::HistoryClaim;
     use sequencer_core::l2_tx::{Direct, UserOpTx};
     use sequencer_core::user_op::UserOp;
-    use std::path::Path;
     use std::time::Duration;
 
     /// Counts the directs it executes and persists only that count.
@@ -132,7 +141,7 @@ mod tests {
             Ok(())
         }
 
-        fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
+        fn state_file_in_dump(prefix: &Path) -> PathBuf {
             prefix.join("state")
         }
 
@@ -144,37 +153,23 @@ mod tests {
         }
     }
 
-    /// Publishes a rebuilt baseline through the storage half `setup --base`
-    /// will reuse: the dump first, then the baseline, the root tip at the
-    /// stop block and setup completion in one transaction. Storage's lifecycle
-    /// check, not this helper, makes a second publish refuse.
-    fn fill_recovery_root<A: Application>(
-        mut recovered_app: A,
-        resume_nonce: u64,
-        stop_block: u64,
-        storage: &mut Storage,
-        dumps_dir: &Path,
-    ) -> Result<(), CommandError> {
-        let count = recovered_app.executed_input_count();
-        let prefix = write_baseline_dump(&mut recovered_app, resume_nonce, dumps_dir)?;
-        storage.complete_baseline_setup(&prefix, count, stop_block, resume_nonce, true)?;
-        Ok(())
-    }
+    const SUBMITTER: Address = Address::repeat_byte(0x99);
 
-    #[test]
-    fn recovery_publishes_complete_baseline_without_application_padding() {
-        use crate::storage::test_helpers::default_protocol_timing;
-        use crate::storage::{FrontierMode, StoredSafeInput};
-        let db = temp_db("complete-recovery-baseline");
-        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
-            .expect("initialize rebuild");
-        let dumps = tempfile::tempdir().expect("dumps");
-        let submitter = Address::repeat_byte(0x99);
-        pin_test_deployment_identity(&mut storage, submitter);
+    /// A setup database holding a direct at block 100 and one at `later`,
+    /// synced through `safe_block`.
+    fn synced_setup(
+        name: &str,
+        later: u64,
+        safe_block: u64,
+    ) -> (crate::test_support::TestDb, Storage) {
+        let db = temp_db(name);
+        let mut storage =
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+        pin_test_deployment_identity(&mut storage, SUBMITTER);
         storage
             .append_safe_inputs_with_timestamp(
-                150,
-                150,
+                safe_block,
+                crate::clock::unix_now_ms() / 1000,
                 &[
                     StoredSafeInput {
                         sender: Address::repeat_byte(0x22),
@@ -184,355 +179,241 @@ mod tests {
                     StoredSafeInput {
                         sender: Address::repeat_byte(0x22),
                         payload: vec![2],
-                        block_number: 120,
+                        block_number: later,
                     },
                 ],
-                submitter,
+                SUBMITTER,
                 &default_protocol_timing(),
                 FrontierMode::DeferUntilAnchorSet,
             )
-            .expect("ingest prefix and later direct");
-        fill_recovery_root(
-            CountedSweepTestApp::new(41),
-            3,
+            .unwrap();
+        (db, storage)
+    }
+
+    /// The scheduler at stop block 100: it has consumed only input 0, and
+    /// the later direct (input 1) lies past the stop block, so the lane drains
+    /// from input 1.
+    fn queued_at_stop(next_batch_nonce: u64) -> SchedulerState {
+        SchedulerState {
+            l1_input_count: 1,
+            next_batch_nonce,
+            clock: 100,
+            first_queued_input: 1,
+            fridge_len: 0,
+        }
+    }
+
+    #[test]
+    fn publish_records_the_era_and_its_baseline_and_opens_no_tip() {
+        let (_db, mut storage) = synced_setup("publish-era", 120, 150);
+        let dumps = tempfile::tempdir().unwrap();
+        let mut app = CountedSweepTestApp::new(41);
+
+        let era = publish(
+            &mut app,
+            &mut storage,
+            dumps.path(),
+            ExecutedInputCount::new(41),
             100,
-            &mut storage,
-            dumps.path(),
+            queued_at_stop(3),
         )
-        .expect("complete baseline");
-        assert!(storage.is_setup_complete().expect("completion"));
-        assert_eq!(storage.batch_tree_anchor().expect("anchor"), 3);
-        let history = storage.history_state().expect("history");
+        .unwrap();
+
+        assert_eq!(
+            era,
+            EraRecord {
+                base_count: ExecutedInputCount::new(41),
+                rebuilt_history_end: ExecutedInputCount::new(41),
+                stop_block: 100,
+                first_queued_input: 1,
+                next_batch_nonce: 3,
+            }
+        );
+        assert!(storage.is_setup_complete().unwrap());
+        assert_eq!(storage.batch_tree_anchor().unwrap(), 3);
+        let history = storage.history_state().unwrap();
         assert_eq!(history.base_executed_input_count, 41);
+        assert_eq!(history.rebuilt_history_end, 41);
         assert_eq!(history.base_safe_block, 100);
-        let root = storage.open_state().expect("root").expect("open root");
-        assert_eq!(root.safe_block, 100);
-        assert_eq!(
-            storage.next_executed_input_count().expect("head"),
-            ExecutedInputCount::new(41)
-        );
+        assert_eq!(history.first_queued_input, 1);
         assert!(
-            storage
-                .finalized_dump()
-                .expect("accepted checkpoint")
-                .is_none()
+            storage.open_state().unwrap().is_none(),
+            "run opens the root"
         );
-        let snapshot = storage
-            .latest_snapshot()
-            .expect("baseline")
-            .expect("baseline");
-        assert_eq!(snapshot.executed_input_count, ExecutedInputCount::new(41));
+        // The baseline is canonical at the stop block: the first checkpoint.
+        let checkpoint = storage.finalized_dump().unwrap().expect("era baseline");
+        assert_eq!(checkpoint.inclusion_block, 100);
+        assert_eq!(checkpoint.executed_input_count, ExecutedInputCount::new(41));
+        assert_eq!(checkpoint.next_batch_nonce, 3);
+        let snapshot = storage.latest_snapshot().unwrap().expect("baseline");
         let restored =
-            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.dump.prefix))
-                .expect("restore baseline");
-        assert_eq!(
-            restored.executed_input_count(),
-            snapshot.executed_input_count
-        );
-        assert_eq!(
-            storage
-                .read(|tx| tx
-                    .query_row("SELECT COUNT(*) FROM application_inputs", [], |row| row
-                        .get::<_, i64>(0)))
-                .expect("application rows"),
-            0
-        );
-        let err = fill_recovery_root(
-            CountedSweepTestApp::new(42),
-            4,
-            150,
+            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
+        assert_eq!(restored.executed_input_count(), ExecutedInputCount::new(41));
+
+        let err = publish(
+            &mut CountedSweepTestApp::new(41),
             &mut storage,
             dumps.path(),
+            ExecutedInputCount::new(41),
+            150,
+            queued_at_stop(4),
         )
-        .expect_err("completed rebuild is one-shot");
+        .expect_err("an era is published once");
         assert!(matches!(
             err,
             CommandError::Lifecycle(crate::storage::LifecycleError::NotAdmissible { .. })
         ));
-        assert_eq!(
-            storage.history_state().expect("unchanged baseline"),
-            history
-        );
+        assert_eq!(storage.history_state().unwrap(), history);
     }
 
+    /// Run's root frame drains from the era's first queued input, and so does
+    /// a replacement after a cascade tears the root; the baseline survives.
     #[test]
-    fn failed_baseline_registration_rolls_back_root_history_and_completion() {
-        let db = temp_db("baseline-registration-rollback");
-        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
-            .expect("initialize rebuild");
-        let dumps = tempfile::tempdir().expect("dumps");
-        storage
-            .write(|tx| {
-                tx.execute_batch(
-                    "CREATE TRIGGER fail_baseline BEFORE INSERT ON snapshots
-            BEGIN SELECT RAISE(ABORT, 'injected baseline failure'); END;",
-                )
-            })
-            .expect("inject failure");
-        let err = fill_recovery_root(
-            CountedSweepTestApp::new(41),
-            3,
+    fn the_root_and_its_replacement_drain_from_the_first_queued_input() {
+        let (_db, mut storage) = synced_setup("root-drains-queued", 1400, 1500);
+        let dumps = tempfile::tempdir().unwrap();
+        publish(
+            &mut CountedSweepTestApp::new(41),
+            &mut storage,
+            dumps.path(),
+            ExecutedInputCount::new(41),
             100,
-            &mut storage,
-            dumps.path(),
+            queued_at_stop(3),
         )
-        .expect_err("registration must fail");
-        assert!(err.to_string().contains("injected baseline failure"));
-        assert!(!storage.is_setup_complete().expect("completion absent"));
-        assert!(storage.open_state().expect("root absent").is_none());
-        assert_eq!(storage.batch_tree_anchor().expect("unchanged anchor"), 0);
-        assert_eq!(
-            storage
-                .read(
-                    |tx| tx.query_row("SELECT COUNT(*) FROM history_state", [], |row| row
-                        .get::<_, i64>(0))
-                )
-                .expect("no history"),
-            0
-        );
-        assert_eq!(
-            std::fs::read_dir(dumps.path())
-                .expect("orphan dump")
-                .count(),
-            1
-        );
+        .unwrap();
+        let generation = storage.history_state().unwrap().version.recovery_generation;
         storage
-            .write(|tx| tx.execute_batch("DROP TRIGGER fail_baseline"))
-            .expect("remove failure");
-        fill_recovery_root(
-            CountedSweepTestApp::new(42),
-            4,
-            150,
-            &mut storage,
-            dumps.path(),
-        )
-        .expect("fresh retry after atomic rollback");
-        assert_eq!(
-            storage
-                .history_state()
-                .expect("history")
-                .base_executed_input_count,
-            42
-        );
-        let root = storage.open_state().expect("open state").expect("root tip");
-        assert_eq!(
-            storage.batch_nonce(root.batch_index).expect("root nonce"),
-            4
-        );
-    }
-
-    #[test]
-    fn plain_setup_refuses_a_nonzero_genesis_application_boundary() {
-        let db = temp_db("nonzero-genesis");
-        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
-            .expect("initialize setup");
-        let dumps = tempfile::tempdir().expect("dumps");
-        assert!(
-            register_genesis_baseline(CountedSweepTestApp::new(1), &mut storage, dumps.path())
-                .is_err()
-        );
-        assert!(!storage.is_setup_complete().expect("completion absent"));
-        assert!(
-            storage
-                .latest_snapshot()
-                .expect("snapshot absent")
-                .is_none()
-        );
-        assert_eq!(
-            std::fs::read_dir(dumps.path())
-                .expect("no artifacts")
-                .count(),
-            0
-        );
-    }
-
-    #[test]
-    fn root_invalidation_keeps_baseline_floor_and_replays_only_post_baseline_directs() {
-        use crate::storage::test_helpers::default_protocol_timing;
-        use crate::storage::{FrontierMode, StoredSafeInput};
-        use sequencer_core::history::HistoryClaim;
-        let db = temp_db("baseline-survives-root-invalidation");
-        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild)
-            .expect("initialize rebuild");
-        let dumps = tempfile::tempdir().expect("dumps");
-        let submitter = Address::repeat_byte(0x99);
-        pin_test_deployment_identity(&mut storage, submitter);
-        storage
-            .append_safe_inputs_with_timestamp(
-                1500,
-                1500,
-                &[
-                    StoredSafeInput {
-                        sender: Address::repeat_byte(0x22),
-                        payload: vec![1],
-                        block_number: 100,
-                    },
-                    StoredSafeInput {
-                        sender: Address::repeat_byte(0x22),
-                        payload: vec![2],
-                        block_number: 1400,
-                    },
-                ],
-                submitter,
+            .ensure_open_tip_for_recovery(
                 &default_protocol_timing(),
-                FrontierMode::DeferUntilAnchorSet,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
             )
-            .expect("ingest inputs");
-        fill_recovery_root(
-            CountedSweepTestApp::new(41),
-            3,
-            100,
-            &mut storage,
-            dumps.path(),
-        )
-        .expect("complete baseline");
-        let history = storage.history_state().expect("history");
-        assert_eq!(
-            storage.recover_aging_tip(1200).expect("recover root"),
-            vec![0]
-        );
-        let current = storage.history_state().expect("current history");
-        assert_eq!(current.base_safe_block, 100);
-        assert_eq!(current.base_executed_input_count, 41);
+            .unwrap();
+        assert_eq!(storage.open_state().unwrap().unwrap().safe_block, 1500);
+
+        let drained = |storage: &mut Storage| {
+            let current = storage.history_state().unwrap();
+            let page = storage
+                .canonical_history_page(
+                    HistoryClaim {
+                        version: current.version,
+                        next_input: ExecutedInputCount::new(41),
+                    },
+                    16,
+                )
+                .unwrap();
+            page.rows
+                .iter()
+                .map(|row| match &row.context {
+                    crate::storage::L2TxContext::Direct { tx, .. } => {
+                        (row.offset.get(), tx.input_index)
+                    }
+                    other => panic!("expected a drained direct, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drained(&mut storage), vec![(41, 1)]);
+
+        // The root ages past the threshold and is torn.
+        storage
+            .append_safe_inputs(2800, &[], SUBMITTER, &default_protocol_timing())
+            .unwrap();
+        assert_eq!(storage.recover_aging_tip(1200).unwrap(), vec![0]);
+        let current = storage.history_state().unwrap();
         assert_eq!(
             current.version.recovery_generation.get(),
-            history.version.recovery_generation.get() + 1
+            generation.get() + 1
         );
-        let snapshot = storage
-            .latest_snapshot()
-            .expect("baseline")
-            .expect("baseline survives");
-        let mut app = CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.dump.prefix))
-            .expect("restore");
-        let page = storage
-            .canonical_history_page(
-                HistoryClaim {
-                    version: current.version,
-                    next_input: snapshot.executed_input_count,
-                },
-                16,
-            )
-            .expect("replacement history");
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.rows[0].offset, ExecutedInputCount::new(41));
-        match &page.rows[0].context {
-            crate::storage::L2TxContext::Direct { tx, .. } => {
-                assert_eq!(tx.block, 1400);
-                assert_eq!(tx.input_index, 1);
-                sequencer_core::application::execute(
-                    &mut app,
-                    &sequencer_core::l2_tx::L2Tx::Direct(tx.clone()),
-                )
-                .expect("replay direct");
-            }
-            _ => panic!("expected post-baseline direct"),
-        }
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(42));
+        assert_eq!(current.base_safe_block, 100);
+        assert_eq!(current.rebuilt_history_end, 41);
+        assert_eq!(drained(&mut storage), vec![(41, 1)]);
         assert!(
-            storage
-                .recover_aging_tip(1200)
-                .expect("fresh replacement")
-                .is_empty()
-        );
-        assert_eq!(
-            storage.next_executed_input_count().expect("head"),
-            ExecutedInputCount::new(42)
+            storage.latest_snapshot().unwrap().is_some(),
+            "the baseline survives"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovery_then_lane_credits_post_c_deposit_exactly_once() {
-        use crate::storage::StoredSafeInput;
-        use crate::storage::test_helpers::default_protocol_timing;
-
-        let db = temp_db("recovery-credited-once");
+    async fn run_after_setup_credits_a_queued_deposit_exactly_once() {
+        let db = temp_db("setup-then-lane-credits-once");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
         let timing = default_protocol_timing();
 
-        // The recovered checkpoint state S' is the real `WalletApp` (only it
-        // exposes a queryable balance). Its config round-trips through the SSZ
-        // dump, so the lane reloads a devnet-configured app.
+        // The real `WalletApp`: only it exposes a queryable balance. Its config
+        // round-trips through the SSZ dump, so the lane reloads it.
         let cfg = WalletConfig::devnet();
         let portal = cfg.erc20_portal_address;
         let token = cfg.supported_erc20_token;
-        let recovered = WalletApp::new(cfg);
-        let submitter = Address::repeat_byte(0x99); // ingest classifier (not the portal)
-        let pre_c_direct = Address::repeat_byte(0x22); // non-portal => decode None => inert
-        let nested_sender = Address::repeat_byte(0x77); // fresh account, zero balance in S'
+        let mut base = WalletApp::new(cfg);
+        let other = Address::repeat_byte(0x22);
+        let recipient = Address::repeat_byte(0x77);
         let deposit_value = U256::from(2_000_000_u64);
+        let mut deposit_payload = Vec::with_capacity(20 + 20 + 32);
+        deposit_payload.extend_from_slice(token.as_slice());
+        deposit_payload.extend_from_slice(recipient.as_slice());
+        deposit_payload.extend_from_slice(deposit_value.to_be_bytes::<32>().as_slice());
 
-        // C = 100; the resync reached H1 = 150. Three `<= C` directs (already
-        // folded into S'), plus ONE portal USDC deposit at block 120 in the
-        // (C, H1] window. Deposit payload mirrors `encode_erc20_deposit_payload`:
-        // token || nested_sender || value_be32.
-        let deposit_payload = {
-            let mut p = Vec::with_capacity(20 + 20 + 32);
-            p.extend_from_slice(token.as_slice());
-            p.extend_from_slice(nested_sender.as_slice());
-            p.extend_from_slice(deposit_value.to_be_bytes::<32>().as_slice());
-            p
-        };
-        let inputs = vec![
-            StoredSafeInput {
-                sender: pre_c_direct,
-                payload: vec![0x01],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: pre_c_direct,
-                payload: vec![0x02],
-                block_number: 20,
-            },
-            StoredSafeInput {
-                sender: pre_c_direct,
-                payload: vec![0x03],
-                block_number: 30,
-            },
-            StoredSafeInput {
+        // Three directs the base already executed, then a deposit at block
+        // 120, past stop block 100: the era's first queued input.
+        let inputs: Vec<StoredSafeInput> = [10, 20, 30]
+            .into_iter()
+            .map(|block_number| StoredSafeInput {
+                sender: other,
+                payload: vec![1],
+                block_number,
+            })
+            .chain([StoredSafeInput {
                 sender: portal,
                 payload: deposit_payload,
                 block_number: 120,
-            },
-        ];
+            }])
+            .collect();
+        for _ in 0..3 {
+            base.apply_direct(&Direct {
+                input_index: 0,
+                sender: other,
+                block: 10,
+                timestamp: 0,
+                payload: vec![1],
+            })
+            .unwrap();
+        }
         {
             let mut storage =
-                Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Rebuild)
-                    .expect("initialize rebuild");
-            pin_test_deployment_identity(&mut storage, submitter);
+                Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Setup).unwrap();
+            pin_test_deployment_identity(&mut storage, Address::repeat_byte(0x99));
             storage
-                .append_safe_inputs(150, &inputs, submitter, &timing)
-                .expect("sync to H1 = 150");
-            // Fill at N' = 3, C = 100: drains only the three `<= C` directs into
-            // the recovery root frame; the deposit (index 3) stays undrained.
-            fill_recovery_root(recovered, 3, 100, &mut storage, dumps_dir.path())
-                .expect("recovery fill");
-
-            // Preconditions (the (C, H1] cap — covered by the cap tests; pinned
-            // here so a regression that drained the deposit fails early).
-            assert_eq!(
-                storage.next_undrained_safe_input_index().expect("cursor"),
-                3,
-                "the (C, H1] deposit must be left UNDRAINED at index 3"
-            );
-            let finalized = storage
-                .latest_snapshot()
-                .expect("read")
-                .expect("baseline exists");
-            let s_prime = WalletApp::from_dump(&dump_info::app_prefix(&finalized.dump.prefix))
-                .expect("load S'");
-            assert_eq!(
-                s_prime.current_user_balance(nested_sender),
-                U256::ZERO,
-                "S' itself must NOT have credited the deposit"
-            );
+                .append_safe_inputs(150, &inputs, Address::repeat_byte(0x99), &timing)
+                .unwrap();
+            publish(
+                &mut base,
+                &mut storage,
+                dumps_dir.path(),
+                ExecutedInputCount::new(3),
+                100,
+                SchedulerState {
+                    l1_input_count: 3,
+                    next_batch_nonce: 0,
+                    clock: 30,
+                    first_queued_input: 3,
+                    fridge_len: 0,
+                },
+            )
+            .unwrap();
+            let baseline = storage.latest_snapshot().unwrap().expect("baseline");
+            let at_stop =
+                WalletApp::from_dump(&dump_info::app_prefix(&baseline.dump.prefix)).unwrap();
+            assert_eq!(at_stop.current_user_balance(recipient), U256::ZERO);
+            // Run's startup opens the root frame at its own safe head.
+            storage
+                .ensure_open_tip_for_recovery(
+                    &timing,
+                    crate::clock::unix_now_ms(),
+                    WalletApp::scheduler_limits().max_direct_payload_bytes,
+                )
+                .unwrap();
         }
 
-        // Drive the REAL run-side inclusion lane against the recovered DB. The
-        // frontier advance `C -> H1` is already staged (l1_safe_head = 150, the
-        // recovery tip frame's safe block = 100), so the lane's first iteration
-        // leads the deposit at index 3 and executes it once. `batch_submitter`
-        // differs from the portal, so the deposit is not skipped as an own-batch
-        // input; the short `max_batch_open` forces a batch-close snapshot.
         let storage = Storage::open(db.path.as_str()).expect("reopen for lane");
         let config = InclusionLaneConfig {
             dumps_dir: dumps_dir.path().to_path_buf(),
@@ -546,48 +427,32 @@ mod tests {
         let (_tx, handle) =
             InclusionLane::<WalletApp>::start(128, shutdown.clone(), storage, config);
 
-        // Observe via a SECOND storage handle (WAL); the lane owns its own. The
-        // executed-deposit state is externalized only through the pending dump
-        // the lane writes at batch close. Wait for it to reflect the credit.
+        // The lane's state shows only through the dump it writes at batch close.
         let credited = wait_until(Duration::from_secs(5), || {
             let mut s = Storage::open(db.path.as_str()).expect("open observer");
             match s.latest_snapshot().expect("read pending") {
                 Some(p) => {
                     WalletApp::from_dump(&dump_info::app_prefix(&p.dump.prefix))
                         .expect("load lane snapshot")
-                        .current_user_balance(nested_sender)
+                        .current_user_balance(recipient)
                         == deposit_value
                 }
                 None => false,
             }
         })
         .await;
-        assert!(
-            credited,
-            "the lane must lead + execute the (C, H1] deposit, crediting it once"
-        );
-
-        // Exactly once: the drain cursor advanced to 4 (one past the deposit), so
-        // a restart would not re-lead it; and the balance is the deposit value
-        // (== once; 0 would be lost, 2x would be double-credited).
+        assert!(credited, "the root frame executes the queued deposit");
         {
             let mut s = Storage::open(db.path.as_str()).expect("open observer");
+            assert_eq!(s.next_undrained_safe_input_index().unwrap(), 4);
+            let dump = s.latest_snapshot().unwrap().expect("a post-deposit dump");
+            let app = WalletApp::from_dump(&dump_info::app_prefix(&dump.dump.prefix)).unwrap();
             assert_eq!(
-                s.next_undrained_safe_input_index().expect("cursor"),
-                4,
-                "the deposit's drain cursor must advance exactly one past it"
-            );
-            let dump = s
-                .latest_snapshot()
-                .expect("pending")
-                .expect("a post-deposit pending dump");
-            let app =
-                WalletApp::from_dump(&dump_info::app_prefix(&dump.dump.prefix)).expect("load");
-            assert_eq!(
-                app.current_user_balance(nested_sender),
+                app.current_user_balance(recipient),
                 deposit_value,
-                "credited EXACTLY once"
+                "credited once"
             );
+            assert_eq!(app.executed_input_count(), ExecutedInputCount::new(4));
         }
 
         shutdown_lane(&shutdown, handle).await;

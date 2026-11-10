@@ -11,14 +11,17 @@ use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::initialize_history_in;
+use crate::storage::rebuilt_history::RebuiltKey;
 use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
-    StoredSafeInput,
+    DirectInputExecution, EraRecord, FrontierMode, IngestedSafeInput, LifecycleCommand,
+    SafeInputRange,
 };
 use crate::test_support::{pin_test_deployment_identity, temp_db};
+use sequencer_core::l2_tx::L2Tx;
+use sequencer_core::scheduler::Scheduled;
 
 fn included(nonce: u32, offset: u64, payload: u8) -> IncludedUserOp {
     let (respond_to, _response) = oneshot::channel();
@@ -232,66 +235,211 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replace
     );
 }
 
-#[test]
-fn rebuilt_history_starts_at_its_absolute_base_without_padding() {
-    let db = temp_db("canonical-page-rebuild");
-    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+fn scheduled_direct(input_index: u64, batch_nonce: u64) -> Scheduled {
+    Scheduled {
+        batch_nonce,
+        tx: L2Tx::Direct(Direct {
+            input_index,
+            sender: SENDER_B,
+            block: 0,
+            timestamp: 0,
+            payload: vec![],
+        }),
+    }
+}
+
+fn scheduled_op(nonce: u32, batch_nonce: u64) -> Scheduled {
+    Scheduled {
+        batch_nonce,
+        tx: L2Tx::UserOp(UserOpTx {
+            sender: SENDER_B,
+            nonce,
+            fee: 9,
+            block: 7,
+            data: vec![0xd0, nonce as u8],
+        }),
+    }
+}
+
+/// An era rebuilt from a machine at count 41: inputs 0 and 2 are directs,
+/// input 1 an accepted batch with three ops, the second skipped. Counts
+/// 41..45 are rebuilt; the root frame then serves live rows from 45.
+fn seed_two_table_era(storage: &mut Storage) {
+    pin_test_deployment_identity(storage, SENDER_A);
+    let input = |block: u64, payload: u8| IngestedSafeInput {
+        sender: SENDER_B,
+        payload: vec![payload],
+        block_number: block,
+        block_timestamp: 1_000 + block,
+        transaction_hash: B256::repeat_byte(payload),
+    };
     storage
-        .append_safe_inputs(
+        .append_ingested_safe_inputs_with_timestamp(
             10,
-            &[
-                StoredSafeInput {
-                    sender: SENDER_B,
-                    payload: vec![0xaa],
-                    block_number: 10,
-                },
-                StoredSafeInput {
-                    sender: SENDER_B,
-                    payload: vec![0xbb],
-                    block_number: 10,
-                },
-            ],
+            1_010,
+            &[input(5, 0xa0), input(6, 0xa1), input(10, 0xa2)],
             SENDER_A,
             &default_protocol_timing(),
+            FrontierMode::DeferUntilAnchorSet,
         )
         .unwrap();
     storage
-        .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(41), 10))
+        .append_rebuilt_history(&[
+            (0, scheduled_direct(0, 3)),
+            (1, scheduled_op(0, 3)),
+            (1, scheduled_op(5, 3)),
+        ])
         .unwrap();
     storage
-        .initialize_open_state(10, SafeInputRange::empty_at(2))
+        .append_rebuilt_history(&[(1, scheduled_op(1, 3)), (2, scheduled_direct(2, 4))])
         .unwrap();
+    let key = |l1_input_index, position| RebuiltKey {
+        l1_input_index,
+        position,
+    };
+    storage
+        .record_rebuilt_counts(&[
+            (key(0, 0), ExecutedInputCount::new(41)),
+            (key(1, 0), ExecutedInputCount::new(42)),
+            (key(1, 2), ExecutedInputCount::new(43)),
+            (key(2, 0), ExecutedInputCount::new(44)),
+        ])
+        .unwrap();
+    storage
+        .publish_era(
+            std::path::Path::new("/snapshot/era"),
+            &EraRecord {
+                base_count: ExecutedInputCount::new(41),
+                rebuilt_history_end: ExecutedInputCount::new(45),
+                stop_block: 10,
+                first_queued_input: 3,
+                next_batch_nonce: 5,
+            },
+        )
+        .unwrap();
+    storage.ensure_open_tip().unwrap();
+}
+
+#[test]
+fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
+    let db = temp_db("canonical-page-two-tables");
+    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+    seed_two_table_era(&mut storage);
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.available_from, ExecutedInputCount::new(41));
-    assert_eq!(bounds.head, bounds.available_from);
+    assert_eq!(bounds.head, ExecutedInputCount::new(45));
     assert!(
         storage
-            .canonical_history_page(claim(bounds, 41), 10)
+            .canonical_history_page(claim(bounds, 45), 10)
             .unwrap()
             .rows
             .is_empty()
     );
+    let mut head = storage.open_state().unwrap().unwrap();
+    // The first live row must sit at the rebuilt history's end.
     assert!(
-        matches!(storage.canonical_history_page(claim(bounds, 40), 10),
-        Err(HistoryReadError::Policy(HistoryPolicyError::HistoryUnavailable { available_from }))
-            if available_from == bounds.available_from)
+        storage
+            .append_executed_user_ops_chunk(&mut head, &[included(2, 44, 0xcc)])
+            .is_err()
     );
-    assert!(
-        matches!(storage.canonical_history_page(claim(bounds, 42), 10),
-        Err(HistoryReadError::Policy(HistoryPolicyError::AheadOfHead { head }))
-            if head == bounds.head)
-    );
-
     let mut head = storage.open_state().unwrap().unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(0, 41, 0xcc)])
+        .append_executed_user_ops_chunk(&mut head, &[included(2, 45, 0xcc), included(3, 46, 0xdd)])
         .unwrap();
-    let page = storage
-        .canonical_history_page(claim(bounds, 41), 10)
+    let bounds = storage.history_bounds().unwrap();
+    assert_eq!(bounds.head, ExecutedInputCount::new(47));
+
+    let whole = storage
+        .canonical_history_page(claim(bounds, 41), 100)
         .unwrap();
-    assert_eq!(page.rows.len(), 1);
-    assert_eq!(page.rows[0].offset, ExecutedInputCount::new(41));
-    assert_eq!(page.next_input, ExecutedInputCount::new(42));
+    assert_eq!(
+        whole
+            .rows
+            .iter()
+            .map(|row| row.offset.get())
+            .collect::<Vec<_>>(),
+        (41..47).collect::<Vec<_>>()
+    );
+    assert_eq!(whole.next_claim(), claim(bounds, 47));
+    match &whole.rows[0].context {
+        L2TxContext::Direct {
+            tx,
+            batch_nonce,
+            transaction_hash,
+        } => {
+            assert_eq!(
+                (tx.input_index, tx.sender, tx.block, tx.timestamp),
+                (0, SENDER_B, 5, 1_005)
+            );
+            assert_eq!(tx.payload, vec![0xa0]);
+            assert_eq!(*batch_nonce, 3);
+            assert_eq!(*transaction_hash, B256::repeat_byte(0xa0));
+        }
+        other => panic!("expected the rebuilt direct, got {other:?}"),
+    }
+    // The skipped op (nonce 5) has no count, so the feed leaves it out.
+    let rebuilt_ops: Vec<_> = whole.rows[1..3]
+        .iter()
+        .map(|row| match &row.context {
+            L2TxContext::UserOp { tx, batch_nonce } => {
+                assert_eq!((tx.sender, tx.fee, tx.block), (SENDER_B, 9, 7));
+                (tx.nonce, *batch_nonce)
+            }
+            other => panic!("expected a rebuilt user op, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(rebuilt_ops, vec![(0, 3), (1, 3)]);
+    match &whole.rows[3].context {
+        L2TxContext::Direct {
+            tx, batch_nonce, ..
+        } => assert_eq!((tx.input_index, tx.timestamp, *batch_nonce), (2, 1_010, 4)),
+        other => panic!("expected the second rebuilt direct, got {other:?}"),
+    }
+    match &whole.rows[4].context {
+        L2TxContext::UserOp { tx, batch_nonce } => {
+            assert_eq!((tx.data.clone(), *batch_nonce), (vec![0xcc], 5));
+        }
+        other => panic!("expected the first live op, got {other:?}"),
+    }
+
+    // Pages that split at and around the seam keep one contiguous cursor.
+    for (from, limit) in [(43, 3), (44, 1), (44, 2), (45, 5), (41, 4)] {
+        let page = storage
+            .canonical_history_page(claim(bounds, from), limit)
+            .unwrap();
+        let end = (from + limit as u64).min(47);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.offset.get())
+                .collect::<Vec<_>>(),
+            (from..end).collect::<Vec<_>>(),
+            "from {from}, limit {limit}"
+        );
+        assert_eq!(page.next_claim(), claim(bounds, end));
+    }
+    assert!(matches!(
+        storage.canonical_history_page(claim(bounds, 40), 10),
+        Err(HistoryReadError::Policy(HistoryPolicyError::HistoryUnavailable { available_from }))
+            if available_from == ExecutedInputCount::new(41)
+    ));
+}
+
+#[test]
+#[should_panic(expected = "canonical history page has an attribution gap")]
+fn a_missing_rebuilt_count_below_the_end_fails_loud() {
+    let db = temp_db("canonical-page-rebuilt-hole");
+    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+    seed_two_table_era(&mut storage);
+    storage
+        .conn
+        .execute_batch(
+            "DROP TRIGGER trg_rebuilt_history_count_once; \
+             UPDATE rebuilt_history SET l2_tx_count = NULL WHERE l2_tx_count = 42;",
+        )
+        .unwrap();
+    let bounds = storage.history_bounds().unwrap();
+    let _ = storage.canonical_history_page(claim(bounds, 41), 10);
 }
 
 #[test]
@@ -338,7 +486,8 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
     writer
         .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xcc)])
         .unwrap();
-    let retained = canonical_page_in(&tx, before, ExecutedInputCount::new(1), 2).unwrap();
+    let state = query_history_state(&tx).unwrap();
+    let retained = canonical_page_in(&tx, &state, before, ExecutedInputCount::new(1), 2).unwrap();
     assert_eq!(retained.bounds, before);
     assert_eq!(history_bounds_in(&tx).unwrap(), before);
     assert_eq!(retained.rows.len(), 1);
@@ -362,10 +511,10 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
 #[test]
 fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
     let db = temp_db("canonical-page-sqlite-tail");
-    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     let last = i64::MAX as u64;
     storage
-        .write(|tx| initialize_history_in(tx, ExecutedInputCount::new(last), 0))
+        .write(|tx| initialize_history_in(tx, &crate::storage::test_helpers::era(last, last, 0)))
         .unwrap();
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))

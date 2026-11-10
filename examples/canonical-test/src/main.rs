@@ -1,6 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+mod export;
 mod golden;
 
 use std::path::PathBuf;
@@ -508,8 +509,9 @@ pub fn scheduler_executes_an_underfunded_op_and_consumes_its_nonce() -> TestResu
     Ok(())
 }
 
-/// Gate f: once a frame raised the clock, a batch whose first frame lies below
-/// it is rejected without consuming its nonce, and a retry at the clock runs.
+/// Gate f: once a frame raised the clock (to 11), a batch whose first frame lies
+/// below it is rejected without consuming its nonce, and a retry above the
+/// clock runs and drains the later deposit.
 #[testsi::test_dapp(kind("scheduler"))]
 pub fn scheduler_reports_first_frame_below_the_clock_from_guest() -> TestResult {
     let mut machine = devnet_machine()?;
@@ -535,10 +537,96 @@ pub fn scheduler_reports_first_frame_below_the_clock_from_guest() -> TestResult 
     Ok(())
 }
 
+/// A frame drains the deposits of its own safe block, strictly below the
+/// batch's inclusion block, then runs its ops: the deposit's notice leaves
+/// before the op's voucher, in the one input.
+#[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_strict_drain_runs_the_deposit_then_the_op() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let token = WalletConfig::devnet().supported_erc20_token;
+    let alice_key = signing_key(31);
+    let alice = address_from_signing_key(&alice_key);
+    let deposit = U256::from(250_u64);
+    let amount = U256::from(100_u64);
+
+    machine.advance_state(portal_input(10, token, alice, deposit))?;
+    let withdrawal = signed_user_op(
+        &alice_key,
+        0,
+        ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal { amount })),
+    );
+    let (outputs, reports) =
+        machine.advance_state(batch_input(11, batch_with_frame(0, 10, vec![withdrawal])))?;
+    assert!(reports.is_empty(), "expected no reports, got {reports:?}");
+    assert_eq!(outputs.list().len(), 2, "got {:?}", outputs.list());
+    let notice = DepositNotice::abi_decode(&outputs[0].expect_notice().payload)
+        .expect("decode deposit notice");
+    assert_eq!((notice.sender, notice.amount), (alice, deposit));
+    let voucher = outputs[1].expect_voucher();
+    assert_eq!(voucher.destination, token);
+    let paid = Erc20Transfer::abi_decode(&voucher.payload).expect("decode withdrawal voucher");
+    assert_eq!((paid.recipient, paid.amount), (alice, amount));
+    assert_scheduler_report(&mut machine, [2, 2, 1, 10, 2, 0])?;
+    Ok(())
+}
+
+/// The backstop drains an overdue deposit before a batch's gates run, so the
+/// notice leaves before the reject's report, in the one input; the reject
+/// consumes no batch nonce.
+#[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_rejected_batch_reports_after_its_backstop_outputs() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let token = WalletConfig::devnet().supported_erc20_token;
+    let depositor = address!("0x7777777777777777777777777777777777777777");
+    let amount = U256::from(250_u64);
+    let overdue = 1 + sequencer_core::MAX_WAIT_BLOCKS;
+    let overdue_block = usize::try_from(overdue).expect("the block fits usize");
+
+    machine.advance_state(portal_input(1, token, depositor, amount))?;
+    let (outputs, reports) = machine.advance_state(batch_input(overdue_block, empty_batch(1)))?;
+    assert_deposit_notice_then_invalid_batch(&outputs, &reports, depositor, amount);
+    // The drain raised the clock to the deposit's block, and no further.
+    assert_scheduler_report(&mut machine, [2, 1, 0, 1, 2, 0])?;
+
+    let (outputs, reports) = machine.advance_state(batch_input(
+        overdue_block,
+        batch_with_safe_blocks(0, &[overdue - 1]),
+    ))?;
+    assert_no_outputs_or_reports(&outputs, &reports);
+    assert_scheduler_report(&mut machine, [3, 1, 1, overdue - 1, 3, 0])?;
+    Ok(())
+}
+
+/// Only the exact query names are answered; the machine keeps serving after
+/// any other, and an inspect changes no state.
+#[testsi::test_dapp(kind("scheduler"))]
+pub fn scheduler_answers_an_unknown_query_with_a_report() -> TestResult {
+    let mut machine = devnet_machine()?;
+    let token = WalletConfig::devnet().supported_erc20_token;
+    let depositor = address!("0x7777777777777777777777777777777777777777");
+
+    machine.advance_state(portal_input(10, token, depositor, U256::from(9_u64)))?;
+    for query in [&b"scheduler "[..], b"Scheduler", b"state\0", &[0xff; 64]] {
+        assert_eq!(
+            inspect_report(&mut machine, query)?,
+            UNSUPPORTED_QUERY_REPORT,
+            "{query:?}"
+        );
+    }
+    assert_scheduler_report(&mut machine, [1, 0, 0, 0, 0, 1])?;
+    let (outputs, reports) =
+        machine.advance_state(batch_input(11, batch_with_safe_blocks(0, &[10])))?;
+    assert_deposit_notice(&outputs, &reports, token, depositor, U256::from(9_u64));
+    Ok(())
+}
+
+/// The devnet template image, as `just canonical-build-machine-image` stores it.
+fn machine_image_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../canonical-app/out/canonical-machine-image")
+}
+
 fn devnet_machine() -> Result<Machine, Box<dyn std::error::Error + Send + Sync>> {
-    let machine_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../canonical-app/out/canonical-machine-image");
-    let machine = MachineBuilder::load_from(machine_path)
+    let machine = MachineBuilder::load_from(machine_image_path())
         .at_chain(TEST_CHAIN_ID as usize)
         .deployed_at(TEST_DAPP_ADDRESS)
         .no_console_putchar(false)
@@ -710,6 +798,19 @@ fn assert_invalid_batch_step(outputs: &OutputsForInput, reports: &[Vec<u8>]) {
             .any(|report| report.as_slice() == INVALID_BATCH_REPORT),
         "expected invalid batch report, got {reports:?}"
     );
+}
+
+fn assert_deposit_notice_then_invalid_batch(
+    outputs: &OutputsForInput,
+    reports: &[Vec<u8>],
+    sender: Address,
+    amount: U256,
+) {
+    assert_eq!(reports, [INVALID_BATCH_REPORT], "reports");
+    assert_eq!(outputs.list().len(), 1, "got {:?}", outputs.list());
+    let notice = DepositNotice::abi_decode(&outputs[0].expect_notice().payload)
+        .expect("decode deposit notice");
+    assert_eq!((notice.sender, notice.amount), (sender, amount));
 }
 
 fn assert_no_outputs_or_reports(outputs: &OutputsForInput, reports: &[Vec<u8>]) {

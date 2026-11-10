@@ -51,7 +51,7 @@ impl ExecutedInputCount {
     }
 }
 
-/// One durable setup/rebuild era.
+/// One durable era, published by setup.
 ///
 /// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Text and
 /// JSON use the canonical lowercase hyphenated representation.
@@ -165,7 +165,9 @@ impl RecoveryGeneration {
 }
 
 /// Equality/discontinuity token for locally available application history.
-/// Consumers must claim both fields when resuming application history.
+/// Consumers must claim both fields when resuming application history; a
+/// client of an older era adopts a new one only through
+/// [`crate::history_api::HistoryInfo::adopt_claim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HistoryVersion {
     pub era_id: EraId,
@@ -189,8 +191,10 @@ pub struct HistoryBounds {
 
 impl HistoryBounds {
     /// Validate identity before position: equal counts cannot resume a different
-    /// history. Every count in the inclusive range is admissible; `head` waits
-    /// for the next input.
+    /// history by themselves. A client of another era first checks its count
+    /// against the new era's rebuilt range and claims the current version
+    /// ([`crate::history_api::HistoryInfo::adopt_claim`]). Every count in the
+    /// inclusive range is admissible; `head` waits for the next input.
     pub fn validate(&self, claim: HistoryClaim) -> Result<(), HistoryPolicyError> {
         assert!(
             self.available_from <= self.head,

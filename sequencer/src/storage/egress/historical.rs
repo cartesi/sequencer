@@ -21,6 +21,7 @@ use crate::storage::history::{
 };
 use crate::storage::l1_inputs::query_deployment_identity;
 use crate::storage::mutations::batch_tree_anchor_in;
+use crate::storage::queries::safe_input_count_through_block_in;
 use crate::storage::snapshot_dumps::{
     FinalizedSelectionError, finalized_dump_in, has_rollback_safe_snapshot_in,
 };
@@ -99,8 +100,12 @@ impl Storage {
                 },
                 baseline: HistoryBaseline {
                     l1_stop_block: state.base_safe_block,
-                    l1_end_input_index: historical_end_in(tx, state.base_safe_block)?,
+                    l1_end_input_index: safe_input_count_through_block_in(
+                        tx,
+                        state.base_safe_block,
+                    )?,
                     next_batch_nonce: batch_tree_anchor_in(tx)?,
+                    rebuilt_history_end: ExecutedInputCount::new(state.rebuilt_history_end),
                 },
                 accepted_checkpoint: accepted.map(|snapshot| AcceptedCheckpoint {
                     inclusion_block: snapshot.inclusion_block,
@@ -126,7 +131,7 @@ impl Storage {
                 }
                 .into()));
             }
-            let end = historical_end_in(tx, state.base_safe_block)?;
+            let end = safe_input_count_through_block_in(tx, state.base_safe_block)?;
             if !(1..=HISTORICAL_INPUT_MAX_ITEMS).contains(&limit) {
                 return Ok(Err(HistoricalReadError::BadRequest(format!(
                     "limit must be between 1 and {HISTORICAL_INPUT_MAX_ITEMS}"
@@ -152,22 +157,6 @@ impl Storage {
             raw_page_in(tx, era, state.base_safe_block, end, next, limit).map(Ok)
         })?
     }
-}
-
-fn historical_end_in(conn: &Connection, stop: u64) -> rusqlite::Result<u64> {
-    let last: Option<i64> = conn
-        .query_row(
-            "SELECT safe_input_index FROM safe_inputs WHERE block_number <= ?1 \
-             ORDER BY block_number DESC, safe_input_index DESC LIMIT 1",
-            [u64_to_i64(stop)],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(last.map_or(0, |index| {
-        i64_to_u64(index)
-            .checked_add(1)
-            .expect("historical input index overflow")
-    }))
 }
 
 fn first_input_after_block_in(

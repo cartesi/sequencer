@@ -832,13 +832,7 @@ mod tests {
         )
         .expect("open storage");
         storage
-            .complete_baseline_setup(
-                &finalized,
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-                0,
-                false,
-            )
+            .publish_era(&finalized, &crate::storage::EraRecord::EMPTY_GENESIS)
             .expect("register finalized dump");
         storage
             .append_safe_inputs(0, &[], submitter_address, &timing)

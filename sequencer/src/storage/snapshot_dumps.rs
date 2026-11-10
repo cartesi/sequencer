@@ -351,22 +351,24 @@ pub(super) fn finalized_dump_in(
             next_batch_nonce: nonce.checked_add(1).expect("accepted nonce overflow"),
         }));
     }
-    // Genesis is independently known canonical. A rebuilt baseline is not
-    // known to match the canonical machine at C, so it is never comparable.
+    // The baseline is the application's state at the end of the stop block,
+    // which the canonical machine reaches too, so it is the era's first
+    // comparison checkpoint, genesis base or not.
     let Some(snapshot) = baseline_snapshot_in(conn)? else {
         return Ok(None);
     };
     let history = query_history_state(conn)?;
-    if history.base_safe_block == 0 && history.base_executed_input_count == 0 {
-        Ok(Some(FinalizedDump {
-            dump: snapshot.dump,
-            executed_input_count: snapshot.executed_input_count,
-            inclusion_block: 0,
-            next_batch_nonce: super::mutations::batch_tree_anchor_in(conn)?,
-        }))
-    } else {
-        Ok(None)
-    }
+    assert_eq!(
+        snapshot.executed_input_count.get(),
+        history.rebuilt_history_end,
+        "the era baseline sits at the rebuilt history's end"
+    );
+    Ok(Some(FinalizedDump {
+        dump: snapshot.dump,
+        executed_input_count: snapshot.executed_input_count,
+        inclusion_block: history.base_safe_block,
+        next_batch_nonce: super::mutations::batch_tree_anchor_in(conn)?,
+    }))
 }
 
 fn latest_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
@@ -445,8 +447,8 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<Snapshot> {
 mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
-    use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
-    use crate::storage::test_helpers::{SENDER_A, seed_safe_inputs_with_batch_nonces};
+    use crate::storage::history::advance_recovery_generation_in;
+    use crate::storage::test_helpers::{SENDER_A, era, seed_safe_inputs_with_batch_nonces};
     use crate::storage::{LifecycleCommand, SafeInputRange, WriteHead};
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use alloy_primitives::{Address, Signature};
@@ -549,16 +551,19 @@ mod tests {
     }
 
     #[test]
-    fn rebuilt_baseline_is_restorable_but_not_an_accepted_comparison_checkpoint() {
+    fn the_era_baseline_is_the_comparison_checkpoint_at_the_stop_block() {
         let db = temp_db("rebuilt-snapshot");
         let mut storage =
-            Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+            Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+        pin_test_deployment_identity(&mut storage, SENDER_A);
         storage
-            .write(|tx| {
-                initialize_history_in(tx, ExecutedInputCount::new(41), 100)?;
-                insert_baseline_snapshot_in(tx, &prefix(0), ExecutedInputCount::new(41))?;
-                Ok(())
-            })
+            .publish_era(
+                &prefix(0),
+                &crate::storage::EraRecord {
+                    next_batch_nonce: 7,
+                    ..era(41, 41, 100)
+                },
+            )
             .unwrap();
         assert_eq!(
             storage
@@ -569,7 +574,16 @@ mod tests {
                 .get(),
             41
         );
-        assert!(storage.finalized_dump().unwrap().is_none());
+        let checkpoint = storage.finalized_dump().unwrap().expect("baseline");
+        assert_eq!(checkpoint.dump.prefix, prefix(0));
+        assert_eq!(
+            (
+                checkpoint.inclusion_block,
+                checkpoint.executed_input_count.get(),
+                checkpoint.next_batch_nonce
+            ),
+            (100, 41, 7)
+        );
         assert!(storage.has_rollback_safe_snapshot().unwrap());
         assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
     }

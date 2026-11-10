@@ -225,6 +225,83 @@ async fn ws_subscribe_requires_a_valid_history_claim_before_upgrade() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_of_an_older_era_adopts_the_rebuilt_era_at_its_count_and_follows_live_rows() {
+    use crate::egress::test_era;
+    use sequencer_rust_client::{AdoptEraError, AdoptError};
+
+    let db = temp_db("ws-adopt-rebuilt-era");
+    let mut storage =
+        test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
+    let first_live_op = test_era::append_live_user_op(&mut storage, 2);
+    let runtime = start_test_server(&db.path).await;
+    let client = SequencerClient::new(format!("http://{}", runtime.addr)).unwrap();
+
+    let info = client.history(None, None).await.unwrap();
+    assert_eq!(info.history.available_from.get(), test_era::BASE);
+    assert_eq!(
+        info.baseline.rebuilt_history_end.get(),
+        test_era::REBUILT_END
+    );
+    assert_eq!(info.history.head.get(), test_era::REBUILT_END + 2);
+
+    // The client's state sits at count 43 of the era the recovery replaced.
+    let count = ExecutedInputCount::new(43);
+    let old_era = HistoryClaim {
+        version: sequencer_core::history::HistoryVersion {
+            era_id: EraId::from_bytes([0x22, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2])
+                .unwrap(),
+            recovery_generation: sequencer_core::history::RecoveryGeneration::new(3),
+        },
+        next_input: count,
+    };
+    assert!(matches!(
+        client.subscribe(old_era).await,
+        Err(sequencer_rust_client::SubscribeError::History(
+            HistoryPolicyError::EraChanged { current }
+        )) if current == info.history.version
+    ));
+    let claim = client.adopt_current_era(count).await.unwrap();
+    assert_eq!(claim.version, info.history.version);
+    assert_eq!(claim.next_input, count);
+
+    // The feed crosses the seam from the rebuilt rows into the live ones,
+    // then keeps following new rows.
+    let mut ws = client.subscribe(claim).await.unwrap();
+    let mut expected: Vec<_> = (43..=test_era::REBUILT_END)
+        .map(test_era::expected_feed_message)
+        .collect();
+    expected.push(first_live_op);
+    let mut received = Vec::new();
+    for _ in 0..expected.len() {
+        received.push(serde_json::to_value(recv_tx_message(&mut ws).await).unwrap());
+    }
+    assert_eq!(received, expected);
+    let next_live_op = test_era::append_live_user_op(&mut storage, 3);
+    assert_eq!(
+        serde_json::to_value(recv_tx_message(&mut ws).await).unwrap(),
+        next_live_op
+    );
+    drop(ws);
+
+    // Counts outside the base..=rebuilt-end range cannot adopt, even below
+    // the head.
+    assert!(matches!(
+        client
+            .adopt_current_era(ExecutedInputCount::new(test_era::BASE - 1))
+            .await,
+        Err(AdoptEraError::Adopt(AdoptError::BelowBase { .. }))
+    ));
+    assert!(matches!(
+        client
+            .adopt_current_era(ExecutedInputCount::new(test_era::REBUILT_END + 1))
+            .await,
+        Err(AdoptEraError::Adopt(AdoptError::PastRebuiltEnd { .. }))
+    ));
+    drop(storage);
+    shutdown_runtime(runtime).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_subscribe_closes_on_oversized_inbound_message() {
     let db = temp_db("ws-oversized-inbound");
     seed_ordered_txs(db.path.as_str());

@@ -73,7 +73,10 @@ Judge mechanisms for this class against this boundary. Cockroach recovery
 deliberately creates a second data directory pinned to the same submitter
 address, and the lock cannot stop the old one from running with the same key,
 so the operator must keep the old instance stopped
-([incident playbook](../recovery/cockroach.md#incident-playbook)).
+([before anything](../recovery/cockroach.md#before-anything)). Setup's escape
+check (exit 40) catches an old instance whose transactions are unsettled, or
+whose batch landed past the stop block, when setup looks; one started later
+shows only when its batch lands, as a content-identity divergence.
 
 ### Fee oracle
 
@@ -114,11 +117,15 @@ The sequencer trusts its own code in a specific sense: **impossible states are n
 
 If a bug corrupts local state or causes the sequencer to emit malformed batches,
 frames, or user operations, the operator must diagnose and fix it. Then
-[cockroach recovery](../recovery/cockroach.md) rebuilds from a trusted canonical
-machine and L1; this build has no rebuild command, which arrives with
-`setup --base`. The machine must be trusted independently of the faulty local
-state. Historical inputs, including malformed batches, receive
-the canonical scheduler's normal treatment during replay.
+[cockroach recovery](../recovery/cockroach.md) (`setup --base`) rebuilds a
+second data directory from a canonical machine and L1, reading nothing from
+the old one. The base machine is trusted input: it must be trusted
+independently of the faulty local state, because setup checks only its
+scheduler export against L1, not its application state, and the watchdog's
+comparison of the new era's baseline is the first independent check. The
+rebuild runs every input after the base, malformed batches included, through
+the canonical scheduler's normal treatment, up to the stop block: a safe block
+pinned after the flush, so the rebuilt history never changes.
 
 This is **not** a prohibition on checking: internal invariants are asserted loudly wherever a check is near-free (types, SQL constraints and triggers, boundary assertions). The [check policy](../invariants.md#the-check-policy-fail-loud) owns the rule, its reasons, and the decision test.
 
@@ -158,7 +165,7 @@ blocking production diagnostics would require revisiting that assumption
   rollbackable soft confirmations, the watchdog's digest comparison, and the I15
   divergence freeze.
 - **Adversarial mempool:** reorder, delay, drop, selective inclusion by builders
-- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the runtime recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every *simulated-accepted* landing strictly after baseline block `C` against the valid closed batch we sealed at that nonce. The complete prefix through `C` is opaque and is never reinterpreted using the recovered nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. Cockroach recovery does not read the previous database's watermark, so that flush relies on the provider's pool view; the content-identity check is what keeps the residual zombie detected-and-frozen rather than silent (see [the flush boundary](../recovery/cockroach.md#flush-and-stopping-block)).
+- **Zombie transactions:** a submitted batch may sit in a private mempool indefinitely and land long after we believed it was gone. Two load-bearing defenses: the runtime recovery flusher consumes every wallet-nonce slot this deployment ever used (anchored by the persisted watermark, I14) so zombies cannot claim them; and the content-identity check (I9/I15) compares every *simulated-accepted* landing strictly after the era's stop block against the valid closed batch we sealed at that nonce. The rebuilt prefix through the stop block is never reinterpreted using the anchor nonce. A foreign or byte-different landing records divergence when it becomes safe and is ingested, freezes the accepted frontier, and requires cockroach recovery. This is trust-boundary validation of external input (the mempool replaying our own stale transactions at times we don't control), not defense-in-depth against self-bugs or a general canonical-state oracle. Cockroach recovery's setup has no watermark from the previous database, so its flush relies on the provider's pool view; its escape check and then the content-identity check keep the residual zombie detected rather than silent (see [the flush and the stop block](../recovery/cockroach.md#the-flush-and-the-stop-block)).
 - L1 reorgs up to safe depth
 - Malicious `POST /tx` callers: malformed signatures, spoofed sender, replay across chains or apps, nonce manipulation
 - Malicious direct-input senders: arbitrary payload, any intent; sender authenticity is guaranteed by InputBox

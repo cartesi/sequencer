@@ -15,7 +15,9 @@ linking, genesis, host commands, and the reference wallet under `examples/`.
   obligations.
 - [Scheduler semantics](scheduler-semantics.md) defines canonical ordering and
   the acceptance boundary. The native engine does not acquire an ordering role
-  through this ABI.
+  through this ABI. A C or C++ guest reaches the reference scheduler through
+  [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h), whose
+  transaction records are this header's.
 - The [C header](../../bindings/c-app-engine/include/application-engine.h)
   defines record layout, statuses, pointer ownership, and call lifetimes. An
   engine archive and its generated Rust bindings must agree on that header.
@@ -54,6 +56,9 @@ and [admission](application-contract.md#3-admission--policy-never-consensus):
 - `application_engine_from_canonical_state` opens an engine over a canonical
   machine's comparison bytes at that machine's count
   ([canonical recovery](application-contract.md#7-canonical-recovery-integration)).
+  `setup --base` calls it with the bytes the stored machine answers to the
+  `state` inspect query and the count from its `scheduler` report
+  ([state export](scheduler-semantics.md#state-export)).
 
 An admission, nonce-read, execution, or output-drain failure discards the
 engine; the host owns process termination and distinguishes terminal faults

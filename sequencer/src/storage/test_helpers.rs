@@ -36,6 +36,17 @@ pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 pub(crate) const TEST_MAX_DIRECT_PAYLOAD_BYTES: u64 =
     WALLET_SCHEDULER_LIMITS.max_direct_payload_bytes;
 
+/// An era record with nothing queued and anchor 0; fixtures override fields.
+pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::EraRecord {
+    super::EraRecord {
+        base_count: ExecutedInputCount::new(base),
+        rebuilt_history_end: ExecutedInputCount::new(rebuilt_end),
+        stop_block,
+        first_queued_input: 0,
+        next_batch_nonce: 0,
+    }
+}
+
 /// Default protocol timing for tests that don't care about specific tuning.
 /// Sender-independent (timing carries no address); pair with a submitter
 /// address as needed at the call site.
@@ -126,7 +137,7 @@ impl Storage {
 /// wall clock its production counterpart enforces.
 impl Storage {
     /// Set the batch-tree anchor nonce directly; production sets it once, in
-    /// `complete_baseline_setup`. Aborts if `setup_complete` already exists
+    /// `publish_era`. Aborts if `setup_complete` already exists
     /// (`trg_batch_tree_anchor_write_once`).
     pub(crate) fn set_batch_tree_anchor(&mut self, nonce: u64) -> rusqlite::Result<()> {
         self.write(|tx| super::mutations::set_batch_tree_anchor_in(tx, nonce))

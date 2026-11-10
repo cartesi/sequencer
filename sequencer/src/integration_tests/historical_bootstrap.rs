@@ -285,7 +285,7 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
         },
     )
     .unwrap();
-    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Rebuild).unwrap();
+    let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     pin_test_deployment_identity(&mut storage, SUBMITTER);
     storage
         .append_ingested_safe_inputs_with_timestamp(
@@ -298,14 +298,19 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
         )
         .unwrap();
     storage
-        .complete_baseline_setup(
+        .publish_era(
             &baseline_dump,
-            reference_app.executed_input_count(),
-            STOP,
-            reference_nonce,
-            true,
+            &crate::storage::EraRecord {
+                base_count: reference_app.executed_input_count(),
+                rebuilt_history_end: reference_app.executed_input_count(),
+                stop_block: STOP,
+                first_queued_input: reference_export.first_queued_input,
+                next_batch_nonce: reference_nonce,
+            },
         )
         .unwrap();
+    // Setup opens no Tip; run's startup roots the batch tree at the anchor.
+    storage.ensure_open_tip().unwrap();
     let server = Server::start(&db.path).await;
     let client = SequencerClient::new(format!("http://{}", server.addr)).unwrap();
     let metadata = client.history(None, None).await.unwrap();
@@ -323,7 +328,15 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
     assert_eq!(metadata.baseline.l1_stop_block, STOP);
     assert_eq!(metadata.baseline.l1_end_input_index, 8);
     assert_eq!(metadata.baseline.next_batch_nonce, reference_nonce);
-    assert_eq!(metadata.accepted_checkpoint, None);
+    // The era baseline is canonical at the stop block: the first checkpoint.
+    assert_eq!(
+        metadata.accepted_checkpoint.map(|checkpoint| (
+            checkpoint.inclusion_block,
+            checkpoint.executed_input_count.get(),
+            checkpoint.next_batch_nonce
+        )),
+        Some((STOP, 7, reference_nonce))
+    );
     assert_eq!(metadata.deployment.batch_submitter_address, SUBMITTER);
     assert_eq!(
         sequencer_core::build_input_domain(

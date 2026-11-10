@@ -37,6 +37,9 @@ clap = { workspace = true, features = ["env"] }
 cartesi-rollups-contracts = { workspace = true }
 async-trait = "0.1"
 sha2 = "0.10"
+# Setup reads a base machine's export through the emulator. The same pin and
+# feature as sdk/guest/testsi: one libcartesi, named by LIBCARTESI_PATH.
+cartesi-machine = { git = "https://github.com/cartesi/dave", rev = "612c54cf22d73b364cd57a7058ba6aa449e5c77a", features = ["external_cartesi"] }
 
 [dev-dependencies]
 sequencer-core = { path = "../sequencer-core", features = ["test-support"] }
