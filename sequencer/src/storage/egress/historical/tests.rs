@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use alloy_primitives::{Address, B256};
+
 use super::*;
 use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
 use crate::storage::test_helpers::{
@@ -59,18 +61,8 @@ fn era(storage: &Storage) -> EraId {
     storage.history_state().unwrap().version.era_id
 }
 
-fn page(storage: &mut Storage, next: u64, limit: usize) -> HistoricalL1InputsPage {
-    storage
-        .historical_l1_inputs(
-            era(storage),
-            HistoricalL1InputStart::NextInputIndex(next),
-            limit,
-        )
-        .unwrap()
-}
-
 #[test]
-fn genesis_history_has_an_empty_raw_prefix_even_after_live_inputs_arrive() {
+fn genesis_metadata_is_unmoved_by_live_inputs() {
     let (_db, mut storage) = fixture("historical-genesis", 0, 0, 0);
     append(&mut storage, 20, &[input(10, SENDER_B, vec![1])]);
     let info = storage.history_info(None, None).unwrap();
@@ -102,13 +94,10 @@ fn genesis_history_has_an_empty_raw_prefix_even_after_live_inputs_arrive() {
     );
     assert_eq!(info.deployment.app_deployment_block, 0);
     assert_eq!(info.deployment.batch_submitter_address, SENDER_A);
-    let raw = page(&mut storage, 0, 10);
-    assert!(raw.items.is_empty());
-    assert_eq!((raw.end_input_index, raw.next_input_index), (0, 0));
 }
 
 #[test]
-fn rebuilt_history_preserves_raw_payloads_metadata_and_its_fixed_prefix() {
+fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
     let (_db, mut storage) = fixture("historical-rebuilt", 20, 41, 7);
     let inputs = [
         input(5, SENDER_B, vec![0xaa, 0xbb]),
@@ -134,27 +123,8 @@ fn rebuilt_history_preserves_raw_payloads_metadata_and_its_fixed_prefix() {
         })
     );
 
-    let first = page(&mut storage, 0, 2);
-    assert_eq!((first.end_input_index, first.next_input_index), (3, 2));
-    for (index, actual) in first.items.iter().enumerate() {
-        let expected = &inputs[index];
-        assert_eq!(actual.input_index, index as u64);
-        assert_eq!(actual.sender, expected.sender);
-        assert_eq!(actual.payload.as_ref(), expected.payload);
-        assert_eq!(actual.block_number, expected.block_number);
-        assert_eq!(actual.block_timestamp, expected.block_timestamp);
-        assert_eq!(actual.transaction_hash, expected.transaction_hash);
-    }
-    let last = page(&mut storage, first.next_input_index, 2);
-    assert_eq!(last.items.len(), 1);
-    assert_eq!(last.items[0].input_index, 2);
-    assert!(last.items[0].payload.is_empty());
-    assert_eq!((last.end_input_index, last.next_input_index), (3, 3));
-    assert!(page(&mut storage, 3, 2).items.is_empty());
-
     append(&mut storage, 40, &[input(35, SENDER_B, vec![9])]);
     storage.write(advance_recovery_generation_in).unwrap();
-    assert_eq!(page(&mut storage, 0, 2), first);
     let updated = storage
         .history_info(Some(info.history.version.era_id), None)
         .unwrap();
@@ -163,169 +133,16 @@ fn rebuilt_history_preserves_raw_payloads_metadata_and_its_fixed_prefix() {
 }
 
 #[test]
-fn after_block_skips_the_whole_block_and_paging_keeps_its_remaining_rows() {
-    let (_db, mut storage) = fixture("historical-block-seek", 30, 9, 2);
-    append(
-        &mut storage,
-        40,
-        &[
-            input(5, SENDER_B, vec![0]),
-            input(12, SENDER_A, vec![1]),
-            input(12, SENDER_B, vec![2]),
-            input(20, SENDER_B, vec![3]),
-            input(20, SENDER_A, vec![4]),
-            input(31, SENDER_B, vec![5]),
-        ],
-    );
-    let current = era(&storage);
-    let first = storage
-        .historical_l1_inputs(current, HistoricalL1InputStart::AfterBlock(12), 1)
-        .unwrap();
-    assert_eq!(first.items[0].input_index, 3);
-    assert_eq!(first.next_input_index, 4);
-    assert_eq!(page(&mut storage, 4, 1).items[0].input_index, 4);
-    for block in [20, 25, 30] {
-        let eof = storage
-            .historical_l1_inputs(current, HistoricalL1InputStart::AfterBlock(block), 1)
-            .unwrap();
-        assert!(eof.items.is_empty());
-        assert_eq!((eof.end_input_index, eof.next_input_index), (5, 5));
-    }
-}
-
-#[test]
-fn era_validation_precedes_numeric_bounds_even_for_empty_history() {
+fn metadata_refuses_another_era() {
     let (_db, mut storage) = fixture("historical-claim", 0, 0, 0);
     let current = storage.history_state().unwrap().version;
     let other: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
     assert_ne!(other, current.era_id);
-    for start in [
-        HistoricalL1InputStart::NextInputIndex(0),
-        HistoricalL1InputStart::NextInputIndex(u64::MAX),
-        HistoricalL1InputStart::AfterBlock(u64::MAX),
-    ] {
-        for limit in [0, 1, usize::MAX] {
-            assert!(matches!(
-                storage.historical_l1_inputs(other, start, limit),
-                Err(HistoricalReadError::Policy(HistoryPolicyError::EraChanged { current: actual }))
-                    if actual == current
-            ));
-        }
-    }
     assert!(matches!(
         storage.history_info(Some(other), None),
         Err(HistoricalReadError::Policy(HistoryPolicyError::EraChanged { current: actual }))
             if actual == current
     ));
-    for (start, limit) in [
-        (HistoricalL1InputStart::NextInputIndex(0), 0),
-        (
-            HistoricalL1InputStart::NextInputIndex(0),
-            HISTORICAL_INPUT_MAX_ITEMS + 1,
-        ),
-        (HistoricalL1InputStart::NextInputIndex(1), 1),
-        (HistoricalL1InputStart::NextInputIndex(u64::MAX), 1),
-        (HistoricalL1InputStart::AfterBlock(1), 1),
-        (HistoricalL1InputStart::AfterBlock(u64::MAX), 1),
-    ] {
-        assert!(matches!(
-            storage.historical_l1_inputs(current.era_id, start, limit),
-            Err(HistoricalReadError::BadRequest(_))
-        ));
-    }
-}
-
-#[test]
-fn byte_budget_makes_progress_through_oversized_inputs_without_skipping_them() {
-    let (_db, mut storage) = fixture("historical-byte-budget", 20, 1, 1);
-    let target = HISTORICAL_INPUT_PAYLOAD_TARGET_BYTES;
-    append(
-        &mut storage,
-        20,
-        &[
-            input(1, SENDER_B, vec![1; target / 2]),
-            input(2, SENDER_B, vec![2; target / 2 + 1]),
-            input(3, SENDER_A, vec![3; target + 1]),
-            input(4, SENDER_B, vec![4]),
-        ],
-    );
-    for (start, expected_len) in [
-        (0, target / 2),
-        (1, target / 2 + 1),
-        (2, target + 1),
-        (3, 1),
-    ] {
-        let raw = page(&mut storage, start, HISTORICAL_INPUT_MAX_ITEMS);
-        assert_eq!(raw.items.len(), 1);
-        assert_eq!(raw.items[0].input_index, start);
-        assert_eq!(raw.items[0].payload.len(), expected_len);
-        assert_eq!(raw.next_input_index, start + 1);
-        assert_eq!(raw.end_input_index, 4);
-    }
-}
-
-#[test]
-fn exact_byte_target_and_item_cap_have_independent_boundaries() {
-    let (_db, mut storage) = fixture("historical-item-budget", 20, 1, 1);
-    let mut inputs = vec![input(
-        1,
-        SENDER_B,
-        vec![7; HISTORICAL_INPUT_PAYLOAD_TARGET_BYTES],
-    )];
-    inputs.extend((0..HISTORICAL_INPUT_MAX_ITEMS).map(|_| input(2, SENDER_B, vec![])));
-    append(&mut storage, 20, &inputs);
-    let first = page(&mut storage, 0, HISTORICAL_INPUT_MAX_ITEMS);
-    assert_eq!(first.items.len(), HISTORICAL_INPUT_MAX_ITEMS);
-    assert_eq!(first.next_input_index, HISTORICAL_INPUT_MAX_ITEMS as u64);
-    assert_eq!(first.end_input_index, HISTORICAL_INPUT_MAX_ITEMS as u64 + 1);
-    let last = page(
-        &mut storage,
-        first.next_input_index,
-        HISTORICAL_INPUT_MAX_ITEMS,
-    );
-    assert_eq!(last.items.len(), 1);
-    assert_eq!(last.next_input_index, last.end_input_index);
-}
-
-#[test]
-#[should_panic(expected = "historical L1 page has an input gap")]
-fn missing_raw_input_is_an_invariant_fault() {
-    let (_db, mut storage) = fixture("historical-gap", 20, 3, 1);
-    append(
-        &mut storage,
-        20,
-        &[
-            input(1, SENDER_B, vec![1]),
-            input(2, SENDER_B, vec![2]),
-            input(3, SENDER_B, vec![3]),
-        ],
-    );
-    storage
-        .conn
-        .execute_batch(
-            "DROP TRIGGER trg_safe_inputs_not_deletable; \
-             DELETE FROM safe_inputs WHERE safe_input_index=1;",
-        )
-        .unwrap();
-    let _ = page(&mut storage, 0, 3);
-}
-
-#[test]
-fn maximum_sqlite_index_has_an_unclamped_exclusive_end() {
-    let (_db, mut storage) = fixture("historical-max-index", 20, 1, 1);
-    storage.conn.execute(
-        "INSERT INTO safe_inputs (safe_input_index,sender,payload,block_number,block_timestamp,transaction_hash) \
-         VALUES (?1,?2,?3,20,240,?4)",
-        params![i64::MAX, SENDER_B.as_slice(), &[1_u8][..], B256::ZERO.as_slice()],
-    ).unwrap();
-    let max = i64::MAX as u64;
-    let last = page(&mut storage, max, 10);
-    assert_eq!(last.items.len(), 1);
-    assert_eq!(
-        (last.end_input_index, last.next_input_index),
-        (max + 1, max + 1)
-    );
-    assert!(page(&mut storage, max + 1, 10).items.is_empty());
 }
 
 #[test]

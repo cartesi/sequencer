@@ -17,8 +17,7 @@ info:
     Address casing differs by route. `sender` in `POST /tx` and `GET /nonce`
     responses and WebSocket messages, and `verifyingContract` in
     `GET /domain`, use EIP-55 checksum casing. Address fields in `/history`
-    and `sender` in `/historical-l1-inputs` use lowercase hex. Compare decoded
-    20-byte addresses.
+    use lowercase hex. Compare decoded 20-byte addresses.
 
     All `u64` values are JSON numbers; clients must preserve integer
     precision. Integer formats are OpenAPI Format Registry names (`uint16`,
@@ -43,7 +42,7 @@ tags:
   - name: ingress
     description: Public routes for wallets and submitters.
   - name: history
-    description: Internal. Application-history subscription, metadata, and historical L1 inputs.
+    description: Internal. Application-history subscription and metadata.
   - name: snapshots
     description: Internal. Operator state and snapshot downloads for the watchdog and indexers.
   - name: health
@@ -410,94 +409,6 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               example: { ok: false, code: UNAVAILABLE, message: history read unavailable }
-
-  /historical-l1-inputs:
-    servers:
-      - url: http://127.0.0.1:3001
-        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
-    get:
-      tags: [history]
-      operationId: getHistoricalL1Inputs
-      summary: Page through the era's immutable L1 input prefix
-      description: |
-        Serves InputBox inputs `[0, end_input_index)` through the era's
-        `l1_stop_block`. Provide exactly one of `next_input_index` or
-        `after_block`; continue with the returned `next_input_index`. Only
-        `next_input_index == end_input_index` means EOF; a short page does
-        not. A page may split a block, so continue with `next_input_index`
-        rather than `after_block`. Pages target 1 MiB of raw payloads; a
-        larger first input is returned alone. At most eight responses are in
-        flight. An interrupted body is a failed page.
-
-        Malformed or unknown query fields and selector errors are `400`
-        first. An era mismatch (`409`) then precedes the limit-range and
-        position-bound checks (`400`). Recovery generation changes do not
-        invalidate pages; an era change does.
-      parameters:
-        - name: era_id
-          in: query
-          required: true
-          schema:
-            $ref: "#/components/schemas/EraId"
-        - name: next_input_index
-          in: query
-          required: false
-          description: |
-            Inclusive per-application InputBox index, starting at 0. At most
-            `end_input_index`: equal returns an empty completed page, larger
-            is `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
-        - name: after_block
-          in: query
-          required: false
-          description: |
-            Seek to the first input strictly after this L1 block. At most
-            `l1_stop_block`: equal returns an empty completed page, larger is
-            `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
-        - name: limit
-          in: query
-          required: false
-          description: Out-of-range values are `400`, not clamped.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 256
-            default: 256
-      responses:
-        "200":
-          description: One page of historical inputs.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HistoricalL1InputsPage"
-              example:
-                era_id: 22222222-2222-4222-8222-222222222222
-                l1_stop_block: 1240
-                end_input_index: 8
-                next_input_index: 6
-                items:
-                  - input_index: 5
-                    sender: "0x3333333333333333333333333333333333333333"
-                    payload: "0x00"
-                    block_number: 1230
-                    block_timestamp: 1700014760
-                    transaction_hash: "0x4444444444444444444444444444444444444444444444444444444444444444"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "409":
-          $ref: "#/components/responses/HistoryConflict"
-        "429":
-          description: Historical response limit reached.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example: { ok: false, code: OVERLOADED, message: historical response limit reached }
-        "503":
-          $ref: "#/components/responses/Unavailable"
 
   /finalized_state/inclusion_block:
     servers:
@@ -1155,55 +1066,6 @@ components:
           const: AHEAD_OF_HEAD
         head:
           $ref: "#/components/schemas/U64"
-
-    HistoricalL1Input:
-      type: object
-      required:
-        - input_index
-        - sender
-        - payload
-        - block_number
-        - block_timestamp
-        - transaction_hash
-      properties:
-        input_index:
-          $ref: "#/components/schemas/U64"
-        sender:
-          allOf:
-            - $ref: "#/components/schemas/Address"
-          description: Authenticated InputBox sender, lowercase hex.
-        payload:
-          allOf:
-            - $ref: "#/components/schemas/HexBytes"
-          description: Original inner payload, including malformed or rejected batches.
-        block_number:
-          $ref: "#/components/schemas/U64"
-        block_timestamp:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: Unix seconds.
-        transaction_hash:
-          $ref: "#/components/schemas/Hash32"
-
-    HistoricalL1InputsPage:
-      type: object
-      required: [era_id, l1_stop_block, end_input_index, next_input_index, items]
-      properties:
-        era_id:
-          $ref: "#/components/schemas/EraId"
-        l1_stop_block:
-          $ref: "#/components/schemas/U64"
-        end_input_index:
-          $ref: "#/components/schemas/U64"
-        next_input_index:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: Equality with `end_input_index` is the only EOF signal.
-        items:
-          type: array
-          maxItems: 256
-          items:
-            $ref: "#/components/schemas/HistoricalL1Input"
 
     InclusionBlockResponse:
       type: object

@@ -91,7 +91,7 @@ setup's own sync.
 
 `/history` reports the base count as `history.available_from`, and the stop
 block, its input count, the anchor and the rebuilt history end under
-`baseline` ([history metadata](../../README.md#history-metadata-and-historical-l1-inputs-internal-only)).
+`baseline` ([history metadata](../../README.md#history-metadata-internal-only)).
 The first queued input stays off the wire.
 
 ### What setup does
@@ -334,9 +334,10 @@ feed it already uses, with no file and no separate tool:
 
 A reader that owns more state than the application, such as an indexer of
 transfers or orders, restores a checkpoint of that state too, at the same
-count; matching current balances does not validate historical records. The
-[projection replay contract](../protocol/projection-replay.md) describes
-rebuilding such a projection from L1 when no checkpoint can be trusted.
+count; matching current balances does not validate historical records. A
+reader with no checkpoint it trusts can rebuild from the feed only when the
+era's base is genesis: the feed starts at the base count, and the rows below
+it exist only on L1.
 
 ## What can go wrong
 

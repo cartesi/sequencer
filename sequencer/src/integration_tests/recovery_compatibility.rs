@@ -1,22 +1,152 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+//! A reader's saved checkpoints across standard recoveries: which survive
+//! the generations it missed, and a recovery racing its lookup.
+
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use sequencer_core::application::check_live_user_op;
-use sequencer_core::history::{HistoryVersion, RecoveryGeneration};
-use sequencer_core::l2_tx::UserOpTx;
-use sequencer_core::user_op::SignedUserOp;
-use sequencer_rust_client::{
-    HistoryPolicyError, HistoryReadError, SubscribeError, SubscribeStream,
+use alloy::signers::{SignerSync, local::PrivateKeySigner};
+use alloy_primitives::{Address, B256, U256};
+use alloy_sol_types::{Eip712Domain, SolStruct};
+use app_core::application::{Method, Transfer, WalletApp, WalletConfig};
+use futures_util::StreamExt;
+use sequencer_core::api::WsTxMessage;
+use sequencer_core::application::{
+    AppOutput, AppOutputs, Application, CanonicalState, Executed, check_live_user_op, execute,
 };
-use tokio::sync::oneshot;
+use sequencer_core::history::{HistoryClaim, HistoryVersion, L2TxCount, RecoveryGeneration};
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
+use sequencer_core::user_op::{SignedUserOp, UserOp};
+use sequencer_rust_client::{
+    HistoryPolicyError, HistoryReadError, SequencerClient, SubscribeError, SubscribeStream,
+};
+use ssz::Encode;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
 
-use super::*;
-use crate::ingress::inclusion_lane::IncludedUserOp;
-use crate::storage::WriteHead;
-use crate::storage::test_helpers::local_batch_payload;
+use crate::egress::l2_tx_feed::{L2TxFeed, L2TxFeedConfig};
+use crate::http::{self, ApiConfig};
+use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, dump_info};
+use crate::runtime::shutdown::RuntimeScope;
+use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
+use crate::storage::{
+    DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
+    Storage, WriteHead,
+};
+use crate::test_support::{pin_test_deployment_identity, temp_db};
+
+const SUBMITTER: Address = Address::repeat_byte(0x33);
+const APP: Address = Address::repeat_byte(0x11);
+const RECIPIENT: Address = Address::repeat_byte(0x44);
+
+fn domain() -> Eip712Domain {
+    sequencer_core::build_input_domain(1, APP)
+}
+
+fn config() -> WalletConfig {
+    WalletConfig {
+        sequencer_address: SUBMITTER,
+        ..WalletConfig::default()
+    }
+}
+
+fn deposit(block: u64, recipient: Address, amount: u64) -> IngestedSafeInput {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(config().supported_erc20_token.as_slice());
+    payload.extend_from_slice(recipient.as_slice());
+    payload.extend_from_slice(&U256::from(amount).to_be_bytes::<32>());
+    raw(config().erc20_portal_address, block, payload)
+}
+
+fn raw(sender: Address, block: u64, payload: Vec<u8>) -> IngestedSafeInput {
+    IngestedSafeInput {
+        sender,
+        payload,
+        block_number: block,
+        block_timestamp: 1_700_000_000 + block * 12,
+        transaction_hash: B256::repeat_byte(u8::try_from(block % 251).unwrap()),
+    }
+}
+
+fn notices(outputs: AppOutputs) -> Vec<Vec<u8>> {
+    outputs
+        .into_iter()
+        .map(|output| match output {
+            AppOutput::Notice(bytes) => bytes,
+            other => panic!("unexpected output in transfer-history fixture: {other:?}"),
+        })
+        .collect()
+}
+
+/// Execute a transaction the fixture expects to run: a direct, or a user op at
+/// its sender's next nonce.
+fn execute_done(app: &mut WalletApp, tx: &L2Tx) -> (L2TxCount, AppOutputs) {
+    match execute(app, tx).unwrap() {
+        Executed::Done { index, outputs } => (index, outputs),
+        Executed::Skipped(reason) => panic!("fixture transaction skipped: {reason}"),
+    }
+}
+
+struct Server {
+    addr: SocketAddr,
+    shutdown: RuntimeScope,
+    task: Option<http::ApiServerTask>,
+    _rx: mpsc::Receiver<PendingUserOp>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.shutdown.request_shutdown();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Server {
+    async fn start(db_path: &str) -> Self {
+        let (listeners, _public_addr, addr) =
+            crate::test_support::server::bind_api_listeners().await;
+        let shutdown = RuntimeScope::default();
+        let (tx, rx) = mpsc::channel(1);
+        let feed = L2TxFeed::new(
+            db_path.to_owned(),
+            shutdown.clone(),
+            L2TxFeedConfig::default(),
+        );
+        let task = http::start_on_listeners(
+            listeners,
+            tx,
+            shutdown.clone(),
+            feed,
+            ApiConfig::new(domain(), WalletApp::max_method_payload_bytes()),
+            http::SnapshotState {
+                db_path: db_path.to_owned(),
+                state_file_in_dump: |prefix| {
+                    WalletApp::state_file_in_dump(&dump_info::app_prefix(prefix))
+                },
+            },
+        );
+        Self {
+            addr,
+            shutdown,
+            task: Some(task),
+            _rx: rx,
+        }
+    }
+
+    async fn stop(mut self) {
+        self.shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), self.task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
 
 struct Backup {
     claim: HistoryClaim,

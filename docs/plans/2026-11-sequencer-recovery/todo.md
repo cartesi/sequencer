@@ -54,7 +54,7 @@ Later, in light of this plan:
 - consider a paginated HTTP endpoint for history;
 - remove the methods nothing uses, starting with what the
   [tracks board](../2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
-  lists for deletion, `/history`'s baseline and accepted checkpoint;
+  lists to reshape or retire, `/history`'s baseline and accepted checkpoint;
 - the feed's identity checks (era and generation), `available_from` and the
   rebuilt range, and whether the sequencer refuses a client from an older era
   whose count lies past the rebuilt history end, which today only the client's
@@ -122,10 +122,3 @@ largest drain and the drills' times. What they leave out:
   wallet's ([questions](#questions-for-bart)).
 - **Production-like hardware.** One Apple machine on macOS ran every measurement;
   re-measure the rebuild on the recovery host's Linux storage.
-
-## When this plan lands
-
-Delete what the
-[tracks board](../2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
-lists for deletion. The earlier plans are already
-[archived](../../recovery/history/README.md#superseded-cockroach-recovery-plans).

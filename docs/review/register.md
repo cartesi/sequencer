@@ -365,9 +365,19 @@ force.
 
 ## Integration work owned elsewhere
 
-- [Track 3 follow-ups](../plans/2026-07-track3-feed-replay-design.md):
-  private-engine snapshot-to-live replication and representative deployment latency,
-  including checkpoint creation and complete L1-reconciliation turns.
+- [Track 3](../plans/2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
+  follow-ups, each needed before relying on it in production:
+  - Bart's private DEX indexer and its database backups, while his client
+    adopts the API. Bugs it finds are fixed; missing fields or an awkward
+    workflow feed the new client sync.
+  - Private-engine snapshot-to-live replication.
+  - Ingress latency, feed catch-up headroom and recovery time on the target
+    deployment's workload, including checkpoint creation and complete
+    L1-reconciliation turns.
+- **Not planned without a consumer need:** resumable snapshot transfer (when
+  artifact size makes an interrupted download costly), session fencing (if
+  history can change within an admitted process, or several local writers
+  become supported), and submitter key rotation.
 - [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign):
   external engine/scheduler agreement, application-specific recovery export, independent
   fee-conversion vectors, and consumer-driven ABI/checkpoint decisions.

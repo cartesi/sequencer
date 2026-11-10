@@ -367,7 +367,7 @@ marks it.
 
 Today's procedure instead executes the queued directs during recovery (the
 terminal drain) and publishes the result, and each client repeats that drain
-([projection replay](../../protocol/projection-replay.md)). That state is a
+(projection replay, a contract since deleted). That state is a
 prediction: the canonical machine reaches it only inside the post-`C` input
 that drains the last of the queued directs, so no comparison can check it, and
 a rebuild that started from it would execute those directs twice.

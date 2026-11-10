@@ -84,7 +84,7 @@ vectors pass unchanged (W3b).
 ### Step 0: decisions (settled 2026-10-13)
 
 1. **Bart: done.** His client treats cockroach recoveries as absent, and it can
-   keep doing so once the tool exists. The [Track 3 plan](../plans/2026-07-track3-feed-replay-design.md#follow-up-sequence)
+   keep doing so once the tool exists. The Track 3 plan (`docs/plans/2026-07-track3-feed-replay-design.md`, since deleted)
    and the [tracks board](../plans/2026-07-coordination-tracks.md) still describe
    him integrating scheduler replay; correct that text in W1.
 2. **Fees stay in log space.** The batch-level fee is deferred together with

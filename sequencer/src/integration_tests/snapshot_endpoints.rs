@@ -616,10 +616,9 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
 /// handler's state.
 #[tokio::test]
 async fn every_route_is_served_on_exactly_its_own_listener() {
-    const INTERNAL_ROUTES: [&str; 11] = [
+    const INTERNAL_ROUTES: [&str; 10] = [
         "/ws/subscribe",
         "/history",
-        "/historical-l1-inputs",
         "/finalized_state",
         "/finalized_state/inclusion_block",
         "/finalized_state/digest",

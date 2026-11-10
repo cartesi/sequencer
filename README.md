@@ -207,10 +207,9 @@ and the health probes use their own shapes.
 
 JSON `sender` fields in successful `POST /tx` and `GET /nonce` responses and
 WebSocket messages, and `verifyingContract` in `GET /domain`, use EIP-55
-checksum casing. Address fields in `/history` and `sender` fields in
-`/historical-l1-inputs` use lowercase hex. Clients must compare decoded 20-byte
-addresses and use one normalized encoding for account or projection keys across
-these routes.
+checksum casing. Address fields in `/history` use lowercase hex. Clients must
+compare decoded 20-byte addresses and use one normalized encoding for account or
+projection keys across these routes.
 
 ### `POST /tx`
 
@@ -341,12 +340,12 @@ Message shapes:
 { "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
 ```
 
-### History metadata and historical L1 inputs (internal only)
+### History metadata (internal only)
 
 Readers that maintain additional transfer/order history follow the feed from
-the era's base count, and reconstruct what lies below it from L1. The
-[projection replay contract](docs/protocol/projection-replay.md) describes
-bootstrap and client checkpoints.
+the era's base count and keep their own checkpoints, which they restore to
+realign after a recovery
+([the client's playbook](docs/recovery/cockroach.md#the-clients-playbook)).
 
 `GET /history` returns one coherent view of the deployment, current application
 history, immutable era baseline, and latest accepted checkpoint. Optional
@@ -432,64 +431,10 @@ its count passes it, and only comparing the feed's rows from `K` with its own
 exposes that. The [history contract](docs/protocol/application-history.md#adopting-a-new-era)
 defines the rule; the server adds no check of its own.
 
-`GET /historical-l1-inputs` requires `era_id` and exactly one starting selector:
-
-- `next_input_index=<u64>`: inclusive per-application InputBox index, starting at 0.
-- `after_block=<u64>`: initially seek to the first input strictly after that block;
-  continue using the returned `next_input_index`.
-
-The endpoint serves only `[0,R)` through the selected era's `C`. A reader of
-an era with a genesis base needs none of it: the feed serves the era from count
-0. A response to
-`next_input_index=5&limit=1` can be:
-
-```json
-{
-  "era_id": "22222222-2222-4222-8222-222222222222",
-  "l1_stop_block": 1240,
-  "end_input_index": 8,
-  "next_input_index": 6,
-  "items": [{
-    "input_index": 5,
-    "sender": "0x3333333333333333333333333333333333333333",
-    "payload": "0x00",
-    "block_number": 1230,
-    "block_timestamp": 1700014760,
-    "transaction_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
-  }]
-}
-```
-
-Records preserve original inner payloads and authenticated senders, including
-malformed/rejected batches; they are not complete `EvmAdvance` envelopes. Indices
-are contiguous and ordered. Binary values are hex; timestamps are Unix seconds.
-Clients must preserve integer precision. A page may split a block.
-
-Optional `limit` defaults to 256 and accepts 1–256. Pages target 1 MiB of raw
-payloads; a larger first input is returned alone, intact. Hex encoding increases
-wire size, so this is not a hard response-size limit. Eight historical responses
-can be in flight; a permit remains held through body delivery or cancellation.
-SQLite read transactions end before network delivery. These limits bound memory
-by the page target or largest single input, not total history length.
-
-Only `next_input_index == end_input_index` means EOF; a short page does not.
-Requesting `next_input_index=R` or `after_block=C` returns an empty completed page.
-Generation changes do not invalidate historical pages; an era change does.
-
-Malformed/unknown query fields, invalid selectors/limits, or positions above
-`R`/`C` return the existing `400 BAD_REQUEST` JSON shape. An era mismatch returns
-the existing `409 ERA_CHANGED` history-policy body before semantic position
-checks. Capacity exhaustion returns `429 OVERLOADED`; shutdown or an operational
-read failure returns `503 UNAVAILABLE`. Interrupted bodies are failed pages.
-Missing durable rows or other storage invariant failures follow the process's
-terminal fault policy, never a successful partial page.
-
-The Rust SDK exposes `history(expected_era, from_generation)`,
-`adopt_current_era(count)` and `historical_l1_inputs(era, start, limit)` with
-typed metadata, adoption and era refusals.
-Both use the configured request deadline, including body transfer; callers may
-increase it for large historical inputs. The client owns replay, persistence,
-checkpoint selection, and subscription.
+The Rust SDK exposes `history(expected_era, from_generation)` and
+`adopt_current_era(count)` with typed metadata, adoption and era refusals.
+Both use the configured request deadline, including body transfer. The client
+owns persistence, checkpoint selection, and subscription.
 
 ### Operator snapshot endpoints (internal only)
 

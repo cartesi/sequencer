@@ -12,7 +12,7 @@ freely at this stage — no backward-compatibility constraints.
 
 | # | Track | Owner | Status |
 |---|-------|-------|--------|
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented; client adoption and deployment work remain; frozen until the shared recovery tool and a new client sync** — [scope](#track-3--feed--replay-protocol-redesign) |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented; client adoption and deployment work remain; frozen until a new client sync** — [scope](#track-3--feed--replay-protocol-redesign) |
 | 5 | Fee exponentiation LUT | us | **unblocked, needs Bart** — fees stay in log space; the batch-level alternative is deferred with [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md). Shape decided: exact-floor table, algorithm-free; a consensus change agreed with Bart before implementation; the log-additive `batch_policy` design is frozen until then |
 | 6 | Dump / `Application` API redesign | us + Bart | **interface and reference C binding implemented** — [Application contract](../protocol/application-contract.md); native-engine integration gates remain |
 
@@ -27,24 +27,16 @@ Additional snapshot retention or transport mechanisms require a measured consume
 
 ## Track 3 — Feed & replay protocol redesign
 
-The egress API is implemented. The [history contract](../protocol/application-history.md),
-the [projection contract](../protocol/projection-replay.md) and the
-[API contract](../../README.md#api) own its behavior; the
-[integration plan](2026-07-track3-feed-replay-design.md) owns deployment follow-ups.
+The egress API is implemented. The [history contract](../protocol/application-history.md)
+and the [API contract](../../README.md#api) own its behavior; the
+[register](../review/register.md#integration-work-owned-elsewhere) owns deployment follow-ups.
 
-The proposed [sequencer recovery](2026-11-sequencer-recovery/README.md)
-rebuilds the sequencer from a canonical machine's exported state, each client
-realigns through the feed from its own count, and a new client sync follows its
-design. Until then, what they replace gets bug fixes only, and its docs are not
-polished:
+[Cockroach recovery](../recovery/cockroach.md) rebuilds the sequencer from a
+canonical machine's exported state, and each client realigns through the feed
+from its own count, so the sequencer no longer serves raw L1 inputs for a
+client to replay. A new client sync follows that design. Until then, what it
+replaces gets bug fixes only, and its docs are not polished:
 
-- Deleted when that plan lands: projection replay across a rebuild
-  (`/historical-l1-inputs`, the SDK's `historical_l1_inputs`, the main
-  `historical_bootstrap` test, the projection contract, and the integration
-  plan). First carry the projection contract's worked boundary into the plan's
-  tests (the [plan](2026-11-sequencer-recovery/README.md) replaces its seed
-  and replay rules), move the integration plan's deployment follow-ups to the
-  register, and repoint the links to both files.
 - Reshaped or retired with the new sync: the WS wire format, the SDK
   snapshot-then-subscribe bootstrap, `/latest_snapshot` and its history headers,
   `/history`'s baseline, accepted checkpoint and compatibility query, and the

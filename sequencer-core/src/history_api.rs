@@ -1,17 +1,13 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Historical scheduler inputs and their handoff to the application feed.
+//! `/history`'s metadata, and how a client of an older era adopts the current one.
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::history::{EraId, HistoryBounds, HistoryClaim, L2TxCount, RecoveryGeneration};
+use crate::history::{HistoryBounds, HistoryClaim, L2TxCount, RecoveryGeneration};
 use thiserror::Error;
-
-pub const HISTORICAL_INPUT_MAX_ITEMS: usize = 256;
-/// A larger first input is served alone, preserving progress through any history.
-pub const HISTORICAL_INPUT_PAYLOAD_TARGET_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryDeployment {
@@ -93,33 +89,6 @@ pub struct HistoryCompatibility {
     pub from_generation: RecoveryGeneration,
     /// Checkpoint counts up to and including this boundary preserve their input prefix.
     pub preserved_input_count: L2TxCount,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoricalL1InputStart {
-    NextInputIndex(u64),
-    AfterBlock(u64),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoricalL1Input {
-    pub input_index: u64,
-    pub sender: Address,
-    /// Original inner application/batch payload, including malformed batches.
-    pub payload: Bytes,
-    pub block_number: u64,
-    pub block_timestamp: u64,
-    pub transaction_hash: B256,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoricalL1InputsPage {
-    pub era_id: EraId,
-    pub l1_stop_block: u64,
-    pub end_input_index: u64,
-    /// Only equality with `end_input_index` establishes completion, not page length.
-    pub next_input_index: u64,
-    pub items: Vec<HistoricalL1Input>,
 }
 
 #[cfg(test)]

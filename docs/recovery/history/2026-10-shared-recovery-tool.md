@@ -441,14 +441,14 @@ blocks after `C` ([replay boundaries](../cockroach.md#replay-boundaries)).
 Today's procedure instead executes the queued directs during recovery (the
 terminal drain) and publishes the result, and each client repeats that drain
 after restoring the scheduler's queue and nonce
-([projection replay](../../protocol/projection-replay.md)). That state is a
+(projection replay, a contract since deleted). That state is a
 prediction: the canonical machine reaches it only inside the post-`C` input
 that drains the last of the queued directs, often executing more there, so no
 comparison can check it, a client that applied it must roll it back if a
 second rebuild comes, and a rebuild that started from it would execute those
 directs twice. Track 3 kept the terminal drain because replacing it would carry
 pending work across the baseline
-([scope boundaries](../../plans/2026-07-track3-feed-replay-design.md#scope-boundaries));
+(the Track 3 plan's scope boundaries, since deleted);
 that work crosses as one block, `L'`.
 
 ## The procedure

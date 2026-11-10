@@ -203,7 +203,7 @@ The adopt rule compares counts, not rows. Two faults pass it:
 | Native restart | Load the newest surviving batch snapshot, or the era baseline at `E`, check the engine's count against its row, then replay the live rows after it. |
 | Sequencer replica | Download `/latest_snapshot`, restore its application state, and subscribe using the matching history claim. This follows optimistic execution. |
 | Watchdog | Start from independently trusted canonical machine state and replay L1. Compare at the sequencer's accepted checkpoint; the replica feed does not establish independent trust. |
-| Application projection | Follow the feed from the base count; history below it is rebuilt from the era's historical L1 prefix. The [projection replay contract](projection-replay.md) owns its checkpoint preparation and handoff. |
+| Application projection | Restore its own checkpoint at a count the era serves, then follow the feed ([the client's playbook](../recovery/cockroach.md#the-clients-playbook)). The feed starts at the base count; the rows below it exist only on L1. |
 
 A batch-close snapshot is identified by its local batch identity, not just its
 count or nonce. Recovery can reuse a nonce and empty batches can repeat a count.
@@ -270,8 +270,8 @@ writers become supported.
 | Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
-| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/historical_bootstrap/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |
+| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |
 
 The [integration validation record](../review/2026-09-16-track3-validation.md)
 records wallet replica and canonical-machine evidence. Remaining consumer and
-deployment gates belong to the [Track 3 plan](../plans/2026-07-track3-feed-replay-design.md).
+deployment gates are in the [register](../review/register.md#integration-work-owned-elsewhere).

@@ -180,7 +180,7 @@ clean restart changes neither. The pair is an equality/discontinuity token,
 not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
 application row has its pre-execution count; recovery replaces only the current
 suffix. See the [history contract](../protocol/application-history.md) and
-[follow-up plan](2026-07-track3-feed-replay-design.md).
+[register](../review/register.md#integration-work-owned-elsewhere).
 
 ## Performance posture
 
@@ -191,4 +191,4 @@ records exact revisions, workload, and same-host ACK/WS measurements. They are
 regression evidence: client/host contention and excluded startup or backlog
 work prevent interpreting them as deployment capacity. Representative latency,
 including checkpoint and L1-reconciliation overlap, remains a
-[deployment follow-up](2026-07-track3-feed-replay-design.md#merge-scope-and-follow-up-ownership).
+[deployment follow-up](../review/register.md#integration-work-owned-elsewhere).

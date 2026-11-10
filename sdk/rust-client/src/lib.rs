@@ -14,8 +14,8 @@ pub use sequencer_core::history::{
     RecoveryGeneration,
 };
 pub use sequencer_core::history_api::{
-    AcceptedCheckpoint, AdoptError, HistoricalL1Input, HistoricalL1InputStart,
-    HistoricalL1InputsPage, HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
+    AcceptedCheckpoint, AdoptError, HistoryBaseline, HistoryCompatibility, HistoryDeployment,
+    HistoryInfo,
 };
 
 use alloy_primitives::Address;
