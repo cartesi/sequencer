@@ -197,7 +197,7 @@ fn append_transfer(
 ) {
     let op = UserOp {
         nonce: app.current_user_nonce(signer.address()),
-        max_fee: head.frame_fee,
+        max_fee: head.frame_fee(),
         data: Method::Transfer(Transfer {
             to: RECIPIENT,
             amount: U256::from(amount),
@@ -205,9 +205,9 @@ fn append_transfer(
         .as_ssz_bytes()
         .into(),
     };
-    let refusal = check_live_user_op(app, signer.address(), &op, head.frame_fee).unwrap();
+    let refusal = check_live_user_op(app, signer.address(), &op, head.frame_fee()).unwrap();
     assert_eq!(refusal, None, "fixture transfer refused");
-    let tx = UserOpTx::new(signer.address(), &op, head.frame_fee, head.safe_block);
+    let tx = UserOpTx::new(signer.address(), &op, head.frame_fee(), head.safe_block());
     let (offset, outputs) = execute_done(app, &L2Tx::UserOp(tx));
     history.extend(notices(outputs));
     let (respond_to, _response) = oneshot::channel();
@@ -225,9 +225,7 @@ fn append_transfer(
         },
         l2_tx_index: offset,
     };
-    storage
-        .append_executed_user_ops_chunk(head, &[included])
-        .unwrap();
+    storage.append_included_user_ops(head, &[included]).unwrap();
 }
 
 fn close_and_accept(
@@ -237,8 +235,8 @@ fn close_and_accept(
     dumps: &Path,
     inclusion_block: u64,
 ) {
-    let index = head.batch_index;
-    let nonce = storage.batch_nonce(index).unwrap();
+    let index = head.batch_index();
+    let nonce = head.batch_nonce();
     let prefix = dumps.join(format!("accepted-{index}"));
     dump_info::create_dump_dir_with_info(
         app,
@@ -250,7 +248,7 @@ fn close_and_accept(
     )
     .unwrap();
     storage
-        .close_frame_and_batch_with_snapshot(head, head.safe_block, &prefix, app.l2_tx_count())
+        .close_frame_and_batch_with_snapshot(head, &prefix, app.l2_tx_count())
         .unwrap();
     let payload = local_batch_payload(storage, nonce);
     storage
@@ -274,13 +272,13 @@ fn recover_tip(storage: &mut Storage, head: &mut WriteHead, safe_block: u64) {
         .unwrap();
     let invalidated = storage
         .recover_aging_tip_for_recovery(
-            head.batch_index,
+            head.batch_index(),
             &protocol,
             crate::clock::unix_now_ms(),
             WalletApp::scheduler_limits().max_direct_payload_bytes,
         )
         .unwrap();
-    assert_eq!(invalidated, vec![head.batch_index]);
+    assert_eq!(invalidated, vec![head.batch_index()]);
     *head = storage.open_state().unwrap().unwrap();
 }
 

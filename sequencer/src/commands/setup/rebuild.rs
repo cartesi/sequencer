@@ -415,7 +415,7 @@ mod tests {
     fn stored(storage: &mut Storage) -> Vec<(L2TxCount, Scheduled)> {
         let to_u64 = |value: i64| u64::try_from(value).unwrap();
         storage
-            .read(|tx| {
+            .raw_read(|tx| {
                 let mut statement = tx.prepare(
                     "SELECT r.l2_tx_count, r.batch_nonce, r.safe_input_index, r.sender, \
                             r.nonce, r.fee, r.safe_block, r.data, \
@@ -921,7 +921,7 @@ mod tests {
         assert_eq!(end.first_queued_input, 6);
         assert_drained_directs_stored(&mut storage, 0, &end, cap()).unwrap();
         storage
-            .write(|tx| {
+            .raw_write(|tx| {
                 tx.execute_batch(
                     "DROP TRIGGER trg_rebuilt_history_not_deletable;
                      DELETE FROM rebuilt_history WHERE safe_input_index = 4;",
@@ -1217,7 +1217,7 @@ mod tests {
             .ensure_open_tip_for_recovery(&default_protocol_timing(), now_ms, cap())
             .unwrap();
         let root = storage.open_state().unwrap().expect("the root is open");
-        assert_eq!(root.safe_block, 30);
+        assert_eq!(root.safe_block(), 30);
         let version = storage.history_version().unwrap();
         let drained: Vec<(u64, u64, u64)> = storage
             .canonical_history_page(
@@ -1247,7 +1247,7 @@ mod tests {
             payload: Batch {
                 nonce: era.anchor_batch_nonce,
                 frames: vec![Frame {
-                    safe_block: root.safe_block,
+                    safe_block: root.safe_block(),
                     fee_price: 0,
                     user_ops: Vec::new(),
                 }],

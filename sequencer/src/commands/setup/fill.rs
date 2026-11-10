@@ -288,7 +288,7 @@ mod tests {
                 TEST_MAX_DIRECT_PAYLOAD_BYTES,
             )
             .unwrap();
-        assert_eq!(storage.open_state().unwrap().unwrap().safe_block, 1500);
+        assert_eq!(storage.open_state().unwrap().unwrap().safe_block(), 1500);
 
         let drained = |storage: &mut Storage| {
             let version = storage.history_version().unwrap();

@@ -46,6 +46,7 @@ pub struct NewEra {
 impl NewEra {
     /// An era at genesis that rebuilt nothing, with stop block 0 and anchor 0:
     /// what the crate-test open path and seeded harnesses publish.
+    #[cfg(test)]
     pub const EMPTY_GENESIS: Self = Self {
         base: L2TxCount::ZERO,
         rebuilt_end: L2TxCount::ZERO,

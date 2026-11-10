@@ -15,7 +15,7 @@ pub mod l1;
 pub mod machine;
 pub mod recovery;
 pub mod runtime;
-pub mod storage;
+pub(crate) mod storage;
 
 #[cfg(test)]
 extern crate self as sequencer;

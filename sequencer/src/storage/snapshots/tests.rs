@@ -18,11 +18,10 @@ fn prefix(n: u64) -> PathBuf {
 
 /// Close the open batch with a snapshot at `prefix(batch_index + 1)`.
 fn close(storage: &mut Storage, head: &mut WriteHead) -> i64 {
-    let index = head.batch_index;
-    let safe_block = head.safe_block;
+    let index = head.batch_index();
     let count = storage.next_l2_tx_count().unwrap();
     storage
-        .close_frame_and_batch_with_snapshot(head, safe_block, &prefix(index + 1), count)
+        .close_frame_and_batch_with_snapshot(head, &prefix(index + 1), count)
         .unwrap();
     storage.latest_snapshot().unwrap().unwrap().id
 }
@@ -168,7 +167,7 @@ fn leases_keep_artifact_count_and_version_together_after_acceptance_and_generati
     let old_version = old.history_version;
     let (respond_to, _) = tokio::sync::oneshot::channel();
     storage
-        .append_executed_user_ops_chunk(
+        .append_included_user_ops(
             &mut head,
             &[IncludedUserOp {
                 pending: PendingUserOp {

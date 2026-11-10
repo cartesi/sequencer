@@ -127,15 +127,14 @@ fn seed_two_closed_batches(db_path: &str) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 0");
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 1");
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 2");
 }
 
@@ -146,9 +145,8 @@ fn seed_one_closed_batch(db_path: &str) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 0");
 }
 
@@ -159,9 +157,8 @@ fn close_current_tip(db_path: &str) {
         .open_state()
         .expect("load open state")
         .expect("open Tip exists");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close current Tip");
 }
 

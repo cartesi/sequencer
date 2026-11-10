@@ -14,8 +14,8 @@ use super::convert::{
     external_u64_to_i64, i64_to_u64, now_unix_ms, saturating_query_bound, u64_to_i64,
 };
 use super::queries::{
-    DIRECT_EXECUTES_SQL, current_safe_block, current_safe_block_timestamp, last_safe_progress_ms,
-    query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
+    DIRECT_EXECUTES_SQL, current_safe_block, query_latest_safe_input_index_exclusive,
+    safe_input_count_through_block_in,
 };
 use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange};
 use sequencer_core::protocol::ProtocolTiming;
@@ -49,8 +49,9 @@ impl Storage {
         current_safe_block(&self.conn)
     }
 
+    #[cfg(test)]
     pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
-        current_safe_block_timestamp(&self.conn)
+        super::queries::current_safe_block_timestamp(&self.conn)
     }
 
     /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
@@ -280,8 +281,9 @@ impl Storage {
 
     /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
     /// or `None` if no real safe-head observation has occurred yet.
+    #[cfg(test)]
     pub fn last_safe_progress_ms(&self) -> Result<Option<u64>> {
-        last_safe_progress_ms(&self.conn)
+        super::queries::last_safe_progress_ms(&self.conn)
     }
 
     /// Read the deployment identity this DB is pinned to. Returns `None` on

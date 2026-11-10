@@ -7,10 +7,12 @@
 //! from the lane's rows.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, named_params, params};
 use sequencer_core::l2_tx::Direct;
+use sequencer_core::user_op::SignedUserOp;
 
 use super::acceptance::canonical_divergence_in;
 use super::convert::{
@@ -31,7 +33,15 @@ use super::{
     BatchPolicy, DirectInputExecution, L2TxCount, SafeFrontierState, SafeInputFrontier,
     SafeInputRange, Storage, WriteHead,
 };
-use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
+
+/// One executed user op as storage persists it: the signed op, when the API
+/// received it, and its application-history position. Borrows the caller's op.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutedUserOp<'a> {
+    pub signed: &'a SignedUserOp,
+    pub received_at: SystemTime,
+    pub l2_tx_index: L2TxCount,
+}
 
 const LAST_VALID_USER_NONCE_SQL: &str = "SELECT u.nonce FROM user_ops u
      WHERE u.sender = ?1
@@ -162,18 +172,18 @@ impl Storage {
     /// schema's FK + PK constraints catch the dangerous failure modes (write
     /// to a non-existent frame, duplicate `pos_in_frame`) by failing the
     /// INSERT.
-    pub(crate) fn append_executed_user_ops_chunk(
+    pub(crate) fn append_executed_user_ops_chunk<'a>(
         &mut self,
         head: &mut WriteHead,
-        user_ops: &[IncludedUserOp],
+        user_ops: impl ExactSizeIterator<Item = ExecutedUserOp<'a>> + Clone,
     ) -> Result<()> {
-        if user_ops.is_empty() {
+        if user_ops.len() == 0 {
             return Ok(());
         }
         // Validate both in-memory counter advances before the transaction.
         // Otherwise an overflow panic after commit would leave durable rows
         // that the unchanged `WriteHead` cannot describe.
-        let mut next_head = *head;
+        let mut next_head = head.duplicate();
         next_head.increment_batch_user_op_count(user_ops.len());
         self.write(|tx| {
             insert_executed_user_ops_batch(
@@ -215,29 +225,25 @@ impl Storage {
 
     /// The artifact is durable before sealing and registering its snapshot in
     /// one transaction. A failed commit leaves only an unreferenced artifact.
+    /// The successor batch's first frame opens at the closing frame's safe
+    /// block: a batch close never advances the frame clock.
     pub fn close_frame_and_batch_with_snapshot(
         &mut self,
         head: &mut WriteHead,
-        next_safe_block: u64,
         dump_dir: &Path,
         l2_tx_count: L2TxCount,
     ) -> Result<()> {
-        let (next_batch_index, now_ms, policy) = self.write(|tx| {
+        let next = self.write(|tx| {
             assert_eq!(
                 next_l2_tx_count_in(tx)?,
                 l2_tx_count,
                 "application count changed between dump creation and batch close"
             );
-            let result = seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
+            let next = seal_and_open_next_batch(tx, head)?;
             insert_batch_snapshot_in(tx, dump_dir, head.batch_index, l2_tx_count)?;
-            Ok(result)
+            Ok(next)
         })?;
-        head.move_to_next_batch(
-            next_batch_index,
-            from_unix_ms(now_ms),
-            policy,
-            next_safe_block,
-        );
+        next.apply_to(head);
         Ok(())
     }
 }
@@ -252,7 +258,7 @@ pub(super) fn insert_tip_rows(
 ) -> Result<u64> {
     let now_ms = now_unix_ms();
     let policy = query_batch_policy(tx)?;
-    let batch_index = insert_new_batch(tx, batch_index_opt, now_ms)?;
+    let (batch_index, _nonce) = insert_new_batch(tx, batch_index_opt, now_ms)?;
     insert_open_frame(
         tx,
         batch_index,
@@ -343,23 +349,38 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
     }
 }
 
-/// Seal the current Tip and open the successor batch's first frame, in `tx`.
+/// The successor batch a close opened, for the caller to apply to its
+/// in-memory write head after the commit.
+pub(super) struct NextBatch {
+    batch_index: u64,
+    nonce: u64,
+    created_at_ms: i64,
+    policy: BatchPolicy,
+}
+
+impl NextBatch {
+    pub(super) fn apply_to(self, head: &mut WriteHead) {
+        head.move_to_next_batch(
+            self.batch_index,
+            self.nonce,
+            from_unix_ms(self.created_at_ms),
+            self.policy,
+        );
+    }
+}
+
+/// Seal the current Tip and open the successor batch's first frame at the
+/// head's safe block, in `tx`.
 ///
 /// Shared with the test fixture `close_frame_and_batch` so the seal ordering
 /// lives in one place: seal first (which frees the old row from the
 /// `ux_single_valid_tip` partial index), then insert the successor as the new
-/// Tip. Returns the new batch index, the close timestamp, and the sampled
-/// policy for the caller to apply to its in-memory write head.
+/// Tip.
 pub(super) fn seal_and_open_next_batch(
     tx: &Transaction<'_>,
-    closing_batch_index: u64,
-    next_safe_block: u64,
-) -> Result<(u64, i64, BatchPolicy)> {
-    let current = load_current_write_head(tx)?.expect("a batch close requires the Tip");
-    assert_eq!(
-        current.safe_block, next_safe_block,
-        "batch closure cannot advance the frame clock"
-    );
+    head: &WriteHead,
+) -> Result<NextBatch> {
+    assert_head_matches_tip(tx, head)?;
     let now_ms = now_unix_ms();
     // Batch policy is sampled here: the derived fee is committed to the newly
     // opened frame, and the batch size target is stored on the write head.
@@ -368,21 +389,55 @@ pub(super) fn seal_and_open_next_batch(
     // the same path the submitter uses and stamp their keccak256 on the row,
     // atomically with the seal. The content-identity check later compares
     // accepted L1 landings against this hash.
-    let nonce = super::snapshots::batch_nonce_in(tx, closing_batch_index)?;
-    let frames = super::l1_submission::load_batch_frames_in(tx, closing_batch_index)?;
+    let nonce = super::snapshots::batch_nonce_in(tx, head.batch_index)?;
+    assert_eq!(
+        nonce, head.batch_nonce,
+        "the sealed batch's nonce differs from the write head's"
+    );
+    let frames = super::l1_submission::load_batch_frames_in(tx, head.batch_index)?;
     let encoded = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch { nonce, frames });
     let payload_hash = alloy_primitives::keccak256(&encoded);
-    seal_batch(tx, closing_batch_index, now_ms, &payload_hash.0)?;
-    let next_batch_index = insert_new_batch(tx, None, now_ms)?;
+    seal_batch(tx, head.batch_index, now_ms, &payload_hash.0)?;
+    let (next_batch_index, next_nonce) = insert_new_batch(tx, None, now_ms)?;
     insert_open_frame(
         tx,
         next_batch_index,
         0,
         now_ms,
         policy.recommended_fee,
-        next_safe_block,
+        head.safe_block,
     )?;
-    Ok((next_batch_index, now_ms, policy))
+    Ok(NextBatch {
+        batch_index: next_batch_index,
+        nonce: next_nonce,
+        created_at_ms: now_ms,
+        policy,
+    })
+}
+
+/// Fail loud unless the Tip reloaded inside `tx` agrees with `head` on every
+/// persisted fact: batch, nonce, frame, counts, fee and safe block. The size
+/// target is left out: a reload samples the policy now, while the head keeps
+/// the value sampled when its frame opened. Runs once per rotation or close.
+fn assert_head_matches_tip(tx: &Transaction<'_>, head: &WriteHead) -> Result<()> {
+    let durable =
+        load_current_write_head(tx)?.expect("a frame rotation or batch close requires the Tip");
+    let persisted = |head: &WriteHead| {
+        (
+            head.batch_index,
+            head.batch_nonce,
+            head.frame_in_batch,
+            head.batch_user_op_count,
+            head.open_frame_user_op_count,
+            head.frame_fee,
+            head.safe_block,
+        )
+    };
+    assert!(
+        persisted(head) == persisted(&durable),
+        "write head disagrees with the durable Tip: cached={head:?}, durable={durable:?}"
+    );
+    Ok(())
 }
 
 /// Rotate to the next frame inside the current batch, in `tx`: open the
@@ -424,6 +479,7 @@ pub(super) fn open_successor_frame_in(
     head: &WriteHead,
     next_safe_block: u64,
 ) -> Result<(BatchPolicy, u32)> {
+    assert_head_matches_tip(tx, head)?;
     assert!(
         next_safe_block >= head.safe_block,
         "frame clock cannot regress"
@@ -450,7 +506,7 @@ fn insert_user_op_iter<'a>(
     batch_index: u64,
     frame_in_batch: u32,
     frame_pos_start: u32,
-    user_ops: impl IntoIterator<Item = &'a PendingUserOp>,
+    user_ops: impl Iterator<Item = ExecutedUserOp<'a>>,
 ) -> Result<()> {
     let mut stmt = tx.prepare_cached(
         "INSERT INTO user_ops (
@@ -458,7 +514,7 @@ fn insert_user_op_iter<'a>(
             sender, nonce, max_fee, data, sig, received_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
-    for (offset, item) in user_ops.into_iter().enumerate() {
+    for (offset, item) in user_ops.enumerate() {
         let offset =
             u32::try_from(offset).expect("user-op chunk offset exceeds u32: contract-impossible");
         let pos_in_frame = frame_pos_start
@@ -481,25 +537,25 @@ fn insert_user_op_iter<'a>(
 }
 
 /// User-op source and application position become durable before acknowledgement.
-fn insert_executed_user_ops_batch(
+fn insert_executed_user_ops_batch<'a>(
     tx: &Transaction<'_>,
     batch_index: u64,
     frame_in_batch: u32,
     frame_pos_start: u32,
-    user_ops: &[IncludedUserOp],
+    user_ops: impl Iterator<Item = ExecutedUserOp<'a>> + Clone,
 ) -> Result<()> {
     insert_user_op_iter(
         tx,
         batch_index,
         frame_in_batch,
         frame_pos_start,
-        user_ops.iter().map(|item| &item.pending),
+        user_ops.clone(),
     )?;
     let mut stmt = tx.prepare_cached(
         "INSERT INTO application_inputs (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (position, item) in user_ops.iter().enumerate() {
+    for (position, item) in user_ops.enumerate() {
         let position = frame_pos_start
             .checked_add(u32::try_from(position).expect("chunk fits u32"))
             .expect("user-op position overflow");
@@ -518,9 +574,9 @@ mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
         DirectInputExecution, IngestedSafeInput, L2TxCount, LifecycleCommand, SafeFrontierState,
-        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
+        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
         test_helpers::{
-            SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
+            SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, WriteHeadParts, default_protocol_timing,
             record_canonical_divergence,
         },
     };
@@ -567,15 +623,15 @@ mod tests {
         storage
             .insert_baseline_snapshot(prefix, L2TxCount::ZERO)
             .unwrap();
-        let batch = head.batch_index;
+        let batch = head.batch_index();
         let error = storage
-            .close_frame_and_batch_with_snapshot(&mut head, 10, prefix, L2TxCount::ZERO)
+            .close_frame_and_batch_with_snapshot(&mut head, prefix, L2TxCount::ZERO)
             .expect_err("colliding artifact name must roll back the whole close");
         assert!(error.to_string().contains("UNIQUE"));
-        assert_eq!(head.batch_index, batch);
+        assert_eq!(head.batch_index(), batch);
         let persisted = storage.open_state().unwrap().unwrap();
-        assert_eq!(persisted.batch_index, batch);
-        assert_eq!(persisted.frame_in_batch, head.frame_in_batch);
+        assert_eq!(persisted.batch_index(), batch);
+        assert_eq!(persisted.frame_in_batch(), head.frame_in_batch());
         assert_eq!(
             storage
                 .conn
@@ -602,6 +658,192 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    /// Heads that each disagree with the durable Tip on one persisted fact:
+    /// an older batch, a wrong nonce, an older or later frame, a position past
+    /// the frame's rows, a batch count, a fee or a safe block.
+    fn stale_heads(head: &WriteHead) -> Vec<(&'static str, WriteHead)> {
+        let live = WriteHeadParts::of(head);
+        let stale = |name, parts: WriteHeadParts| (name, parts.build());
+        vec![
+            stale(
+                "batch",
+                WriteHeadParts {
+                    batch_index: live.batch_index - 1,
+                    ..live
+                },
+            ),
+            stale(
+                "nonce",
+                WriteHeadParts {
+                    batch_nonce: live.batch_nonce + 1,
+                    ..live
+                },
+            ),
+            stale(
+                "older frame",
+                WriteHeadParts {
+                    frame_in_batch: live.frame_in_batch - 1,
+                    ..live
+                },
+            ),
+            stale(
+                "later frame",
+                WriteHeadParts {
+                    frame_in_batch: live.frame_in_batch + 1,
+                    ..live
+                },
+            ),
+            stale(
+                "position",
+                WriteHeadParts {
+                    open_frame_user_op_count: live.open_frame_user_op_count + 1,
+                    ..live
+                },
+            ),
+            stale(
+                "batch count",
+                WriteHeadParts {
+                    batch_user_op_count: live.batch_user_op_count + 1,
+                    ..live
+                },
+            ),
+            stale(
+                "fee",
+                WriteHeadParts {
+                    frame_fee: live.frame_fee + 1,
+                    ..live
+                },
+            ),
+            stale(
+                "safe block",
+                WriteHeadParts {
+                    safe_block: live.safe_block + 1,
+                    ..live
+                },
+            ),
+        ]
+    }
+
+    /// A Tip at batch 1, frame 1 of the batch, with one user op in each frame.
+    fn tip_past_genesis(name: &str) -> (crate::test_support::TestDb, Storage, WriteHead) {
+        let db = temp_db(name);
+        let mut storage = Storage::open(&db.path).unwrap();
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
+        storage
+            .append_included_user_ops(&mut head, &[included_user_op(0, 0)])
+            .unwrap();
+        storage
+            .close_frame_only(&mut head, 10, SafeInputRange::empty_at(0))
+            .unwrap();
+        storage
+            .append_included_user_ops(&mut head, &[included_user_op(1, 1)])
+            .unwrap();
+        (db, storage, head)
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_head_that_disagrees_with_the_tip_fails_loud_at_frame_rotation() {
+        let (_db, mut storage, head) = tip_past_genesis("stale-head-rotation");
+        for (name, mut stale) in stale_heads(&head) {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = storage.close_frame_only_with_executions(
+                    &mut stale,
+                    10,
+                    SafeInputRange::empty_at(0),
+                    TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                    &[],
+                );
+            }))
+            .expect_err(name);
+            assert!(
+                panic_message(panic).contains("write head disagrees with the durable Tip"),
+                "{name}"
+            );
+        }
+        assert_eq!(storage.open_state().unwrap().unwrap().frame_in_batch(), 1);
+        let mut head = head;
+        storage
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                SafeInputRange::empty_at(0),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &[],
+            )
+            .expect("the live head still rotates");
+    }
+
+    #[test]
+    fn a_head_that_disagrees_with_the_tip_fails_loud_at_batch_close() {
+        let (_db, mut storage, head) = tip_past_genesis("stale-head-close");
+        let count = storage.next_l2_tx_count().unwrap();
+        for (name, mut stale) in stale_heads(&head) {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = storage.close_frame_and_batch_with_snapshot(
+                    &mut stale,
+                    std::path::Path::new("/snapshot/stale"),
+                    count,
+                );
+            }))
+            .expect_err(name);
+            assert!(
+                panic_message(panic).contains("write head disagrees with the durable Tip"),
+                "{name}"
+            );
+        }
+        assert_eq!(storage.latest_batch_index().unwrap(), Some(1));
+        let mut head = head;
+        storage
+            .close_frame_and_batch_with_snapshot(
+                &mut head,
+                std::path::Path::new("/snapshot/live"),
+                count,
+            )
+            .expect("the live head still closes");
+        assert_eq!(head.batch_index(), 2);
+    }
+
+    /// The head carries its batch's nonce from the loader and through every
+    /// close, and a reload agrees.
+    #[test]
+    fn the_head_carries_the_open_batch_nonce() {
+        let db = temp_db("head-batch-nonce");
+        let mut storage = Storage::open_with_era(
+            &db.path,
+            &crate::storage::NewEra {
+                anchor_batch_nonce: 7,
+                ..crate::storage::NewEra::EMPTY_GENESIS
+            },
+        );
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .unwrap();
+        assert_eq!(
+            head.batch_nonce(),
+            7,
+            "the era's first batch is at the anchor"
+        );
+        storage.close_frame_and_batch(&mut head).unwrap();
+        assert_eq!(head.batch_nonce(), 8);
+        let count = storage.next_l2_tx_count().unwrap();
+        storage
+            .close_frame_and_batch_with_snapshot(&mut head, std::path::Path::new("/s/9"), count)
+            .unwrap();
+        assert_eq!(head.batch_nonce(), 9);
+        assert_eq!(storage.open_state().unwrap().unwrap().batch_nonce(), 9);
     }
 
     #[test]
@@ -641,27 +883,26 @@ mod tests {
             .expect("load existing open state")
             .expect("open state should now exist");
 
-        assert_eq!(head_a.batch_index, head_b.batch_index);
-        assert_eq!(head_a.frame_in_batch, head_b.frame_in_batch);
-        assert_eq!(head_a.frame_fee, head_b.frame_fee);
+        assert_eq!(head_a.batch_index(), head_b.batch_index());
+        assert_eq!(head_a.frame_in_batch(), head_b.frame_in_batch());
+        assert_eq!(head_a.frame_fee(), head_b.frame_fee());
         // Default log_recommended_fee = 0+296+20+419+621 = 1356
-        assert_eq!(head_a.frame_fee, 1356);
+        assert_eq!(head_a.frame_fee(), 1356);
 
-        let mut head_c = head_b;
-        let next_safe_block = head_c.safe_block;
+        let batch_b = head_b.batch_index();
+        let mut head = head_b;
+        let next_safe_block = head.safe_block();
         storage
-            .close_frame_only(&mut head_c, next_safe_block, SafeInputRange::empty_at(0))
+            .close_frame_only(&mut head, next_safe_block, SafeInputRange::empty_at(0))
             .expect("rotate within same batch");
-        assert_eq!(head_c.batch_index, head_b.batch_index);
-        assert_eq!(head_c.frame_in_batch, 1);
+        assert_eq!(head.batch_index(), batch_b);
+        assert_eq!(head.frame_in_batch(), 1);
 
-        let mut head_d = head_c;
-        let next_safe_block = head_d.safe_block;
         storage
-            .close_frame_and_batch(&mut head_d, next_safe_block)
+            .close_frame_and_batch(&mut head)
             .expect("close batch and rotate");
-        assert!(head_d.batch_index > head_c.batch_index);
-        assert_eq!(head_d.frame_in_batch, 0);
+        assert!(head.batch_index() > batch_b);
+        assert_eq!(head.frame_in_batch(), 0);
     }
 
     #[test]
@@ -697,14 +938,18 @@ mod tests {
     fn append_counter_overflow_happens_before_the_transaction() {
         let db = temp_db("append-counter-overflow-before-write");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let mut head = storage
+        let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        head.open_frame_user_op_count = u32::MAX;
+        let mut head = WriteHeadParts {
+            open_frame_user_op_count: u32::MAX,
+            ..WriteHeadParts::of(&head)
+        }
+        .build();
 
         let included = included_user_op(0, 0);
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = storage.append_executed_user_ops_chunk(&mut head, &[included]);
+            let _ = storage.append_included_user_ops(&mut head, &[included]);
         }));
         assert!(panic.is_err(), "counter overflow must fail loud");
 
@@ -714,7 +959,7 @@ mod tests {
             .expect("count user ops");
         assert_eq!(persisted, 0, "overflow must occur before any durable write");
         assert_eq!(
-            head.open_frame_user_op_count,
+            head.open_frame_user_op_count(),
             u32::MAX,
             "the authoritative head must remain unchanged"
         );
@@ -730,7 +975,7 @@ mod tests {
 
         let included = included_user_op(0, 1);
         let error = storage
-            .append_executed_user_ops_chunk(&mut head, &[included])
+            .append_included_user_ops(&mut head, &[included])
             .expect_err("non-canonical execution offset must fail loud");
         assert!(
             error.to_string().contains("must equal next count"),
@@ -790,7 +1035,7 @@ mod tests {
             );
         }));
         assert!(panic.is_err(), "omitted executable direct must fail loud");
-        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(head.frame_in_batch(), 0);
         let frames: i64 = storage
             .conn
             .query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))
@@ -828,13 +1073,13 @@ mod tests {
             .expect("initialize open state");
 
         storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
+            .append_included_user_ops(&mut head, &[included_user_op(0, 0)])
             .expect("append gold input");
         storage
-            .close_frame_and_batch(&mut head, 0)
+            .close_frame_and_batch(&mut head)
             .expect("seal gold batch");
         storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op(1, 1)])
+            .append_included_user_ops(&mut head, &[included_user_op(1, 1)])
             .expect("append doomed input");
         assert_eq!(
             storage.next_l2_tx_count().expect("pre-recovery count"),
@@ -857,7 +1102,7 @@ mod tests {
 
         let mut replacement = storage.open_state().unwrap().unwrap();
         storage
-            .append_executed_user_ops_chunk(&mut replacement, &[included_user_op(1, 1)])
+            .append_included_user_ops(&mut replacement, &[included_user_op(1, 1)])
             .expect("reuse invalidated logical offset");
 
         let current: Vec<i64> = storage
@@ -918,17 +1163,16 @@ mod tests {
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        let next_safe_block = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, next_safe_block)
+            .close_frame_and_batch(&mut head)
             .expect("rotate batch");
 
         let policy = storage.batch_policy().expect("read policy");
         // log_recommended_fee = 100+296+20+419+621 = 1456
-        assert_eq!(head.frame_fee, 1456);
-        assert_eq!(head.frame_fee, policy.recommended_fee);
+        assert_eq!(head.frame_fee(), 1456);
+        assert_eq!(head.frame_fee(), policy.recommended_fee);
         assert!(
-            head.max_batch_user_op_bytes > 0,
+            head.max_batch_user_op_bytes() > 0,
             "batch size target should be set"
         );
     }
@@ -947,10 +1191,10 @@ mod tests {
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        let original_batch_index = head.batch_index;
-        let original_frame_in_batch = head.frame_in_batch;
+        let original_batch_index = head.batch_index();
+        let original_frame_in_batch = head.frame_in_batch();
         // Default: log_gas_price=0 → log_recommended_fee = 0+296+20+419+621 = 1356
-        assert_eq!(head.frame_fee, 1356);
+        assert_eq!(head.frame_fee(), 1356);
 
         // Simulate an operator policy update mid-frame: fee oracle reports a
         // higher gas price. The derived view reflects the new fee immediately.
@@ -980,7 +1224,8 @@ mod tests {
         // And the in-memory WriteHead mirror must also be stable — the lane
         // submitting against this head should see a consistent fee.
         assert_eq!(
-            head.frame_fee, 1356,
+            head.frame_fee(),
+            1356,
             "WriteHead.frame_fee must stay stable until advance_frame runs",
         );
         assert_eq!(
@@ -991,12 +1236,13 @@ mod tests {
 
         // Closing the frame picks up the new policy — the *next* frame opens
         // at 1456. This is the expected policy-flow boundary.
-        let next_safe_block = head.safe_block;
+        let next_safe_block = head.safe_block();
         storage
             .close_frame_only(&mut head, next_safe_block, SafeInputRange::empty_at(0))
             .expect("rotate within same batch");
         assert_eq!(
-            head.frame_fee, 1456,
+            head.frame_fee(),
+            1456,
             "the next frame must use the updated policy's fee (policy flows in at close)",
         );
         assert_eq!(
@@ -1111,7 +1357,7 @@ mod tests {
         };
         storage.ensure_open_tip().unwrap();
         let root = storage.open_state().unwrap().unwrap();
-        assert_eq!(root.safe_block, 12);
+        assert_eq!(root.safe_block(), 12);
         assert_eq!(drained_directs(&mut storage), vec![1, 4, 5]);
         assert_eq!(storage.next_l2_tx_count().unwrap().get(), 4);
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
@@ -1119,10 +1365,10 @@ mod tests {
         storage.advance_safe_head(40);
         assert_eq!(
             storage.recover_aging_tip(10).unwrap(),
-            vec![root.batch_index]
+            vec![root.batch_index()]
         );
         let reopened = storage.open_state().unwrap().unwrap();
-        assert_ne!(reopened.batch_index, root.batch_index);
+        assert_ne!(reopened.batch_index(), root.batch_index());
         assert_eq!(drained_directs(&mut storage), vec![1, 4, 5]);
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
     }
@@ -1136,17 +1382,17 @@ mod tests {
             .initialize_open_state(12, SafeInputRange::empty_at(0))
             .expect("initialize open state");
 
-        assert_eq!(head.batch_index, 0);
-        assert_eq!(head.frame_in_batch, 0);
-        assert_eq!(head.safe_block, 12);
+        assert_eq!(head.batch_index(), 0);
+        assert_eq!(head.frame_in_batch(), 0);
+        assert_eq!(head.safe_block(), 12);
 
         let loaded = storage
             .open_state()
             .expect("load open state")
             .expect("open state should exist");
-        assert_eq!(loaded.batch_index, 0);
-        assert_eq!(loaded.frame_in_batch, 0);
-        assert_eq!(loaded.safe_block, 12);
+        assert_eq!(loaded.batch_index(), 0);
+        assert_eq!(loaded.frame_in_batch(), 0);
+        assert_eq!(loaded.safe_block(), 12);
     }
 
     #[test]
@@ -1233,10 +1479,11 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("genesis tip exists");
-        assert_eq!(head.batch_index, 0, "genesis batch is index 0");
-        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(head.batch_index(), 0, "genesis batch is index 0");
+        assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(
-            head.safe_block, 10,
+            head.safe_block(),
+            10,
             "genesis frame opens at the synced safe head"
         );
 
@@ -1291,11 +1538,13 @@ mod tests {
             .expect("load open state")
             .expect("tip still exists");
         assert_eq!(
-            head.batch_index, seeded.batch_index,
+            head.batch_index(),
+            seeded.batch_index(),
             "warm path leaves the existing Tip, does not reopen"
         );
         assert_eq!(
-            head.safe_block, 5,
+            head.safe_block(),
+            5,
             "existing frame's safe_block is preserved, not refreshed"
         );
     }
@@ -1328,9 +1577,9 @@ mod tests {
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();
         storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
+            .append_included_user_ops(&mut head, &[included_user_op(0, 0)])
             .unwrap();
-        storage.close_frame_and_batch(&mut head, 0).unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
         let err = storage.conn.execute("INSERT INTO application_inputs (l2_tx_count,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
         assert!(err.to_string().contains("current valid Tip"));
         assert!(
@@ -1379,7 +1628,7 @@ mod tests {
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
         assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::ZERO);
         assert!(crate::storage::test_helpers::all_ordered_l2_txs(&mut storage).is_empty());
-        storage.close_frame_and_batch(&mut head, 10).unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
     }
 
@@ -1401,7 +1650,7 @@ mod tests {
         assert_eq!(storage.next_user_nonce(alice).unwrap(), 0, "unseen sender");
 
         storage
-            .append_executed_user_ops_chunk(
+            .append_included_user_ops(
                 &mut head,
                 &[
                     included_user_op_from(alice, 0, 0),
@@ -1410,9 +1659,9 @@ mod tests {
                 ],
             )
             .unwrap();
-        storage.close_frame_and_batch(&mut head, 0).unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
         storage
-            .append_executed_user_ops_chunk(
+            .append_included_user_ops(
                 &mut head,
                 &[
                     included_user_op_from(alice, 2, 3),
@@ -1424,7 +1673,7 @@ mod tests {
         assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
 
         // A cascade rolls Alice back; her invalidated rows stay for audit.
-        storage.insert_invalid_batch(head.batch_index).unwrap();
+        storage.insert_invalid_batch(head.batch_index()).unwrap();
         assert_eq!(storage.next_user_nonce(alice).unwrap(), 2);
         assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
 
@@ -1437,7 +1686,7 @@ mod tests {
         let mut head = storage.open_state().unwrap().unwrap();
         let offset = storage.next_l2_tx_count().unwrap().get();
         storage
-            .append_executed_user_ops_chunk(&mut head, &[included_user_op_from(alice, 2, offset)])
+            .append_included_user_ops(&mut head, &[included_user_op_from(alice, 2, offset)])
             .unwrap();
         assert_eq!(storage.next_user_nonce(alice).unwrap(), 3);
         let raw_max: i64 = storage
@@ -1566,7 +1815,7 @@ mod tests {
             );
         }));
         assert!(panic.is_err(), "an over-cap execution must fail loud");
-        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 0);
 
         let executions = [
@@ -1612,7 +1861,7 @@ mod tests {
         );
 
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("the batch closes over the drained frame");
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 4);
     }

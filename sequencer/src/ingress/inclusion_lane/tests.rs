@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, record_canonical_divergence,
-    set_one_op_batch_target,
+    SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, WriteHeadParts, default_protocol_timing,
+    record_canonical_divergence, set_one_op_batch_target,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, L2TxContext, SafeInputRange, Storage, StoredSafeInput,
@@ -494,9 +494,8 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
         .expect("advance below threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("observe block 4");
-    let unchanged_clock = state.head.safe_block;
     lane.storage
-        .close_frame_and_batch(&mut state.head, unchanged_clock)
+        .close_frame_and_batch(&mut state.head)
         .expect("create successor batch frame");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 0]);
 
@@ -569,7 +568,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
     let user_op_a = make_included_user_op(0x51, 0);
     let user_op_b = make_included_user_op(0x52, 1);
     storage
-        .append_executed_user_ops_chunk(&mut head, &[user_op_a, user_op_b])
+        .append_included_user_ops(&mut head, &[user_op_a, user_op_b])
         .expect("append attributed first-frame user ops");
     storage
         .append_safe_inputs(
@@ -598,7 +597,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
 
     let user_op_c = make_included_user_op(0x53, 3);
     storage
-        .append_executed_user_ops_chunk(&mut head, &[user_op_c])
+        .append_included_user_ops(&mut head, &[user_op_c])
         .expect("append attributed second-frame user op");
     storage
         .append_safe_inputs(
@@ -1015,16 +1014,12 @@ async fn batch_closes_when_max_user_op_bytes_is_reached() {
 /// in `dequeue_and_execute_user_op_chunk` never triggers from the size check
 /// alone. Tests that want to exercise the size check construct their own.
 fn unbounded_head() -> WriteHead {
-    WriteHead {
-        batch_index: 0,
+    WriteHeadParts {
         batch_created_at: SystemTime::now(),
-        frame_fee: 0,
-        safe_block: 0,
-        batch_user_op_count: 0,
-        open_frame_user_op_count: 0,
-        frame_in_batch: 0,
         max_batch_user_op_bytes: u64::MAX,
+        ..WriteHeadParts::ZERO
     }
+    .build()
 }
 
 #[test]
@@ -1192,20 +1187,19 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     super::execute_user_op(
         &mut live_app,
         prefix_op,
-        head.frame_fee,
-        head.safe_block,
+        head.frame_fee(),
+        head.safe_block(),
         &mut included,
     )
     .expect("execute prefix user op");
     assert_eq!(included[0].l2_tx_index, L2TxCount::ZERO);
     storage
-        .append_executed_user_ops_chunk(&mut head, &included)
+        .append_included_user_ops(&mut head, &included)
         .expect("persist prefix user op");
     super::snapshot::close_batch_with_snapshot(
         &mut live_app,
         &mut storage,
         &mut head,
-        0,
         dumps_dir.path(),
     )
     .expect("close prefix batch with snapshot");
@@ -1271,20 +1265,19 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     super::execute_user_op(
         &mut live_app,
         doomed_op,
-        head.frame_fee,
-        head.safe_block,
+        head.frame_fee(),
+        head.safe_block(),
         &mut included,
     )
     .expect("execute doomed user op");
     assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
     storage
-        .append_executed_user_ops_chunk(&mut head, &included)
+        .append_included_user_ops(&mut head, &included)
         .expect("persist doomed user op");
     super::snapshot::close_batch_with_snapshot(
         &mut live_app,
         &mut storage,
         &mut head,
-        10,
         dumps_dir.path(),
     )
     .expect("close doomed batch with snapshot");
@@ -1353,20 +1346,20 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     // The replacement suffix reuses offset 2, rolling H forward without
     // retaining the invalidated op that previously occupied that coordinate.
     let mut recovery_head = storage.open_state().unwrap().unwrap();
-    let replacement_safe_block = recovery_head.safe_block;
+    let replacement_safe_block = recovery_head.safe_block();
     let (replacement_op, _response) = make_pending_user_op(0x53);
     included.clear();
     super::execute_user_op(
         &mut restarted,
         replacement_op,
-        recovery_head.frame_fee,
-        recovery_head.safe_block,
+        recovery_head.frame_fee(),
+        recovery_head.safe_block(),
         &mut included,
     )
     .expect("execute replacement user op");
     assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
     storage
-        .append_executed_user_ops_chunk(&mut recovery_head, &included)
+        .append_included_user_ops(&mut recovery_head, &included)
         .expect("persist replacement suffix");
     assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(3));
 
@@ -1608,29 +1601,24 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
     let dumps = tempfile::tempdir().unwrap();
     let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, dumps.path());
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 0, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
-    let tip = head.batch_index;
+    let tip = head.batch_index();
     let dump_count = storage.list_snapshots().unwrap().len();
 
     app.fail_dump = true;
-    let error = super::snapshot::close_batch_with_snapshot(
-        &mut app,
-        &mut storage,
-        &mut head,
-        0,
-        dumps.path(),
-    )
-    .expect_err("an application dump failure must precede the batch seal");
+    let error =
+        super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
+            .expect_err("an application dump failure must precede the batch seal");
     assert!(matches!(
         error,
         super::snapshot::TakeDumpError::CreateDump(super::dump_info::CreateDumpDirError::App(
             AppError::Io(ref source)
         )) if source.to_string() == "injected application dump failure"
     ));
-    assert_eq!(head.batch_index, tip);
-    assert_eq!(storage.open_state().unwrap().unwrap().batch_index, tip);
+    assert_eq!(head.batch_index(), tip);
+    assert_eq!(storage.open_state().unwrap().unwrap().batch_index(), tip);
     assert_eq!(storage.latest_batch_index().unwrap(), Some(tip));
     assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
     assert_eq!(storage.list_snapshots().unwrap().len(), dump_count);
@@ -1646,9 +1634,9 @@ fn empty_batch_snapshot_preserves_application_count() {
     assert_eq!(app.replayed, expected);
     let mut head = storage.open_state().unwrap().unwrap();
     let dumps = tempfile::tempdir().unwrap();
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.l2_tx_count.get(), 6);
@@ -1752,10 +1740,11 @@ fn refusal_text(app: &mut StubApp, user_op: UserOp) -> String {
     let (mut pending, mut response) = make_pending_user_op(0x61);
     pending.signed.user_op = user_op;
     tx.try_send(pending).expect("enqueue refused op");
-    let head = WriteHead {
+    let head = WriteHeadParts {
         frame_fee: 10,
-        ..unbounded_head()
-    };
+        ..WriteHeadParts::of(&unbounded_head())
+    }
+    .build();
     let count_before = app.l2_tx_count();
     let mut included = Vec::new();
 

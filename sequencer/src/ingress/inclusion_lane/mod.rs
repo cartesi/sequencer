@@ -128,7 +128,6 @@ impl<A: Application + 'static> InclusionLane<A> {
 
             if turn.hit_batch_target() || should_close_batch_by_time(&lane_state.head, &self.config)
             {
-                let next_safe_block = lane_state.head.safe_block;
                 // Atomic close: dump the app state, then seal the batch
                 // and register its snapshot in one transaction.
                 // A create_dump failure leaves the batch open for retry;
@@ -138,7 +137,6 @@ impl<A: Application + 'static> InclusionLane<A> {
                     &mut self.app,
                     &mut self.storage,
                     &mut lane_state.head,
-                    next_safe_block,
                     &self.config.dumps_dir,
                 )
                 .map_err(InclusionLaneError::Snapshot)?;
@@ -215,12 +213,12 @@ impl<A: Application + 'static> InclusionLane<A> {
             lane_state.next_safe_input_index
         );
         assert!(
-            frontier.safe_block >= lane_state.head.safe_block,
+            frontier.safe_block >= lane_state.head.safe_block(),
             "safe-block frontier regressed: observed={}, frame={}",
             frontier.safe_block,
-            lane_state.head.safe_block,
+            lane_state.head.safe_block(),
         );
-        if frontier.safe_block - lane_state.head.safe_block
+        if frontier.safe_block - lane_state.head.safe_block()
             < sequencer_core::protocol::ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS
         {
             return Ok(());
@@ -306,7 +304,7 @@ fn persist_included_user_ops(
     included: &mut Vec<IncludedUserOp>,
 ) -> Result<(), InclusionLaneError> {
     storage
-        .append_executed_user_ops_chunk(head, included.as_slice())
+        .append_executed_user_ops_chunk(head, included.iter().map(IncludedUserOp::executed))
         .map_err(|err| {
             for item in included.drain(..) {
                 let _ = item.pending.respond_to.send(Err(SequencerError::internal(
@@ -351,7 +349,7 @@ fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) ->
     // until the clock catches up. Acceptable: the size trigger
     // is unaffected, and a wedge here is liveness-only, never correctness.
     let age = SystemTime::now()
-        .duration_since(head.batch_created_at)
+        .duration_since(head.batch_created_at())
         .unwrap_or_default();
     age >= config.max_batch_open
 }
@@ -424,9 +422,9 @@ fn fail_user_op(item: PendingUserOp, error: InclusionLaneError) -> InclusionLane
 /// Dequeue and execute up to `max_chunk` user ops, stopping early if the batch
 /// would cross its size target. Returns the outcome that drove the stop.
 ///
-/// `head.batch_user_op_count` reflects already-persisted ops; `included.len()`
+/// `head.batch_user_op_count()` reflects already-persisted ops; `included.len()`
 /// is the count we'd add by persisting now. When their sum's bytes equal or
-/// exceed `head.max_batch_user_op_bytes`, we stop and the caller closes the
+/// exceed `head.max_batch_user_op_bytes()`, we stop and the caller closes the
 /// batch.
 fn dequeue_and_execute_user_op_chunk<A: Application>(
     rx: &mut mpsc::Receiver<PendingUserOp>,
@@ -440,16 +438,16 @@ fn dequeue_and_execute_user_op_chunk<A: Application>(
     while attempted < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
-                execute_user_op(app, item, head.frame_fee, head.safe_block, included)?;
+                execute_user_op(app, item, head.frame_fee(), head.safe_block(), included)?;
                 attempted += 1;
 
                 let included_count =
                     u64::try_from(included.len()).expect("in-memory chunk length must fit in u64");
                 let projected = head
-                    .batch_user_op_count
+                    .batch_user_op_count()
                     .checked_add(included_count)
                     .expect("batch user-op count overflow: contract-impossible");
-                if user_op_count_to_bytes::<A>(projected) >= head.max_batch_user_op_bytes {
+                if user_op_count_to_bytes::<A>(projected) >= head.max_batch_user_op_bytes() {
                     return Ok(TurnOutcome::HitBatchTarget);
                 }
             }
@@ -485,7 +483,7 @@ fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
 /// Lane-local state threaded through every loop iteration.
 ///
 /// `head` and `next_safe_input_index` stay in lockstep — every safe-frontier
-/// advance updates both `head.safe_block` (persisted in the open frame) and
+/// advance updates both the head's safe block (persisted in the open frame) and
 /// `next_safe_input_index` (in-memory drain cursor).
 ///
 /// `last_frontier_check` is the time gate's bookkeeping; `None` initially so

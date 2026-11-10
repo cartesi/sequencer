@@ -114,7 +114,7 @@ impl Storage {
     /// don't hold a write lock and don't block writers. If `f` returns `Err`
     /// the transaction is dropped unsent (auto-rollback); on success the
     /// commit is issued before returning `Ok`.
-    pub fn read<T, F>(&mut self, f: F) -> Result<T>
+    pub(super) fn read<T, F>(&mut self, f: F) -> Result<T>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T>,
     {
@@ -133,7 +133,7 @@ impl Storage {
     /// see `SQLITE_BUSY` immediately rather than mid-transaction — this is
     /// the right cadence under WAL + single-writer discipline. Same commit /
     /// auto-rollback semantics as [`Storage::read`].
-    pub fn write<T, F>(&mut self, f: F) -> Result<T>
+    pub(super) fn write<T, F>(&mut self, f: F) -> Result<T>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T>,
     {

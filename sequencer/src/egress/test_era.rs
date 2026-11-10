@@ -178,13 +178,13 @@ pub(crate) fn append_live_user_op(storage: &mut Storage, nonce: u32) -> serde_js
         l2_tx_index: offset,
     };
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included])
+        .append_included_user_ops(&mut head, &[included])
         .expect("append a live user op");
     let op = UserOpTx {
         sender: OP_SENDER,
         nonce,
-        fee: head.frame_fee,
-        block: head.safe_block,
+        fee: head.frame_fee(),
+        block: head.safe_block(),
         data,
     };
     serde_json::to_value(BroadcastTxMessage::from_user_op(

@@ -383,7 +383,7 @@ mod tests {
             storage.ensure_open_tip().expect("run opens the root");
             let mut head = storage.open_state().expect("read root").expect("root");
             storage
-                .close_frame_and_batch(&mut head, 30)
+                .close_frame_and_batch(&mut head)
                 .expect("close resumed batch");
             let payload = local_batch_payload(&mut storage, 1);
             storage
@@ -434,7 +434,7 @@ mod tests {
             .expect("initialize");
         for nonce in 0..4 {
             storage
-                .close_frame_and_batch(&mut head, 10)
+                .close_frame_and_batch(&mut head)
                 .unwrap_or_else(|e| panic!("close {nonce}: {e}"));
         }
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1]);
@@ -492,12 +492,8 @@ mod tests {
         let mut head = storage
             .initialize_open_state(1900, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 1900)
-            .expect("close 0");
-        storage
-            .close_frame_and_batch(&mut head, 1900)
-            .expect("close 1");
+        storage.close_frame_and_batch(&mut head).expect("close 0");
+        storage.close_frame_and_batch(&mut head).expect("close 1");
 
         // Non-stale landing of batch 0 (block 1950 - safe_block 1900 < 1200).
         let non_stale_payload = local_batch_payload(&mut storage, 0);
@@ -544,7 +540,7 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         let stamped: Vec<u8> = storage
@@ -576,7 +572,7 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         // Same nonce + same first-frame safe block (fresh by inclusion),
@@ -699,13 +695,18 @@ mod tests {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close the nonce-7 batch");
         assert_eq!(
-            storage.batch_nonce(0).expect("nonce"),
+            head.batch_nonce(),
             7,
             "the era's first batch carries the anchor nonce N'"
+        );
+        storage
+            .close_frame_and_batch(&mut head)
+            .expect("close the nonce-7 batch");
+        assert_eq!(
+            head.batch_nonce(),
+            8,
+            "the successor carries the next nonce"
         );
 
         // Its genuine wire bytes (looked up by nonce N'=7) land from the
@@ -814,7 +815,7 @@ mod tests {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
-        storage.close_frame_and_batch(&mut head, 10).expect("close");
+        storage.close_frame_and_batch(&mut head).expect("close");
 
         let landed = local_batch_payload(&mut storage, 0);
         storage
@@ -853,7 +854,7 @@ mod tests {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
-        storage.close_frame_and_batch(&mut head, 10).expect("close");
+        storage.close_frame_and_batch(&mut head).expect("close");
 
         storage
             .append_safe_inputs(
@@ -881,10 +882,8 @@ mod tests {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("init");
-        storage.close_frame_and_batch(&mut head, 10).expect("close");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close 2");
+        storage.close_frame_and_batch(&mut head).expect("close");
+        storage.close_frame_and_batch(&mut head).expect("close 2");
 
         storage
             .append_safe_inputs(

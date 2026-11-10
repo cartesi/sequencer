@@ -407,11 +407,15 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   discards it and reloads from SQLite.
 - **Enforced by:** the lane being the only open-state writer;
   `load_current_write_head` being the single constructor for persisted state;
-  the `Storage::append_executed_user_ops_chunk`/attributed `close_*` update
-  ordering; and the Tip,
-  frame-position, FK, and PK constraints that fail loud on dangerous stale
-  cache writes. Direct-input uniqueness is enforced in the current application sequence;
-  invalidation removes the old row before recovery can reuse its source.
+  the head being opaque outside storage (private fields, read accessors,
+  storage-private mutators); the
+  `Storage::append_executed_user_ops_chunk`/attributed `close_*` update
+  ordering; storage reloading the Tip and comparing it with the head (batch,
+  nonce, frame, counts, fee, safe block) at every frame rotation and batch
+  close; and the Tip, frame-position, FK, and PK constraints that fail loud on
+  dangerous stale cache writes. Direct-input uniqueness is enforced in the
+  current application sequence; invalidation removes the old row before
+  recovery can reuse its source.
 - **Depended on by:** the hot path avoiding a redundant SQLite re-read on every
   chunk; batch-size/frame counters; safe-block drain attribution; every storage
   method that trusts the passed head.

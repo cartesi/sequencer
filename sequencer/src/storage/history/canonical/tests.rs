@@ -54,11 +54,11 @@ fn seed_aging_tip(storage: &mut Storage) {
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(0, 0, 0xaa)])
+        .append_included_user_ops(&mut head, &[included(0, 0, 0xaa)])
         .unwrap();
-    storage.close_frame_and_batch(&mut head, 0).unwrap();
+    storage.close_frame_and_batch(&mut head).unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xbb)])
+        .append_included_user_ops(&mut head, &[included(1, 1, 0xbb)])
         .unwrap();
     storage
         .append_safe_inputs(1_500, &[], SENDER_A, &default_protocol_timing())
@@ -73,11 +73,11 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
-    let first_fee = head.frame_fee;
+    let first_fee = head.frame_fee();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(7, 0, 0x11)])
+        .append_included_user_ops(&mut head, &[included(7, 0, 0x11)])
         .unwrap();
-    storage.close_frame_and_batch(&mut head, 0).unwrap();
+    storage.close_frame_and_batch(&mut head).unwrap();
     let envelope = local_batch_payload(&mut storage, 0);
     let transaction_hash = B256::repeat_byte(0x42);
     storage
@@ -116,7 +116,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         )
         .unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(8, 2, 0x33)])
+        .append_included_user_ops(&mut head, &[included(8, 2, 0x33)])
         .unwrap();
 
     let bounds = storage.history_bounds().unwrap();
@@ -159,7 +159,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     match &last.rows[0].context {
         L2TxContext::UserOp { tx, batch_nonce } => {
             assert_eq!(tx.data, vec![0x33]);
-            assert_eq!(tx.fee, head.frame_fee);
+            assert_eq!(tx.fee, head.frame_fee());
             assert_eq!((tx.nonce, tx.block, *batch_nonce), (8, 10, 1));
         }
         other => panic!("expected user op, got {other:?}"),
@@ -204,7 +204,7 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replace
     );
     let mut head = storage.open_state().unwrap().unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xcc)])
+        .append_included_user_ops(&mut head, &[included(1, 1, 0xcc)])
         .unwrap();
     let page = storage
         .canonical_history_page(claim(recovered, 1), 2)
@@ -324,12 +324,12 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
     // The first live row must sit at the rebuilt history's end.
     assert!(
         storage
-            .append_executed_user_ops_chunk(&mut head, &[included(2, 44, 0xcc)])
+            .append_included_user_ops(&mut head, &[included(2, 44, 0xcc)])
             .is_err()
     );
     let mut head = storage.open_state().unwrap().unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(2, 45, 0xcc), included(3, 46, 0xdd)])
+        .append_included_user_ops(&mut head, &[included(2, 45, 0xcc), included(3, 46, 0xdd)])
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.head, L2TxCount::new(47));
@@ -438,7 +438,7 @@ fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
         .map(|offset| included(offset, u64::from(offset), 0xaa))
         .collect();
     storage
-        .append_executed_user_ops_chunk(&mut head, &inputs)
+        .append_included_user_ops(&mut head, &inputs)
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.head, L2TxCount::new(50_001));
@@ -469,7 +469,7 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
     writer.recover_aging_tip(1_200).unwrap();
     let mut head = writer.open_state().unwrap().unwrap();
     writer
-        .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xcc)])
+        .append_included_user_ops(&mut head, &[included(1, 1, 0xcc)])
         .unwrap();
     let era = crate::storage::history::era_in(&tx).unwrap();
     let retained = canonical_page_in(&tx, &era, before, L2TxCount::new(1), 2).unwrap();
@@ -506,7 +506,7 @@ fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
         .unwrap();
     let mut head = storage.open_state().unwrap().unwrap();
     storage
-        .append_executed_user_ops_chunk(&mut head, &[included(0, last, 0xaa)])
+        .append_included_user_ops(&mut head, &[included(0, last, 0xaa)])
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
     assert_eq!(bounds.head, L2TxCount::new(last + 1));
@@ -531,7 +531,7 @@ fn an_interior_history_hole_fails_loud() {
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
     storage
-        .append_executed_user_ops_chunk(
+        .append_included_user_ops(
             &mut head,
             &[
                 included(0, 0, 0xaa),

@@ -6,7 +6,7 @@
 use rusqlite::{Result, params};
 
 use super::Storage;
-use super::convert::{i64_to_u64, now_unix_ms};
+use super::convert::now_unix_ms;
 
 impl Storage {
     pub fn log_gas_price(&self) -> Result<i16> {
@@ -31,11 +31,12 @@ impl Storage {
 
     /// Unix-ms of the last successful `log_gas_price` write. `0` means never
     /// written (migration default); completed setup guarantees a nonzero value.
+    #[cfg(test)]
     pub fn log_gas_price_updated_at_ms(&self) -> Result<u64> {
         self.conn.query_row(
             "SELECT log_gas_price_updated_at_ms FROM batch_policy WHERE singleton_id = 0",
             [],
-            |row| Ok(i64_to_u64(row.get::<_, i64>(0)?)),
+            |row| Ok(super::convert::i64_to_u64(row.get::<_, i64>(0)?)),
         )
     }
 

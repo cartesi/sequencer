@@ -357,7 +357,7 @@ fn seed_ordered_txs(db_path: &str) {
 
     let l2_tx_index = storage.next_l2_tx_count().expect("next offset");
     storage
-        .append_executed_user_ops_chunk(
+        .append_included_user_ops(
             &mut head,
             &[IncludedUserOp {
                 pending,

@@ -12,7 +12,7 @@ use rusqlite::params;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::protocol::ProtocolTiming;
 
-use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, u64_to_i64};
+use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::next_l2_tx_count_in;
 use super::ingress::{
     insert_tip_rows, open_fresh_tip_in_tx, open_successor_frame_in, seal_and_open_next_batch,
@@ -53,6 +53,65 @@ pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::NewEra
 pub(crate) fn default_protocol_timing() -> ProtocolTiming {
     ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12)
         .expect("valid test timing")
+}
+
+/// Every field of a [`WriteHead`], for the few tests that build one by hand:
+/// the lane's pure dequeue tests, the counter-overflow tests and the stale-head
+/// tests. Production heads come only from storage's loader.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteHeadParts {
+    pub batch_index: u64,
+    pub batch_nonce: u64,
+    pub batch_created_at: std::time::SystemTime,
+    pub frame_fee: u16,
+    pub safe_block: u64,
+    pub batch_user_op_count: u64,
+    pub open_frame_user_op_count: u32,
+    pub frame_in_batch: u32,
+    pub max_batch_user_op_bytes: u64,
+}
+
+impl WriteHeadParts {
+    /// Batch 0, nonce 0, frame 0, everything zero, a one-byte size target.
+    pub(crate) const ZERO: Self = Self {
+        batch_index: 0,
+        batch_nonce: 0,
+        batch_created_at: std::time::UNIX_EPOCH,
+        frame_fee: 0,
+        safe_block: 0,
+        batch_user_op_count: 0,
+        open_frame_user_op_count: 0,
+        frame_in_batch: 0,
+        max_batch_user_op_bytes: 1,
+    };
+
+    pub(crate) fn of(head: &WriteHead) -> Self {
+        Self {
+            batch_index: head.batch_index,
+            batch_nonce: head.batch_nonce,
+            batch_created_at: head.batch_created_at,
+            frame_fee: head.frame_fee,
+            safe_block: head.safe_block,
+            batch_user_op_count: head.batch_user_op_count,
+            open_frame_user_op_count: head.open_frame_user_op_count,
+            frame_in_batch: head.frame_in_batch,
+            max_batch_user_op_bytes: head.max_batch_user_op_bytes,
+        }
+    }
+
+    pub(crate) fn build(self) -> WriteHead {
+        WriteHead {
+            batch_index: self.batch_index,
+            batch_nonce: self.batch_nonce,
+            batch_created_at: self.batch_created_at,
+            frame_fee: self.frame_fee,
+            safe_block: self.safe_block,
+            batch_user_op_count: self.batch_user_op_count,
+            open_frame_user_op_count: self.open_frame_user_op_count,
+            frame_in_batch: self.frame_in_batch,
+            max_batch_user_op_bytes: self.max_batch_user_op_bytes,
+        }
+    }
 }
 
 /// Lane fixtures. Production opens the Tip through
@@ -107,19 +166,9 @@ impl Storage {
     }
 
     /// Close the batch without registering a snapshot.
-    pub(crate) fn close_frame_and_batch(
-        &mut self,
-        head: &mut WriteHead,
-        next_safe_block: u64,
-    ) -> rusqlite::Result<()> {
-        let (next_batch_index, now_ms, policy) =
-            self.write(|tx| seal_and_open_next_batch(tx, head.batch_index, next_safe_block))?;
-        head.move_to_next_batch(
-            next_batch_index,
-            from_unix_ms(now_ms),
-            policy,
-            next_safe_block,
-        );
+    pub(crate) fn close_frame_and_batch(&mut self, head: &mut WriteHead) -> rusqlite::Result<()> {
+        let next = self.write(|tx| seal_and_open_next_batch(tx, head))?;
+        next.apply_to(head);
         Ok(())
     }
 
@@ -128,12 +177,14 @@ impl Storage {
     }
 
     /// The published era; errors before setup publishes one.
-    pub(crate) fn era(&mut self) -> rusqlite::Result<super::Era> {
+    pub(crate) fn era(&mut self) -> rusqlite::Result<super::history::Era> {
         self.read(|tx| super::history::era_in(tx))
     }
 
     /// The era id and the recovery generation (the greatest cut).
-    pub(crate) fn history_version(&mut self) -> rusqlite::Result<super::HistoryVersion> {
+    pub(crate) fn history_version(
+        &mut self,
+    ) -> rusqlite::Result<sequencer_core::history::HistoryVersion> {
         self.read(|tx| super::history::history_version_in(tx))
     }
 }
@@ -160,6 +211,24 @@ impl Storage {
 
     pub(crate) fn has_rollback_safe_snapshot(&mut self) -> rusqlite::Result<bool> {
         self.read(|tx| super::snapshots::has_rollback_safe_snapshot_in(tx))
+    }
+
+    /// [`Storage::read`]'s deferred transaction, for tests outside storage
+    /// that read raw SQL.
+    pub(crate) fn raw_read<T>(
+        &mut self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.read(f)
+    }
+
+    /// [`Storage::write`]'s immediate transaction, for tests outside storage
+    /// that write raw SQL.
+    pub(crate) fn raw_write<T>(
+        &mut self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        self.write(f)
     }
 
     /// A raw connection with [`Storage::open`]'s pragmas, for tests that reach
@@ -317,8 +386,7 @@ impl Storage {
             None => self.initialize_open_state(0, SafeInputRange::empty_at(0))?,
         };
         let batch_index = head.batch_index;
-        let safe_block = head.safe_block;
-        self.close_frame_and_batch(&mut head, safe_block)?;
+        self.close_frame_and_batch(&mut head)?;
         Ok((
             self.insert_batch_snapshot(prefix, batch_index)?,
             batch_index,
@@ -517,9 +585,8 @@ pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
     for _ in 0..count {
-        let safe_block = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, safe_block)
+            .close_frame_and_batch(&mut head)
             .expect("close batch");
     }
 }
@@ -614,7 +681,7 @@ impl RecoveryFixture for Storage {
                 SafeInputRange::new(start, u64::try_from(end).unwrap()),
             )?;
         }
-        self.close_frame_and_batch(head, safe_block)
+        self.close_frame_and_batch(head)
     }
 
     #[track_caller]

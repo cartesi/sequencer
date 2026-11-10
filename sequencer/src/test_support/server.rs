@@ -203,7 +203,7 @@ fn start_wallet_lane(
         .expect("load open state")
         .expect("open state exists");
     // Default log_gas_price=0 -> 0+296+20+419+621 = 1356.
-    assert_eq!(head.frame_fee, 1356);
+    assert_eq!(head.frame_fee(), 1356);
 
     InclusionLane::<WalletApp>::start(
         128,

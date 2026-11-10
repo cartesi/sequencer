@@ -6,6 +6,7 @@
 
 use std::time::SystemTime;
 
+use crate::storage::ExecutedUserOp;
 use sequencer_core::history::L2TxCount;
 use sequencer_core::user_op::SignedUserOp;
 use thiserror::Error;
@@ -28,6 +29,29 @@ pub struct PendingUserOp {
 pub(crate) struct IncludedUserOp {
     pub pending: PendingUserOp,
     pub l2_tx_index: L2TxCount,
+}
+
+impl IncludedUserOp {
+    /// The borrowed view storage persists.
+    pub(crate) fn executed(&self) -> ExecutedUserOp<'_> {
+        ExecutedUserOp {
+            signed: &self.pending.signed,
+            received_at: self.pending.received_at,
+            l2_tx_index: self.l2_tx_index,
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::storage::Storage {
+    /// Test shorthand: append a chunk of lane-included ops.
+    pub(crate) fn append_included_user_ops(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        user_ops: &[IncludedUserOp],
+    ) -> rusqlite::Result<()> {
+        self.append_executed_user_ops_chunk(head, user_ops.iter().map(IncludedUserOp::executed))
+    }
 }
 
 /// Per-op outcome reported back to the API caller via the response channel.

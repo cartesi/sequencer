@@ -755,12 +755,11 @@ mod tests {
         let mut head = storage
             .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
             .expect("open the genesis tip");
-        let (batch_index, safe_block) = (head.batch_index, head.safe_block);
+        let batch_index = head.batch_index();
         let count = storage.next_l2_tx_count().expect("next count");
         storage
             .close_frame_and_batch_with_snapshot(
                 &mut head,
-                safe_block,
                 Path::new("/tmp/missing-accepted/batch"),
                 count,
             )

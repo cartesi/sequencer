@@ -113,7 +113,7 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
         })
         .collect();
     storage
-        .append_executed_user_ops_chunk(&mut head, &inputs)
+        .append_included_user_ops(&mut head, &inputs)
         .unwrap();
     drop(storage);
     let feed = L2TxFeed::new(
@@ -420,7 +420,7 @@ fn seed_ordered_txs(db_path: &str) {
         .initialize_open_state(123, SafeInputRange::empty_at(0))
         .expect("initialize open state");
     storage
-        .close_frame_and_batch(&mut head, 123)
+        .close_frame_and_batch(&mut head)
         .expect("advance to batch nonce 1");
 
     let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
@@ -439,7 +439,7 @@ fn seed_ordered_txs(db_path: &str) {
     };
 
     storage
-        .append_executed_user_ops_chunk(
+        .append_included_user_ops(
             &mut head,
             &[IncludedUserOp {
                 pending,

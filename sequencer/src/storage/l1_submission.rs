@@ -197,7 +197,7 @@ mod tests {
             .expect("initialize open state");
         // Close batch 0 so it becomes eligible for submission.
         storage
-            .close_frame_and_batch(&mut head, 12)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         let pending = storage.pending_batches(0).expect("load pending batches");
@@ -238,9 +238,8 @@ mod tests {
             .expect("initialize open state");
 
         // Close current batch and move to next so batch 0 becomes closed.
-        let next_safe_block = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, next_safe_block)
+            .close_frame_and_batch(&mut head)
             .expect("close batch and rotate");
 
         // Latest batch nonce should now be 1 (open), with batch 0 closed.
@@ -288,9 +287,8 @@ mod tests {
         );
 
         // Close batch 0 — this rotates the Tip to batch 1 and seals batch 0.
-        let safe_block = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, safe_block)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         // After close: batch 0 is eligible with nonce 0 (genesis: no valid
@@ -393,12 +391,8 @@ mod tests {
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close 0");
-        storage
-            .close_frame_and_batch(&mut head, 10)
-            .expect("close 1");
+        storage.close_frame_and_batch(&mut head).expect("close 0");
+        storage.close_frame_and_batch(&mut head).expect("close 1");
         // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
         // which records the accepted batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
@@ -452,7 +446,7 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         storage.insert_invalid_batch(0).expect("invalidate batch 0");
@@ -468,7 +462,7 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("recovery batch");
-        assert_eq!(head.batch_index, 2);
+        assert_eq!(head.batch_index(), 2);
 
         // No valid batch remains → the recovery Tip carries the anchor, 0.
         let recovery_nonce: i64 = storage

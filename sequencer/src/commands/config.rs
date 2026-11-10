@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(status_at(&mut storage, seal_safe_block), DangerStatus::Safe);
         // Closure keeps the frame clock; the batch still ages from first_frame.
         storage
-            .close_frame_and_batch(&mut head, first_frame)
+            .close_frame_and_batch(&mut head)
             .expect("seal by time");
 
         // The sealed batch keeps the margin, less the frame lag, to become accepted.

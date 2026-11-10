@@ -222,10 +222,10 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 1");
 
         let protocol = default_protocol_timing();
@@ -283,10 +283,10 @@ mod tests {
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 1");
 
         let protocol = default_protocol_timing();

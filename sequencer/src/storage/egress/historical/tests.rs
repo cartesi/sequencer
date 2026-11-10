@@ -151,7 +151,6 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
         storage
             .close_frame_and_batch_with_snapshot(
                 &mut head,
-                20,
                 Path::new(&format!("/snapshot/{index}")),
                 L2TxCount::new(41),
             )
@@ -299,7 +298,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
     assert_eq!(
         storage
             .recover_aging_tip_for_recovery(
-                head.batch_index,
+                head.batch_index(),
                 &protocol,
                 now,
                 TEST_MAX_DIRECT_PAYLOAD_BYTES,

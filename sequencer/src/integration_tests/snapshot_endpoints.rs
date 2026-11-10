@@ -53,16 +53,10 @@ fn register_accepted(
             .initialize_open_state(inclusion_block, crate::storage::SafeInputRange::empty_at(0))
             .unwrap()
     });
-    let nonce = storage.batch_nonce(head.batch_index).unwrap();
+    let nonce = head.batch_nonce();
     let prefix = write_state(dir, name, bytes, nonce + 1);
-    let safe_block = head.safe_block;
     storage
-        .close_frame_and_batch_with_snapshot(
-            &mut head,
-            safe_block,
-            &prefix,
-            crate::storage::L2TxCount::ZERO,
-        )
+        .close_frame_and_batch_with_snapshot(&mut head, &prefix, crate::storage::L2TxCount::ZERO)
         .unwrap();
     crate::storage::test_helpers::seed_safe_inputs_with_batch_nonces(
         &mut storage,
@@ -76,19 +70,17 @@ fn register_accepted(
 fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonce: u64) -> i64 {
     let mut storage = Storage::open(db_path).unwrap();
     let mut head = storage.open_state().unwrap().unwrap();
-    while storage.batch_nonce(head.batch_index).unwrap() <= nonce {
-        let current = storage.batch_nonce(head.batch_index).unwrap();
+    while head.batch_nonce() <= nonce {
+        let current = head.batch_nonce();
         let dump_name = if current == nonce {
             name.to_owned()
         } else {
             format!("intermediate-{current}")
         };
         let prefix = write_state(dir, &dump_name, bytes, current + 1);
-        let safe_block = head.safe_block;
         storage
             .close_frame_and_batch_with_snapshot(
                 &mut head,
-                safe_block,
                 &prefix,
                 crate::storage::L2TxCount::ZERO,
             )
@@ -125,7 +117,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
         .unwrap();
     let prefix = write_state(root.path(), "local", b"local checkpoint", 1);
     storage
-        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, L2TxCount::ZERO)
+        .close_frame_and_batch_with_snapshot(&mut head, &prefix, L2TxCount::ZERO)
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     let inputs = vec![

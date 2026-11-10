@@ -22,10 +22,10 @@ pub(super) const DIRECT_EXECUTES_SQL: &str = "(sender != :batch_submitter \
 
 // ── Write-head loading ───────────────────────────────────────────────────
 //
-// Used by ingress (initialize/resume open state) and recovery (open recovery
-// batch after cascade). The WriteHead is the in-memory mirror of the latest
-// open batch/frame and must always match what's persisted in `batches` and
-// `frames`.
+// The only constructor of a `WriteHead` outside tests. Ingress loads the lane's
+// head with it and reloads it to compare at every frame rotation and batch
+// close. The head is the in-memory mirror of the latest open batch/frame and
+// must always match what's persisted in `batches` and `frames`.
 
 pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
     // The Tip is the single row in `valid_open_batch` (enforced by
@@ -34,6 +34,7 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
     let latest_batch = match tx.query_row(
         "SELECT
             b.batch_index,
+            b.nonce,
             b.created_at_ms,
             (SELECT COUNT(*) FROM user_ops u WHERE u.batch_index = b.batch_index) AS user_op_count
          FROM valid_open_batch b",
@@ -43,6 +44,7 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         },
     ) {
@@ -50,7 +52,8 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(other) => return Err(other),
     };
-    let (batch_index_i64, batch_created_at_ms, batch_user_op_count_i64) = latest_batch;
+    let (batch_index_i64, batch_nonce_i64, batch_created_at_ms, batch_user_op_count_i64) =
+        latest_batch;
 
     let (frame_in_batch_i64, frame_fee_i64, safe_block_i64): (i64, i64, i64) = tx.query_row(
         "SELECT frame_in_batch, fee, safe_block FROM frames \
@@ -68,6 +71,7 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
     let policy = query_batch_policy(tx)?;
     Ok(Some(WriteHead {
         batch_index: i64_to_u64(batch_index_i64),
+        batch_nonce: i64_to_u64(batch_nonce_i64),
         batch_created_at: from_unix_ms(batch_created_at_ms),
         frame_fee: i64_to_u16(frame_fee_i64),
         safe_block: i64_to_u64(safe_block_i64),

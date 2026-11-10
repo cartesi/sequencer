@@ -33,22 +33,21 @@ use thiserror::Error;
 pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
 pub(crate) use history::ApplicationInputRow;
-pub use history::{DirectInputExecution, Era, NewEra};
+pub use history::{DirectInputExecution, NewEra};
 pub(crate) use history::{HistoryReadError, L2TxContext};
-pub use l1_inputs::AdmittedDirects;
-pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
+pub(crate) use ingress::ExecutedUserOp;
+pub use lifecycle::{LifecycleCommand, LifecycleError};
 pub use open::Storage;
-pub use rebuilt_history::RebuiltDirects;
 pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
-pub use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};
+pub use sequencer_core::history::L2TxCount;
 pub use snapshots::{
-    FinalizedDump, FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot,
-    SnapshotLeases,
+    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot, SnapshotLeases,
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
-/// the L1 block where it was included.
+/// the L1 block where it was included. Test fixtures seed inputs with it.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSafeInput {
     pub sender: alloy_primitives::Address,
@@ -260,26 +259,74 @@ pub struct BatchPolicy {
 }
 
 /// Trusted, reconstructible in-memory cache of the latest durable open batch +
-/// frame. Mutated by `Storage` methods that change the open state
-/// (`append_executed_user_ops_chunk`, attributed `close_*`). The sole-writer
-/// lane loads one from SQLite and threads it through every call; failed
-/// writes/restarts discard it. Physical-only siblings are test fixtures.
-#[derive(Debug, Clone, Copy)]
+/// frame. Opaque outside storage: only the loader (`queries::load_current_write_head`)
+/// builds one, and only the `Storage` methods that change the open state
+/// (`append_executed_user_ops_chunk`, attributed `close_*`) advance it, after
+/// their commit. Storage reloads the Tip and compares it at every frame
+/// rotation and batch close. Failed writes and restarts discard it.
+#[derive(Debug)]
 pub struct WriteHead {
-    pub batch_index: u64,
-    pub batch_created_at: SystemTime,
+    batch_index: u64,
+    /// The open batch's nonce; immutable once the batch is inserted.
+    batch_nonce: u64,
+    batch_created_at: SystemTime,
     /// Log-space fee exponent (base 129/128) committed for this open frame.
-    pub frame_fee: u16,
-    pub safe_block: u64,
-    pub batch_user_op_count: u64,
-    pub open_frame_user_op_count: u32,
-    pub frame_in_batch: u32,
+    frame_fee: u16,
+    safe_block: u64,
+    batch_user_op_count: u64,
+    open_frame_user_op_count: u32,
+    frame_in_batch: u32,
     // Soft batch size threshold read from batch_policy at each frame/batch transition.
-    pub max_batch_user_op_bytes: u64,
+    max_batch_user_op_bytes: u64,
 }
 
 impl WriteHead {
-    pub fn increment_batch_user_op_count(&mut self, count: usize) {
+    pub(crate) fn batch_index(&self) -> u64 {
+        self.batch_index
+    }
+
+    pub(crate) fn batch_nonce(&self) -> u64 {
+        self.batch_nonce
+    }
+
+    pub(crate) fn batch_created_at(&self) -> SystemTime {
+        self.batch_created_at
+    }
+
+    /// Log-space fee exponent (base 129/128) committed for the open frame.
+    pub(crate) fn frame_fee(&self) -> u16 {
+        self.frame_fee
+    }
+
+    pub(crate) fn safe_block(&self) -> u64 {
+        self.safe_block
+    }
+
+    pub(crate) fn batch_user_op_count(&self) -> u64 {
+        self.batch_user_op_count
+    }
+
+    pub(crate) fn max_batch_user_op_bytes(&self) -> u64 {
+        self.max_batch_user_op_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_in_batch(&self) -> u32 {
+        self.frame_in_batch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_frame_user_op_count(&self) -> u32 {
+        self.open_frame_user_op_count
+    }
+
+    /// A private copy, so a counter advance is validated before the
+    /// transaction that commits it.
+    fn duplicate(&self) -> Self {
+        Self { ..*self }
+    }
+
+    fn increment_batch_user_op_count(&mut self, count: usize) {
         let count_u64 =
             u64::try_from(count).expect("user-op chunk length exceeds u64: contract-impossible");
         let count_u32 =
@@ -296,7 +343,7 @@ impl WriteHead {
         self.open_frame_user_op_count = next_frame_count;
     }
 
-    pub fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
+    fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
         self.frame_in_batch = self
             .frame_in_batch
             .checked_add(1)
@@ -307,17 +354,17 @@ impl WriteHead {
         self.max_batch_user_op_bytes = batch_size_target_bytes(policy);
     }
 
-    pub fn move_to_next_batch(
+    fn move_to_next_batch(
         &mut self,
         batch_index: u64,
+        batch_nonce: u64,
         batch_created_at: SystemTime,
         policy: BatchPolicy,
-        safe_block: u64,
     ) {
         self.batch_index = batch_index;
+        self.batch_nonce = batch_nonce;
         self.batch_created_at = batch_created_at;
         self.frame_fee = policy.recommended_fee;
-        self.safe_block = safe_block;
         self.batch_user_op_count = 0;
         self.open_frame_user_op_count = 0;
         self.frame_in_batch = 0;
@@ -338,44 +385,40 @@ fn batch_size_target_bytes(policy: BatchPolicy) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::WriteHeadParts;
     use super::*;
     use alloy_primitives::U256;
-    use std::time::UNIX_EPOCH;
-
-    fn write_head() -> WriteHead {
-        WriteHead {
-            batch_index: 0,
-            batch_created_at: UNIX_EPOCH,
-            frame_fee: 0,
-            safe_block: 0,
-            batch_user_op_count: 0,
-            open_frame_user_op_count: 0,
-            frame_in_batch: 0,
-            max_batch_user_op_bytes: 1,
-        }
-    }
 
     #[test]
     #[should_panic(expected = "batch user-op count overflow: contract-impossible")]
     fn write_head_batch_count_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.batch_user_op_count = u64::MAX;
+        let mut head = WriteHeadParts {
+            batch_user_op_count: u64::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.increment_batch_user_op_count(1);
     }
 
     #[test]
     #[should_panic(expected = "frame user-op count overflow: contract-impossible")]
     fn write_head_frame_count_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.open_frame_user_op_count = u32::MAX;
+        let mut head = WriteHeadParts {
+            open_frame_user_op_count: u32::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.increment_batch_user_op_count(1);
     }
 
     #[test]
     #[should_panic(expected = "frame index overflow: contract-impossible")]
     fn write_head_frame_index_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.frame_in_batch = u32::MAX;
+        let mut head = WriteHeadParts {
+            frame_in_batch: u32::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.advance_frame(
             BatchPolicy {
                 recommended_fee: 0,

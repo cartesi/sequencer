@@ -666,7 +666,7 @@ mod recover_post_flush {
 
         // A fresh recovery Tip exists with a higher batch_index.
         let head = storage.open_state().expect("load").expect("recovery Tip");
-        assert_eq!(head.batch_index, 2);
+        assert_eq!(head.batch_index(), 2);
     }
 
     #[test]
@@ -697,7 +697,7 @@ mod recover_post_flush {
 
         // Tip preserved.
         let head = storage.open_state().expect("load").expect("Tip");
-        assert_eq!(head.batch_index, 1);
+        assert_eq!(head.batch_index(), 1);
     }
 }
 
@@ -757,7 +757,7 @@ mod tip_staleness {
 
         // A fresh recovery batch must be opened at batch_index=1.
         let head = storage.open_state().expect("load").expect("head");
-        assert_eq!(head.batch_index, 1, "recovery batch is the next index");
+        assert_eq!(head.batch_index(), 1, "recovery batch is the next index");
     }
 
     #[test]
@@ -784,7 +784,8 @@ mod tip_staleness {
         // The open batch must still be the live one (no recovery batch opened).
         let head = storage.open_state().expect("load").expect("head");
         assert_eq!(
-            head.batch_index, 0,
+            head.batch_index(),
+            0,
             "original open batch 0 must still be the head"
         );
     }
@@ -1652,7 +1653,7 @@ mod boundary {
             .expect("collect");
         assert_eq!(accepted, vec![(0, 0, true), (1, 1, true)]);
         let tip = storage.open_state().expect("load").expect("a fresh Tip");
-        assert_eq!(storage.batch_nonce(tip.batch_index).expect("nonce"), 2);
+        assert_eq!(tip.batch_nonce(), 2);
     }
 
     #[test]
@@ -1744,7 +1745,7 @@ mod valid_batch_invariants {
 
         // Phase 5: rotations after torn cascade — the new Tip follows batch 0.
         let mut head = storage.open_state().expect("load").unwrap();
-        assert_eq!(storage.batch_nonce(head.batch_index).expect("nonce"), 1);
+        assert_eq!(head.batch_nonce(), 1);
         for _ in 0..5 {
             storage.close_batch_at(&mut head, 2000).expect("close gen3");
             assert_valid_spine_from_anchor(&mut storage);
@@ -1783,7 +1784,7 @@ mod valid_batch_invariants {
         assert_valid_spine_from_anchor(&mut storage);
 
         let mut head = storage.open_state().expect("load").unwrap();
-        assert_eq!(storage.batch_nonce(head.batch_index).expect("nonce"), 0);
+        assert_eq!(head.batch_nonce(), 0);
         for _ in 0..5 {
             storage.close_batch_at(&mut head, 2000).expect("close gen2");
             assert_valid_spine_from_anchor(&mut storage);
@@ -1945,10 +1946,10 @@ mod check_danger {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 1");
 
         let protocol = default_protocol_timing();
@@ -1985,10 +1986,10 @@ mod check_danger {
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, 100)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 1");
 
         let protocol = default_protocol_timing();
@@ -2036,7 +2037,7 @@ mod check_danger {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         let protocol = default_protocol_timing();
@@ -2080,7 +2081,7 @@ mod check_danger {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0; batch 1 is Tip");
 
         let protocol = default_protocol_timing();
@@ -2127,7 +2128,7 @@ mod check_danger {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
         let protocol = default_protocol_timing();
@@ -2243,7 +2244,7 @@ mod check_danger {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage
-            .close_frame_and_batch(&mut head, 10)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;

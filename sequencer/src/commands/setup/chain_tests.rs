@@ -313,7 +313,7 @@ fn feed(storage: &mut Storage, from: u64) -> Vec<Row> {
 /// How many rows the rebuilt history holds.
 fn rebuilt_rows(storage: &mut Storage) -> u64 {
     storage
-        .read(|tx| tx.query_row("SELECT COUNT(*) FROM rebuilt_history", [], |row| row.get(0)))
+        .raw_read(|tx| tx.query_row("SELECT COUNT(*) FROM rebuilt_history", [], |row| row.get(0)))
         .map(|count: i64| u64::try_from(count).unwrap())
         .unwrap()
 }
@@ -571,7 +571,7 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
 
     let mut storage = Storage::open(&db_path).unwrap();
     let root = storage.open_state().unwrap().expect("run opened the root");
-    assert!(root.safe_block >= summary.through_block);
+    assert!(root.safe_block() >= summary.through_block);
     let drained: Vec<(u64, u64, u64)> = feed(&mut storage, rebuilt_end)
         .into_iter()
         .map(|(offset, tx, batch_nonce)| match tx {

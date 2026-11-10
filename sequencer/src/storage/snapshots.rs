@@ -229,10 +229,6 @@ impl Storage {
             stmt.query_map([], row_to_snapshot)?.collect()
         })
     }
-
-    pub fn batch_nonce(&mut self, batch_index: u64) -> Result<u64> {
-        self.read(|tx| batch_nonce_in(tx, batch_index))
-    }
 }
 
 /// Select the collectible snapshots, keep the leased ones, drop the registry's

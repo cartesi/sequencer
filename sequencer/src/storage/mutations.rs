@@ -19,28 +19,30 @@ use super::{DirectInputExecution, SafeInputRange};
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
 /// The explicit form pins the very first genesis batch at `batch_index = 0`.
 /// `trg_batch_insert` checks the same rule, so caller and schema agree.
+/// Returns the new batch's index and nonce.
 pub(super) fn insert_new_batch(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
     created_at_ms: i64,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let nonce = compute_next_nonce(tx)?;
-    match batch_index_opt {
+    let batch_index = match batch_index_opt {
         Some(bi) => {
             tx.execute(
                 "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (?1, ?2, ?3)",
                 params![u64_to_i64(bi), u64_to_i64(nonce), created_at_ms],
             )?;
-            Ok(bi)
+            bi
         }
         None => {
             tx.execute(
                 "INSERT INTO batches (nonce, created_at_ms) VALUES (?1, ?2)",
                 params![u64_to_i64(nonce), created_at_ms],
             )?;
-            Ok(i64_to_u64(tx.last_insert_rowid()))
+            i64_to_u64(tx.last_insert_rowid())
         }
-    }
+    };
+    Ok((batch_index, nonce))
 }
 
 /// The last valid nonce + 1, or the era's anchor when no batch is valid: the

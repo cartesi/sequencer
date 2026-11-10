@@ -679,7 +679,7 @@ mod tests {
         }
         if !has_recovery_checkpoint {
             storage
-                .write(|tx| {
+                .raw_write(|tx| {
                     tx.execute("DELETE FROM snapshots WHERE batch_index IS NULL", [])?;
                     Ok(())
                 })
@@ -748,7 +748,7 @@ mod tests {
         let mut storage = storage::Storage::open_writer(&db.path).expect("open writer");
         if closed {
             let mut head = storage.open_state().unwrap().unwrap();
-            storage.close_frame_and_batch(&mut head, 0).unwrap();
+            storage.close_frame_and_batch(&mut head).unwrap();
         }
         storage
             .append_safe_inputs_with_timestamp(
@@ -765,7 +765,7 @@ mod tests {
     fn invalidated_batches(db_path: &str) -> Vec<u64> {
         let mut storage = storage::Storage::open_writer(db_path).unwrap();
         storage
-            .read(|tx| {
+            .raw_read(|tx| {
                 tx.prepare("SELECT batch_index FROM batches WHERE invalidated_at_ms IS NOT NULL ORDER BY batch_index")?
                     .query_map([], |row| {
                         Ok(u64::try_from(row.get::<_, i64>(0)?).expect("nonnegative batch index"))
@@ -787,7 +787,7 @@ mod tests {
 
         storage::Storage::open_writer(&db.path)
             .unwrap()
-            .write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
+            .raw_write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
             .unwrap();
         let mut l1 = TestL1::new(&db.path, &protocol, vec![offline()]);
         assert_retry(
@@ -869,7 +869,7 @@ mod tests {
 
         let mut storage = storage::Storage::open_writer(&db.path).unwrap();
         let rows: Vec<(i64, Option<i64>)> = storage
-            .read(|tx| {
+            .raw_read(|tx| {
                 tx.prepare(
                     "SELECT l2_tx_count, safe_input_index FROM application_inputs ORDER BY l2_tx_count",
                 )?
@@ -892,11 +892,11 @@ mod tests {
         storage
             .close_frame_only(&mut head, block, storage::SafeInputRange::empty_at(0))
             .unwrap();
-        storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
         storage
             .insert_batch_snapshot(&db._dir.path().join("batch0"), 0)
             .unwrap();
-        storage.close_frame_and_batch(&mut head, block).unwrap();
+        storage.close_frame_and_batch(&mut head).unwrap();
         storage
             .insert_batch_snapshot(&db._dir.path().join("batch1"), 1)
             .unwrap();
@@ -1027,7 +1027,7 @@ mod tests {
         let ahead = crate::clock::unix_now_ms() + protocol.seconds_per_block() * 2_000;
         storage::Storage::open_writer(&db.path)
             .unwrap()
-            .write(|tx| {
+            .raw_write(|tx| {
                 tx.execute(
                     "UPDATE l1_safe_head SET synced_at_ms = ?1",
                     [i64::try_from(ahead).unwrap()],
@@ -1050,7 +1050,7 @@ mod tests {
         let _admission = admit_runtime(&db.path, &protocol).unwrap();
         storage::Storage::open_writer(&db.path)
             .unwrap()
-            .write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
+            .raw_write(|tx| tx.execute("UPDATE l1_safe_head SET block_timestamp = 0", []))
             .unwrap();
         assert_retry(admit_runtime(&db.path, &protocol).unwrap_err());
     }

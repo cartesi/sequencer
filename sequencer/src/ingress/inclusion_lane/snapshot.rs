@@ -46,21 +46,15 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     app: &mut A,
     storage: &mut Storage,
     head: &mut WriteHead,
-    next_safe_block: u64,
     dumps_dir: &Path,
 ) -> Result<(), TakeDumpError> {
-    let batch_index = head.batch_index;
-    let nonce = storage.batch_nonce(batch_index)?;
+    let batch_index = head.batch_index();
+    let nonce = head.batch_nonce();
     let dump_dir = make_dump_dir(dumps_dir, nonce);
     let started = Instant::now();
     dump_info::create_dump_dir_with_info(app, &dump_dir, &DumpInfo::at_batch_close(nonce))?;
     let snapshot_elapsed = started.elapsed();
-    storage.close_frame_and_batch_with_snapshot(
-        head,
-        next_safe_block,
-        &dump_dir,
-        app.l2_tx_count(),
-    )?;
+    storage.close_frame_and_batch_with_snapshot(head, &dump_dir, app.l2_tx_count())?;
     let snapshot_ms = snapshot_elapsed.as_millis();
     if snapshot_elapsed >= SLOW_SNAPSHOT {
         tracing::warn!(
