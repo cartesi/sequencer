@@ -231,7 +231,6 @@ impl<A: Application + 'static> InclusionLane<A> {
             &mut lane_state.head,
             frontier.safe_block,
             leading_direct_range,
-            A::scheduler_limits().max_direct_payload_bytes,
             &executions,
         )?;
         lane_state.next_safe_input_index = frontier.end_exclusive;
@@ -246,18 +245,16 @@ impl<A: Application + 'static> InclusionLane<A> {
     }
 
     /// Execute the directs `range` drains. Storage hands out only those that
-    /// execute: no batch-submitter input and none over the application's
-    /// payload cap, which therefore get no execution row.
+    /// execute: no batch-submitter input and none over the pinned payload
+    /// cap, which therefore get no execution row.
     fn execute_direct_range(
         &mut self,
         range: SafeInputRange,
         chunk: &mut Vec<Direct>,
     ) -> Result<Vec<crate::storage::DirectInputExecution>, InclusionLaneError> {
-        let max_direct_payload_bytes = A::scheduler_limits().max_direct_payload_bytes;
         let mut executions = Vec::new();
         for chunk_range in range.chunks(self.config.safe_input_buffer_capacity.max(1) as u64) {
-            self.storage
-                .fill_direct_inputs(chunk_range, max_direct_payload_bytes, chunk)?;
+            self.storage.fill_direct_inputs(chunk_range, chunk)?;
             for direct in chunk.drain(..) {
                 let safe_input_index = direct.input_index;
                 let l2_tx_index = match execute(&mut self.app, &L2Tx::Direct(direct))

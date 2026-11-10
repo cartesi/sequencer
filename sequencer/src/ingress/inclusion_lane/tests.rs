@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, WriteHeadParts, default_protocol_timing,
-    record_canonical_divergence, set_one_op_batch_target,
+    SENDER_A, WriteHeadParts, default_protocol_timing, record_canonical_divergence,
+    set_one_op_batch_target,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, L2TxContext, SafeInputRange, Storage, StoredSafeInput,
@@ -587,7 +587,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             10,
             SafeInputRange::new(0, 1),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 l2_tx_index: L2TxCount::new(2),
@@ -616,7 +615,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             20,
             SafeInputRange::new(1, 2),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
                 l2_tx_index: L2TxCount::new(4),
@@ -641,7 +639,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             30,
             SafeInputRange::new(2, 3),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 2,
                 l2_tx_index: L2TxCount::new(5),
@@ -1245,7 +1242,6 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
             &mut head,
             10,
             SafeInputRange::new(0, 2),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
                 l2_tx_index: direct_index,
@@ -1292,12 +1288,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         vec![0, 1, 2]
     );
     let invalidated = storage
-        .recover_post_flush_for_recovery(
-            10,
-            &protocol,
-            crate::clock::unix_now_ms(),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
-        )
+        .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
         .expect("standard recovery cascade");
     assert_eq!(invalidated, vec![1, 2]);
     let recovered_history = storage.history_version().expect("recovered history");

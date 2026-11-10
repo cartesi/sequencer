@@ -12,8 +12,7 @@ use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::scheduler::Scheduled;
 
 use super::convert::{i64_to_u64, saturating_query_bound, u64_to_i64};
-use super::l1_inputs::query_deployment_identity;
-use super::queries::DIRECT_EXECUTES_SQL;
+use super::queries::{DIRECT_EXECUTES_SQL, DirectOperands};
 use super::{SafeInputRange, Storage};
 
 /// The rebuilt directs, counted against the input table.
@@ -71,14 +70,9 @@ impl Storage {
     /// The directs the rebuilt history holds, and how many of them are inputs
     /// of `range` that execute as directs by the predicate every drain uses.
     /// Setup checks both against the admitted inputs of the range it drained.
-    pub fn rebuilt_directs(
-        &mut self,
-        range: SafeInputRange,
-        max_direct_payload_bytes: u64,
-    ) -> Result<RebuiltDirects> {
+    pub fn rebuilt_directs(&mut self, range: SafeInputRange) -> Result<RebuiltDirects> {
         self.read(|tx| {
-            let identity =
-                query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let operands = DirectOperands::load(tx)?;
             let stored: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM rebuilt_history WHERE safe_input_index IS NOT NULL",
                 [],
@@ -93,12 +87,12 @@ impl Storage {
                                                  WHERE safe_input_index IS NOT NULL)"
                 ))?
                 .query_row(
-                    named_params! {
-                        ":start": saturating_query_bound(range.start()),
-                        ":end": saturating_query_bound(range.end()),
-                        ":batch_submitter": identity.batch_submitter_address.as_slice(),
-                        ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
-                    },
+                    operands
+                        .bind(named_params! {
+                            ":start": saturating_query_bound(range.start()),
+                            ":end": saturating_query_bound(range.end()),
+                        })
+                        .as_slice(),
                     |row| row.get(0),
                 )?;
             Ok(RebuiltDirects {

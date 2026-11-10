@@ -271,12 +271,7 @@ fn recover_tip(storage: &mut Storage, head: &mut WriteHead, safe_block: u64) {
         .append_safe_inputs(safe_block, &[], SUBMITTER, &protocol)
         .unwrap();
     let invalidated = storage
-        .recover_aging_tip_for_recovery(
-            head.batch_index(),
-            &protocol,
-            crate::clock::unix_now_ms(),
-            WalletApp::scheduler_limits().max_direct_payload_bytes,
-        )
+        .recover_aging_tip_for_recovery(head.batch_index(), &protocol, crate::clock::unix_now_ms())
         .unwrap();
     assert_eq!(invalidated, vec![head.batch_index()]);
     *head = storage.open_state().unwrap().unwrap();
@@ -370,13 +365,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
         });
     }
     storage
-        .close_frame_only_with_executions(
-            &mut head,
-            10,
-            SafeInputRange::new(0, 2),
-            WalletApp::scheduler_limits().max_direct_payload_bytes,
-            &executions,
-        )
+        .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &executions)
         .unwrap();
     append_transfer(&mut storage, &mut head, &mut app, &mut history, &signer, 10);
     close_and_accept(&mut storage, &mut head, &mut app, dumps.path(), 20);

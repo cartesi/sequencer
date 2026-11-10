@@ -9,8 +9,7 @@ use sequencer_core::history::L2TxCount;
 use super::*;
 use crate::storage::history::{advance_recovery_generation_in, insert_era_in};
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, era as era_record,
-    local_batch_payload,
+    SENDER_A, SENDER_B, default_protocol_timing, era as era_record, local_batch_payload,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
@@ -279,7 +278,6 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             &mut head,
             110,
             SafeInputRange::new(0, 1),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 l2_tx_index: L2TxCount::new(41),
@@ -297,12 +295,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
     );
     assert_eq!(
         storage
-            .recover_aging_tip_for_recovery(
-                head.batch_index(),
-                &protocol,
-                now,
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-            )
+            .recover_aging_tip_for_recovery(head.batch_index(), &protocol, now,)
             .unwrap(),
         [0]
     );

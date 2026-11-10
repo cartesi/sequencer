@@ -501,6 +501,7 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
                 input_box_address: chain.input_box,
                 app_deployment_block: chain.app_deployment_block,
                 batch_submitter_address: chain.submitter,
+                max_direct_payload_bytes: WalletApp::scheduler_limits().max_direct_payload_bytes,
                 fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
             })
             .unwrap();
@@ -564,7 +565,6 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
             allow_insecure_rpc: false,
         },
         &timing,
-        WalletApp::scheduler_limits().max_direct_payload_bytes,
     )
     .await
     .unwrap();
@@ -751,6 +751,7 @@ async fn the_escape_check_refuses_activity_past_the_stop_block() {
             input_box_address: chain.input_box,
             app_deployment_block: chain.app_deployment_block,
             batch_submitter_address: chain.submitter,
+            max_direct_payload_bytes: WalletApp::scheduler_limits().max_direct_payload_bytes,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .unwrap();

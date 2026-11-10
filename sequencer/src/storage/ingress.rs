@@ -15,18 +15,15 @@ use sequencer_core::l2_tx::Direct;
 use sequencer_core::user_op::SignedUserOp;
 
 use super::acceptance::canonical_divergence_in;
-use super::convert::{
-    from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
-    u64_to_i64,
-};
+use super::convert::{from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, to_unix_ms, u64_to_i64};
 use super::history::{era_in, next_l2_tx_count_in};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence,
     persist_frame_direct_sequence_derived, seal_batch,
 };
 use super::queries::{
-    DIRECT_EXECUTES_SQL, current_safe_block_required, load_current_write_head, query_batch_policy,
-    query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
+    DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block_required, load_current_write_head,
+    query_batch_policy, query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::snapshots::insert_batch_snapshot_in;
 use super::{
@@ -117,21 +114,19 @@ impl Storage {
     }
 
     /// The directs in `range` that execute, in input order, each with the
-    /// index and timestamp the application receives. A direct over
-    /// `max_direct_payload_bytes` is left out, as storage's derivation of the
-    /// frame's executions leaves it out.
+    /// index and timestamp the application receives. A direct over the
+    /// pinned cap is left out, as storage's derivation of the frame's
+    /// executions leaves it out.
     pub(crate) fn fill_direct_inputs(
         &mut self,
         range: SafeInputRange,
-        max_direct_payload_bytes: u64,
         out: &mut Vec<Direct>,
     ) -> Result<()> {
         out.clear();
         if range.is_empty() {
             return Ok(());
         }
-        let identity = super::l1_inputs::query_deployment_identity(&self.conn)?
-            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        let operands = DirectOperands::load(&self.conn)?;
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT safe_input_index, sender, payload, block_number, block_timestamp
              FROM safe_inputs
@@ -140,12 +135,12 @@ impl Storage {
              ORDER BY safe_input_index"
         ))?;
         let rows = statement.query_map(
-            named_params! {
-                ":start": u64_to_i64(range.start()),
-                ":end": u64_to_i64(range.end()),
-                ":batch_submitter": identity.batch_submitter_address.as_slice(),
-                ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
-            },
+            operands
+                .bind(named_params! {
+                    ":start": u64_to_i64(range.start()),
+                    ":end": u64_to_i64(range.end()),
+                })
+                .as_slice(),
             |row| {
                 let sender: Vec<u8> = row.get(1)?;
                 Ok(Direct {
@@ -199,25 +194,16 @@ impl Storage {
     }
 
     /// Commit frame advancement together with its application inputs, which
-    /// must be exactly the directs the range executes under
-    /// `max_direct_payload_bytes`.
+    /// must be exactly the directs the range executes.
     pub fn close_frame_only_with_executions(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
-        max_direct_payload_bytes: u64,
         executions: &[DirectInputExecution],
     ) -> Result<()> {
         let policy = self.write(|tx| {
-            close_frame_in(
-                tx,
-                head,
-                next_safe_block,
-                leading_direct_range,
-                max_direct_payload_bytes,
-                executions,
-            )
+            close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)
         })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
@@ -272,7 +258,7 @@ pub(super) fn insert_tip_rows(
 
 /// Extend the valid batch path with a fresh open Tip at the current safe head,
 /// draining every undrained safe input into its first frame: each direct that
-/// executes under `max_direct_payload_bytes` gets its row there (lane catch-up
+/// executes gets its row there (lane catch-up
 /// executes them, I11).
 ///
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
@@ -283,10 +269,7 @@ pub(super) fn insert_tip_rows(
 /// `batch_index` is the explicit genesis `0` only when the `batches` table is
 /// empty, otherwise the monotonic PK (so recovery batches keep climbing and
 /// indices are never reused).
-pub(super) fn open_fresh_tip_in_tx(
-    tx: &Transaction<'_>,
-    max_direct_payload_bytes: u64,
-) -> Result<()> {
+pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
     let safe_block = current_safe_block_required(tx)?;
     let table_empty = tx
         .query_row("SELECT MAX(batch_index) FROM batches", [], |row| {
@@ -299,7 +282,6 @@ pub(super) fn open_fresh_tip_in_tx(
         batch_index_opt,
         safe_block,
         query_latest_safe_input_index_exclusive(tx)?,
-        max_direct_payload_bytes,
     )
 }
 
@@ -311,18 +293,11 @@ fn insert_draining_tip_with_executions(
     batch_index: Option<u64>,
     safe_block: u64,
     drain_upper: u64,
-    max_direct_payload_bytes: u64,
 ) -> Result<()> {
     let leading_direct_range =
         SafeInputRange::new(next_undrained_safe_input_index_in(tx)?, drain_upper);
     let batch_index = insert_tip_rows(tx, batch_index, safe_block)?;
-    persist_frame_direct_sequence_derived(
-        tx,
-        batch_index,
-        0,
-        leading_direct_range,
-        max_direct_payload_bytes,
-    )?;
+    persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
     Ok(())
 }
 
@@ -451,7 +426,6 @@ fn close_frame_in(
     head: &WriteHead,
     next_safe_block: u64,
     leading_direct_range: SafeInputRange,
-    max_direct_payload_bytes: u64,
     executions: &[DirectInputExecution],
 ) -> Result<BatchPolicy> {
     assert_eq!(
@@ -468,7 +442,6 @@ fn close_frame_in(
         head.batch_index,
         next_frame_in_batch,
         leading_direct_range,
-        max_direct_payload_bytes,
         executions,
     )?;
     Ok(policy)
@@ -763,7 +736,6 @@ mod tests {
                     &mut stale,
                     10,
                     SafeInputRange::empty_at(0),
-                    TEST_MAX_DIRECT_PAYLOAD_BYTES,
                     &[],
                 );
             }))
@@ -776,13 +748,7 @@ mod tests {
         assert_eq!(storage.open_state().unwrap().unwrap().frame_in_batch(), 1);
         let mut head = head;
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                10,
-                SafeInputRange::empty_at(0),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &[],
-            )
+            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::empty_at(0), &[])
             .expect("the live head still rotates");
     }
 
@@ -855,13 +821,7 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .unwrap();
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                9,
-                SafeInputRange::empty_at(0),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &[],
-            )
+            .close_frame_only_with_executions(&mut head, 9, SafeInputRange::empty_at(0), &[])
             .unwrap();
     }
 
@@ -1030,7 +990,6 @@ mod tests {
                 &mut head,
                 10,
                 SafeInputRange::new(0, 2),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
                 &incomplete,
             );
         }));
@@ -1053,13 +1012,7 @@ mod tests {
             },
         ];
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                10,
-                SafeInputRange::new(0, 2),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &complete,
-            )
+            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &complete)
             .expect("commit complete direct attribution");
         assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
     }
@@ -1617,13 +1570,7 @@ mod tests {
             )
             .unwrap();
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                10,
-                SafeInputRange::new(0, 1),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &[],
-            )
+            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 1), &[])
             .unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
         assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::ZERO);
@@ -1770,7 +1717,7 @@ mod tests {
         let range = SafeInputRange::new(0, 4);
         let mut directs = Vec::new();
         storage
-            .fill_direct_inputs(range, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut directs)
+            .fill_direct_inputs(range, &mut directs)
             .expect("read executable directs");
         let cap = usize::try_from(TEST_MAX_DIRECT_PAYLOAD_BYTES).unwrap();
         let at_cap = Direct {
@@ -1806,13 +1753,7 @@ mod tests {
             },
         ];
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            let _ = storage.close_frame_only_with_executions(
-                &mut head,
-                10,
-                range,
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &with_over_cap,
-            );
+            let _ = storage.close_frame_only_with_executions(&mut head, 10, range, &with_over_cap);
         }));
         assert!(panic.is_err(), "an over-cap execution must fail loud");
         assert_eq!(head.frame_in_batch(), 0);
@@ -1829,13 +1770,7 @@ mod tests {
             },
         ];
         storage
-            .close_frame_only_with_executions(
-                &mut head,
-                10,
-                range,
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                &executions,
-            )
+            .close_frame_only_with_executions(&mut head, 10, range, &executions)
             .expect("close the frame over the executable directs");
 
         assert_eq!(

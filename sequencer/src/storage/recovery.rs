@@ -146,12 +146,11 @@ impl Storage {
 
     /// Execute `EnsureOpenTip` only if its local decision
     /// still holds in the write transaction. The new Tip drains the undrained
-    /// directs under the application's `max_direct_payload_bytes`.
+    /// directs.
     pub(crate) fn ensure_open_tip_for_recovery(
         &mut self,
         protocol: &ProtocolTiming,
         now_ms: u64,
-        max_direct_payload_bytes: u64,
     ) -> std::result::Result<(), RecoveryMutationError> {
         let tx = self
             .conn
@@ -170,7 +169,7 @@ impl Storage {
         if facts.has_open_tip {
             return Err(RecoveryMutationError::TipAlreadyOpen);
         }
-        open_fresh_tip_in_tx(&tx, max_direct_payload_bytes)?;
+        open_fresh_tip_in_tx(&tx)?;
         // A broken postcondition must roll back this transaction and refuse
         // startup, including in release builds.
         if !has_valid_open_batch(&tx)? {
@@ -182,13 +181,12 @@ impl Storage {
 
     /// Execute `RecoverTip` only while the same Tip is
     /// still the observed-danger arm in the write transaction. The reopened
-    /// Tip drains under the application's `max_direct_payload_bytes`.
+    /// Tip drains the undrained directs.
     pub(crate) fn recover_aging_tip_for_recovery(
         &mut self,
         expected_batch_index: u64,
         protocol: &ProtocolTiming,
         now_ms: u64,
-        max_direct_payload_bytes: u64,
     ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
         let tx = self
             .conn
@@ -205,8 +203,7 @@ impl Storage {
                 actual: facts.danger,
             });
         }
-        let invalidated =
-            recover_aging_tip_inner(&tx, protocol.danger_threshold(), max_direct_payload_bytes)?;
+        let invalidated = recover_aging_tip_inner(&tx, protocol.danger_threshold())?;
         tx.commit()?;
         Ok(invalidated)
     }
@@ -214,14 +211,13 @@ impl Storage {
     /// Execute post-flush Cascade. The boot-local flush observation is
     /// represented by its observed safe-block floor; this transaction
     /// reasserts both I15 and the post-flush resync coherence check
-    /// immediately before changing the batches. The reopened Tip drains
-    /// under the application's `max_direct_payload_bytes`.
+    /// immediately before changing the batches. The reopened Tip drains the
+    /// undrained directs.
     pub(crate) fn recover_post_flush_for_recovery(
         &mut self,
         flush_observed_safe_block: u64,
         protocol: &ProtocolTiming,
         now_ms: u64,
-        max_direct_payload_bytes: u64,
     ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
         let tx = self
             .conn
@@ -240,8 +236,7 @@ impl Storage {
                 flush_observed_safe_block,
             });
         }
-        let invalidated =
-            recover_post_flush_inner(&tx, protocol.danger_threshold(), max_direct_payload_bytes)?;
+        let invalidated = recover_post_flush_inner(&tx, protocol.danger_threshold())?;
         tx.commit()?;
         Ok(invalidated)
     }
@@ -326,7 +321,6 @@ fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMu
 pub(super) fn recover_post_flush_inner(
     tx: &Transaction<'_>,
     danger_threshold: u64,
-    max_direct_payload_bytes: u64,
 ) -> Result<Vec<u64>> {
     // Path 1: any closed batch past gold cascades unconditionally.
     let pivot = match first_non_gold_closed_batch(tx)? {
@@ -334,7 +328,7 @@ pub(super) fn recover_post_flush_inner(
         // All closed batches are accepted; the Tip can still have aged.
         None => find_tip_batch_in_danger(tx, danger_threshold)?,
     };
-    cascade_and_reopen(tx, pivot, max_direct_payload_bytes)
+    cascade_and_reopen(tx, pivot)
 }
 
 /// Discard only the aging Tip. It has no L1 footprint, so no flush is required.
@@ -348,10 +342,9 @@ pub(super) fn recover_post_flush_inner(
 pub(super) fn recover_aging_tip_inner(
     tx: &Transaction<'_>,
     danger_threshold: u64,
-    max_direct_payload_bytes: u64,
 ) -> Result<Vec<u64>> {
     let pivot = find_tip_batch_in_danger(tx, danger_threshold)?;
-    cascade_and_reopen(tx, pivot, max_direct_payload_bytes)
+    cascade_and_reopen(tx, pivot)
 }
 
 /// Shared tail of both recovery paths — the pivot selection above is the
@@ -369,11 +362,7 @@ pub(super) fn recover_aging_tip_inner(
 /// 4. **Reopen the Tip** the cascade just invalidated (or one a torn crash
 ///    left missing), atomically with the cascade. Same mechanism the
 ///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
-fn cascade_and_reopen(
-    tx: &Transaction<'_>,
-    pivot: Option<u64>,
-    max_direct_payload_bytes: u64,
-) -> Result<Vec<u64>> {
+fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u64>> {
     let invalidated = match pivot {
         Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
         None => Vec::new(),
@@ -382,7 +371,7 @@ fn cascade_and_reopen(
         advance_recovery_generation_in(tx)?;
     }
     if !invalidated.is_empty() || !has_valid_open_batch(tx)? {
-        open_fresh_tip_in_tx(tx, max_direct_payload_bytes)?;
+        open_fresh_tip_in_tx(tx)?;
     }
     Ok(invalidated)
 }

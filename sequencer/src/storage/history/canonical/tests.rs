@@ -12,7 +12,7 @@ use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::insert_era_in;
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
+    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
@@ -108,7 +108,6 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
             &mut head,
             10,
             SafeInputRange::new(0, 2),
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 l2_tx_index: L2TxCount::new(1),

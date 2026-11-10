@@ -48,6 +48,7 @@ pub(crate) fn pin_test_deployment_identity(
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 0,
             batch_submitter_address,
+            max_direct_payload_bytes: crate::storage::test_helpers::TEST_MAX_DIRECT_PAYLOAD_BYTES,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("pin test deployment identity");

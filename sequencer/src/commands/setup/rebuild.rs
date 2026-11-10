@@ -33,7 +33,6 @@ pub(crate) fn check_export(
     export: &SchedulerExport,
     inputs_through_stop: u64,
     stop_block: u64,
-    max_direct_payload_bytes: u64,
 ) -> Result<(), CommandError> {
     if export.l1_input_count > inputs_through_stop {
         return Err(SetupError::BaseAheadOfStop {
@@ -43,11 +42,7 @@ pub(crate) fn check_export(
         }
         .into());
     }
-    let admitted = storage.admitted_directs_above_clock(
-        export.l1_input_count,
-        export.clock,
-        max_direct_payload_bytes,
-    )?;
+    let admitted = storage.admitted_directs_above_clock(export.l1_input_count, export.clock)?;
     let starts_at_first_queued = admitted
         .first_index
         .is_none_or(|index| index == export.first_queued_input);
@@ -164,12 +159,7 @@ pub(crate) fn rebuild_history<A: Application>(
 
     let end = scheduler.state();
     check_clock(&end, stop_block)?;
-    assert_drained_directs_stored(
-        storage,
-        export.first_queued_input,
-        &end,
-        config.max_direct_payload_bytes,
-    )?;
+    assert_drained_directs_stored(storage, export.first_queued_input, &end)?;
     Ok(end)
 }
 
@@ -182,11 +172,10 @@ fn assert_drained_directs_stored(
     storage: &mut Storage,
     base_first_queued_input: u64,
     end: &SchedulerState,
-    max_direct_payload_bytes: u64,
 ) -> Result<(), CommandError> {
     let drained = SafeInputRange::new(base_first_queued_input, end.first_queued_input);
-    let admitted = storage.admitted_directs_in(drained, max_direct_payload_bytes)?;
-    let rebuilt = storage.rebuilt_directs(drained, max_direct_payload_bytes)?;
+    let admitted = storage.admitted_directs_in(drained)?;
+    let rebuilt = storage.rebuilt_directs(drained)?;
     assert!(
         rebuilt.stored == admitted && rebuilt.admitted_in_range == admitted,
         "the rebuild stored {} directs, {} of them admitted inputs in [{base_first_queued_input}, {}), \
@@ -506,7 +495,7 @@ mod tests {
         let mut runner = reference(&inputs, 0);
         let export = runner.export();
 
-        check_export(&mut storage, &export, through_stop, 30, cap()).unwrap();
+        check_export(&mut storage, &export, through_stop, 30).unwrap();
         let mut app = wallet();
         let state =
             rebuild_history(&mut storage, &mut app, config(), &export, through_stop, 30).unwrap();
@@ -623,7 +612,7 @@ mod tests {
         let export = runner.export();
         assert_eq!((export.fridge_len, export.first_queued_input), (2, 1));
 
-        check_export(&mut storage, &export, 9, 30, cap()).unwrap();
+        check_export(&mut storage, &export, 9, 30).unwrap();
         let mut app = runner.app().clone();
         let state = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30).unwrap();
 
@@ -661,14 +650,10 @@ mod tests {
         let inputs = chain();
         let (_db, mut storage) = synced("export-check", &inputs, 30);
         let honest = reference(&inputs, 5).export();
-        check_export(&mut storage, &honest, 9, 30, cap()).unwrap();
+        check_export(&mut storage, &honest, 9, 30).unwrap();
 
         let refused = |storage: &mut Storage, export: SchedulerExport| match check_export(
-            storage,
-            &export,
-            9,
-            30,
-            cap(),
+            storage, &export, 9, 30,
         ) {
             Err(CommandError::Bootstrap(crate::commands::BootstrapError::Setup(error))) => *error,
             other => panic!("expected a setup refusal, got {other:?}"),
@@ -733,7 +718,7 @@ mod tests {
         ));
         // A base past the stop block.
         assert!(matches!(
-            match check_export(&mut storage, &honest, 4, 13, cap()) {
+            match check_export(&mut storage, &honest, 4, 13) {
                 Err(CommandError::Bootstrap(crate::commands::BootstrapError::Setup(error))) =>
                     *error,
                 other => panic!("expected a setup refusal, got {other:?}"),
@@ -760,7 +745,7 @@ mod tests {
             fridge_len: 0,
             ..reference(&inputs, 5).export()
         };
-        check_export(&mut storage, &export, 9, 30, cap()).unwrap();
+        check_export(&mut storage, &export, 9, 30).unwrap();
         let mut app = reference(&inputs, 5).app().clone();
         let error = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30)
             .expect_err("a range that does not match the state is refused");
@@ -919,7 +904,7 @@ mod tests {
         let end = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30).unwrap();
         // Inputs 0, 1 and 4 drained; 2 is the submitter's and 3 is over the cap.
         assert_eq!(end.first_queued_input, 6);
-        assert_drained_directs_stored(&mut storage, 0, &end, cap()).unwrap();
+        assert_drained_directs_stored(&mut storage, 0, &end).unwrap();
         storage
             .raw_write(|tx| {
                 tx.execute_batch(
@@ -928,7 +913,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let _ = assert_drained_directs_stored(&mut storage, 0, &end, cap());
+        let _ = assert_drained_directs_stored(&mut storage, 0, &end);
     }
 
     /// A fridge at its bound drains whole blocks on arrival, and those
@@ -969,7 +954,7 @@ mod tests {
             fridge_len: 0,
             ..reference(&inputs, 5).export()
         };
-        check_export(&mut storage, &past, 9, 30, cap()).unwrap();
+        check_export(&mut storage, &past, 9, 30).unwrap();
         let mut app = reference(&inputs, 5).app().clone();
         let error = rebuild_history(&mut storage, &mut app, config(), &past, 9, 30)
             .expect_err("the clock is past the stop block");
@@ -1016,7 +1001,7 @@ mod tests {
 
         // Past the base, a direct that only queues.
         let (_db, mut storage) = synced("empty-fridge-base", &inputs, 13);
-        check_export(&mut storage, &export, 3, 13, cap()).unwrap();
+        check_export(&mut storage, &export, 3, 13).unwrap();
         let mut app = base.app().clone();
         let state = rebuild_history(&mut storage, &mut app, config(), &export, 3, 13).unwrap();
         assert!(stored(&mut storage).is_empty());
@@ -1214,7 +1199,7 @@ mod tests {
 
         // Run's startup opens the root at its own safe head.
         storage
-            .ensure_open_tip_for_recovery(&default_protocol_timing(), now_ms, cap())
+            .ensure_open_tip_for_recovery(&default_protocol_timing(), now_ms)
             .unwrap();
         let root = storage.open_state().unwrap().expect("the root is open");
         assert_eq!(root.safe_block(), 30);

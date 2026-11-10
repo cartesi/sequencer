@@ -5,20 +5,52 @@
 //! they compose inside any writer's transaction; single-caller reads stay with the
 //! writer that owns them.
 
-use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Result, ToSql, Transaction, params};
 
-use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
+use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::{BatchPolicy, WriteHead};
 
 /// Whether a safe input executes as a direct when its range drains: any input
 /// but the batch submitter's, unless its payload is over the application's
 /// cap. Every query that picks the directs to execute uses this one predicate,
 /// so the lane's executions and storage's derivation of them always agree.
-/// It binds `:batch_submitter` and `:max_direct_payload_bytes`. `length` takes
+/// It binds `:batch_submitter` and `:max_direct_payload_bytes`, both from the
+/// pinned deployment identity through [`DirectOperands`]. `length` takes
 /// the bare column, so SQLite answers it from the record header without
 /// reading the payload; every writer stores the payload as a blob.
 pub(super) const DIRECT_EXECUTES_SQL: &str = "(sender != :batch_submitter \
      AND length(payload) <= :max_direct_payload_bytes)";
+
+/// Both operands of [`DIRECT_EXECUTES_SQL`], read from the one pinned
+/// deployment identity. A statement that uses the predicate binds them
+/// together through [`DirectOperands::bind`], so neither is ever bound alone.
+pub(super) struct DirectOperands {
+    batch_submitter: Vec<u8>,
+    max_direct_payload_bytes: i64,
+}
+
+impl DirectOperands {
+    /// Fails with `QueryReturnedNoRows` when no identity is pinned.
+    pub(super) fn load(conn: &Connection) -> Result<Self> {
+        let identity = super::l1_inputs::query_deployment_identity(conn)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok(Self {
+            batch_submitter: identity.batch_submitter_address.to_vec(),
+            max_direct_payload_bytes: u64_to_i64(identity.max_direct_payload_bytes),
+        })
+    }
+
+    /// `params` followed by the predicate's two bindings.
+    pub(super) fn bind<'a>(
+        &'a self,
+        params: &[(&'a str, &'a dyn ToSql)],
+    ) -> Vec<(&'a str, &'a dyn ToSql)> {
+        let mut bound = params.to_vec();
+        bound.push((":batch_submitter", &self.batch_submitter));
+        bound.push((":max_direct_payload_bytes", &self.max_direct_payload_bytes));
+        bound
+    }
+}
 
 // ── Write-head loading ───────────────────────────────────────────────────
 //

@@ -30,9 +30,8 @@ use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 
-/// The direct payload cap every fixture opens frames under: the wallet's,
-/// which `StubApp` shares, so fixtures and either test lane drain the same
-/// directs.
+/// The direct payload cap every test identity pins: the wallet's, which
+/// `StubApp` shares, so fixtures and either test lane drain the same directs.
 pub(crate) const TEST_MAX_DIRECT_PAYLOAD_BYTES: u64 =
     WALLET_SCHEDULER_LIMITS.max_direct_payload_bytes;
 
@@ -130,13 +129,7 @@ impl Storage {
                 "open state already exists"
             );
             let batch_index = insert_tip_rows(tx, Some(0), safe_block)?;
-            persist_frame_direct_sequence_derived(
-                tx,
-                batch_index,
-                0,
-                leading_direct_range,
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-            )?;
+            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
             Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
         })
     }
@@ -148,7 +141,7 @@ impl Storage {
             if load_current_write_head(tx)?.is_some() {
                 return Ok(());
             }
-            open_fresh_tip_in_tx(tx, TEST_MAX_DIRECT_PAYLOAD_BYTES)
+            open_fresh_tip_in_tx(tx)
         })
     }
 
@@ -351,9 +344,7 @@ impl Storage {
         &mut self,
         danger_threshold: u64,
     ) -> rusqlite::Result<Vec<u64>> {
-        self.write(|tx| {
-            recover_post_flush_inner(tx, danger_threshold, TEST_MAX_DIRECT_PAYLOAD_BYTES)
-        })
+        self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
     }
 
     /// The unguarded twin of `recover_aging_tip_for_recovery`.
@@ -361,9 +352,7 @@ impl Storage {
         &mut self,
         danger_threshold: u64,
     ) -> rusqlite::Result<Vec<u64>> {
-        self.write(|tx| {
-            recover_aging_tip_inner(tx, danger_threshold, TEST_MAX_DIRECT_PAYLOAD_BYTES)
-        })
+        self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
     }
 
     pub(crate) fn insert_batch_snapshot(
@@ -498,7 +487,6 @@ fn close_frame_derived_in(
         head.batch_index,
         next_frame_in_batch,
         leading_direct_range,
-        TEST_MAX_DIRECT_PAYLOAD_BYTES,
     )?;
     Ok(policy)
 }

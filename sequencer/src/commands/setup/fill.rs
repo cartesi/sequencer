@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
-    use crate::storage::test_helpers::{TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing};
+    use crate::storage::test_helpers::default_protocol_timing;
     use crate::storage::{LifecycleCommand, StoredSafeInput};
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use crate::test_support::{shutdown_lane, wait_until};
@@ -282,11 +282,7 @@ mod tests {
         .unwrap();
         let generation = storage.history_version().unwrap().recovery_generation;
         storage
-            .ensure_open_tip_for_recovery(
-                &default_protocol_timing(),
-                crate::clock::unix_now_ms(),
-                TEST_MAX_DIRECT_PAYLOAD_BYTES,
-            )
+            .ensure_open_tip_for_recovery(&default_protocol_timing(), crate::clock::unix_now_ms())
             .unwrap();
         assert_eq!(storage.open_state().unwrap().unwrap().safe_block(), 1500);
 
@@ -404,11 +400,7 @@ mod tests {
             assert_eq!(at_stop.current_user_balance(recipient), U256::ZERO);
             // Run's startup opens the root frame at its own safe head.
             storage
-                .ensure_open_tip_for_recovery(
-                    &timing,
-                    crate::clock::unix_now_ms(),
-                    WalletApp::scheduler_limits().max_direct_payload_bytes,
-                )
+                .ensure_open_tip_for_recovery(&timing, crate::clock::unix_now_ms())
                 .unwrap();
         }
 

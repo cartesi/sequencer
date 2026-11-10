@@ -106,7 +106,8 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 ## Running
 
 The sequencer runs in two phases. **`setup`** creates a data directory: it
-pins the deployment identity (including the reviewed fee-oracle source),
+pins the deployment identity (including the reviewed fee-oracle source and
+the application's direct-payload cap),
 flushes the submitter's wallet to pin a stop block, syncs L1 through it,
 rebuilds the history from a base through it, and publishes the era's baseline.
 The base is genesis, or a stored canonical machine with `--base <MACHINE_DIR>`
@@ -115,8 +116,9 @@ directory: it refuses one that holds anything, a completed setup included, with
 exit 30, and never touches it. `--dry-run` prints what setup would rebuild,
 takes no key, and never touches the data directory. **`run`** boots the
 sequencer from the set-up DB, reading identity from it (so chain id / app
-address are not `run` arguments). Both take the signing key: setup's flush and
-`run`'s submitter sign for the batch-submitter address.
+address are not `run` arguments); it refuses, with exit 30, a binary whose
+direct-payload cap differs from the pinned one. Both take the signing key:
+setup's flush and `run`'s submitter sign for the batch-submitter address.
 
 ```bash
 # Phase A — set up a new data dir (once; it refuses a non-empty one).

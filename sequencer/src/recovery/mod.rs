@@ -235,12 +235,9 @@ impl RecoveryL1 for StartupL1<'_> {
 /// facts except the wallet watermark; Sync is the only external operation that
 /// can discover divergence. The guarded repair transaction checks those new
 /// facts before mutation, including the post-flush safe-head floor.
-/// `max_direct_payload_bytes` must be the lane's cap, so the reopened Tip's
-/// executed directs match what the lane would have drained.
 async fn recover_startup(
     db_path: &str,
     protocol: &ProtocolTiming,
-    max_direct_payload_bytes: u64,
     l1: &mut impl RecoveryL1,
 ) -> Result<(), RecoveryError> {
     refuse_local_terminal(inspect_recovery(db_path, protocol)?)?;
@@ -268,23 +265,14 @@ async fn recover_startup(
         RecoveryAction::EnsureOpenTip => {
             let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
             storage
-                .ensure_open_tip_for_recovery(
-                    protocol,
-                    crate::clock::unix_now_ms(),
-                    max_direct_payload_bytes,
-                )
+                .ensure_open_tip_for_recovery(protocol, crate::clock::unix_now_ms())
                 .map_err(classify_mutation)?;
             Vec::new()
         }
         RecoveryAction::RecoverTip { batch_index } => {
             let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
             storage
-                .recover_aging_tip_for_recovery(
-                    batch_index,
-                    protocol,
-                    crate::clock::unix_now_ms(),
-                    max_direct_payload_bytes,
-                )
+                .recover_aging_tip_for_recovery(batch_index, protocol, crate::clock::unix_now_ms())
                 .map_err(classify_mutation)?
         }
         RecoveryAction::Flush => {
@@ -298,7 +286,6 @@ async fn recover_startup(
                     observed_safe_block,
                     protocol,
                     crate::clock::unix_now_ms(),
-                    max_direct_payload_bytes,
                 )
                 .map_err(classify_mutation)?
         }
@@ -343,12 +330,10 @@ pub(crate) async fn run_startup_recovery(
     input_reader: &mut InputReader,
     l1_config: &L1Config,
     protocol: &ProtocolTiming,
-    max_direct_payload_bytes: u64,
 ) -> Result<(), RecoveryError> {
     recover_startup(
         db_path,
         protocol,
-        max_direct_payload_bytes,
         &mut StartupL1 {
             db_path,
             input_reader,
@@ -781,9 +766,7 @@ mod tests {
         let (db, protocol) = admission_fixture("recovery-warm-provider-failure", true, true);
         let offline = || SyncStep::Fail(InputReaderError::Provider("offline".into()));
         let mut l1 = TestL1::new(&db.path, &protocol, vec![offline()]);
-        recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
-            .await
-            .unwrap();
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
         assert_eq!(l1.calls, ["sync"]);
 
         storage::Storage::open_writer(&db.path)
@@ -792,7 +775,7 @@ mod tests {
             .unwrap();
         let mut l1 = TestL1::new(&db.path, &protocol, vec![offline()]);
         assert_retry(
-            recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
+            recover_startup(&db.path, &protocol, &mut l1)
                 .await
                 .unwrap_err(),
         );
@@ -809,7 +792,7 @@ mod tests {
             }
             let mut l1 = TestL1::new(&db.path, &protocol, vec![]);
             assert_refuse(
-                recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
+                recover_startup(&db.path, &protocol, &mut l1)
                     .await
                     .unwrap_err(),
             );
@@ -821,17 +804,13 @@ mod tests {
     async fn fresh_start_opens_tip_and_tip_repair_never_flushes() {
         let (db, protocol) = admission_fixture("recovery-ensure-tip", true, false);
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
-        recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
-            .await
-            .unwrap();
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
         assert!(inspect_recovery(&db.path, &protocol).unwrap().has_open_tip);
         assert_eq!(l1.calls, ["sync"]);
 
         let (db, protocol) = danger_fixture("recovery-tip", false);
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
-        recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
-            .await
-            .unwrap();
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
         assert_eq!(invalidated_batches(&db.path), [0]);
         assert_eq!(l1.calls, ["sync"]);
         assert_eq!(
@@ -864,9 +843,7 @@ mod tests {
             )
             .unwrap();
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
-        recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
-            .await
-            .unwrap();
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
 
         let mut storage = storage::Storage::open_writer(&db.path).unwrap();
         let rows: Vec<(i64, Option<i64>)> = storage
@@ -927,9 +904,7 @@ mod tests {
                 },
             ],
         );
-        recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
-            .await
-            .unwrap();
+        recover_startup(&db.path, &protocol, &mut l1).await.unwrap();
         assert_eq!(l1.calls, ["sync", "flush", "sync"]);
         // Batch 0 became gold; the young unresolved batch 1 still belongs to
         // the flushed suffix even though it no longer trips observed danger.
@@ -961,7 +936,7 @@ mod tests {
             ],
         );
         assert_refuse(
-            recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
+            recover_startup(&db.path, &protocol, &mut l1)
                 .await
                 .unwrap_err(),
         );
@@ -981,7 +956,7 @@ mod tests {
             ],
         );
         assert_retry(
-            recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
+            recover_startup(&db.path, &protocol, &mut l1)
                 .await
                 .unwrap_err(),
         );
@@ -995,14 +970,9 @@ mod tests {
         let mut interrupted =
             TestL1::new(&db.path, &protocol, vec![SyncStep::Keep, SyncStep::Keep]);
         interrupted.flush_block += 1;
-        let error = recover_startup(
-            &db.path,
-            &protocol,
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
-            &mut interrupted,
-        )
-        .await
-        .unwrap_err();
+        let error = recover_startup(&db.path, &protocol, &mut interrupted)
+            .await
+            .unwrap_err();
         assert!(matches!(error, RecoveryError::Retry(failure)
             if matches!(*failure, RecoveryFailure::PolicyRetry(RecoveryRetryReason::ResyncBehindFlushView { .. }))));
         assert_eq!(interrupted.calls, ["sync", "flush", "sync"]);
@@ -1010,14 +980,9 @@ mod tests {
         drop(interrupted);
 
         let mut restarted = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep, SyncStep::Keep]);
-        recover_startup(
-            &db.path,
-            &protocol,
-            TEST_MAX_DIRECT_PAYLOAD_BYTES,
-            &mut restarted,
-        )
-        .await
-        .unwrap();
+        recover_startup(&db.path, &protocol, &mut restarted)
+            .await
+            .unwrap();
         assert_eq!(restarted.calls, ["sync", "flush", "sync"]);
         assert_eq!(invalidated_batches(&db.path), [0, 1]);
     }
@@ -1036,7 +1001,7 @@ mod tests {
             })
             .unwrap();
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
-        let error = recover_startup(&db.path, &protocol, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut l1)
+        let error = recover_startup(&db.path, &protocol, &mut l1)
             .await
             .unwrap_err();
         assert!(matches!(error, RecoveryError::Retry(failure)

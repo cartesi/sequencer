@@ -15,7 +15,8 @@ use crate::commands::config::RunConfig;
 use crate::commands::error::CommandError;
 use crate::commands::{
     INPUT_READER_POLL_INTERVAL, load_setup_identity, preflight_lifecycle_command,
-    record_terminal_fault_best_effort, verify_submitter_key, warn_on_previous_terminal_fault,
+    record_terminal_fault_best_effort, require_pinned_direct_payload_cap, verify_submitter_key,
+    warn_on_previous_terminal_fault,
 };
 use crate::l1::L1Config;
 use crate::l1::reader::{InputReader, InputReaderConfig};
@@ -50,6 +51,8 @@ where
     warn_on_previous_terminal_fault(&db_path);
     preflight_lifecycle_command(&config.data_dir, LifecycleCommand::Run)?;
     let identity = load_setup_identity(&config.data_dir)?;
+    // Storage classifies directs by the pinned cap; the binary must agree.
+    require_pinned_direct_payload_cap(&identity, A::scheduler_limits().max_direct_payload_bytes)?;
 
     // `run` holds the signing key (it submits). The key's address must match
     // the pinned submitter address — running with the wrong key against a DB
@@ -152,15 +155,7 @@ where
 
     // ── Recovery ─────────────────────────────────────────────
     // Local terminal facts are inspected before the first provider call.
-    // The cap is the lane's, so the reopened Tip executes the same directs.
-    crate::recovery::run_startup_recovery(
-        &db_path,
-        &mut input_reader,
-        &l1_config,
-        &timing,
-        A::scheduler_limits().max_direct_payload_bytes,
-    )
-    .await?;
+    crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
 
     // Setup persisted a real first price, so run performs no synchronous
     // fee-source I/O and fee availability never precedes recovery's local

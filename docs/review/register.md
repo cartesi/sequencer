@@ -23,10 +23,12 @@ payload is over a cap never joins it. Both are template constants the
 application supplies through `Application::scheduler_limits`; the wallet's
 values, 16384 entries and 1024 bytes
 ([`wallet.rs`](../../examples/app-core/src/application/wallet.rs)), are
-provisional. The [scheduler contract](../protocol/scheduler-semantics.md)
-owns the rules: an overflow drains whole blocks of the oldest entries, which
-live prediction cannot mirror, so an overflow is a deliberate divergence that
-the watchdog's divergence latch reports and cockroach recovery answers.
+provisional, and changing the cap means a new setup: `run` refuses a data
+directory whose pinned cap differs. The
+[scheduler contract](../protocol/scheduler-semantics.md) owns the rules: an
+overflow drains whole blocks of the oldest entries, which live prediction
+cannot mirror, so an overflow is a deliberate divergence that the watchdog's
+divergence latch reports and cockroach recovery answers.
 
 To settle with Bart:
 

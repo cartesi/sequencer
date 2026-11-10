@@ -114,10 +114,11 @@ empty but for the lock file, so retrying in the same directory is safe.
    genesis, it builds the binary's genesis application, which must start at
    count zero.
 2. **Flushes and pins the stop block.** From here setup writes: it pins the
-   deployment identity and the first fee quote, then replaces whatever the
-   provider's pool holds for the submitter account and waits until that is
-   safe ([the flush and the stop block](#the-flush-and-the-stop-block)). The
-   stop block is a safe block observed after it.
+   deployment identity (the application's direct-payload cap with it) and the
+   first fee quote, then replaces whatever the provider's pool holds for the
+   submitter account and waits until that is safe
+   ([the flush and the stop block](#the-flush-and-the-stop-block)). The stop
+   block is a safe block observed after it.
 3. **Fills the input table and checks for an escape.** It syncs every L1 input
    from the deployment block to a safe head at or past the stop block. Then it
    refuses, with exit 40, if the wallet is still unsettled or a submitter

@@ -6,10 +6,9 @@
 
 use rusqlite::{Result, Transaction, named_params, params};
 
-use super::convert::{i64_to_u64, saturating_query_bound, u64_to_i64};
+use super::convert::{i64_to_u64, u64_to_i64};
 use super::history::{era_in, next_l2_tx_count_in};
-use super::l1_inputs::query_deployment_identity;
-use super::queries::DIRECT_EXECUTES_SQL;
+use super::queries::{DIRECT_EXECUTES_SQL, DirectOperands};
 use super::{DirectInputExecution, SafeInputRange};
 
 /// Insert a new batch after the last valid one. Its nonce is the last valid
@@ -111,12 +110,11 @@ pub(super) fn persist_frame_direct_sequence(
     batch_index: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
-    max_direct_payload_bytes: u64,
     executions: &[DirectInputExecution],
 ) -> Result<()> {
     assert_eq!(
         executions,
-        derive_direct_input_executions_in(tx, range, max_direct_payload_bytes)?,
+        derive_direct_input_executions_in(tx, range)?,
         "direct executions must cover the complete external-input range at the next application count"
     );
     persist_direct_executions(tx, batch_index, frame_in_batch, executions)
@@ -129,9 +127,8 @@ pub(super) fn persist_frame_direct_sequence_derived(
     batch_index: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
-    max_direct_payload_bytes: u64,
 ) -> Result<()> {
-    let executions = derive_direct_input_executions_in(tx, range, max_direct_payload_bytes)?;
+    let executions = derive_direct_input_executions_in(tx, range)?;
     persist_direct_executions(tx, batch_index, frame_in_batch, &executions)
 }
 
@@ -162,13 +159,12 @@ fn persist_direct_executions(
 fn derive_direct_input_executions_in(
     tx: &Transaction<'_>,
     range: SafeInputRange,
-    max_direct_payload_bytes: u64,
 ) -> Result<Vec<DirectInputExecution>> {
     if range.is_empty() {
         return Ok(Vec::new());
     }
 
-    let identity = query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let operands = DirectOperands::load(tx)?;
     let mut next = next_l2_tx_count_in(tx)?;
     // Every input in the range is read, so the range's completeness is
     // checked even where none of its inputs executes.
@@ -179,12 +175,12 @@ fn derive_direct_input_executions_in(
          ORDER BY safe_input_index ASC"
     ))?;
     let rows = stmt.query_map(
-        named_params! {
-            ":start": u64_to_i64(range.start()),
-            ":end": u64_to_i64(range.end()),
-            ":batch_submitter": identity.batch_submitter_address.as_slice(),
-            ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
-        },
+        operands
+            .bind(named_params! {
+                ":start": u64_to_i64(range.start()),
+                ":end": u64_to_i64(range.end()),
+            })
+            .as_slice(),
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
     )?;
 

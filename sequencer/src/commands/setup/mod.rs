@@ -111,6 +111,7 @@ where
         input_box_address: input_reader.input_box_address(),
         app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
+        max_direct_payload_bytes: A::scheduler_limits().max_direct_payload_bytes,
         fee_oracle: fee_oracle.identity(),
     };
     // The flush settles the pinned account, so the key must sign for it.
@@ -279,13 +280,7 @@ pub(crate) fn rebuild_and_publish<A: Application>(
 ) -> Result<SetupSummary, CommandError> {
     let Base { export, mut app } = base;
     let inputs_through_stop = storage.safe_input_count_through_block(stop_block)?;
-    rebuild::check_export(
-        storage,
-        &export,
-        inputs_through_stop,
-        stop_block,
-        scheduler_config.max_direct_payload_bytes,
-    )?;
+    rebuild::check_export(storage, &export, inputs_through_stop, stop_block)?;
     let submitter_inputs_past_base = rebuild::count_submitter_inputs(
         storage,
         scheduler_config.sequencer_address,
@@ -351,6 +346,7 @@ where
         input_box_address: input_reader.input_box_address(),
         app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
+        max_direct_payload_bytes: A::scheduler_limits().max_direct_payload_bytes,
         fee_oracle: fee_oracle_identity(&fee_oracle),
     };
     let submitter = identity.batch_submitter_address;
@@ -381,13 +377,7 @@ where
     )
     .await?;
     let synced_inputs = storage.safe_input_count_through_block(safe_block)?;
-    rebuild::check_export(
-        &mut storage,
-        &base.export,
-        synced_inputs,
-        safe_block,
-        scheduler_config.max_direct_payload_bytes,
-    )?;
+    rebuild::check_export(&mut storage, &base.export, synced_inputs, safe_block)?;
     // The scheduler's own resume checks are part of the export check. Feeding
     // never moves the clock past the block of the input that names it, so a
     // resumed clock past the safe head is one setup would refuse too.

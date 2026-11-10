@@ -148,6 +148,10 @@ its answer never changes what an included op does
 | `max_method_payload_bytes() -> usize` | Return the engine's stable method payload bound without constructing an instance. |
 | `scheduler_limits() -> SchedulerLimits` | Return the fridge bound and direct payload cap the application's template compiles in. |
 
+Setup pins the direct payload cap with the deployment identity, and storage
+selects the directs to execute by the pinned value; `run` refuses a binary
+whose cap differs from it.
+
 The lane checks a live op with
 [`check_live_user_op`](../../sequencer-core/src/application/mod.rs), in the
 order whose texts clients see: the fee cap against the frame's price, then the

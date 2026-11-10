@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! `run`'s bootstrap guards on the identity `setup` pinned: no setup, a key for
-//! another submitter, and a wrong-chain RPC (against Anvil) are refused, and a
-//! matching chain is not. Setup's on-chain discovery is covered by the e2e suite.
+//! another submitter, a binary with another direct-payload cap, and a
+//! wrong-chain RPC (against Anvil) are refused, and a matching chain is not.
+//! Setup's on-chain discovery is covered by the e2e suite.
 
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use sequencer::l1::reader::InputReaderError;
 use sequencer::recovery::{RecoveryError, RecoveryFailure};
 use sequencer::storage::{DeploymentIdentity, Storage};
 use sequencer::{Cli, Command};
+use sequencer_core::application::Application;
 use tempfile::TempDir;
 
 // Anvil's default devnet private key #0 and its address.
@@ -59,14 +61,20 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
     }
 }
 
+/// The direct-payload cap of the binary these tests run.
+fn wallet_cap() -> u64 {
+    app_core::application::WalletApp::scheduler_limits().max_direct_payload_bytes
+}
+
 /// Seed a pinned deployment identity (chain id `chain_id`, submitter
-/// `submitter`), finalized-snapshot fact, and completed setup lifecycle — the
-/// minimal local state needed to reach `run`'s initial L1 sync without doing
-/// `setup`'s on-chain discovery. Uses the same typed controller path `setup`
+/// `submitter`, direct-payload cap `cap`), finalized-snapshot fact, and
+/// completed setup lifecycle — the minimal local state needed to reach `run`'s
+/// initial L1 sync without doing `setup`'s on-chain discovery. Uses the same
+/// typed controller path `setup`
 /// itself records through (admission → facts → completion), so this seed
 /// cannot drift from the lifecycle schema or encode a state the controller
 /// would never write.
-fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
+fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address, cap: u64) {
     use sequencer::storage::LifecycleCommand;
 
     let mut storage = Storage::initialize_for_command(db_path, LifecycleCommand::Setup)
@@ -78,6 +86,7 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
             input_box_address: TEST_INPUT_BOX,
             app_deployment_block: 100,
             batch_submitter_address: submitter,
+            max_direct_payload_bytes: cap,
             fee_oracle: sequencer::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("seed deployment identity");
@@ -119,7 +128,7 @@ async fn run_refuses_on_submitter_key_mismatch() {
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let db_path = format!("{data_dir}/sequencer.db");
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR);
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
 
     let config = run_config(data_dir, "http://127.0.0.1:1", OTHER_KEY);
     let result = tokio::time::timeout(
@@ -139,6 +148,33 @@ async fn run_refuses_on_submitter_key_mismatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_refuses_a_cap_other_than_the_pinned_one() {
+    // Setup pinned a cap one byte larger than the binary's: storage would
+    // classify directs the lane's application does not execute, so `run`
+    // must fail loud before any L1 contact.
+    let dir = TempDir::new().expect("tempdir");
+    let data_dir = dir.path().to_str().unwrap();
+    let db_path = format!("{data_dir}/sequencer.db");
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap() + 1);
+
+    let config = run_config(data_dir, "http://127.0.0.1:1", ANVIL_KEY);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        sequencer::run::<app_core::application::WalletApp>(config),
+    )
+    .await
+    .expect("run() must return quickly on a cap mismatch");
+
+    match result {
+        Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+            fields,
+            ..
+        }))) => assert_eq!(fields, "max_direct_payload_bytes"),
+        other => panic!("expected max_direct_payload_bytes mismatch, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_refuses_on_wrong_chain_rpc() {
     // Pinned chain id 31337, but the (reachable) RPC reports a different
     // chain id: a wrong-chain RPC after setup must be refused.
@@ -149,7 +185,7 @@ async fn run_refuses_on_wrong_chain_rpc() {
     let db_path = format!("{data_dir}/sequencer.db");
     // Submitter = anvil key address so the key check passes and we reach the
     // chain-id check.
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR);
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
 
     let config = run_config(data_dir, &anvil.endpoint(), ANVIL_KEY);
     let result = tokio::time::timeout(
@@ -187,7 +223,7 @@ async fn run_accepts_matching_chain_rpc() {
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let db_path = format!("{data_dir}/sequencer.db");
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR);
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
 
     let config = run_config(data_dir, &anvil.endpoint(), ANVIL_KEY);
     let result = tokio::time::timeout(

@@ -14,8 +14,8 @@ use super::convert::{
     external_u64_to_i64, i64_to_u64, now_unix_ms, saturating_query_bound, u64_to_i64,
 };
 use super::queries::{
-    DIRECT_EXECUTES_SQL, current_safe_block, query_latest_safe_input_index_exclusive,
-    safe_input_count_through_block_in,
+    DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block,
+    query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange};
 use sequencer_core::protocol::ProtocolTiming;
@@ -153,29 +153,27 @@ impl Storage {
 
     /// The admitted directs among the first `l1_input_count` inputs whose
     /// block is above `clock`, by the predicate every drain uses: not from
-    /// the batch submitter, payload within `max_direct_payload_bytes`. A
+    /// the batch submitter, payload within the pinned cap. A
     /// canonical export queues exactly these, from the first of them.
     pub fn admitted_directs_above_clock(
         &mut self,
         l1_input_count: u64,
         clock: u64,
-        max_direct_payload_bytes: u64,
     ) -> Result<AdmittedDirects> {
         self.read(|tx| {
-            let identity =
-                query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let operands = DirectOperands::load(tx)?;
             tx.prepare_cached(&format!(
                 "SELECT COUNT(*), MIN(safe_input_index) FROM safe_inputs \
                  WHERE safe_input_index < :count AND block_number > :clock \
                    AND {DIRECT_EXECUTES_SQL}"
             ))?
             .query_row(
-                named_params! {
-                    ":count": saturating_query_bound(l1_input_count),
-                    ":clock": saturating_query_bound(clock),
-                    ":batch_submitter": identity.batch_submitter_address.as_slice(),
-                    ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
-                },
+                operands
+                    .bind(named_params! {
+                        ":count": saturating_query_bound(l1_input_count),
+                        ":clock": saturating_query_bound(clock),
+                    })
+                    .as_slice(),
                 |row| {
                     Ok(AdmittedDirects {
                         count: i64_to_u64(row.get(0)?),
@@ -188,26 +186,21 @@ impl Storage {
 
     /// How many inputs with an index in `range` execute as directs, by the
     /// predicate every drain uses. Setup checks its executed directs against it.
-    pub fn admitted_directs_in(
-        &mut self,
-        range: SafeInputRange,
-        max_direct_payload_bytes: u64,
-    ) -> Result<u64> {
+    pub fn admitted_directs_in(&mut self, range: SafeInputRange) -> Result<u64> {
         self.read(|tx| {
-            let identity =
-                query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let operands = DirectOperands::load(tx)?;
             tx.prepare_cached(&format!(
                 "SELECT COUNT(*) FROM safe_inputs \
                  WHERE safe_input_index >= :start AND safe_input_index < :end \
                    AND {DIRECT_EXECUTES_SQL}"
             ))?
             .query_row(
-                named_params! {
-                    ":start": saturating_query_bound(range.start()),
-                    ":end": saturating_query_bound(range.end()),
-                    ":batch_submitter": identity.batch_submitter_address.as_slice(),
-                    ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
-                },
+                operands
+                    .bind(named_params! {
+                        ":start": saturating_query_bound(range.start()),
+                        ":end": saturating_query_bound(range.end()),
+                    })
+                    .as_slice(),
                 |row| Ok(i64_to_u64(row.get(0)?)),
             )
         })
@@ -323,10 +316,10 @@ impl Storage {
             let changed = tx.execute(
                 "INSERT INTO deployment_identity \
                     (singleton_id, chain_id, app_address, input_box_address, \
-                     app_deployment_block, batch_submitter_address, fee_oracle_mode, \
-                     fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
-                     fee_oracle_pool, fee_oracle_twap_window_secs) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+                     fee_oracle_mode, fixed_log_gas_price, fee_oracle_weth, \
+                     fee_oracle_fee_token, fee_oracle_pool, fee_oracle_twap_window_secs) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     external_u64_to_i64(identity.chain_id, "deployment chain ID")?,
                     identity.app_address.as_slice(),
@@ -336,6 +329,10 @@ impl Storage {
                         "application deployment block"
                     )?,
                     identity.batch_submitter_address.as_slice(),
+                    external_u64_to_i64(
+                        identity.max_direct_payload_bytes,
+                        "maximum direct payload bytes"
+                    )?,
                     mode,
                     fixed,
                     weth,
@@ -366,7 +363,7 @@ pub(super) fn query_deployment_identity(
         "SELECT chain_id, app_address, input_box_address, \
                 app_deployment_block, batch_submitter_address, fee_oracle_mode, \
                 fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
-                fee_oracle_pool, fee_oracle_twap_window_secs \
+                fee_oracle_pool, fee_oracle_twap_window_secs, max_direct_payload_bytes \
          FROM deployment_identity WHERE singleton_id = 0",
         [],
         |row| {
@@ -389,6 +386,7 @@ pub(super) fn query_deployment_identity(
                 input_box_address: Address::from_slice(&row.get::<_, Vec<u8>>(2)?),
                 app_deployment_block: i64_to_u64(row.get::<_, i64>(3)?),
                 batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
+                max_direct_payload_bytes: i64_to_u64(row.get::<_, i64>(11)?),
                 fee_oracle,
             })
         },
@@ -448,6 +446,7 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: SENDER_A,
+            max_direct_payload_bytes: 4096,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
@@ -558,6 +557,10 @@ mod tests {
     /// and 15 (direct). SENDER_A is the batch submitter.
     fn seed_classified_inputs(storage: &mut Storage) {
         pin_test_deployment_identity(storage, SENDER_A);
+        seed_inputs(storage);
+    }
+
+    fn seed_inputs(storage: &mut Storage) {
         let input = |sender, payload: Vec<u8>, block_number| StoredSafeInput {
             sender,
             payload,
@@ -626,7 +629,7 @@ mod tests {
         seed_classified_inputs(&mut storage);
         let check = |storage: &mut Storage, count, clock| {
             storage
-                .admitted_directs_above_clock(count, clock, TEST_MAX_DIRECT_PAYLOAD_BYTES)
+                .admitted_directs_above_clock(count, clock)
                 .expect("check")
         };
         // Above clock 5 among all five: the submitter input and the over-cap
@@ -681,10 +684,7 @@ mod tests {
         seed_classified_inputs(&mut storage);
         let count = |storage: &mut Storage, start, end| {
             storage
-                .admitted_directs_in(
-                    SafeInputRange::new(start, end),
-                    TEST_MAX_DIRECT_PAYLOAD_BYTES,
-                )
+                .admitted_directs_in(SafeInputRange::new(start, end))
                 .expect("count")
         };
         // Input 1 is the submitter's and input 2 is over the cap.
@@ -693,6 +693,34 @@ mod tests {
         assert_eq!(count(&mut storage, 1, 4), 1);
         assert_eq!(count(&mut storage, 4, 4), 0);
         assert_eq!(count(&mut storage, 0, u64::MAX), 3);
+    }
+
+    /// The predicate's cap is the pinned one: under a cap of zero no
+    /// one-byte direct executes, so nothing in the seeded inputs is admitted.
+    #[test]
+    fn the_pinned_cap_decides_which_directs_execute() {
+        let db = temp_db("pinned-cap");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        storage
+            .pin_deployment_identity(DeploymentIdentity {
+                max_direct_payload_bytes: 0,
+                ..identity()
+            })
+            .expect("pin identity");
+        seed_inputs(&mut storage);
+        assert_eq!(
+            storage
+                .admitted_directs_in(SafeInputRange::new(0, 5))
+                .expect("count"),
+            0
+        );
+        assert_eq!(
+            storage
+                .admitted_directs_above_clock(5, 0)
+                .expect("check")
+                .count,
+            0
+        );
     }
 
     #[test]
@@ -745,6 +773,16 @@ mod tests {
             .expect_err("unrepresentable configured application deployment block must be refused");
         assert!(matches!(
             deployment_block_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let cap_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                max_direct_payload_bytes: u64::MAX,
+                ..identity()
+            })
+            .expect_err("an unrepresentable direct payload cap must be refused");
+        assert!(matches!(
+            cap_err,
             rusqlite::Error::ToSqlConversionFailure(_)
         ));
         assert_eq!(storage.deployment_identity().expect("read identity"), None);

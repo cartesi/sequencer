@@ -61,7 +61,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 | recovery (startup) | the era's first Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
 | history metadata (setup/recovery) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades, whose greatest key is the recovery generation |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
-| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `snapshots` row (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| setup | `deployment_identity` (pinned once, the direct-payload cap with it), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `snapshots` row (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
 | snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete, unleased `snapshots` row deletion (`collect_snapshots`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
@@ -248,7 +248,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 
 - **Holds:** `safe_inputs` retains every InputBox observation. The storage/lane
   boundary selects external directs by the setup-pinned submitter address and
-  the payload cap ([I20](#i20-application-history-is-committed-with-its-execution-receipts));
+  payload cap ([I20](#i20-application-history-is-committed-with-its-execution-receipts));
   only those inputs and included user ops enter `application_inputs`.
 - **Enforced by:** append-only `safe_inputs` triggers; classified direct reads
   and complete receipt validation at append. Standard startup recovery
@@ -504,7 +504,11 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   (`scheduler_limits().max_direct_payload_bytes`) exactly once, keyed by
   mandatory pre-execution count. A direct over the cap never executes and has
   no row; one SQL predicate (`DIRECT_EXECUTES_SQL`, `storage/queries.rs`)
-  selects the directs to execute in every query. Its source reference, owning batch/frame, and payload tables reconstruct replay.
+  selects the directs to execute in every query, and it reads both its
+  operands, the submitter and the cap, from the pinned `deployment_identity`
+  row. Setup pins the cap; `run` refuses a binary whose cap differs. A
+  direct's source reference, owning batch/frame, and payload tables
+  reconstruct replay.
   There are no entries for batch envelopes, and none below the rebuilt
   history end `E`: the era's rows before it are `rebuilt_history`'s
   ([I18](#i18-history-identity-is-published-with-the-era)).

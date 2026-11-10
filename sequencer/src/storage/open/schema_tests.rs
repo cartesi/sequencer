@@ -790,16 +790,37 @@ fn schema_rejects_deployment_identity_with_zero_chain_id() {
     let err = storage.conn.execute(
         "INSERT INTO deployment_identity \
              (singleton_id, chain_id, app_address, input_box_address, \
-              app_deployment_block, batch_submitter_address, \
+              app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
               fee_oracle_mode, fixed_log_gas_price, \
               fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
               fee_oracle_twap_window_secs) \
-             VALUES (0, 0, ?1, ?1, 0, ?1, 'fixed', 0, NULL, NULL, NULL, NULL)",
+             VALUES (0, 0, ?1, ?1, 0, ?1, 1024, 'fixed', 0, NULL, NULL, NULL, NULL)",
         params![address],
     );
     assert!(
-        format!("{err:?}").contains("CHECK constraint failed"),
+        format!("{err:?}").contains("CHECK constraint failed: chain_id > 0"),
         "expected CHECK constraint error on chain_id > 0, got: {err:?}",
+    );
+}
+
+#[test]
+fn schema_rejects_deployment_identity_with_negative_direct_payload_cap() {
+    let db = crate::test_support::temp_db("schema-deployment-negative-cap");
+    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let address = vec![0u8; 20];
+    let err = storage.conn.execute(
+        "INSERT INTO deployment_identity \
+             (singleton_id, chain_id, app_address, input_box_address, \
+              app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+              fee_oracle_mode, fixed_log_gas_price, \
+              fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
+              fee_oracle_twap_window_secs) \
+             VALUES (0, 1, ?1, ?1, 0, ?1, -1, 'fixed', 0, NULL, NULL, NULL, NULL)",
+        params![address],
+    );
+    assert!(
+        format!("{err:?}").contains("CHECK constraint failed: max_direct_payload_bytes >= 0"),
+        "expected CHECK constraint error on max_direct_payload_bytes >= 0, got: {err:?}",
     );
 }
 

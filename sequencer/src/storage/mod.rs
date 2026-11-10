@@ -186,7 +186,8 @@ pub struct PendingBatch {
 /// Deployment identity the database is bound to.
 ///
 /// The persisted sequencer state is not portable across these fields:
-/// historical safe inputs are classified using the batch-submitter address,
+/// historical safe inputs are classified using the batch-submitter address
+/// and the direct-payload cap,
 /// user-op signatures use the app/domain identity, and recovery/frontier logic
 /// depends on the app's InputBox stream, which is empty before
 /// `app_deployment_block` (the v3 InputBox refuses inputs for apps that do
@@ -198,6 +199,9 @@ pub struct DeploymentIdentity {
     pub input_box_address: alloy_primitives::Address,
     pub app_deployment_block: u64,
     pub batch_submitter_address: alloy_primitives::Address,
+    /// The application's `scheduler_limits().max_direct_payload_bytes`: with
+    /// the batch submitter, it decides which safe inputs execute as directs.
+    pub max_direct_payload_bytes: u64,
     pub fee_oracle: FeeOracleIdentity,
 }
 

@@ -267,6 +267,23 @@ pub(crate) fn verify_submitter_key(
     Ok(key)
 }
 
+/// `run`'s check that the binary's direct-payload cap is the one `setup`
+/// pinned: storage classifies directs by the pinned cap, and the lane's
+/// application executes under the binary's. A different cap is an identity
+/// mismatch, so a new cap needs a new `setup`.
+pub(crate) fn require_pinned_direct_payload_cap(
+    identity: &DeploymentIdentity,
+    binary_cap: u64,
+) -> Result<(), CommandError> {
+    require_deployment_identity_match(
+        *identity,
+        DeploymentIdentity {
+            max_direct_payload_bytes: binary_cap,
+            ..*identity
+        },
+    )
+}
+
 fn deployment_identity_mismatch_fields(
     stored: DeploymentIdentity,
     expected: DeploymentIdentity,
@@ -287,6 +304,9 @@ fn deployment_identity_mismatch_fields(
     if stored.batch_submitter_address != expected.batch_submitter_address {
         fields.push("batch_submitter_address");
     }
+    if stored.max_direct_payload_bytes != expected.max_direct_payload_bytes {
+        fields.push("max_direct_payload_bytes");
+    }
     if stored.fee_oracle != expected.fee_oracle {
         fields.push("fee_oracle");
     }
@@ -298,7 +318,7 @@ mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
         deployment_identity_mismatch_fields, preflight_lifecycle_command, require_data_dir,
-        require_deployment_identity_match,
+        require_deployment_identity_match, require_pinned_direct_payload_cap,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
@@ -401,8 +421,23 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: Address::repeat_byte(0x33),
+            max_direct_payload_bytes: 1024,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
+    }
+
+    #[test]
+    fn run_refuses_a_cap_other_than_the_pinned_one() {
+        let pinned = identity();
+        require_pinned_direct_payload_cap(&pinned, 1024).expect("the pinned cap matches");
+        let err = require_pinned_direct_payload_cap(&pinned, 2048)
+            .expect_err("a different cap refuses startup");
+        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
+        assert!(matches!(
+            err,
+            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
+                if fields == "max_direct_payload_bytes"
+        ));
     }
 
     #[test]

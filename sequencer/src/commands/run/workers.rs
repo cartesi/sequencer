@@ -860,6 +860,7 @@ mod tests {
                 .expect("input box address"),
             app_deployment_block: 0,
             batch_submitter_address: submitter_address,
+            max_direct_payload_bytes: crate::storage::test_helpers::TEST_MAX_DIRECT_PAYLOAD_BYTES,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         };
         let input_reader = InputReader::from_parts(

@@ -797,6 +797,7 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 0,
             batch_submitter_address: Address::repeat_byte(0x33),
+            max_direct_payload_bytes: 1024,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }

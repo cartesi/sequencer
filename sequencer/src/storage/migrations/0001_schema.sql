@@ -533,6 +533,9 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     input_box_address         BLOB    NOT NULL CHECK (length(input_box_address) = 20),
     app_deployment_block      INTEGER NOT NULL CHECK (app_deployment_block >= 0),
     batch_submitter_address   BLOB    NOT NULL CHECK (length(batch_submitter_address) = 20),
+    -- The longest direct payload the application executes; with the batch
+    -- submitter address it decides which safe inputs execute as directs.
+    max_direct_payload_bytes  INTEGER NOT NULL CHECK (max_direct_payload_bytes >= 0),
     -- Immutable setup-pinned fee source. Fixed has only fixed_log_gas_price;
     -- Uniswap has the complete reviewed token/pool tuple.
     fee_oracle_mode           TEXT    NOT NULL CHECK (fee_oracle_mode IN ('fixed', 'uniswap')),
