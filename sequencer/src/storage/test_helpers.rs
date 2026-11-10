@@ -20,7 +20,7 @@ use super::ingress::{
 use super::mutations::persist_frame_direct_sequence_derived;
 use super::queries::{load_current_write_head, query_batch_policy};
 use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
-use super::snapshot_dumps::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
+use super::snapshots::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
     BatchPolicy, IngestedSafeInput, L2TxCount, SafeInputRange, Storage, StorageOpenError,
     StoredSafeInput, WriteHead,
@@ -159,20 +159,7 @@ impl Storage {
     }
 
     pub(crate) fn has_rollback_safe_snapshot(&mut self) -> rusqlite::Result<bool> {
-        self.read(|tx| super::snapshot_dumps::has_rollback_safe_snapshot_in(tx))
-    }
-
-    pub(crate) fn dump_lease_count(&mut self, dump_id: i64) -> rusqlite::Result<Option<i64>> {
-        use rusqlite::OptionalExtension;
-
-        self.read(|tx| {
-            tx.query_row(
-                "SELECT lease_count FROM dumps WHERE id = ?1",
-                [dump_id],
-                |r| r.get(0),
-            )
-            .optional()
-        })
+        self.read(|tx| super::snapshots::has_rollback_safe_snapshot_in(tx))
     }
 
     /// A raw connection with [`Storage::open`]'s pragmas, for tests that reach
@@ -316,6 +303,26 @@ impl Storage {
         batch_index: u64,
     ) -> rusqlite::Result<i64> {
         self.write(|tx| insert_batch_snapshot_in(tx, prefix, batch_index, next_l2_tx_count_in(tx)?))
+    }
+
+    /// Close the open batch (the genesis Tip when none is open) and register
+    /// `prefix` as its snapshot: the fixture for a non-baseline row, since a
+    /// second baseline is refused. Returns the snapshot id and batch index.
+    pub(crate) fn insert_closed_batch_snapshot(
+        &mut self,
+        prefix: &Path,
+    ) -> rusqlite::Result<(i64, u64)> {
+        let mut head = match self.open_state()? {
+            Some(head) => head,
+            None => self.initialize_open_state(0, SafeInputRange::empty_at(0))?,
+        };
+        let batch_index = head.batch_index;
+        let safe_block = head.safe_block;
+        self.close_frame_and_batch(&mut head, safe_block)?;
+        Ok((
+            self.insert_batch_snapshot(prefix, batch_index)?,
+            batch_index,
+        ))
     }
 
     pub(crate) fn insert_baseline_snapshot(

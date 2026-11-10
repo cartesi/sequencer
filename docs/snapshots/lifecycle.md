@@ -26,12 +26,11 @@ source deletion. Its canonical comparison file may be only one part of that
 artifact. The [Application contract](../protocol/application-contract.md#6-checkpoint-lifecycle)
 owns durability and engine behavior; [format.md](format.md) describes the wallet.
 
-SQLite separates artifact ownership from snapshot boundaries:
+SQLite holds one row per artifact and the boundary it holds:
 
 | Fact | Meaning |
 |---|---|
-| `dumps` | Artifact path and active reader lease count |
-| `snapshots` | Artifact's immutable application count and local batch identity |
+| `snapshots` | Artifact path, immutable application count, and local batch identity |
 | Baseline snapshot (`batch_index IS NULL`) | The application at the end of the era's stop block, at its rebuilt history end |
 | `batches.accepted_input` | The safe input whose scheduler-accepted, content-matched landing accepted the batch |
 
@@ -74,14 +73,16 @@ comparison checkpoint: the application's state at the end of the stop block is
 the canonical machine's state there, whatever the base, so it is served with
 the stop block as its inclusion block, the rebuilt history end as its count,
 and the anchor as its next batch nonce. After a recovery, this is the
-watchdog's first comparison of the new era. Acceptance already includes scheduler validation and local
-content identity, so merely observing an own-sender L1 input is insufficient.
+watchdog's first comparison of the new era. Acceptance already includes
+scheduler validation and local content identity, so merely observing an
+own-sender L1 input is insufficient.
 
 A persisted canonical-divergence marker refuses accepted-checkpoint selection,
 including when a matching batch precedes a divergent acceptance in the same
-block. Selection checks the marker in the same SQLite transaction as its read
-and any download lease. Finalized endpoints return HTTP 503 before consulting
-conditional cache headers; they do not fall back to an older artifact.
+block. Selection checks the marker in the same read transaction, which a
+download runs under the lease registry's lock. Finalized endpoints return HTTP
+503 before consulting conditional cache headers; they do not fall back to an
+older artifact.
 
 This selection is independent of the lane's L1 reconciliation cursor. A crash
 between reader ingestion and lane reconciliation cannot miss a promotion or
@@ -119,7 +120,7 @@ These endpoints are operator-only and require network isolation:
 
 Snapshot bodies carry `X-History-Era`, `X-Recovery-Generation`, and
 `X-Executed-Input-Count`. Acceptance endpoints also carry `X-Inclusion-Block`.
-The metadata, selected artifact, and lease are captured in one transaction.
+The metadata and selected artifact come from one read, taken under the lease.
 Restoring `/latest_snapshot` and subscribing with its history claim gives the
 consumer a coherent snapshot-plus-suffix starting point.
 
@@ -143,8 +144,34 @@ The baseline artifact can be retired after an accepted checkpoint replaces its
 rollback role; the era's immutable baseline metadata and its rebuilt history
 remain in SQLite.
 
-Selection, lease acquisition, and GC serialize through SQLite write
-transactions. A lease release guard is armed only after its increment commits.
+Leases live in the serving process, in one registry of per-snapshot counters
+that `run` shares between the egress handlers, the lane's GC and startup
+hygiene. A lease means something only while this process serves a body, and
+only `run` serves and collects, under the data directory's exclusive process
+lock; nothing durable records a lease, so a restart starts with none. A second
+process that served or collected would need a shared lease record: revisit this
+if one ever does. The registry follows one protocol:
+
+- **Acquire** runs on a blocking thread over a read-only connection, which it
+  opens and makes load the schema first. It locks the registry, then selects in
+  one deferred read transaction (the finalized endpoints' divergence check
+  included), ends it, increments the snapshot's counter and unlocks. The
+  selection's transaction begins under the lock, so what it reads postdates any
+  GC commit.
+- **GC** begins its IMMEDIATE write transaction first, then locks the registry,
+  selects its candidates, drops every candidate whose counter is above zero,
+  removes the zero entries from the registry, deletes the remaining rows and
+  commits. It unlocks only after the commit returns: before that, an acquire
+  would still read the rows being deleted and lease a snapshot whose artifact
+  is about to go, and a missing artifact is terminal.
+- **Release** is the guard's drop: it decrements the counter, takes no lock
+  and does no I/O, so it is safe on an async worker thread. A zero entry stays
+  until the next GC removes it.
+
+GC takes SQLite's writer lock, then the registry; acquire takes the registry,
+then only reads. WAL readers never take the writer lock, and any wait a reader
+does meet is bounded by its 50 ms busy timeout, so the two cannot deadlock.
+
 An HTTP body retains the lease through completion or disconnect. Archive
 production also retains ownership until it stops reading the source, so dropping
 the network stream cannot race producer reads against filesystem deletion.
@@ -153,9 +180,9 @@ GC selects and deletes eligible database rows in one transaction, then removes
 the enclosing dump directories recursively. This filesystem operation disposes
 of all checkpoint resources. Filesystem deletion failure leaves a harmless
 orphan for the startup sweep. The reverse ordering would leave a durable row pointing at missing
-state and is forbidden. Startup clears leases left by the dead process,
-checks the rollback checkpoint's `info.toml` and format version, collects obsolete
-rows, and sweeps orphan directories before workers start. The sweep matches
+state and is forbidden. Startup, before the listeners are bound, checks the
+rollback checkpoint's `info.toml` and format version, collects obsolete rows,
+and sweeps orphan directories. The sweep matches
 artifacts by filesystem identity (device and inode), not by path, because setup
 and run can spell the same directory differently; it resolves every retained
 artifact before deleting anything and stops if one cannot be resolved

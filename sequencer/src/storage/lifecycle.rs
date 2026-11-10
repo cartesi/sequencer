@@ -97,7 +97,7 @@ impl Storage {
             ));
         }
         super::history::insert_era_in(&tx, era)?;
-        super::snapshot_dumps::insert_baseline_snapshot_in(&tx, baseline_prefix, era.rebuilt_end)?;
+        super::snapshots::insert_baseline_snapshot_in(&tx, baseline_prefix, era.rebuilt_end)?;
         tx.commit()?;
         Ok(())
     }
@@ -332,7 +332,7 @@ mod tests {
             storage.era(),
             Err(rusqlite::Error::QueryReturnedNoRows)
         ));
-        assert!(storage.list_dump_rows().unwrap().is_empty());
+        assert!(storage.list_snapshots().unwrap().is_empty());
         assert!(!storage.is_setup_complete().unwrap());
 
         let published = NewEra {

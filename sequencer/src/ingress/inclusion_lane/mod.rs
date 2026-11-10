@@ -78,7 +78,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             // can never drift apart.
             let checkpoint = catch_up_snapshot(&mut storage)
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
-            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.dump.prefix))
+            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.prefix))
                 .map_err(InclusionLaneError::LoadFromDump)?;
             let mut lane = Self {
                 rx,
@@ -240,7 +240,7 @@ impl<A: Application + 'static> InclusionLane<A> {
 
         // Acceptance can advance independently of application inputs. A bounded
         // reconciliation cadence reclaims retired artifacts even under load.
-        let removed = snapshot::run_gc(&mut self.storage)?;
+        let removed = snapshot::run_gc(&mut self.storage, &self.config.snapshot_leases)?;
         if removed > 0 {
             tracing::debug!(removed, "snapshot garbage collection removed artifacts");
         }

@@ -393,14 +393,14 @@ fn assert_matches_reference(
     // The baseline is the reference's state at the end of the stop block, and
     // the era's first comparison checkpoint.
     let baseline = storage.latest_snapshot().unwrap().expect("baseline");
-    let prefix = dump_info::app_prefix(&baseline.dump.prefix);
+    let prefix = dump_info::app_prefix(&baseline.prefix);
     assert_eq!(
         std::fs::read(WalletApp::state_file_in_dump(&prefix)).unwrap(),
         runner.app().canonical_snapshot_bytes().unwrap()
     );
     let checkpoint = storage.finalized_dump().unwrap().expect("era baseline");
     assert_eq!(checkpoint.inclusion_block, stop_block);
-    assert_eq!(checkpoint.l2_tx_count, runner.app().l2_tx_count());
+    assert_eq!(checkpoint.snapshot.l2_tx_count, runner.app().l2_tx_count());
     assert_eq!(checkpoint.next_batch_nonce, 2);
     assert!(
         storage.open_state().unwrap().is_none(),

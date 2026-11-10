@@ -14,7 +14,7 @@ use crate::storage::history::{
 };
 use crate::storage::l1_inputs::query_deployment_identity;
 use crate::storage::queries::safe_input_count_through_block_in;
-use crate::storage::snapshot_dumps::{
+use crate::storage::snapshots::{
     FinalizedSelectionError, finalized_dump_in, has_rollback_safe_snapshot_in,
 };
 
@@ -96,10 +96,10 @@ impl Storage {
                     next_batch_nonce: era.anchor_batch_nonce,
                     rebuilt_history_end: era.rebuilt_end,
                 },
-                accepted_checkpoint: accepted.map(|snapshot| AcceptedCheckpoint {
-                    inclusion_block: snapshot.inclusion_block,
-                    executed_input_count: snapshot.l2_tx_count,
-                    next_batch_nonce: snapshot.next_batch_nonce,
+                accepted_checkpoint: accepted.map(|finalized| AcceptedCheckpoint {
+                    inclusion_block: finalized.inclusion_block,
+                    executed_input_count: finalized.snapshot.l2_tx_count,
+                    next_batch_nonce: finalized.next_batch_nonce,
                 }),
                 compatibility,
             }))

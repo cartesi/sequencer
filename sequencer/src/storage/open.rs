@@ -38,11 +38,6 @@ const SYNCHRONOUS_PRAGMA: &str = "FULL";
 /// `Storage` instance opened via [`Storage::open_read_only`].
 pub struct Storage {
     pub(super) conn: Connection,
-    /// The path this connection was opened from. Carried so a lease guard can
-    /// re-open a brief writer connection to release on drop (see
-    /// `snapshot_dumps::LeaseGuard`); the egress snapshot handlers open
-    /// per-op, so the guard can't borrow this `Storage`.
-    pub(super) path: String,
 }
 
 impl Storage {
@@ -67,10 +62,7 @@ impl Storage {
         }
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn, None)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// Create the schema for setup in one migration transaction. The era is
@@ -87,10 +79,7 @@ impl Storage {
         );
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn, Some(command))?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// A private in-memory database with setup's schema, for questions the
@@ -98,34 +87,25 @@ impl Storage {
     pub(crate) fn schema_only() -> Result<Self, StorageOpenError> {
         let mut conn = Connection::open_in_memory()?;
         run_migrations(&mut conn, Some(LifecycleCommand::Setup))?;
-        Ok(Self {
-            conn,
-            path: ":memory:".to_owned(),
-        })
+        Ok(Self { conn })
     }
 
     /// Read-only handle. Uses a 50ms `busy_timeout` (vs. 5s for writers) so
     /// readers fail fast under write pressure and don't block on hot paths.
     pub fn open_read_only(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_reader_connection(path)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// Read-write handle that does NOT run migrations — for components that
-    /// open the DB *after* startup has already migrated it (e.g. egress
-    /// snapshot handlers doing brief lease writes, and tests that pre-seed
-    /// the schema). Same pragmas as [`Storage::open`] (WAL, `foreign_keys`,
-    /// 5s `busy_timeout`); running migrations is the caller's responsibility
+    /// open the DB *after* startup has already migrated it (e.g. the
+    /// submitter and recovery, and tests that pre-seed the schema). Same
+    /// pragmas as [`Storage::open`] (WAL, `foreign_keys`, 5s `busy_timeout`);
+    /// running migrations is the caller's responsibility
     /// (the runtime does it once via [`Storage::open`] at startup).
     pub fn open_writer(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_writer_connection(path)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// Run `f` inside a Deferred transaction, commit on success. For pure reads.

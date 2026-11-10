@@ -653,24 +653,21 @@ SELECT *,
 FROM batch_policy;
 
 -- ---------------------------------------------------------------------------
--- Snapshot dumps
+-- Snapshots
 --
--- Immutable snapshots belong to one local batch, or to the era baseline.
+-- A snapshot: an immutable artifact directory and the boundary it holds — one
+-- local batch at its close, or the era baseline (batch_index NULL). Files are
+-- durable before the row is inserted; rows are deleted before files.
 -- Acceptance is read from `batches.accepted_input`; it never mutates snapshots.
--- Lease acquisition and garbage collection serialize in SQLite. Files are
--- durable before insertion; database rows are deleted before filesystem cleanup.
+-- Download leases live in the serving process, not here
+-- (docs/snapshots/lifecycle.md).
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS dumps (
-    id           INTEGER PRIMARY KEY,
-    prefix       TEXT NOT NULL UNIQUE,
-    lease_count  INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0)
-) STRICT;
-
 CREATE TABLE IF NOT EXISTS snapshots (
-    dump_id               INTEGER PRIMARY KEY REFERENCES dumps(id) ON DELETE RESTRICT,
-    batch_index           INTEGER UNIQUE REFERENCES batches(batch_index) ON DELETE RESTRICT,
-    l2_tx_count           INTEGER NOT NULL CHECK (l2_tx_count >= 0)
+    snapshot_id INTEGER PRIMARY KEY,
+    batch_index INTEGER UNIQUE REFERENCES batches(batch_index) ON DELETE RESTRICT,
+    l2_tx_count INTEGER NOT NULL CHECK (l2_tx_count >= 0),
+    prefix      TEXT    NOT NULL UNIQUE
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_single_baseline
 ON snapshots ((1)) WHERE batch_index IS NULL;

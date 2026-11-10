@@ -372,7 +372,7 @@ it exist only on L1.
 | Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
 | The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`, `history_version_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
 | The root frame's drain from the first queued input | `next_undrained_safe_input_index_in` in [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs). |
-| The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshot_dumps.rs`](../../sequencer/src/storage/snapshot_dumps.rs). |
+| The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshots.rs`](../../sequencer/src/storage/snapshots.rs). |
 | The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |
 | Adoption | `HistoryInfo::adopt_claim` in [`history_api.rs`](../../sequencer-core/src/history_api.rs); `adopt_current_era` in [`sdk/rust-client`](../../sdk/rust-client/src/history.rs). |
 | The flush | [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs) `flush_to_safe`. |

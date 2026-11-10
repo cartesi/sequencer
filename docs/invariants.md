@@ -56,14 +56,13 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 
 | Writer | Writes |
 |---|---|
-| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
+| inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `batches.accepted_input`, `canonical_divergence` (the divergence poison marker) |
 | recovery (startup) | the era's first Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
 | history metadata (setup/recovery) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades, whose greatest key is the recovery generation |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
-| egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
-| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `dumps` + `snapshots` rows (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
-| snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete `snapshots` and unreferenced `dumps` row deletion (`gc_unreferenced_dumps`), including a superseded baseline artifact |
+| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `snapshots` row (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete, unleased `snapshots` row deletion (`collect_snapshots`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
 
@@ -273,17 +272,19 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 - **Breaks:** danger detection silently late during exactly the outages it
   exists for.
 
-### I13. No `dumps` row points at a missing directory
+### I13. No `snapshots` row points at a missing directory
 
 - **Holds:** file create (fsync'd) before row insert; row delete before file
   delete; orphan *files* are acceptable and swept at startup.
-- **Enforced by:** ordering split between `storage/snapshot_dumps.rs`
+- **Enforced by:** ordering split between `storage/snapshots.rs`
   (SQLite-only) and the FS halves outside it (the lane's
   `inclusion_lane/snapshot.rs`; the startup sweep in
   `commands/run/startup_hygiene.rs`) — the module boundary *is* the ordering
-  guarantee. Startup and egress classify a missing or structurally corrupt
-  DB-referenced artifact as terminal; generic filesystem availability errors
-  remain operational.
+  guarantee. GC never collects a snapshot a download has leased
+  ([lease protocol](snapshots/lifecycle.md#retention-leases-and-crash-safety)).
+  Startup and egress classify a missing or structurally corrupt DB-referenced
+  artifact as terminal; generic filesystem availability errors remain
+  operational.
 - **Depended on by:** `from_dump` at catch-up; the serving endpoints.
 - **Breaks:** terminal startup refusal (or a terminal egress fault if detected
   while serving), requiring inspection or cockroach recovery rather than an
@@ -342,8 +343,8 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   process, so a chunk committed before either may acknowledge and later roll
   back.
 - **Watchdog boundary:** accepted-checkpoint selection checks the marker in
-  the same transaction as selection and any download lease, and refuses while
-  it is present. A matching batch before a divergent acceptance in the same L1
+  the same read as selection, under the lease registry's lock for a download,
+  and refuses while it is present. A matching batch before a divergent acceptance in the same L1
   block is not that block's final state, and the watchdog skips replay when
   the finalized inclusion block is unchanged, so it does not subsume this
   wire-identity detector. Nor does the check subsume the watchdog's broader,
@@ -527,7 +528,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 The refactorer-facing mirror of the register above — each of these *looks*
 like a simplification and would break a registered invariant:
 
-- **Don't move filesystem work into `storage/snapshot_dumps.rs`** — the
+- **Don't move filesystem work into `storage/snapshots.rs`** — the
   module boundary *is* the GC crash-ordering guarantee (I13).
 - **Don't reorder `check_danger`'s arms** or merge its two `find_*` helpers
   into one that consults the Tip first — the closed-frontier-first order is

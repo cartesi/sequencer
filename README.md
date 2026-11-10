@@ -460,7 +460,7 @@ they are served only on the internal listener, behind network controls.
   next batch nonce: an operator backup, which no command consumes.
 
 Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
-and `X-Executed-Input-Count`, selected atomically with the artifact lease.
+and `X-Executed-Input-Count`, selected in the read that takes the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 Bodies stream without `Content-Length`; a failure after the headers aborts the
 transfer, so treat an incomplete body as a failed download.
@@ -469,8 +469,8 @@ is accepted, it is the era baseline at the stop block, genesis base included,
 so a `404` from the accepted endpoints means the wrong listener or a database
 setup never completed. Known divergence makes
 all four finalized endpoints return `503 UNAVAILABLE`, including conditional
-state requests. The check shares the checkpoint-selection transaction, before
-any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
+state requests. The check shares the checkpoint-selection read, before any
+lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
 
 ### Health probes (internal only)
 
@@ -497,7 +497,7 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
 - `history_generation_cuts`: one immutable cut per standard-recovery transition; the greatest is the recovery generation
 - `rebuilt_history`: the transactions setup executed from the base through the stop block, each with its count; the feed serves them before the live rows
-- `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is read from `batches.accepted_input`
+- `snapshots`: one immutable row per batch-close or baseline artifact (its directory and count); accepted status is read from `batches.accepted_input`, and download leases live in the serving process
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.
 
 ## Project Layout

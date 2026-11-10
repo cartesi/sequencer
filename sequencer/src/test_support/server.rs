@@ -21,7 +21,7 @@ use crate::ingress::inclusion_lane::{
     InclusionLane, InclusionLaneConfig, InclusionLaneError, PendingUserOp, dump_info,
 };
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::Storage;
+use crate::storage::{SnapshotLeases, Storage};
 
 /// Two ephemeral loopback listeners; returns (listeners, public, internal).
 pub(crate) async fn bind_api_listeners() -> (
@@ -90,6 +90,7 @@ impl TestServerBuilder {
     pub(crate) async fn start(self) -> TestServer {
         let (listeners, public_addr, internal_addr) = bind_api_listeners().await;
         let shutdown = RuntimeScope::default();
+        let snapshot_leases = SnapshotLeases::default();
         let db_path = self.db_path.as_str();
         let (tx, lane_handle, queue_rx) = match self.queue {
             QueueMode::Idle => {
@@ -97,7 +98,7 @@ impl TestServerBuilder {
                 (tx, None, Some(rx))
             }
             QueueMode::Lane => {
-                let (tx, handle) = start_wallet_lane(db_path, &shutdown);
+                let (tx, handle) = start_wallet_lane(db_path, &shutdown, &snapshot_leases);
                 (tx, Some(handle), None)
             }
             QueueMode::Full => {
@@ -144,11 +145,13 @@ impl TestServerBuilder {
                 state_file_in_dump: |dump_dir| {
                     WalletApp::state_file_in_dump(&dump_info::app_prefix(dump_dir))
                 },
+                leases: snapshot_leases.clone(),
             },
         );
         TestServer {
             public_addr,
             internal_addr,
+            snapshot_leases,
             lane_handle,
             shutdown,
             server_task: Some(server_task),
@@ -162,6 +165,7 @@ impl TestServerBuilder {
 fn start_wallet_lane(
     db_path: &str,
     shutdown: &RuntimeScope,
+    snapshot_leases: &SnapshotLeases,
 ) -> (
     mpsc::Sender<PendingUserOp>,
     tokio::task::JoinHandle<Result<(), InclusionLaneError>>,
@@ -207,6 +211,7 @@ fn start_wallet_lane(
         storage,
         InclusionLaneConfig {
             dumps_dir,
+            snapshot_leases: snapshot_leases.clone(),
             max_user_ops_per_chunk: 32,
             safe_input_buffer_capacity: 32,
             max_batch_open: Duration::from_secs(60 * 60),
@@ -222,6 +227,9 @@ fn start_wallet_lane(
 pub(crate) struct TestServer {
     pub(crate) public_addr: SocketAddr,
     pub(crate) internal_addr: SocketAddr,
+    /// The registry the egress handlers lease from; a test's GC passes it to
+    /// share the protocol with the server.
+    pub(crate) snapshot_leases: SnapshotLeases,
     pub(crate) lane_handle: Option<tokio::task::JoinHandle<Result<(), InclusionLaneError>>>,
     shutdown: RuntimeScope,
     server_task: Option<http::ApiServerTask>,

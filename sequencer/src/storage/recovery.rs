@@ -17,7 +17,7 @@ use super::ingress::open_fresh_tip_in_tx;
 use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
 };
-use super::snapshot_dumps::has_rollback_safe_snapshot_in;
+use super::snapshots::has_rollback_safe_snapshot_in;
 
 /// Outcome of [`Storage::check_danger`]. The runtime detector exits on any
 /// non-`Safe` variant; startup maps each variant to one action

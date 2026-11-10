@@ -1793,6 +1793,7 @@ mod valid_batch_invariants {
 
 mod recovery_snapshot_selection {
     use super::*;
+    use crate::storage::SnapshotLeases;
     use std::path::Path;
 
     fn baseline(storage: &mut Storage) -> i64 {
@@ -1818,48 +1819,42 @@ mod recovery_snapshot_selection {
         for index in 0..3 {
             batch_snapshot(&mut storage, index);
         }
-        assert_ne!(
-            storage.latest_snapshot().unwrap().unwrap().dump.id,
-            baseline_id
-        );
+        assert_ne!(storage.latest_snapshot().unwrap().unwrap().id, baseline_id);
         storage.advance_safe_head(1500); // safe head
         assert_eq!(
             storage.recover_post_flush(1200).expect("cascade"),
             vec![0, 1, 2, 3]
         );
-        assert_eq!(
-            storage.latest_snapshot().unwrap().unwrap().dump.id,
-            baseline_id
-        );
+        assert_eq!(storage.latest_snapshot().unwrap().unwrap().id, baseline_id);
         assert!(
             storage
                 .has_rollback_safe_snapshot()
                 .expect("rollback checkpoint")
         );
         let garbage = storage
-            .gc_unreferenced_dumps()
+            .collect_snapshots(&SnapshotLeases::default())
             .expect("gc doomed snapshots");
         assert_eq!(garbage.len(), 3);
-        assert!(garbage.iter().all(|dump| dump.id != baseline_id));
+        assert!(
+            garbage
+                .iter()
+                .all(|prefix| prefix != Path::new("/tmp/recovery-baseline"))
+        );
     }
 
     #[test]
     fn accepted_snapshot_survives_cascade_after_baseline_gc_and_restart() {
         let (db, mut storage) = open_temp_storage("recovery-accepted-fallback");
-        let baseline_id = baseline(&mut storage);
+        baseline(&mut storage);
         seed_closed_batches(&mut storage, 2);
         let accepted_id = batch_snapshot(&mut storage, 0);
         let doomed_id = batch_snapshot(&mut storage, 1);
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0]);
-        let garbage = storage.gc_unreferenced_dumps().expect("retire baseline");
-        assert_eq!(
-            garbage.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![baseline_id]
-        );
-        assert_eq!(
-            storage.latest_snapshot().unwrap().unwrap().dump.id,
-            doomed_id
-        );
+        let garbage = storage
+            .collect_snapshots(&SnapshotLeases::default())
+            .expect("retire baseline");
+        assert_eq!(garbage, vec![Path::new("/tmp/recovery-baseline")]);
+        assert_eq!(storage.latest_snapshot().unwrap().unwrap().id, doomed_id);
         drop(storage);
         let mut storage = Storage::open(&db.path).expect("restart");
         assert!(
@@ -1871,22 +1866,16 @@ mod recovery_snapshot_selection {
             storage.recover_post_flush(1200).expect("cascade suffix"),
             vec![1, 2]
         );
+        assert_eq!(storage.latest_snapshot().unwrap().unwrap().id, accepted_id);
         assert_eq!(
-            storage.latest_snapshot().unwrap().unwrap().dump.id,
-            accepted_id
-        );
-        assert_eq!(
-            storage.finalized_dump().unwrap().unwrap().dump.id,
+            storage.finalized_dump().unwrap().unwrap().snapshot.id,
             accepted_id
         );
         assert_eq!(
             storage
-                .gc_unreferenced_dumps()
-                .unwrap()
-                .iter()
-                .map(|d| d.id)
-                .collect::<Vec<_>>(),
-            vec![doomed_id]
+                .collect_snapshots(&SnapshotLeases::default())
+                .unwrap(),
+            vec![Path::new("/tmp/recovery-batch-1")]
         );
         assert!(
             storage

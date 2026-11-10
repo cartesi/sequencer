@@ -172,7 +172,9 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
             &default_protocol_timing(),
         )
         .unwrap();
-    storage.gc_unreferenced_dumps().unwrap();
+    storage
+        .collect_snapshots(&crate::storage::SnapshotLeases::default())
+        .unwrap();
     let info = storage.history_info(None, None).unwrap();
     assert_eq!(info.baseline.next_batch_nonce, 7);
     assert_eq!(info.baseline.l1_stop_block, 20);

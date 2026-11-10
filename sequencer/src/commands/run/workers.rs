@@ -167,9 +167,14 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         std::fs::create_dir_all(&dumps_dir)
             .map_err(|err| crate::commands::io_error_at("dumps dir", &dumps_dir, err))?;
 
+        // One lease registry for the process: the lane's GC, startup hygiene
+        // and the egress handlers share it (`SnapshotLeases`).
+        let snapshot_leases = crate::storage::SnapshotLeases::default();
+
         // Validate rollback checkpoint metadata and collect obsolete snapshots before admission.
         super::startup_hygiene::run_snapshot_hygiene(
             &mut storage,
+            &snapshot_leases,
             &run_config.data_dir,
             &dumps_dir,
         )?;
@@ -213,8 +218,8 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         // Configuration ends here: the remaining values are exactly what
         // `launch` hands to the workers, so the config structs never cross
         // the authority boundary.
-        let lane_config =
-            InclusionLaneConfig::new(dumps_dir).with_max_batch_open(run_config.max_batch_open());
+        let lane_config = InclusionLaneConfig::new(dumps_dir, snapshot_leases.clone())
+            .with_max_batch_open(run_config.max_batch_open());
         let api_config = ApiConfig::new(domain, A::max_method_payload_bytes());
         let bind = |what: &'static str, addr: &str| {
             let addr = addr.to_owned();
@@ -235,6 +240,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             // The DB row stores the dump *directory*; the app's state
             // file is located relative to the opaque application prefix.
             state_file_in_dump: |dump_dir| A::state_file_in_dump(&dump_info::app_prefix(dump_dir)),
+            leases: snapshot_leases,
         };
 
         Ok(Self {

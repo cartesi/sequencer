@@ -242,11 +242,11 @@ mod tests {
         // The baseline is canonical at the stop block: the first checkpoint.
         let checkpoint = storage.finalized_dump().unwrap().expect("era baseline");
         assert_eq!(checkpoint.inclusion_block, 100);
-        assert_eq!(checkpoint.l2_tx_count, L2TxCount::new(41));
+        assert_eq!(checkpoint.snapshot.l2_tx_count, L2TxCount::new(41));
         assert_eq!(checkpoint.next_batch_nonce, 3);
         let snapshot = storage.latest_snapshot().unwrap().expect("baseline");
         let restored =
-            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
+            CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.prefix)).unwrap();
         assert_eq!(restored.l2_tx_count(), L2TxCount::new(41));
 
         let err = publish(
@@ -400,8 +400,7 @@ mod tests {
             )
             .unwrap();
             let baseline = storage.latest_snapshot().unwrap().expect("baseline");
-            let at_stop =
-                WalletApp::from_dump(&dump_info::app_prefix(&baseline.dump.prefix)).unwrap();
+            let at_stop = WalletApp::from_dump(&dump_info::app_prefix(&baseline.prefix)).unwrap();
             assert_eq!(at_stop.current_user_balance(recipient), U256::ZERO);
             // Run's startup opens the root frame at its own safe head.
             storage
@@ -416,6 +415,7 @@ mod tests {
         let storage = Storage::open(db.path.as_str()).expect("reopen for lane");
         let config = InclusionLaneConfig {
             dumps_dir: dumps_dir.path().to_path_buf(),
+            snapshot_leases: crate::storage::SnapshotLeases::default(),
             max_user_ops_per_chunk: 16,
             safe_input_buffer_capacity: 16,
             max_batch_open: Duration::from_millis(10),
@@ -431,7 +431,7 @@ mod tests {
             let mut s = Storage::open(db.path.as_str()).expect("open observer");
             match s.latest_snapshot().expect("read pending") {
                 Some(p) => {
-                    WalletApp::from_dump(&dump_info::app_prefix(&p.dump.prefix))
+                    WalletApp::from_dump(&dump_info::app_prefix(&p.prefix))
                         .expect("load lane snapshot")
                         .current_user_balance(recipient)
                         == deposit_value
@@ -445,7 +445,7 @@ mod tests {
             let mut s = Storage::open(db.path.as_str()).expect("open observer");
             assert_eq!(s.next_undrained_safe_input_index().unwrap(), 4);
             let dump = s.latest_snapshot().unwrap().expect("a post-deposit dump");
-            let app = WalletApp::from_dump(&dump_info::app_prefix(&dump.dump.prefix)).unwrap();
+            let app = WalletApp::from_dump(&dump_info::app_prefix(&dump.prefix)).unwrap();
             assert_eq!(
                 app.current_user_balance(recipient),
                 deposit_value,

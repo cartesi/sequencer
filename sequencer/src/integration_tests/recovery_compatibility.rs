@@ -127,6 +127,7 @@ impl Server {
                 state_file_in_dump: |prefix| {
                     WalletApp::state_file_in_dump(&dump_info::app_prefix(prefix))
                 },
+                leases: crate::storage::SnapshotLeases::default(),
             },
         );
         Self {

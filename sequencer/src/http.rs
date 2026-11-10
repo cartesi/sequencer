@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
 
 pub use crate::egress::api::SnapshotState;
@@ -26,7 +26,6 @@ use crate::egress::l2_tx_feed::L2TxFeed;
 use crate::ingress::api::{ReadState, SubmitState};
 use crate::ingress::inclusion_lane::{PendingUserOp, SequencerError};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
-use crate::storage::ReleaseScheduler;
 use sequencer_core::api::{DomainResponse, TxRequest, TxRequestError};
 
 #[derive(Debug, Error, Clone)]
@@ -142,69 +141,6 @@ const DEFAULT_MAX_BODY_BYTES: usize = TxRequest::MAX_JSON_BYTES_RECOMMENDED;
 
 pub type ApiServerTask = JoinHandle<std::io::Result<()>>;
 
-type SnapshotReleaseTask = Box<dyn FnOnce() + Send + 'static>;
-
-/// Joins every blocking snapshot-lease release before the HTTP worker exits.
-///
-/// The scheduler passed into each lease guard owns a channel producer. The
-/// receiver therefore cannot close while a guard can still submit a release,
-/// including a guard dropping concurrently with graceful HTTP shutdown.
-struct SnapshotReleaseDrain {
-    supervisor: JoinHandle<()>,
-}
-
-impl SnapshotReleaseDrain {
-    async fn finish(self) {
-        if let Err(join) = self.supervisor.await {
-            abort_terminal(format_args!(
-                "snapshot lease release supervisor task failed: {join}"
-            ));
-        }
-    }
-}
-
-fn supervise_snapshot_releases(shutdown: RuntimeScope) -> (ReleaseScheduler, SnapshotReleaseDrain) {
-    let (sender, receiver) = mpsc::unbounded_channel::<SnapshotReleaseTask>();
-    let schedule_shutdown = shutdown.clone();
-    let scheduler: ReleaseScheduler = Arc::new(move |release| {
-        let _runtime_lifetime = &schedule_shutdown;
-        if sender.send(release).is_err() {
-            abort_terminal("snapshot lease release supervisor is unavailable");
-        }
-    });
-    let supervisor_shutdown = shutdown.clone();
-    let supervisor = tokio::spawn(async move {
-        run_snapshot_release_supervisor(receiver, supervisor_shutdown).await;
-    });
-    (scheduler, SnapshotReleaseDrain { supervisor })
-}
-
-async fn run_snapshot_release_supervisor(
-    mut receiver: mpsc::UnboundedReceiver<SnapshotReleaseTask>,
-    _shutdown: RuntimeScope,
-) {
-    let mut releases = JoinSet::new();
-    let mut accepting = true;
-
-    while accepting || !releases.is_empty() {
-        tokio::select! {
-            task = receiver.recv(), if accepting => {
-                match task {
-                    Some(release) => {
-                        releases.spawn_blocking(release);
-                    }
-                    None => accepting = false,
-                }
-            }
-            result = releases.join_next(), if !releases.is_empty() => {
-                if let Some(Err(join)) = result {
-                    abort_terminal(format_args!("snapshot lease release task panicked: {join}"));
-                }
-            }
-        }
-    }
-}
-
 /// The `503` a handler returns when it refuses new work after shutdown is
 /// requested.
 pub(crate) fn reject_if_shutting_down(shutdown: &RuntimeScope) -> Result<(), ApiError> {
@@ -313,8 +249,6 @@ pub(crate) fn start_on_listeners(
     config: ApiConfig,
     snapshot_state: SnapshotState,
 ) -> ApiServerTask {
-    let (snapshot_release_scheduler, snapshot_release_drain) =
-        supervise_snapshot_releases(shutdown.clone());
     let health_state = Arc::new(crate::egress::api::HealthState {
         tx_sender: tx_sender.clone(),
         shutdown: shutdown.clone(),
@@ -348,7 +282,6 @@ pub(crate) fn start_on_listeners(
         health_state,
         snapshot_state,
         shutdown.clone(),
-        snapshot_release_scheduler,
     )
     .layer(TraceLayer::new_for_http());
 
@@ -359,8 +292,6 @@ pub(crate) fn start_on_listeners(
             serve(listeners.public, public, shutdown.clone()),
             serve(listeners.internal, internal, shutdown),
         );
-        // Finish every scheduled release before ordinary HTTP shutdown ends.
-        snapshot_release_drain.finish().await;
         public.and(internal)
     })
 }
@@ -377,10 +308,6 @@ async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use tokio::sync::oneshot;
-
     use super::*;
 
     /// An application's policy refusal is a client error like any other lane
@@ -399,52 +326,5 @@ mod tests {
             body,
             serde_json::json!({ "ok": false, "code": "EXECUTION_REJECTED", "message": text })
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_release_drain_waits_for_late_release() {
-        let shutdown = RuntimeScope::default();
-        let (schedule, drain) = supervise_snapshot_releases(shutdown.clone());
-        let (started_tx, started_rx) = oneshot::channel();
-        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
-        let mut drain_task = tokio::spawn(drain.finish());
-
-        // Start draining first. The scheduler's producer token must keep the
-        // queue open so this release, submitted concurrently with shutdown,
-        // cannot be missed.
-        tokio::task::yield_now().await;
-        assert!(!drain_task.is_finished());
-
-        schedule(Box::new(move || {
-            let _ = started_tx.send(());
-            unblock_rx.recv().expect("release test gate");
-        }));
-        started_rx.await.expect("release task started");
-        drop(schedule);
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut drain_task)
-                .await
-                .is_err(),
-            "drain returned before the in-flight release completed"
-        );
-
-        unblock_tx.send(()).expect("unblock release");
-        drain_task.await.expect("join release drain");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(unix)]
-    async fn snapshot_release_task_panic_is_terminal_before_drain_returns() {
-        if !crate::runtime::shutdown::abort_test_child(
-            "http::tests::snapshot_release_task_panic_is_terminal_before_drain_returns",
-        ) {
-            return;
-        }
-        let (schedule, drain) = supervise_snapshot_releases(RuntimeScope::default());
-        schedule(Box::new(|| panic!("simulated lease release panic")));
-        drop(schedule);
-        drain.finish().await;
-        panic!("terminal runtime returned instead of aborting");
     }
 }

@@ -26,7 +26,7 @@ use super::queries::{
     DIRECT_EXECUTES_SQL, current_safe_block_required, load_current_write_head, query_batch_policy,
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
-use super::snapshot_dumps::insert_batch_snapshot_in;
+use super::snapshots::insert_batch_snapshot_in;
 use super::{
     BatchPolicy, DirectInputExecution, L2TxCount, SafeFrontierState, SafeInputFrontier,
     SafeInputRange, Storage, WriteHead,
@@ -368,7 +368,7 @@ pub(super) fn seal_and_open_next_batch(
     // the same path the submitter uses and stamp their keccak256 on the row,
     // atomically with the seal. The content-identity check later compares
     // accepted L1 landings against this hash.
-    let nonce = super::snapshot_dumps::batch_nonce_in(tx, closing_batch_index)?;
+    let nonce = super::snapshots::batch_nonce_in(tx, closing_batch_index)?;
     let frames = super::l1_submission::load_batch_frames_in(tx, closing_batch_index)?;
     let encoded = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch { nonce, frames });
     let payload_hash = alloy_primitives::keccak256(&encoded);

@@ -225,8 +225,8 @@ explains block-boundary comparison and rollback retention. The
    verify its count against that header. The archive alone does not carry the
    complete subscription claim.
 3. Subscribe with the matching era, generation, and next-input count. Snapshot
-   selection, headers, and lease share one transaction; recovery during the
-   download can still invalidate the claim before subscription. If the server
+   selection and headers share one read, taken under the lease; recovery during
+   the download can still invalidate the claim before subscription. If the server
    refuses that old era, [adopt](#adopting-a-new-era) the new one at the
    restored count, or rebootstrap; within the same era, a compatible saved
    checkpoint can instead be selected through `/history`.

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::dump_info::{self, DumpInfo};
-use crate::storage::{Storage, WriteHead};
+use crate::storage::{SnapshotLeases, Storage, WriteHead};
 use sequencer_core::application::Application;
 
 #[derive(Debug, thiserror::Error)]
@@ -25,11 +25,11 @@ pub enum GcError {
     Storage(#[from] rusqlite::Error),
 }
 
-pub(super) fn run_gc(storage: &mut Storage) -> Result<usize, GcError> {
-    let removed = storage.gc_unreferenced_dumps()?;
-    for row in &removed {
-        if let Err(err) = dump_info::delete_dump_dir(&row.prefix) {
-            tracing::warn!(error = %err, prefix = ?row.prefix,
+pub(super) fn run_gc(storage: &mut Storage, leases: &SnapshotLeases) -> Result<usize, GcError> {
+    let removed = storage.collect_snapshots(leases)?;
+    for prefix in &removed {
+        if let Err(err) = dump_info::delete_dump_dir(prefix) {
+            tracing::warn!(error = %err, ?prefix,
                 "GC: filesystem delete failed; orphan left for next startup sweep");
         }
     }

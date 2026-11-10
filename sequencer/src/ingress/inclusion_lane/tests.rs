@@ -44,6 +44,7 @@ fn default_test_config() -> InclusionLaneConfig {
         dumps_dir: tempfile::tempdir()
             .expect("create dumps_dir tempdir")
             .keep(),
+        snapshot_leases: crate::storage::SnapshotLeases::default(),
         max_user_ops_per_chunk: 16,
         safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
@@ -1261,7 +1262,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .finalized_dump()
         .expect("read finalized prefix")
         .expect("prefix snapshot promoted");
-    assert_eq!(finalized_before.l2_tx_count, L2TxCount::new(1));
+    assert_eq!(finalized_before.snapshot.l2_tx_count, L2TxCount::new(1));
 
     // The direct and this user op are both beyond the finalized checkpoint.
     // Closing batch 1 makes it the first non-gold recovery pivot.
@@ -1323,8 +1324,8 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         "the accepted prefix checkpoint must survive the cascade"
     );
     assert_eq!(
-        storage.latest_snapshot().unwrap().unwrap().dump,
-        finalized_before.dump
+        storage.latest_snapshot().unwrap().unwrap(),
+        finalized_before.snapshot
     );
     let after_recovery = history_rows(&mut storage, 32);
     assert_eq!(after_recovery.len(), 2);
@@ -1338,8 +1339,11 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     assert_eq!(after_recovery[1].offset, L2TxCount::new(1));
 
     let checkpoint = catch_up_snapshot(&mut storage).expect("select surviving checkpoint");
-    assert_eq!(checkpoint.l2_tx_count, finalized_before.l2_tx_count);
-    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
+    assert_eq!(
+        checkpoint.l2_tx_count,
+        finalized_before.snapshot.l2_tx_count
+    );
+    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.prefix))
         .expect("load surviving application checkpoint");
     assert_eq!(restarted.l2_tx_count(), L2TxCount::new(1));
     catch_up_application_paged(&mut restarted, &mut storage, checkpoint.l2_tx_count, 2)
@@ -1380,9 +1384,8 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     // the application in place of an application-held clock.
     assert_eq!(user_ops, vec![(0x51, 0), (0x53, replacement_safe_block)]);
 
-    let mut restarted_again =
-        StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
-            .expect("reload surviving checkpoint");
+    let mut restarted_again = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.prefix))
+        .expect("reload surviving checkpoint");
     catch_up_application_paged(
         &mut restarted_again,
         &mut storage,
@@ -1529,7 +1532,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix) == 3)
+            .map(|p| read_dump_counter(&p.prefix) == 3)
             .unwrap_or(false)
     })
     .await;
@@ -1543,6 +1546,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
             s.finalized_dump()
                 .expect("finalized")
                 .expect("genesis finalized exists")
+                .snapshot
                 .l2_tx_count
                 .get(),
             0,
@@ -1575,7 +1579,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix) == 4)
+            .map(|p| read_dump_counter(&p.prefix) == 4)
             .unwrap_or(false)
     })
     .await;
@@ -1583,7 +1587,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix))
+            .map(|p| read_dump_counter(&p.prefix))
     };
     shutdown_lane(&shutdown2, handle2).await;
 
@@ -1608,7 +1612,7 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     let tip = head.batch_index;
-    let dump_count = storage.list_dump_rows().unwrap().len();
+    let dump_count = storage.list_snapshots().unwrap().len();
 
     app.fail_dump = true;
     let error = super::snapshot::close_batch_with_snapshot(
@@ -1629,7 +1633,7 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
     assert_eq!(storage.open_state().unwrap().unwrap().batch_index, tip);
     assert_eq!(storage.latest_batch_index().unwrap(), Some(tip));
     assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
-    assert_eq!(storage.list_dump_rows().unwrap().len(), dump_count);
+    assert_eq!(storage.list_snapshots().unwrap().len(), dump_count);
 }
 
 #[test]
@@ -1648,8 +1652,7 @@ fn empty_batch_snapshot_preserves_application_count() {
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     assert_eq!(snapshot.l2_tx_count.get(), 6);
-    let restored =
-        StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
+    let restored = StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.prefix)).unwrap();
     assert_eq!(restored.l2_tx_count().get(), 6);
 }
 

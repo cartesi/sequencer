@@ -473,6 +473,7 @@ async fn start_test_server_with_limits(
         http::SnapshotState {
             db_path: db_path.to_string(),
             state_file_in_dump: snapshot_state_file,
+            leases: crate::storage::SnapshotLeases::default(),
         },
     );
 

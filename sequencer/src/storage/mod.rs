@@ -20,7 +20,7 @@ mod open;
 mod queries;
 mod rebuilt_history;
 mod recovery;
-mod snapshot_dumps;
+mod snapshots;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -42,9 +42,9 @@ pub use rebuilt_history::RebuiltDirects;
 pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};
-pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump,
-    PersistentReleaseFailureReporter, ReleaseScheduler, Snapshot,
+pub use snapshots::{
+    FinalizedDump, FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot,
+    SnapshotLeases,
 };
 
 /// One safe input as stored on the L1 InputBox: sender, opaque payload, and
