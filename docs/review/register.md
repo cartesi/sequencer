@@ -46,9 +46,13 @@ To settle with Bart:
   a rebuild both drain a full fridge in one input, so the bound must fit that
   drain in the guest's budget, temporary allocations, execution and
   accumulated outputs included. The five-block local frame tick is not a
-  canonical drain interval.
+  canonical drain interval. The wallet drains its bound of 16,384 deposits in
+  one input in 1.94 G cycles, 1/145,000 of the per-input budget, and four
+  times the bound also completes
+  ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#c-draining-a-full-fridge-in-one-input));
+  libdex's drain is its own to measure.
 
-Next: settle these values and measure headroom, then exercise delayed fresh
+Next: settle these values and measure libdex's headroom, then exercise delayed fresh
 batches, same-block overflow and outages on devnet. An overflow changes the
 application state after a block's last accepted batch, so the watchdog's
 block-boundary comparison does not hold for that block
@@ -218,6 +222,16 @@ at `6b2a233`.
   another node. Evidence: [`l1/reader.rs`](../../sequencer/src/l1/reader.rs),
   [`l1/partition.rs`](../../sequencer/src/l1/partition.rs),
   [`storage/l1_inputs.rs`](../../sequencer/src/storage/l1_inputs.rs).
+- **Setup recovers signatures on one core** (measured 2026-11-10). Each user
+  op's signature recovery costs about 78 µs and takes 95% of the rebuild, so
+  setup's time is about 85 µs per user op past the base
+  ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#a-setups-rebuild-and-execution)).
+  The scheduler reads nothing from the application, so a page's ops could be
+  recovered on all cores before the scheduler hands them out in order; the
+  speedup is unmeasured. Nothing else in setup takes more than about 3% of its
+  time. Act when a recovery's rebuild time matters to an incident's duration.
+  Evidence: [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs),
+  `Scheduler` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs).
 
 ## Verification gaps
 
@@ -229,7 +243,7 @@ at the smallest useful boundary when working on that behavior.
 |---|---|
 | Elapsed-time danger | Storage/procedure coverage exists. Add a process scenario isolating `EstimatedBatchInDanger` from stale-view refusal: retry at exit 20 without a speculative cascade. Start in [recovery](../../sequencer/src/recovery/mod.rs) and the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Canonical divergence | Storage freeze and startup refusal are covered separately. Compose accepted divergent input, runtime stop, and refusal after respawn in a process test; frontier must remain frozen. See [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen). |
-| Rebuilt anchor | Setup writes the anchor from its rebuild. Storage tests accept a first batch at a nonzero anchor and tear a nonzero-anchor root, which drains again from the first queued input ([`fill.rs`](../../sequencer/src/commands/setup/fill.rs)). No process scenario submits after a full-tear cascade of a recovered era and checks the nonce it resumes at; the stored-machine round trip below is the natural place. See [I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce). |
+| Rebuilt anchor | Setup writes the anchor from its rebuild. Storage tests accept a first batch at a nonzero anchor and tear a nonzero-anchor root, which drains again from the first queued input ([`fill.rs`](../../sequencer/src/commands/setup/fill.rs)). The devnet round trips land a recovered era's first batch at the anchor nonce ([`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs)), but no process scenario submits after a full-tear cascade of a recovered era and checks the nonce it resumes at; those round trips are the natural place. See [I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce). |
 | Same-block directs | `multi_deposit_reconciliation_test` accumulates directs in separate blocks. Queue portal sends, mine once, assert equal receipt blocks, and verify canonical/WS order and attribution in the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Boot failure exits | Exit 20 has a process assertion, and exit 30 for setup on a set-up directory. Exit 40 is setup's escape check, covered only by unit and chain tests (`escape_check_*`, `the_escape_check_refuses_activity_past_the_stop_block`); exits 40 and 1 still need exact assertions in process scenarios, so the supervisor receives the intended hint. Start in the [E2E scenarios](../../tests/e2e/src/test_cases.rs) and [exit contract](../../sequencer/src/commands/error.rs). |
 | SDK HTTPS | A test pins that `https://` endpoints open with a TLS ClientHello. Certificate rejection is untested; it relies on reqwest's rustls platform verifier, with no override in the SDK. Add a rejection test if the SDK gains custom roots. See the [client](../../sdk/rust-client/src/lib.rs). |
@@ -261,14 +275,33 @@ unverified paths.
   application's state only through the `state` inspect query
   ([`machine.rs`](../../sequencer/src/machine.rs)), whose report must fit the
   guest's 2 MiB transmit buffer; the watchdog's labeled-range state source has
-  no setup counterpart. The reference wallet's `state` report passes that
-  size at about 27,000 accounts, where the guest's inspect halts. This is
-  acceptable while no deployment's state approaches it; add a range read
-  before a deployment's application state can exceed 2 MiB, which libdex's
-  likely will ([state sources](../watchdog/README.md#state-sources)).
-- **The 2^36-cycle cap on each inspect query** (`QUERY_MCYCLE_BUDGET`) bounds
-  a guest that never answers. Its headroom over encoding a 2 MiB report is
-  unmeasured; measure it with the range read above.
+  no setup counterpart. The reference wallet's `state` report fits 27,593
+  accounts that hold a balance and a nonce, or 40,328 that hold only a
+  balance; one more and the guest's inspect halts, and setup refuses the base
+  with exit 30. The 2^36-cycle cap on each query (`QUERY_MCYCLE_BUDGET`) has at
+  least 3,269 times headroom over the largest report that fits, so the report
+  size binds first ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#b-reading-a-base-machine)).
+  This is acceptable while no deployment's state approaches it; until then a
+  deployment past it can recover only from an older base or genesis. Add a
+  range read, and measure its queries against the cap, before a deployment's
+  application state can exceed 2 MiB, which libdex's likely will
+  ([state sources](../watchdog/README.md#state-sources)).
+- **Not every machine the watchdog stores is a base.** Setup loads only a
+  machine waiting at an `RX_ACCEPTED` yield, and the
+  [watchdog README](../watchdog/README.md#machines-a-recovery-can-start-from)
+  says which of its machines do. It stays because setup refuses one that does
+  not wait, at its first step with exit 30, before writing anything. Evidence:
+  [`replay.lua`](../../watchdog/replay.lua), [`tick.lua`](../../watchdog/tick.lua),
+  and the three yield tests in [`e2e.lua`](../../watchdog/tests/e2e.lua).
+- **The loader's failure arms against the real emulator.** Unit tests in
+  [`machine.rs`](../../sequencer/src/machine.rs) drive every arm of
+  `read_machine_export` through a scripted emulator; whether the real
+  emulator behaves as scripted (an undeliverable response leaving `iflags.Y`
+  set, for one) rests on the [emulator facts](../cartesi-machine.md#reading-a-stored-machines-export).
+  Against the built image, canonical-test's `export` cases cover only the
+  answered queries and a missing directory; the measurement above also saw a
+  `state` report over 2 MiB halt the guest and `read_machine_export` refuse
+  the base.
 - **The scheduler header's direction.** [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h)
   and its reference export exist; whether a C or C++ guest links that export
   or its port implements the header, and so whether the sequencer would link
@@ -277,31 +310,30 @@ unverified paths.
   Until then setup and the sequencer call the Rust `Scheduler` directly, with
   no adapter and no `Scheduler` trait: nothing foreign runs on that path yet,
   so a seam would have no second implementation to test it.
-- **Unverified on the devnet.** The rollups-e2e scenarios
-  `setup_refuses_a_set_up_data_directory_test`,
-  `c_host_setup_refuses_a_set_up_data_directory_test`,
-  `recovery_from_genesis_round_trip_test` and
-  `c_host_recovery_from_genesis_round_trip_test`, and the harness's setup and
-  respawn model, compile and pass clippy but were not run.
-  `recovery_from_stored_machine_round_trip_test` is ignored: the current image
-  already answers the `scheduler` query
-  (`export_of_the_template_image_is_genesis` in canonical-test), but it needs
-  the watchdog Lua dependencies and `cartesi-machine`, and it assumes the
-  shape of `sequencer-watchdog replay`'s output. Run
-  `just test-recovery-round-trip` before removing the ignore.
-  Evidence: [`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs),
-  [`test_cases.rs`](../../tests/e2e/src/test_cases.rs).
 - **Unverified on GitHub Actions:** the release workflow's native arm64
   runner (`ubuntu-24.04-arm`) and the amd64 release link, now that the
-  sequencer links the emulator. Evidence:
-  [`release.yml`](../../.github/workflows/release.yml).
-- **Release notes owe two items.** `HistoryBaseline.rebuilt_history_end` is a
-  required field, so an older SDK build fails to decode `/history`; and the
+  sequencer links the emulator; and the `rollups-e2e` job's run of the six
+  recovery scenarios and the divergence drill, which now also need the
+  `cartesi-machine` CLI, the watchdog's Lua modules and both canonical images.
+  The whole devnet suite passed locally on 2026-11-10, 53 scenarios with none
+  ignored, and each recovery scenario three times more. Evidence:
+  [`release.yml`](../../.github/workflows/release.yml),
+  [`ci.yml`](../../.github/workflows/ci.yml),
+  [`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs).
+- **Release notes owe three items.** `HistoryBaseline.rebuilt_history_end` is
+  a required field, so an older SDK build fails to decode `/history`; the
   released binaries link the emulator statically, so they need the Ubuntu
-  24.04 or Debian 13 C++ runtime.
-- **Rebuild and execution time on a large history** are unmeasured
-  ([measure](../plans/2026-11-sequencer-recovery/todo.md#measure)). Setup
-  streams both in chunks, so memory stays bounded; time is the open question.
+  24.04 or Debian 13 C++ runtime; and the new template hashes. Read from this
+  tree's images on 2026-11-10, the devnet template is `0x8268d15a…92b5` and
+  the Sepolia template `0x96c69616…a1a2`; publish the released images' own.
+- **One unexplained memory reading in the rebuild.** Setup streams its passes
+  in pages, and a test process rebuilding 10^6 inputs, sampled every 5 s,
+  stayed between 26 and 55 MB resident. `/usr/bin/time -l` around one such
+  run's whole `cargo test` command reported a 2.9 GB peak, which sampling would
+  miss if it lasted under 5 s
+  ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#a-setups-rebuild-and-execution)).
+  Recheck with a peak-memory reading of the setup process alone before
+  sizing a recovery host's memory.
 
 ## Canonical rules open for the C++ port
 
@@ -314,7 +346,8 @@ force.
 
 - **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
   and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`
-  only.
+  only. `POST /tx` is not pinned for `s ≥ n` or `v` from 29 to 34, which only
+  the batch path's guest scenarios cover, and neither path for `s > n`.
 - **Empty batches** are valid at any age and consume a nonce, though the
   sequencer never sends one. Reject them only if the port forces a new image
   anyway.
@@ -324,9 +357,10 @@ force.
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
   the [fridge bound and cap values](#bound-the-canonical-direct-input-fridge),
-  and a setup check of the guest's compiled `sequencer_address`. With them
-  come versioned gate and signature vectors, adding the unpinned `s ≥ n`, `v`
-  from 29 to 34 and the fee-range reject.
+  and a setup check of the guest's compiled `sequencer_address`. The port's
+  image ships its own vector set, as
+  [`consensus_vectors_v2.json`](../../tests/fixtures/consensus_vectors_v2.json)
+  is this template's ([conformance](../protocol/scheduler-semantics.md#conformance)).
 
 ## Integration work owned elsewhere
 

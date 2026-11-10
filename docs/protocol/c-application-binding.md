@@ -16,8 +16,11 @@ linking, genesis, host commands, and the reference wallet under `examples/`.
 - [Scheduler semantics](scheduler-semantics.md) defines canonical ordering and
   the acceptance boundary. The native engine does not acquire an ordering role
   through this ABI. A C or C++ guest reaches the reference scheduler through
-  [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h), whose
-  transaction records are this header's.
+  [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h), a proposed
+  header in [`bindings/c-scheduler`](../../bindings/c-scheduler/README.md)
+  whose transaction records are this header's. A port of that header is held
+  to the [conformance vectors](scheduler-semantics.md#conformance) through the
+  crate's `tests/conformance.rs`.
 - The [C header](../../bindings/c-app-engine/include/application-engine.h)
   defines record layout, statuses, pointer ownership, and call lifetimes. An
   engine archive and its generated Rust bindings must agree on that header.

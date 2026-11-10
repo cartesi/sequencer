@@ -64,12 +64,6 @@ test-rollups-e2e: setup ensure-machine-image ensure-sepolia-machine-image
     cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p c-wallet-engine --bin c-wallet-genesis -p c-wallet-sequencer --bin c-wallet-sequencer -p rollups-e2e --bin rollups-e2e
     cargo run -p rollups-e2e --bin rollups-e2e
 
-# Needs a machine image whose template answers the `scheduler` inspect query.
-# Recover with setup --base from a stored machine, run, adopt the new era.
-test-recovery-round-trip: setup watchdog-lua-deps ensure-machine-image
-    cargo build -p wallet-sequencer --bin wallet-sequencer-devnet -p rollups-e2e --bin rollups-e2e
-    cargo run -p rollups-e2e --bin rollups-e2e -- recovery_from_stored_machine_round_trip_test --exact --include-ignored --nocapture
-
 ensure-machine-image:
     @test -d examples/canonical-app/out/canonical-machine-image || just canonical build-machine-image
 

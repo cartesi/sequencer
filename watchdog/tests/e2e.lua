@@ -19,6 +19,7 @@ local incident = require("watchdog.incident")
 local json = require("watchdog.json").new()
 local l1_mod = require("watchdog.l1")
 local machine = require("watchdog.machine").new()
+local main = require("watchdog.main")
 local replay = require("watchdog.replay")
 local store_mod = require("watchdog.store")
 local support = require("watchdog.tests.support")
@@ -460,6 +461,88 @@ test("replay re-derives the digest a tick agreed on", function()
         { from_dir = cfg.bootstrap_dir, from_block = 0, to_block = 3, out_dir = out })
     eq(result.sha256, digest({ "hello", "world!" }))
     eq(result.input_count, 3)
+end)
+
+-- ── Stored machines as a recovery base ────────────────────────────────────
+
+--- Where a stored machine rests, read from its registers in the order of the
+--- sequencer's base loader (`read_machine_export`, sequencer/src/machine.rs):
+--- `setup --base` takes only "rx-accepted", a manual RX_ACCEPTED yield.
+local function rest(dir)
+    local m = cartesi.new()
+    m:load(dir, {}, cartesi.SHARING_NONE)
+    local halted, yielded = m:read_reg("iflags_H") ~= 0, m:read_reg("iflags_Y") ~= 0
+    local dev, cmd = m:read_reg("htif_tohost_dev"), m:read_reg("htif_tohost_cmd")
+    local reason = m:read_reg("htif_tohost_reason")
+    m:destroy()
+    if halted then
+        return "halted"
+    elseif not yielded then
+        return "not at a yield"
+    elseif dev == cartesi.HTIF_DEV_YIELD and cmd == cartesi.HTIF_YIELD_CMD_MANUAL and reason == RX_ACCEPTED then
+        return "rx-accepted"
+    end
+    return string.format("yield dev %d cmd %d reason %d", dev, cmd, reason)
+end
+
+local EXCEPTION_REST = string.format("yield dev %d cmd %d reason %d", cartesi.HTIF_DEV_YIELD,
+    cartesi.HTIF_YIELD_CMD_MANUAL, TX_EXCEPTION)
+
+test("every checkpoint rests at an accept yield, after a rejected last input too", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "world!", "reject"))
+    eq(rest(store:head().dir), "rx-accepted")
+    eq(run_tick(cfg, store, l1, { block = 3, sha256 = digest({ "hello", "world!" }) }).kind, "agreed")
+    eq(store:head().input_count, 3)
+    eq(rest(store:head().dir), "rx-accepted")
+end)
+
+test("incident/canonical rests at an accept yield only for a state mismatch", function()
+    local cfg, store, l1 = deployment(guest_inputs("hello", "world!"))
+    local wrong = guest_state({ "hello", "WORLD!" })
+    eq(run_tick(cfg, store, l1, { block = 2, sha256 = machine.sha256(wrong), bytes = wrong }).kind, "diverged")
+    eq(incident.marker(store).kind, "state_mismatch")
+    eq(rest(store:path("incident", "canonical")), "rx-accepted")
+
+    for _, case in ipairs({
+        { payload = "halt", rest = "halted" },
+        { payload = "exception", rest = EXCEPTION_REST },
+    }) do
+        local dead_cfg, dead_store, dead_l1 = deployment(guest_inputs("hello", case.payload))
+        eq(run_tick(dead_cfg, dead_store, dead_l1, { block = 2, sha256 = digest({ "hello" }) }).kind, "diverged")
+        eq(incident.marker(dead_store).kind, "canonical_machine_dead")
+        eq(rest(dead_store:path("incident", "canonical")), case.rest)
+    end
+end)
+
+--- `sequencer-watchdog replay` as an operator runs it; returns the exit
+--- code, the decoded result, and the `--out` directory.
+local function replay_command(inputs, to_block)
+    local cfg, store, l1 = deployment(inputs)
+    local out = support.tmpdir() .. "/replayed"
+    local printed = {}
+    local code = main.run({ "replay", "--from", cfg.bootstrap_dir, "--from-block", "0",
+        "--to-block", tostring(to_block), "--out", out }, {
+        env = { CARTESI_WATCHDOG_STATE_DIR = store.dir },
+        factory = { machine = function() return machine end, l1 = function() return l1 end },
+        stdout = { write = function(_, ...) printed[#printed + 1] = table.concat({ ... }) end },
+    })
+    return code, printed[1] and json.decode(printed[1]), out
+end
+
+test("replay --out rests at an accept yield unless the replay stopped", function()
+    local code, result, out = replay_command(guest_inputs("hello", "world!", "reject"), 3)
+    eq(code, 0)
+    eq(result.input_count, 3)
+    eq(result.sha256, digest({ "hello", "world!" }))
+    eq(rest(out), "rx-accepted")
+
+    -- A stop is a result, not a failure: the command exits 0 with `stop` set
+    -- and leaves the stopped machine at --out.
+    code, result, out = replay_command(guest_inputs("hello", "halt", "world!"), 3)
+    eq(code, 0)
+    eq(result.stop.status, "halted")
+    eq(result.sha256, nil)
+    eq(rest(out), "halted")
 end)
 
 test("init refuses a bootstrap machine the tick cannot run in place", function()

@@ -1457,6 +1457,7 @@ dependencies = [
  "ethereum_ssz",
  "k256",
  "sequencer-core",
+ "serde_json",
 ]
 
 [[package]]

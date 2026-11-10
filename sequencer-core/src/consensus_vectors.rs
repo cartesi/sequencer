@@ -1,10 +1,11 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Byte-level consensus vectors from `tests/fixtures/consensus_vectors_v1.json`.
+//! Byte-level consensus vectors from `tests/fixtures/consensus_vectors_v2.json`.
 //! They were pinned once, before any toolchain or dependency move, and are never
 //! regenerated: a mismatch means consensus bytes changed and is a finding.
-//! Signature, SSZ and fee cases are asserted next to the code they pin.
+//! Signature, SSZ and fee cases are asserted next to the code they pin; the
+//! guest scenarios are checked where the wallet and the machine are.
 
 use alloy_primitives::{Address, B256, Bytes, U64, U256, keccak256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
@@ -16,11 +17,17 @@ use crate::user_op::UserOp;
 
 const CONSENSUS_VECTORS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../tests/fixtures/consensus_vectors_v1.json"
+    "/../tests/fixtures/consensus_vectors_v2.json"
 ));
 
 pub(crate) fn vectors() -> ConsensusVectors {
-    serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v1.json")
+    serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v2.json")
+}
+
+/// The file untyped, for the scheduler-only scenarios, which the scheduler's
+/// tests replay field by field.
+pub(crate) fn raw_vectors() -> serde_json::Value {
+    serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v2.json")
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,7 +177,7 @@ pub(crate) struct FeeCase {
     pub linear: U256,
 }
 
-/// The guest scenarios' input payloads; `canonical-test` replays them.
+/// The guest scenarios' input payloads, of which the SSZ case is one.
 #[derive(Debug, Deserialize)]
 pub(crate) struct GuestPayloads {
     pub payloads: BTreeMap<String, Bytes>,

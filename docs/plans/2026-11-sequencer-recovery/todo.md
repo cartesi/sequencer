@@ -34,20 +34,21 @@ limits this work accepts and the paths it left unverified.
   and its reference export are code, tested against the Rust `Scheduler`.
   Settle with Bart whether his guest links that export or his port implements
   the header ([questions](#questions-for-bart)); only the second needs a Rust
-  adapter over a foreign scheduler, and a `Scheduler` trait for it.
-- **Vectors**: a set for this template that carries the `scheduler` report
-  after every input, so every scenario asserts the clock's split of the
-  directs ([conformance](scheduler.md#conformance)). The v1 set pins the
-  earlier template, and its golden guest cases are ignored.
+  adapter over a foreign scheduler, and a `Scheduler` trait for it. A port is
+  held to the [conformance vectors](../../protocol/scheduler-semantics.md#conformance)
+  through `c-scheduler`'s `tests/conformance.rs`, which today links only the
+  reference export; package it so a port links its own implementation in one
+  command.
 - **A base machine's state through the range source.** Setup reads only the
   `state` inspect report, which must fit 2 MiB; add the labeled-range read the
-  watchdog uses before a deployment's state can outgrow it
+  watchdog uses before a deployment's state can outgrow it, and measure its
+  queries against the loader's cycle cap
   ([register](../../review/register.md#sequencer-recovery-follow-ups)).
-- **Drills on the devnet in CI**: recover from a stored machine with directs
-  queued at the stop block, then realign a toy-wallet client by the adopt
-  rule. `recovery_from_stored_machine_round_trip_test` is the start; it is
-  ignored and runs with `just test-recovery-round-trip`. A path run once in a
-  deployment's life rots.
+- **Drills that are not tests yet.** The round trips from genesis and from a
+  stored machine run on the devnet for both hosts
+  ([drills](../../watchdog/incident-runbook.md#drills)). No test clears a
+  watchdog latch around a rebuild, or realigns a reader other than the toy
+  wallet. A path run once in a deployment's life rots.
 
 ## Redesign the egress API
 
@@ -110,13 +111,17 @@ operator's job.
 
 ## Measure
 
-- Setup's rebuild and execution from a base machine to the stop block, at the
-  age a base machine will typically have, and from genesis.
-- Reading a large application state from a stopped machine, and the headroom
-  of the 2^36-cycle cap on each inspect query.
-- The guest's cost to drain a full fridge in one input, which the first frame
-  after an outage and the root frame after a recovery both do.
-- The time to recover, end to end, in a drill.
+The [recovery measurements](../../review/2026-11-10-recovery-measurements.md)
+give setup's rebuild rate, the cost of reading a base machine, the wallet's
+largest drain and the drills' times. What they leave out:
+
+- **The L1 sync** through a deployment's RPC provider, the one part of
+  setup's time the provider bounds.
+- **libdex's numbers**: its execution rate in setup, its cost per drained
+  direct, and its `state` size, since every guest number there is the
+  wallet's ([questions](#questions-for-bart)).
+- **Production-like hardware.** One Apple machine on macOS ran every measurement;
+  re-measure the rebuild on the recovery host's Linux storage.
 
 ## When this plan lands
 

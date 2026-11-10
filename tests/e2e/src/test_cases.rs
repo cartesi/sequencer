@@ -147,7 +147,6 @@ fn rust(name: &'static str, run: ScenarioFn) -> Scenario {
         host: Host::Rust,
         run,
         configure: no_overrides,
-        ignored: false,
     }
 }
 
@@ -157,7 +156,6 @@ fn c_host(name: &'static str, run: ScenarioFn) -> Scenario {
         host: Host::C,
         run,
         configure: no_overrides,
-        ignored: false,
     }
 }
 
@@ -426,10 +424,6 @@ pub fn test_cases() -> Vec<Scenario> {
             Box::pin(crate::recovery_round_trip::run_recovery_from_genesis_round_trip_test(runtime))
         })
         .with(real_clock),
-        // Ignored until it runs in CI: it needs `cartesi-machine` and the
-        // watchdog's Lua dependencies on the path, and the devnet machine image
-        // (whose template already answers the `scheduler` query); run it with
-        // `just test-recovery-round-trip`.
         rust("recovery_from_stored_machine_round_trip_test", |runtime| {
             Box::pin(
                 crate::recovery_round_trip::run_recovery_from_stored_machine_round_trip_test(
@@ -437,8 +431,19 @@ pub fn test_cases() -> Vec<Scenario> {
                 ),
             )
         })
-        .with(real_clock)
-        .ignored(),
+        .with(real_clock),
+        // The base state taken out of a stored machine, opened by the C engine.
+        c_host(
+            "c_host_recovery_from_stored_machine_round_trip_test",
+            |runtime| {
+                Box::pin(
+                    crate::recovery_round_trip::run_recovery_from_stored_machine_round_trip_test(
+                        runtime,
+                    ),
+                )
+            },
+        )
+        .with(real_clock),
     ]
 }
 

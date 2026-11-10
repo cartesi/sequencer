@@ -12,7 +12,6 @@ fn main() {
     let trials: Vec<Trial> = rollups_e2e::test_cases::test_cases()
         .into_iter()
         .map(|scenario| {
-            let ignored = scenario.ignored;
             Trial::test(scenario.name, move || {
                 let spawn_config = scenario.spawn_config();
                 run_trial(scenario.name, || async move {
@@ -35,7 +34,6 @@ fn main() {
                     scenario_result
                 })
             })
-            .with_ignored_flag(ignored)
         })
         .collect();
 

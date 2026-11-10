@@ -294,9 +294,10 @@ builds the instance with `from_canonical_state`. The `state` report must fit
 one 2 MiB report; a read through the labeled range, as the watchdog does, is
 not built yet ([register](../review/register.md#sequencer-recovery-follow-ups)).
 Each integration's conformance tests check the projection; setup's own tests
-hand it a machine's export and state bytes directly, and the devnet round trip
-from a stored machine (`recovery_from_stored_machine_round_trip_test`) is
-written but ignored until it runs in CI.
+hand it a machine's export and state bytes directly, and the devnet round
+trips from a stored machine (`recovery_from_stored_machine_round_trip_test`
+and its C-host twin) build the reference wallet from a real machine's `state`
+report ([drills](../watchdog/incident-runbook.md#drills)).
 The runtime `Application` trait stays independent of machine image layouts and
 host tooling: reading the state source and the `scheduler` report is the
 host's work.

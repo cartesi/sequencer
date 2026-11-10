@@ -560,7 +560,10 @@ The sequencer is a library: an application crate composes it with its
 `Application` implementation into a binary, as
 [`examples/wallet-sequencer/`](examples/wallet-sequencer/) does with the
 placeholder wallet in [`examples/app-core/`](examples/app-core/). Native engines
-bind through the [C ABI adapter](bindings/c-app-engine/README.md). The
+bind through the [C ABI adapter](bindings/c-app-engine/README.md). A C or C++
+guest reaches the canonical scheduler through the proposed
+[`scheduler.h`](bindings/c-scheduler/README.md), and a port of it is held to the
+[conformance vectors](docs/protocol/scheduler-semantics.md#conformance). The
 [architecture map](AGENTS.md#architecture-map) covers the workspace and the
 sequencer's modules.
 

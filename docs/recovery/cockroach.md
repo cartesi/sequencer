@@ -205,6 +205,36 @@ in the input table for `run`.
   never change: no standard recovery cuts below the stop block, and storage
   triggers refuse a deletion or a second count.
 
+## How long a recovery takes
+
+Setup's time has three parts, and the base decides the largest one. The
+[recovery measurements](../review/2026-11-10-recovery-measurements.md) hold
+the numbers for the reference wallet.
+
+- **The sync** reads every input from the deployment block, so the RPC
+  provider bounds it; its database writes are a small part. The dry run syncs
+  the same inputs, so it takes as long. A sync through a deployment's provider
+  is not measured yet.
+- **The flush** returns at once on a settled wallet, and otherwise waits until
+  its no-ops are safe.
+- **The rebuild** recovers each user op's signature, one op after another on
+  one core, and that is almost all of its time; writing the rows, executing
+  them and publishing take the rest. Its time therefore follows the user ops
+  past the base, not the length of the history: a recent base keeps a
+  recovery short, and genesis costs the whole history. The dry run prints how
+  many inputs the rebuild replays; the measured rate per user op turns the ops
+  among them into a time. Execution is the application's own cost, so measure
+  a native engine's with it.
+
+Reading the base machine is never the slow step. Memory stayed bounded in the
+measurements, as the paging in [what setup does](#what-setup-does) intends,
+but one reading is unexplained
+([register](../review/register.md#sequencer-recovery-follow-ups)). On disk,
+the rebuilt history about doubles the database. When the new era's first
+batch lands, the canonical machine drains every direct still queued in that
+one input; for the wallet, a fridge full to its bound drains well inside the
+guest's budget for one input.
+
 ## Before anything
 
 - **The old instance stays down.** The new data directory is pinned to the
@@ -224,8 +254,11 @@ in the input table for `run`.
 - **The base must load.** It must be a machine of the deployment's template,
   stored by the Cartesi Machine version the sequencer links
   ([versions](../cartesi-machine.md#versions-are-all-or-nothing)), and stopped
-  between inputs. Setup refuses a halted machine, so a canonical machine that
-  halted cannot be recovered: the application is dead on chain.
+  between inputs, waiting at an `RX_ACCEPTED` yield. Not every machine the
+  watchdog stores does
+  ([which ones](../watchdog/README.md#machines-a-recovery-can-start-from)).
+  Setup refuses a halted machine, so a canonical machine that halted cannot be
+  recovered: the application is dead on chain.
 - **Recovery repairs only the sequencer.** What the canonical machine executed
   stays executed, a faulty sequencer's accepted batches included.
 - **Preserve the evidence first.** Keep the old data directory, its logs, and
@@ -242,6 +275,10 @@ needed:
   queries ([canonical recovery integration](../protocol/application-contract.md#7-canonical-recovery-integration)).
   The `state` answer must fit one 2 MiB report; a larger state needs another
   state source ([the loader's limits](../cartesi-machine.md#reading-a-stored-machines-export)).
+  The [measurements](../review/2026-11-10-recovery-measurements.md#b-reading-a-base-machine)
+  give how many wallet accounts fit; measure the application's own `state`
+  size against it, since until setup has a range read a machine whose state
+  has outgrown it cannot be a base.
 - **The operator can find a trusted machine** at or below a given L2 tx count,
   and keeps machines backed up. The watchdog's checkpoints are one source
   ([backups](../watchdog/operator-deployment.md#checkpoint-disk-usage-and-backups));
@@ -308,7 +345,8 @@ rebuilding such a projection from L1 when no checkpoint can be trusted.
 | The data directory holds anything | Setup refuses it untouched, exit 30 | Run setup in an empty directory. |
 | L1 is unreachable, or the deployment block is not yet safe | Setup's checks before writing, exit 20 | Retry in the same directory. |
 | The key does not sign for the submitter address | Setup's identity check before writing, exit 30 | Configure the pinned submitter's key. |
-| The base machine cannot be loaded, is not between inputs, or does not answer | Setup's step 1, exit 30 | Pick another machine. |
+| The base machine cannot be loaded, is not between inputs, or does not answer | Setup's step 1, exit 30 | Pick another machine ([which watchdog machines qualify](../watchdog/README.md#machines-a-recovery-can-start-from)). |
+| The base's `state` report is over 2 MiB | Setup's step 1, exit 30: the machine did not answer the `state` query, because it halted | Recover from an older machine whose state fits, or from genesis. |
 | The application cannot be built from the machine's state | Setup's step 1, exit 30 | A guest that fails to encode its state still answers `state`, with its error text (`inspect failed: ...`) as the report, so a decode error here may mean the guest's encoder failed: query the machine's `state` and read the report. |
 | A transaction escaped the flush, or the old instance runs | Setup's escape check, exit 40 | Stop the old instance, discard the directory, run setup again. |
 | The RPC node lags the base, so the base lies past the stop block | Setup's export check, exit 30 | Let the node catch up, discard the directory, run setup again. |
@@ -326,7 +364,7 @@ rebuilding such a projection from L1 when no checkpoint can be trusted.
 |---|---|
 | Arguments and the key | [`commands/config.rs`](../../sequencer/src/commands/config.rs) `SetupConfig`; its `setup_*` tests. |
 | The procedure, the empty-directory rule, the dry run and the escape check | [`commands/setup/mod.rs`](../../sequencer/src/commands/setup/mod.rs); [`chain_tests.rs`](../../sequencer/src/commands/setup/chain_tests.rs) runs setup against Anvil on a chain with history and compares it with `CanonicalRunner`. |
-| The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, tested by `canonical-test`'s `export` cases. |
+| The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, whose unit tests drive every failure arm through a scripted emulator, and `canonical-test`'s `export` cases run on the built image. |
 | Export check, rebuild and execution | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs). |
 | Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
 | The rebuilt history table and the era record | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
@@ -335,4 +373,4 @@ rebuilding such a projection from L1 when no checkpoint can be trusted.
 | The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |
 | Adoption | `HistoryInfo::adopt_claim` in [`history_api.rs`](../../sequencer-core/src/history_api.rs); `adopt_current_era` in [`sdk/rust-client`](../../sdk/rust-client/src/history.rs). |
 | The flush | [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs) `flush_to_safe`. |
-| End to end on the devnet | [`tests/e2e/src/recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs). |
+| End to end on the devnet | [`tests/e2e/src/recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs): the round trips from genesis and from a stored machine, and setup's refusal of a set-up directory, each for the Rust and C hosts ([drills](../watchdog/incident-runbook.md#drills)). |

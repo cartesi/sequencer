@@ -18,8 +18,11 @@ The reference panics on impossible states; the export turns each into a
 negative status and a dead handle, so no panic unwinds into C. That needs the
 default `panic = "unwind"`: a build with `panic = "abort"` aborts instead.
 
-`cargo test -p c-scheduler` compares the export, through the header's own
-declarations, with the Rust `Scheduler` input by input, and builds and runs
-the C example with the system compiler (`CC`, else `cc`), linked against the
-archive Cargo built for that test run (in `target/<profile>/deps`), so no
-separate `cargo build` comes first.
+`cargo test -p c-scheduler` replays the
+[conformance vectors](../../docs/protocol/scheduler-semantics.md#conformance)
+through the header's declarations alone in
+[`tests/conformance.rs`](tests/conformance.rs), the check a port of the header
+is held to. It also compares the export with the Rust `Scheduler` input by
+input, and builds and runs the C example with the system compiler (`CC`, else
+`cc`), linked against the archive Cargo built for that test run (in
+`target/<profile>/deps`), so no separate `cargo build` comes first.

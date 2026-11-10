@@ -123,7 +123,7 @@ signing, and SSZ batch encoding.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
 - `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
 - `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
-- `bindings/c-scheduler/` — `scheduler.h`, the canonical scheduler's C API, and its reference export: sequencer-core's `Scheduler` behind the C functions, for C guests.
+- `bindings/c-scheduler/` — `scheduler.h`, the canonical scheduler's proposed C API, and its reference export: sequencer-core's `Scheduler` behind the C functions, for C guests. Its `tests/conformance.rs` replays the [conformance vectors](docs/protocol/scheduler-semantics.md#conformance) through the header alone.
 - `examples/c-wallet-engine/` — reference wallet engine exporting the C ABI, plus its genesis tool and conformance tests.
 - `examples/c-wallet-sequencer/` — binary composing the C-engine host with the reference wallet engine.
 - `examples/canonical-app/` — on-chain scheduler reference implementation.

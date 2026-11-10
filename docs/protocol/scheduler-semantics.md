@@ -148,7 +148,8 @@ signed; it is recovered from `r ‖ s ‖ v` (alloy's `Signature::from_raw` and
    and the EIP-712 signing hash.
 
 This acceptance set is the library's, pinned on both the batch path and
-`POST /tx` by the signature vectors except for `s ≥ n` and `v` from 29 to 34.
+`POST /tx` by the signature vectors, and for `s = n` and `v` from 29 to 34 on
+the batch path by the guest scenarios ([conformance](#conformance)).
 Narrowing it to `v ∈ {27, 28}` and low `s` is **Open**. Batches the sequencer
 builds carry `v ∈ {27, 28}`, but keep a user's `s` as signed.
 
@@ -445,18 +446,59 @@ owns the bit-exact conversion. A checked-in lookup table in its place is
 
 ## Conformance
 
-[`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json)
-pins EIP-712 hashes, keccak256, the signature cases above (every accepted `v`
-form, `v = 2`, high `s`, 64 bytes, `r = 0`, `s = 0`, `r = n`) with the sender
-each path recovers, SSZ bytes, fee conversions, `EvmAdvance` calldata, and
-guest scenarios with their exact outputs. It is never regenerated: a mismatch
-is a consensus change. Its guest scenarios belong to the earlier template:
-they drain at a safe block equal to the inclusion block, which strict frames
-reject, so the [golden guest tests](../../examples/canonical-test/src/golden.rs)
-that replay them are ignored. Gate edge cases are pinned by the reference's
-unit tests and the [guest tests](../../examples/canonical-test/src/main.rs);
-a vector set for these rules, with the `scheduler` report after every input,
-is still to write ([todo](../plans/2026-11-sequencer-recovery/todo.md#build)).
+[`consensus_vectors_v2.json`](../../tests/fixtures/consensus_vectors_v2.json)
+is this template's vector set. It is written once per template and never
+regenerated: a mismatch is a consensus change to explain, not a reason to
+update the file, and the next template ships a new file. It holds three kinds
+of case:
+
+- **Byte-level cases**, carried unchanged from the earlier template's set:
+  EIP-712 hashes, keccak256, the signature cases above (every accepted `v`
+  form, `v = 2`, high `s`, 64 bytes, `r = 0`, `s = 0`, `r = n`) with the sender
+  each path recovers, SSZ bytes, the wallet's output payloads, fee conversions
+  and `EvmAdvance` calldata.
+- **Guest scenarios**, each replayed from genesis on the devnet wallet
+  template. A step is one input (sender, block, timestamp, payload) with its
+  outcome, the transactions it handed out in order and whether each user op
+  executed, its exact outputs, and the `scheduler` report after it; a scenario
+  ends with the `state` report. They restate the earlier template's scenarios
+  under strict frames, and cover every gate (gate d on a later frame as well as
+  the first), the clock, the backstop (before a dropped direct too), the
+  payload cap, each fate of a user op, and `s = n` and `v` from 29 to 34 on the
+  batch path. The `scheduler` report after every step makes every scenario
+  assert that [the clock splits the directs](#the-invariant).
+- **Scheduler-only scenarios**, under their own configuration with a fridge
+  bound of 2, which the wallet's bound of 16384 keeps the guest scenarios from
+  reaching. They pin the overflow drain: whole blocks, oldest first, never the
+  arriving block, and the clock it raises. Resume cases pin which exported
+  states and re-supplied ranges resume, and how a resumed scheduler continues.
+
+The skip for a sender whose next nonce is `u32::MAX` has no scenario, since
+reaching it from genesis takes 2^32 ops; the executor's unit tests in
+[`application/mod.rs`](../../sequencer-core/src/application/mod.rs) hold it,
+and a C engine's caller must apply it too.
+
+The expected values came once from the reference, `CanonicalRunner` over the
+wallet for the guest scenarios and the `Scheduler` alone for the rest, and four
+checks hold them:
+
+| Check | Where | What it compares |
+|---|---|---|
+| Native, guest | `the_reference_reproduces_every_guest_scenario` in [`wallet.rs`](../../examples/app-core/src/application/wallet.rs) | Every field of every step and the final state, and the clock's split from the pinned data alone. |
+| Native, scheduler only | `the_reference_reproduces_every_scheduler_only_scenario` in [`scheduler/mod.rs`](../../sequencer-core/src/scheduler/mod.rs) | Every field of every step, and each resume's result and refusal reason. |
+| In the machine | The golden tests in [`golden.rs`](../../examples/canonical-test/src/golden.rs), on the built image | The guest scenarios' outputs, whether a reject report appears, and both inspect reports. |
+| Through the header | [`conformance.rs`](../../bindings/c-scheduler/tests/conformance.rs) in `c-scheduler` | For both kinds of scenario, each input's outcome and reject reason, every handed-out transaction, the state after it, and whether each resume is refused. |
+
+The last check is the one a C or C++ port of
+[`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h) is held to. It
+calls only the header's functions and reads only the file, but it links this
+crate's reference export, so today a port replays the file through the header
+the same way in its own harness; packaging the check to link another
+implementation is in the
+[todo](../plans/2026-11-sequencer-recovery/todo.md#build). It compares the
+reject reason because the header reports it, though no output depends on it.
+The header has one status for every refused resume, so only the native check
+compares the refusal's reason.
 
 ## Sequencer side
 

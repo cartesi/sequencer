@@ -10,8 +10,7 @@ keeps only the operational work that is not built yet.
   operator's job, with no tooling yet
   ([machine sourcing](todo.md#machine-sourcing)).
 - **Drills that are not tests yet.** No test clears a watchdog latch around a
-  rebuild, or realigns a client other than the devnet's toy wallet, and the
-  round trip from a stored machine is not part of the default e2e run
+  rebuild, or realigns a client other than the devnet's toy wallet
   ([drills](../../watchdog/incident-runbook.md#drills)).
 - **Bart's client.** Its backups and its realignment at a count it trusts are
   his to build ([client backups](client-backups.md),
@@ -20,5 +19,7 @@ keeps only the operational work that is not built yet.
   only against the era's start and its head, so the check is the client's;
   whether the sequencer refuses such a client itself is part of the
   [egress redesign](todo.md#redesign-the-egress-api).
-- **Recovery time.** Nobody has measured a rebuild from a machine of typical
-  age, or from genesis, end to end ([measure](todo.md#measure)).
+- **Recovery time on a real deployment.** The rebuild's time follows the user
+  ops past the base ([how long a recovery takes](../../recovery/cockroach.md#how-long-a-recovery-takes));
+  the L1 sync through a deployment's provider and libdex's execution are not
+  measured yet ([measure](todo.md#measure)).

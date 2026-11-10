@@ -1074,7 +1074,7 @@ mod tests {
 
     const CONSENSUS_VECTORS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/consensus_vectors_v1.json"
+        "/../../tests/fixtures/consensus_vectors_v2.json"
     ));
 
     /// The guest emits these payloads as notices and voucher calldata, so their
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn output_encodings_match_the_pinned_bytes() {
         let vectors: serde_json::Value =
-            serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v1.json");
+            serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v2.json");
         let pinned = &vectors["wallet_outputs"];
         let text = |value: &serde_json::Value| value.as_str().expect("pinned string").to_owned();
         let address = |key: &str| {
@@ -1126,6 +1126,289 @@ mod tests {
                 bytes(&case["erc20_transfer"]),
                 "Erc20Transfer, amount {amount:#x}"
             );
+        }
+    }
+
+    /// Replays every guest scenario of the vector file through the reference
+    /// scheduler and executor over the wallet, comparing every field of every
+    /// step and each scenario's final state. canonical-test holds the machine
+    /// to the same file, and c-scheduler's conformance test holds scheduler.h.
+    mod guest_vectors {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use alloy_primitives::{Address, U256, hex, keccak256};
+        use serde_json::{Value, json};
+
+        use super::CONSENSUS_VECTORS;
+        use crate::application::{DEVNET_SEQUENCER_ADDRESS, WalletApp, WalletConfig};
+        use sequencer_core::application::{AppOutput, SkipReason};
+        use sequencer_core::l2_tx::L2Tx;
+        use sequencer_core::scheduler::{
+            Advanced, BatchRejectReason, CanonicalRunner, InputOutcome, L1Input,
+            SCHEDULER_INSPECT_QUERY, STATE_INSPECT_QUERY, SchedulerConfig, SchedulerExport, TxFate,
+        };
+
+        fn text(value: &Value) -> &str {
+            value.as_str().expect("pinned string")
+        }
+
+        fn number(value: &Value) -> u64 {
+            value.as_u64().expect("pinned number")
+        }
+
+        fn bytes(value: &Value) -> Vec<u8> {
+            hex::decode(text(value)).expect("pinned hex bytes")
+        }
+
+        fn address(value: &Value) -> Address {
+            text(value).parse().expect("pinned address")
+        }
+
+        fn hex_of(bytes: &[u8]) -> String {
+            format!("0x{}", hex::encode(bytes))
+        }
+
+        fn pinned_output(value: &Value) -> AppOutput {
+            if let Some(notice) = value.get("notice") {
+                return AppOutput::Notice(bytes(notice));
+            }
+            let voucher = &value["voucher"];
+            AppOutput::Voucher {
+                destination: address(&voucher["destination"]),
+                value: text(&voucher["value"])
+                    .parse::<U256>()
+                    .expect("pinned value"),
+                payload: bytes(&voucher["payload"]),
+            }
+        }
+
+        /// The step fields that say what became of the input, in the file's form.
+        fn rendered(advanced: &Advanced) -> Value {
+            let reject = match advanced.outcome {
+                InputOutcome::BatchRejected(reason) => Some(match reason {
+                    BatchRejectReason::DecodeFailed => json!({"reason": "decode_failed"}),
+                    BatchRejectReason::WrongNonce { expected, got } => {
+                        json!({"reason": "wrong_nonce", "expected": expected, "got": got})
+                    }
+                    BatchRejectReason::SafeBlockNotBelowInclusionBlock => {
+                        json!({"reason": "safe_block_not_below_inclusion_block"})
+                    }
+                    BatchRejectReason::NonMonotonicSafeBlocks => {
+                        json!({"reason": "non_monotonic_safe_blocks"})
+                    }
+                    BatchRejectReason::FeePriceOutOfRange => {
+                        json!({"reason": "fee_price_out_of_range"})
+                    }
+                    BatchRejectReason::FirstFrameBelowClock { safe_block, clock } => json!({
+                        "reason": "first_frame_below_clock",
+                        "safe_block": safe_block,
+                        "clock": clock,
+                    }),
+                }),
+                _ => None,
+            };
+            let outcome = match advanced.outcome {
+                InputOutcome::DirectQueued => "direct_queued",
+                InputOutcome::DirectDropped => "direct_dropped",
+                InputOutcome::BatchAccepted => "batch_accepted",
+                InputOutcome::BatchStale => "batch_stale",
+                InputOutcome::BatchRejected(_) => "batch_rejected",
+            };
+            let txs: Vec<Value> = advanced
+                .txs
+                .iter()
+                .map(|record| {
+                    let batch_nonce = record.scheduled.batch_nonce;
+                    match (&record.scheduled.tx, record.fate) {
+                        (L2Tx::Direct(direct), TxFate::Done { .. }) => {
+                            json!({"direct": direct.input_index, "batch_nonce": batch_nonce})
+                        }
+                        (L2Tx::Direct(_), TxFate::Skipped(reason)) => {
+                            panic!("a direct always executes, got {reason:?}")
+                        }
+                        (L2Tx::UserOp(op), fate) => json!({
+                            "user_op": {
+                                "sender": op.sender.to_string(),
+                                "nonce": op.nonce,
+                                "fee": op.fee,
+                                "block": op.block,
+                                "data": hex_of(&op.data),
+                            },
+                            "batch_nonce": batch_nonce,
+                            "fate": match fate {
+                                TxFate::Done { .. } => "executed",
+                                TxFate::Skipped(SkipReason::WrongNonce { .. }) => "wrong_nonce",
+                                TxFate::Skipped(SkipReason::NonceExhausted) => "nonce_exhausted",
+                            },
+                        }),
+                    }
+                })
+                .collect();
+            let mut fields = json!({"outcome": outcome, "txs": txs});
+            if let Some(reject) = reject {
+                fields["reject"] = reject;
+            }
+            fields
+        }
+
+        fn export_of(pinned: &Value) -> SchedulerExport {
+            SchedulerExport {
+                l1_input_count: number(&pinned["l1_input_count"]),
+                l2_tx_count: number(&pinned["l2_tx_count"]),
+                next_batch_nonce: number(&pinned["next_batch_nonce"]),
+                clock: number(&pinned["clock"]),
+                first_queued_input: number(&pinned["first_queued_input"]),
+                fridge_len: number(&pinned["fridge_len"]),
+            }
+        }
+
+        /// What the pinned data alone says after each step: blocks never go
+        /// backwards along the handed-out sequence, and the clock splits the
+        /// admitted directs into executed (at or below it) and queued (above).
+        struct Invariant {
+            /// Admitted directs by input index, with their blocks.
+            admitted: BTreeMap<u64, u64>,
+            executed: BTreeSet<u64>,
+            last_block: u64,
+        }
+
+        impl Invariant {
+            fn check(&mut self, index: u64, step: &Value, scenario: &str) {
+                let block = number(&step["block"]);
+                if text(&step["outcome"]) == "direct_queued" {
+                    self.admitted.insert(index, block);
+                }
+                for tx in step["txs"].as_array().expect("pinned txs") {
+                    let tx_block = if let Some(direct) = tx.get("direct") {
+                        let direct = number(direct);
+                        assert!(self.executed.insert(direct), "{scenario}: {direct} twice");
+                        self.admitted[&direct]
+                    } else {
+                        number(&tx["user_op"]["block"])
+                    };
+                    assert!(tx_block >= self.last_block, "{scenario}: block went back");
+                    self.last_block = tx_block;
+                }
+                let export = export_of(&step["scheduler"]);
+                let queued: Vec<u64> = self
+                    .admitted
+                    .iter()
+                    .filter(|(index, _)| !self.executed.contains(index))
+                    .map(|(index, _)| *index)
+                    .collect();
+                for (direct, direct_block) in &self.admitted {
+                    assert_eq!(
+                        self.executed.contains(direct),
+                        *direct_block <= export.clock,
+                        "{scenario}, step {index}: the clock must split the directs"
+                    );
+                }
+                assert_eq!(
+                    export.fridge_len,
+                    queued.len() as u64,
+                    "{scenario}, step {index}"
+                );
+                assert_eq!(
+                    export.first_queued_input,
+                    queued.first().copied().unwrap_or(export.l1_input_count),
+                    "{scenario}, step {index}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_reference_reproduces_every_guest_scenario() {
+            let vectors: Value =
+                serde_json::from_str(CONSENSUS_VECTORS).expect("parse consensus_vectors_v2.json");
+            let guest = &vectors["guest"];
+            let chain_id = number(&guest["chain_id"]);
+            let app_contract = address(&guest["app_contract"]);
+            let pinned_config = &guest["config"];
+            let config = SchedulerConfig {
+                sequencer_address: address(&pinned_config["sequencer_address"]),
+                max_wait_blocks: number(&pinned_config["max_wait_blocks"]),
+                fridge_bound: number(&pinned_config["fridge_bound"]),
+                max_direct_payload_bytes: number(&pinned_config["max_direct_payload_bytes"]),
+            };
+            // The vectors run on the devnet template exactly as the machine is built.
+            assert_eq!(
+                config,
+                SchedulerConfig::for_application::<WalletApp>(DEVNET_SEQUENCER_ADDRESS)
+            );
+            let senders: BTreeMap<&str, Address> = guest["senders"]
+                .as_object()
+                .expect("pinned senders")
+                .iter()
+                .map(|(name, value)| (name.as_str(), address(value)))
+                .collect();
+            assert_eq!(senders["sequencer"], config.sequencer_address);
+            assert_eq!(
+                senders["portal"],
+                WalletConfig::devnet().erc20_portal_address
+            );
+            let payloads = &guest["payloads"];
+            let outputs = &guest["outputs"];
+
+            let scenarios = guest["scenarios"].as_array().expect("pinned scenarios");
+            assert!(!scenarios.is_empty());
+            for scenario in scenarios {
+                let name = text(&scenario["name"]);
+                let mut runner =
+                    CanonicalRunner::genesis(WalletApp::new(WalletConfig::devnet()), config);
+                let mut invariant = Invariant {
+                    admitted: BTreeMap::new(),
+                    executed: BTreeSet::new(),
+                    last_block: 0,
+                };
+                let steps = scenario["steps"].as_array().expect("pinned steps");
+                for (index, step) in (0_u64..).zip(steps) {
+                    let input = L1Input {
+                        index,
+                        sender: senders[text(&step["from"])],
+                        block: number(&step["block"]),
+                        timestamp: number(&step["timestamp"]),
+                        chain_id,
+                        app_contract,
+                        payload: bytes(&payloads[text(&step["payload"])]),
+                    };
+                    let advanced = runner.process_input(input).expect("no application error");
+
+                    let mut expected = json!({
+                        "outcome": step["outcome"].clone(),
+                        "txs": step["txs"].clone(),
+                    });
+                    if let Some(reject) = step.get("reject") {
+                        expected["reject"] = reject.clone();
+                    }
+                    assert_eq!(rendered(&advanced), expected, "{name}, step {index}");
+
+                    let expected_outputs: Vec<AppOutput> = step["outputs"]
+                        .as_array()
+                        .expect("pinned outputs")
+                        .iter()
+                        .map(|output| pinned_output(&outputs[text(output)]))
+                        .collect();
+                    assert_eq!(advanced.outputs, expected_outputs, "{name}, step {index}");
+
+                    let export = export_of(&step["scheduler"]);
+                    assert_eq!(runner.export(), export, "{name}, step {index}");
+                    assert_eq!(
+                        runner.inspect(SCHEDULER_INSPECT_QUERY),
+                        Ok(export.encode().to_vec()),
+                        "{name}, step {index}"
+                    );
+                    invariant.check(index, step, name);
+                }
+
+                let state = runner.inspect(STATE_INSPECT_QUERY).expect("state report");
+                match (scenario.get("state"), scenario.get("state_keccak256")) {
+                    (Some(pinned), None) => assert_eq!(hex_of(&state), text(pinned), "{name}"),
+                    (None, Some(pinned)) => {
+                        assert_eq!(keccak256(&state).to_string(), text(pinned), "{name}")
+                    }
+                    _ => panic!("{name} pins its state one way"),
+                }
+            }
         }
     }
 }

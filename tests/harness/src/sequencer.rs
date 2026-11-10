@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
+use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolEvent;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use sequencer_rust_client::SequencerClient;
@@ -26,6 +27,10 @@ use crate::util::{
 };
 use crate::wallet::{TestSigner, WalletL1Client, WalletL2Client};
 use crate::ws::WsClient;
+
+/// A path under the data directory, with a file's length and keccak256, or
+/// `None` for a directory.
+pub type DataDirEntry = (String, Option<(u64, B256)>);
 
 const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -530,8 +535,9 @@ impl ManagedSequencer {
         self.max_batch_open_seconds = secs;
     }
 
-    /// The currently exportable canonical checkpoint's L1 block. A rebuilt
-    /// optimistic baseline returns `None` until a matching batch is accepted.
+    /// The currently exportable canonical checkpoint's L1 block. In a new era
+    /// it is the baseline's stop block until the era's first batch is
+    /// accepted.
     pub async fn finalized_inclusion_block(&self) -> HarnessResult<Option<u64>> {
         let response = reqwest::Client::new()
             .get(format!(
@@ -1000,6 +1006,47 @@ impl ManagedSequencer {
         Ok(names)
     }
 
+    /// Every file and directory under the data directory by relative path,
+    /// sorted, a file with its length and the keccak256 of its bytes; empty
+    /// while the directory does not exist. Two equal readings mean nothing was
+    /// added, removed or rewritten.
+    pub fn data_dir_contents(&self) -> HarnessResult<Vec<DataDirEntry>> {
+        let root = self.data_dir_path.as_path();
+        let mut contents = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = match fs::read_dir(dir.as_path()) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && dir == root => {
+                    return Ok(Vec::new());
+                }
+                Err(err) => {
+                    return Err(io_other(format!("read {}: {err}", dir.display())).into());
+                }
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let name = path
+                    .strip_prefix(root)
+                    .map_err(|err| io_other(format!("{}: {err}", path.display())))?
+                    .to_string_lossy()
+                    .into_owned();
+                if path.is_dir() {
+                    contents.push((name, None));
+                    pending.push(path);
+                    continue;
+                }
+                let bytes = fs::read(path.as_path())
+                    .map_err(|err| io_other(format!("read {}: {err}", path.display())))?;
+                let len =
+                    u64::try_from(bytes.len()).map_err(|_| io_other("file length overflows"))?;
+                contents.push((name, Some((len, alloy_primitives::keccak256(&bytes)))));
+            }
+        }
+        contents.sort();
+        Ok(contents)
+    }
+
     /// Live bytes in the database: pages in use, including pages still in the
     /// WAL and excluding free pages. File sizes show neither. Read while the
     /// sequencer runs, so the WAL index is there for the read-only connection.
@@ -1029,6 +1076,17 @@ impl ManagedSequencer {
 
     /// L1 blocks of the application's InputBox inputs, in input order.
     pub async fn input_blocks(&self) -> HarnessResult<Vec<u64>> {
+        Ok(self
+            .raw_inputs()
+            .await?
+            .into_iter()
+            .map(|(block, _)| block)
+            .collect())
+    }
+
+    /// The application's InputBox inputs, in input order: each one's L1 block
+    /// and its `EvmAdvance` encoding, the bytes a machine receives.
+    pub async fn raw_inputs(&self) -> HarnessResult<Vec<(u64, Vec<u8>)>> {
         let provider = ProviderBuilder::new()
             .connect(self.l1_endpoint())
             .await
@@ -1042,7 +1100,26 @@ impl ManagedSequencer {
             .get_logs(&filter)
             .await
             .map_err(|err| io_other(format!("failed to read InputAdded logs: {err}")))?;
-        Ok(logs.iter().filter_map(|log| log.block_number).collect())
+        // Callers index inputs by position, so the log order must be the
+        // InputBox order.
+        (0_u64..)
+            .zip(&logs)
+            .map(|(position, log)| {
+                let block = log
+                    .block_number
+                    .ok_or_else(|| io_other("InputAdded log without a block number"))?;
+                let event = InputAdded::decode_log_data(&log.inner.data)
+                    .map_err(|err| io_other(format!("failed to decode InputAdded: {err}")))?;
+                if event.index != U256::from(position) {
+                    return Err(io_other(format!(
+                        "InputAdded log {position} carries index {}",
+                        event.index
+                    ))
+                    .into());
+                }
+                Ok((block, event.input.to_vec()))
+            })
+            .collect()
     }
 
     pub fn erc20_portal_address(&self) -> Address {

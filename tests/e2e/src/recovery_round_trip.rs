@@ -4,9 +4,11 @@
 //! Setup as an operator runs it: in an empty data directory only, from a
 //! base (genesis or a stored canonical machine) through a stop block, then
 //! `run`, then a wallet client of the old era adopting the new one at its own
-//! count. The procedure is docs/recovery/cockroach.md ("What setup does").
+//! count, and a watchdog fresh from the template agreeing with the new era's
+//! first accepted batch. The procedure is docs/recovery/cockroach.md ("What
+//! setup does").
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
@@ -14,6 +16,7 @@ use rollups_harness::{
     ManagedSequencer, RebuiltHistoryRows, ReplayWalletApp, TestSigner, WalletL2Client, WsClient,
 };
 use sequencer_core::api::WsTxMessage;
+use sequencer_core::scheduler::{SCHEDULER_INSPECT_QUERY, SchedulerExport};
 use sequencer_rust_client::{
     AdoptEraError, AdoptError, ExecutedInputCount, HistoryClaim, HistoryPolicyError,
     SequencerClient, SubscribeError,
@@ -25,7 +28,8 @@ use crate::test_cases::{
     mine_until_finalized_advances,
 };
 use crate::watchdog_compare::{
-    DEVNET_MACHINE_IMAGE, Watchdog, head_block, machine_image, require_cartesi_machine,
+    DEVNET_MACHINE_IMAGE, StoredMachine, Watchdog, cm_inspect, head_block, machine_image,
+    require_cartesi_machine,
 };
 
 /// Setup's terminal exit class: do not restart, page.
@@ -60,7 +64,7 @@ pub(crate) async fn run_setup_refuses_a_set_up_data_directory_test(
         }
     );
     runtime.stop().await?;
-    let entries = runtime.data_dir_entries()?;
+    let contents = runtime.data_dir_contents()?;
 
     let dry_run = runtime.setup_dry_run().await?;
     assert!(dry_run.success(), "the dry run must exit 0: {dry_run:?}");
@@ -70,8 +74,8 @@ pub(crate) async fn run_setup_refuses_a_set_up_data_directory_test(
         dry_run.stdout
     );
     assert_eq!(
-        runtime.data_dir_entries()?,
-        entries,
+        runtime.data_dir_contents()?,
+        contents,
         "the dry run never touches the data directory"
     );
 
@@ -82,8 +86,8 @@ pub(crate) async fn run_setup_refuses_a_set_up_data_directory_test(
         "setup refuses a set-up directory with the terminal class: {refused:?}"
     );
     assert_eq!(
-        runtime.data_dir_entries()?,
-        entries,
+        runtime.data_dir_contents()?,
+        contents,
         "a refused setup leaves the directory as it was"
     );
     assert_eq!(
@@ -106,12 +110,12 @@ pub(crate) async fn run_recovery_from_genesis_round_trip_test(
     run_round_trip(runtime, RecoveryBase::Genesis).await
 }
 
-/// The round trip from a stored canonical machine, taken at the first
-/// batch's inclusion block by the watchdog's `replay` from the template image.
+/// The round trip from a stored canonical machine, taken by the watchdog's
+/// `replay` from the template image at a block where a direct of the old era
+/// is still queued, so setup resumes the machine's non-empty fridge.
 pub(crate) async fn run_recovery_from_stored_machine_round_trip_test(
     runtime: &mut ManagedSequencer,
 ) -> ScenarioResult<()> {
-    require_cartesi_machine();
     run_round_trip(runtime, RecoveryBase::StoredMachine).await
 }
 
@@ -172,6 +176,9 @@ impl WalletClient {
 struct OldEra {
     /// The accepted checkpoint after the first batch landed.
     first_accepted: (u64, u64),
+    /// A direct deposited after the first batch landed, as its input index
+    /// and block: the second batch drains it, so it is queued between.
+    queued_between: (u64, u64),
     /// The accepted checkpoint after the second batch landed: the client's
     /// trusted count is its count.
     last_accepted_count: u64,
@@ -183,6 +190,8 @@ struct OldEra {
 }
 
 async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> ScenarioResult<()> {
+    require_cartesi_machine();
+    let template = machine_image(DEVNET_MACHINE_IMAGE)?;
     let alice = TestSigner::from_default(1)?;
     let bob = TestSigner::from_default(2)?;
     let alice_address = alice.address();
@@ -201,8 +210,9 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
             &mut ws,
             &mut client.app,
             &alice_l1,
-            // Fees for the two batch-sealing pumps of self-transfers.
-            U256::from(30_000_000_u64),
+            // Fees for the three batch-sealing pumps of self-transfers: two in
+            // the old era, one in the new.
+            U256::from(45_000_000_u64),
         )
         .await?;
         client.rows.push(deposit);
@@ -213,6 +223,24 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
         let first_accepted =
             land_a_batch(runtime, &mut ws, &mut client, &mut alice_l2, alice_address).await?;
 
+        let between = apply_reconciled_supported_deposit(
+            runtime,
+            &mut ws,
+            &mut client.app,
+            &alice_l1,
+            U256::from(200_000_u64),
+        )
+        .await?;
+        let queued_between = match &between {
+            WsTxMessage::DirectInput {
+                input_index,
+                block_number,
+                ..
+            } => (*input_index, *block_number),
+            other => return Err(format!("expected the deposit, got {other:?}").into()),
+        };
+        client.rows.push(between);
+
         bob_l2
             .transfer(alice_address, U256::from(1_000_u64))
             .await?;
@@ -221,32 +249,58 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
             land_a_batch(runtime, &mut ws, &mut client, &mut alice_l2, alice_address).await?;
         OldEra {
             first_accepted,
+            queued_between,
             last_accepted_count,
             claim: runtime.history_claim(last_accepted_count)?,
             head: client.count(),
         }
     };
 
-    // ── The old instance stops for good; a direct arrives while it is down
-    // and becomes safe, so it is queued at the stop block.
+    // ── The old instance stops for good; two directs arrive, in two blocks,
+    // while it is down and become safe, so they are queued at the stop block.
     runtime.stop().await?;
-    let queued_amount = U256::from(500_000_u64);
-    alice_l1.mint_supported_token(queued_amount).await?;
-    let queued_block = alice_l1.deposit_supported_token(queued_amount).await?;
+    let bob_l1 = runtime.wallet_l1(bob.clone()).await?;
+    let alice_queued = U256::from(500_000_u64);
+    let bob_queued = U256::from(300_000_u64);
+    alice_l1.mint_supported_token(alice_queued).await?;
+    let first_queued_block = alice_l1.deposit_supported_token(alice_queued).await?;
+    bob_l1.mint_supported_token(bob_queued).await?;
+    let queued_block = bob_l1.deposit_supported_token(bob_queued).await?;
+    assert!(
+        queued_block > first_queued_block,
+        "the queued directs land in two blocks"
+    );
     mine_until_safe(runtime, queued_block).await?;
     let input_blocks = runtime.input_blocks().await?;
     let queued_input = u64::try_from(input_blocks.len())?
-        .checked_sub(1)
-        .ok_or("the queued deposit is an input")?;
+        .checked_sub(2)
+        .ok_or("the two queued deposits are inputs")?;
 
     // ── The base, and the client's trusted state at the last accepted count.
-    let (base_dir, base_count, base_inputs) = match base {
+    let (base_machine, base_count, base_inputs) = match base {
         RecoveryBase::Genesis => (None, 0, 0),
         RecoveryBase::StoredMachine => {
-            let (block, count) = old.first_accepted;
-            let dir = stored_machine_at(runtime, block).await?;
+            let (queued_index, block) = old.queued_between;
+            let machine = stored_machine_at(runtime, &template, block).await?;
             let inputs = input_blocks.iter().filter(|b| **b <= block).count();
-            (Some(dir), count, inputs)
+            let report = cm_inspect(&machine.path, SCHEDULER_INSPECT_QUERY).await?;
+            let export = SchedulerExport::decode(&report)?;
+            assert_eq!(
+                (
+                    export.l1_input_count,
+                    export.l2_tx_count,
+                    export.first_queued_input,
+                    export.fridge_len
+                ),
+                (
+                    u64::try_from(inputs)?,
+                    old.first_accepted.1,
+                    queued_index,
+                    1
+                ),
+                "the base holds the first batch's rows and queues the deposit after it"
+            );
+            (Some(machine), old.first_accepted.1, inputs)
         }
     };
     let trusted = old.last_accepted_count;
@@ -255,7 +309,7 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     // ── The operator's playbook: a new data directory, the dry run, setup,
     // run.
     runtime.discard_data_dir();
-    runtime.set_setup_base(base_dir);
+    runtime.set_setup_base(base_machine.as_ref().map(|machine| machine.path.clone()));
     let dry_run = runtime.setup_dry_run().await?;
     assert!(dry_run.success(), "the dry run must exit 0: {dry_run:?}");
     for expected in [
@@ -280,16 +334,16 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     assert_eq!(
         era.rebuilt_history_end, trusted,
         "the rebuilt history ends where the landed batches end: the old \
-         instance's unsubmitted rows never landed, and the queued direct waits \
+         instance's unsubmitted rows never landed, and the queued directs wait \
          for the root frame"
     );
     assert_eq!(
         era.first_queued_input, queued_input,
-        "the direct that arrived while the old instance was down is queued"
+        "the directs that arrived while the old instance was down are queued"
     );
     assert!(
         era.stop_block >= queued_block,
-        "the queued direct is safe at the stop block"
+        "the queued directs are safe at the stop block"
     );
     assert_eq!(
         era.next_batch_nonce, 2,
@@ -332,9 +386,11 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
             HistoryPolicyError::EraChanged { .. }
         ))
     ));
-    // The sealing pump overshoots the batch size target, so the old instance
-    // served rows past its last landed batch; a client at its head cannot
-    // adopt the new era there.
+    // The lane seals a batch at a fixed user-op count, and each transfer waits
+    // for its inclusion before the next is sent, so where the pumps split
+    // into batches is fixed: the second pump leaves rows in the open batch
+    // that the old instance served but never submitted. A client at its head
+    // cannot adopt the new era there.
     assert!(
         old.head > trusted,
         "the old instance served rows past its last landed batch: head {}, last accepted {trusted}",
@@ -356,20 +412,37 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     }
     check_rebuilt_rows(runtime, &client, base_count, trusted).await?;
 
-    let balance_before = client.app.current_user_balance(alice_address);
+    let alice_before = client.app.current_user_balance(alice_address);
+    let bob_before = client.app.current_user_balance(bob_address);
     let mut ws = runtime.ws_adopting(trusted).await?;
-    let drained = ws
-        .expect_direct_input_from(runtime.erc20_portal_address())
-        .await?;
-    assert_eq!(
-        drained.offset(),
-        trusted,
-        "the root frame drains the queued direct first"
-    );
-    client.apply(drained)?;
+    for (i, queued_block) in (0_u64..).zip([first_queued_block, queued_block]) {
+        let drained = ws
+            .expect_direct_input_from(runtime.erc20_portal_address())
+            .await?;
+        let WsTxMessage::DirectInput {
+            offset,
+            input_index,
+            block_number,
+            batch_nonce,
+            ..
+        } = &drained
+        else {
+            return Err(format!("expected a queued direct, got {drained:?}").into());
+        };
+        assert_eq!(
+            (*offset, *input_index, *block_number, *batch_nonce),
+            (trusted + i, queued_input + i, queued_block, 2),
+            "the root frame drains the queued directs first, in order, in the era's first batch"
+        );
+        client.apply(drained)?;
+    }
     assert_eq!(
         client.app.current_user_balance(alice_address),
-        balance_before + queued_amount
+        alice_before + alice_queued
+    );
+    assert_eq!(
+        client.app.current_user_balance(bob_address),
+        bob_before + bob_queued
     );
 
     // Live rows follow; the client signs on from its own nonce.
@@ -380,7 +453,19 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
         .transfer(bob_address, U256::from(7_000_u64))
         .await?;
     let live = ws.expect_user_op_from(alice_address).await?;
-    assert_eq!(live.offset(), trusted + 1);
+    let WsTxMessage::UserOp {
+        offset,
+        batch_nonce,
+        ..
+    } = &live
+    else {
+        return Err(format!("expected the live op, got {live:?}").into());
+    };
+    assert_eq!(
+        (*offset, *batch_nonce),
+        (trusted + 2, 2),
+        "the live op follows the drain in the era's first batch"
+    );
     client.apply(live)?;
     assert_eq!(
         client.app.current_user_balance(bob_address),
@@ -388,20 +473,81 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     );
     ws.expect_no_message_for(NO_WS_MESSAGE_WAIT).await?;
 
-    if base == RecoveryBase::StoredMachine {
-        // The watchdog compares the era's baseline on its next tick.
-        let watchdog = Watchdog::new(machine_image(DEVNET_MACHINE_IMAGE)?, 0)?;
-        watchdog.expect(runtime, &["init"], 0).await?;
-        watchdog.expect(runtime, &["tick"], 0).await?;
-        let status = watchdog.status(runtime).await?;
-        let agreed = head_block(&status).ok_or("status without a head")?;
-        if agreed < era.stop_block || status["last_tick"]["outcome"] != "agreed" {
-            return Err(format!(
-                "expected the watchdog to agree with the baseline at block {}: {status}",
-                era.stop_block
-            )
-            .into());
-        }
+    // ── The canonical machine's verdict. First on the era's baseline: the
+    // rebuilt history through the stop block.
+    expect_watchdog_agrees(
+        runtime,
+        &template,
+        Agreement::At(era.stop_block),
+        "the era's baseline",
+    )
+    .await?;
+
+    // Then on the new era's first batch: the root frame's drain and the live
+    // rows, accepted on L1. A watchdog fresh from the template replays every
+    // input from genesis, so agreement past the stop block proves the rebuilt
+    // history plus the root drain is what the canonical machine executes.
+    let (landed_block, landed_count) =
+        land_a_batch(runtime, &mut ws, &mut client, &mut alice_l2, alice_address).await?;
+    assert!(
+        landed_block > era.stop_block,
+        "the new era's first batch lands past the stop block: {landed_block} vs {}",
+        era.stop_block
+    );
+    assert!(
+        landed_count > trusted + 2,
+        "the new era's first batch holds the drained directs and the live rows: \
+         count {landed_count}, rebuilt end {trusted}"
+    );
+    let info = sequencer.history(None, None).await?;
+    let landed = info
+        .accepted_checkpoint
+        .ok_or("the landed batch is an accepted checkpoint")?;
+    assert_eq!(
+        landed.next_batch_nonce, 3,
+        "the new era's first batch takes the nonce after the old era's two"
+    );
+    expect_watchdog_agrees(
+        runtime,
+        &template,
+        Agreement::AtOrAfter(landed_block),
+        "the new era's first accepted batch",
+    )
+    .await?;
+    Ok(())
+}
+
+/// The block a watchdog's agreement must be at.
+#[derive(Debug, Clone, Copy)]
+enum Agreement {
+    /// Exactly this checkpoint, so nothing later stands in for it.
+    At(u64),
+    /// This checkpoint or a later one.
+    AtOrAfter(u64),
+}
+
+/// A watchdog started fresh from the template image replays L1 from genesis
+/// and must agree with the sequencer's accepted checkpoint where `expected`
+/// says.
+async fn expect_watchdog_agrees(
+    runtime: &ManagedSequencer,
+    template: &Path,
+    expected: Agreement,
+    what: &str,
+) -> ScenarioResult<()> {
+    let watchdog = Watchdog::new(template.to_path_buf(), 0)?;
+    watchdog.expect(runtime, &["init"], 0).await?;
+    watchdog.expect(runtime, &["tick"], 0).await?;
+    let status = watchdog.status(runtime).await?;
+    let agreed = head_block(&status).ok_or("status without a head")?;
+    let placed = match expected {
+        Agreement::At(block) => agreed == block,
+        Agreement::AtOrAfter(block) => agreed >= block,
+    };
+    if !placed || status["last_tick"]["outcome"] != "agreed" {
+        return Err(
+            format!("expected the watchdog to agree with {what} ({expected:?}): {status}").into(),
+        );
     }
     Ok(())
 }
@@ -455,20 +601,23 @@ async fn mine_until_safe(runtime: &ManagedSequencer, block: u64) -> ScenarioResu
 
 /// A canonical machine stopped after every input through `block`, as an
 /// operator sources one: replayed from the template image by the watchdog.
-async fn stored_machine_at(runtime: &ManagedSequencer, block: u64) -> ScenarioResult<PathBuf> {
-    let image = machine_image(DEVNET_MACHINE_IMAGE)?;
-    let out = tempfile::tempdir()
-        .map_err(|err| format!("stored machine dir: {err}"))?
-        .keep()
-        .join("base");
-    let watchdog = Watchdog::new(image.clone(), 0)?;
+async fn stored_machine_at(
+    runtime: &ManagedSequencer,
+    template: &Path,
+    block: u64,
+) -> ScenarioResult<StoredMachine> {
+    let base = StoredMachine::new("base")?;
+    let out = &base.path;
+    // `replay` reads the chain and network from an initialized state directory.
+    let watchdog = Watchdog::new(template.to_path_buf(), 0)?;
+    watchdog.expect(runtime, &["init"], 0).await?;
     let stdout = watchdog
         .expect(
             runtime,
             &[
                 "replay",
                 "--from",
-                &image.to_string_lossy(),
+                &template.to_string_lossy(),
                 "--from-block",
                 "0",
                 "--to-block",
@@ -484,7 +633,7 @@ async fn stored_machine_at(runtime: &ManagedSequencer, block: u64) -> ScenarioRe
     if !replay["stop"].is_null() {
         return Err(format!("the canonical machine stopped while replaying: {replay}").into());
     }
-    Ok(out)
+    Ok(base)
 }
 
 /// The client's optional row check: the new era serves, from the base to the

@@ -120,7 +120,7 @@ is decoded and fed to the machine before the next is fetched.
 | `tick` | One compare cycle; writes `last_tick.json` and `status.prom`. | 0 ok or idle, 1 warning, 2 divergence |
 | `status` | JSON on stdout: config, head, latched divergence, last tick. Read-only; fails on a missing state directory. | 0, or 1 |
 | `clear --block B --reason TEXT` | Archive the divergence latched at block B into `incidents/`. Refuses any other block, except for an unreadable marker, which has none. | 0, or 1 |
-| `replay --from DIR --from-block START --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, or 1 |
+| `replay --from DIR --from-block START --to-block B --out DIR` | Re-derive canonical state from a stored machine into a new directory and print its digest, or the input it stopped at. The machine must be a trusted start, like init's bootstrap; `--out` must not exist, and both paths are absolute. Reads the state directory's `config.json` and never writes it. | 0, a stop included, or 1 |
 
 The `sequencer-watchdog` wrapper takes a non-blocking `flock` on
 `$CARTESI_WATCHDOG_STATE_DIR/run.lock` for `init`, `tick`, and `clear`;
@@ -215,6 +215,22 @@ evidence, only the canonical machine is fsynced: after a host crash, check
 running `init` again; a torn one (`config.json is not valid JSON`) means wiping
 the state directory first. The watchdog stores whole machines, never the
 sequencer's restore archives.
+
+### Machines a recovery can start from
+
+The sequencer's `setup --base` ([recovery](../recovery/cockroach.md)) loads
+only a machine that waits for an input, at an `RX_ACCEPTED` yield. Not every
+machine the watchdog stores does:
+
+| Stored machine | Waits for an input | Why |
+|---|---|---|
+| `checkpoints/<block>-<count>/` | Always | `init` refuses a bootstrap machine that does not wait, and a tick publishes only a machine whose state it has just read at that yield. |
+| `incident/canonical/` | Only for `state_mismatch` | A `canonical_machine_dead` incident keeps the machine at its fixed point. |
+| `replay --out` | Only when the result carries `sha256` | A result with `stop` still exits 0 and leaves the stopped machine at `--out`. |
+
+A rejected last input leaves the machine waiting too, because the executor
+restores the snapshot taken before it. `watchdog/tests/e2e.lua` reads each
+stored machine's yield from its registers.
 
 ## Divergence latch
 

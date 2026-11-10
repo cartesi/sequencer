@@ -479,16 +479,12 @@ owns the bit-exact conversion. A checked-in lookup table in its place is
 
 ## Conformance
 
-[`consensus_vectors_v1.json`](../../../tests/fixtures/consensus_vectors_v1.json)
-pins today's template: EIP-712 hashes, keccak256, signature cases, SSZ bytes,
-fee conversions, `EvmAdvance` calldata, and guest scenarios with their exact
-outputs. It is never regenerated, since a mismatch is a consensus change. The
-next template ships a new vector set:
-
-- the guest scenarios rewritten for strict frames, which change 18 of the 19;
-- scenarios for gate f, an overflow, the payload cap, an underfunded op, and
-  the export query;
-- the `scheduler` report after every input of every scenario, so each one
-  asserts the clock's [split of the directs](#the-invariant);
-- the cases v1 leaves out: `s ≥ n`, `v` from 29 to 34, the fee-range reject,
-  and the gate edge cases the reference's unit tests pin today.
+[`consensus_vectors_v2.json`](../../../tests/fixtures/consensus_vectors_v2.json)
+is the new template's vector set, written once and never regenerated. It
+restates the earlier set's guest scenarios under strict frames, which change 18
+of the 19, and adds scenarios for the rules this plan changes, including the
+overflow drain and resume at a small fridge bound. A native test, the
+in-machine golden tests and a test through `scheduler.h` hold it, and the last
+is what a C port runs.
+[Scheduler semantics](../../protocol/scheduler-semantics.md#conformance) owns
+what the set holds and how each check runs.

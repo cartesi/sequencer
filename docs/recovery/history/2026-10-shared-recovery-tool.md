@@ -103,7 +103,7 @@ form `T[X_m..K)`, and each client executes its own part of that list.
   block the sequencer agreed with, or the uncompared bootstrap block before
   the first agreement, and `B` the block of the comparison that failed.
 - **Conformance vectors**:
-  [`consensus_vectors_v1.json`](../../../tests/fixtures/consensus_vectors_v1.json),
+  [`consensus_vectors_v1.json`](https://github.com/cartesi/sequencer/blob/3e92563a3947673b3931a6b43eecc16ec4e0ba48/tests/fixtures/consensus_vectors_v1.json),
   frozen cases (EIP-712 hashes, signatures, SSZ bytes, fee conversions, guest
   scenarios with their exact outputs) that every port of the scheduler must
   reproduce ([conformance](../../protocol/scheduler-semantics.md#conformance)).

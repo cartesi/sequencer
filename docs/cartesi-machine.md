@@ -73,13 +73,12 @@ not:
 The checkout path does not enter the hash, and `just canonical-print-build-hashes`
 prints all four inputs to compare; compare cold builds, since a warm `target/`
 can hold crates compiled before `rust-src` arrived. A move that is meant to preserve behavior is
-checked against [`tests/fixtures/consensus_vectors_v1.json`](../tests/fixtures/consensus_vectors_v1.json),
+checked against [`tests/fixtures/consensus_vectors_v2.json`](../tests/fixtures/consensus_vectors_v2.json),
 which pins the consensus bytes (EIP-712 hashes, signature recovery, SSZ, fee
-table, output payloads) natively. `canonical-test`'s golden cases, which replay
-its guest scenarios in the built image, are ignored: those scenarios post
-frames at their inclusion block, which strict frames reject, and their
-successors arrive with the next vectors. The fixture is never regenerated: a mismatch is a behavior
-change to explain. A release that moves the hash says so, and deployed
+table, output payloads) natively, and whose guest scenarios `canonical-test`'s
+golden cases replay in the built image, comparing every output and inspect
+report ([conformance](protocol/scheduler-semantics.md#conformance)). The
+fixture is never regenerated: a mismatch is a behavior change to explain. A release that moves the hash says so, and deployed
 applications keep their old image, which the watchdog checks against the
 on-chain hash.
 
@@ -237,7 +236,9 @@ a machine advanced and stored by testsi.
   sling does) holds an exclusive lock and cannot be loaded meanwhile; read a
   clone.
 - **A stored machine is between inputs only at an `RX_ACCEPTED` manual
-  yield.** The image recipe stores one there, and so does a node. Check it as
+  yield.** The image recipe stores one there, and so does a node; not every
+  machine the watchdog stores does
+  ([which ones](watchdog/README.md#machines-a-recovery-can-start-from)). Check it as
   the step does (`iflags.H`, `iflags.Y`, then tohost's device, command and
   reason) before sending anything.
 - **What to send.** An inspect is `send_cmio_response` with the

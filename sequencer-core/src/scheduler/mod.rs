@@ -2363,4 +2363,208 @@ mod tests {
             );
         }
     }
+
+    // ── The scheduler-only conformance vectors ────────────────────────────
+
+    /// Replays the vector file's scheduler-only section: the overflow drain and
+    /// resume, at a small fridge bound the wallet's template never reaches.
+    /// c-scheduler's conformance test holds scheduler.h to the same section.
+    mod scheduler_vectors {
+        use super::*;
+        use serde_json::{Value, json};
+
+        fn text(value: &Value) -> &str {
+            value.as_str().expect("pinned string")
+        }
+
+        fn number(value: &Value) -> u64 {
+            value.as_u64().expect("pinned number")
+        }
+
+        fn address(value: &Value) -> Address {
+            text(value).parse().expect("pinned address")
+        }
+
+        /// The file's inputs: senders and payloads by name from the guest section.
+        struct Inputs<'a> {
+            guest: &'a Value,
+            chain_id: u64,
+            app_contract: Address,
+        }
+
+        impl Inputs<'_> {
+            fn input(&self, index: u64, record: &Value) -> L1Input {
+                L1Input {
+                    index,
+                    sender: address(&self.guest["senders"][text(&record["from"])]),
+                    block: number(&record["block"]),
+                    timestamp: number(&record["timestamp"]),
+                    chain_id: self.chain_id,
+                    app_contract: self.app_contract,
+                    payload: alloy_primitives::hex::decode(text(
+                        &self.guest["payloads"][text(&record["payload"])],
+                    ))
+                    .expect("pinned hex bytes"),
+                }
+            }
+        }
+
+        fn rendered_state(state: SchedulerState) -> Value {
+            json!({
+                "l1_input_count": state.l1_input_count,
+                "next_batch_nonce": state.next_batch_nonce,
+                "clock": state.clock,
+                "first_queued_input": state.first_queued_input,
+                "fridge_len": state.fridge_len,
+            })
+        }
+
+        fn pinned_state(pinned: &Value) -> SchedulerState {
+            SchedulerState {
+                l1_input_count: number(&pinned["l1_input_count"]),
+                next_batch_nonce: number(&pinned["next_batch_nonce"]),
+                clock: number(&pinned["clock"]),
+                first_queued_input: number(&pinned["first_queued_input"]),
+                fridge_len: number(&pinned["fridge_len"]),
+            }
+        }
+
+        /// One fed input in the file's form: outcome, reject, txs and state.
+        fn rendered_step(h: &mut Harness, input: L1Input) -> Value {
+            let (outcome, txs) = h.feed(input);
+            let (name, reject) = match outcome {
+                InputOutcome::DirectQueued => ("direct_queued", None),
+                InputOutcome::DirectDropped => ("direct_dropped", None),
+                InputOutcome::BatchAccepted => ("batch_accepted", None),
+                InputOutcome::BatchStale => ("batch_stale", None),
+                InputOutcome::BatchRejected(reason) => (
+                    "batch_rejected",
+                    Some(match reason {
+                        BatchRejectReason::DecodeFailed => json!({"reason": "decode_failed"}),
+                        BatchRejectReason::WrongNonce { expected, got } => {
+                            json!({"reason": "wrong_nonce", "expected": expected, "got": got})
+                        }
+                        BatchRejectReason::SafeBlockNotBelowInclusionBlock => {
+                            json!({"reason": "safe_block_not_below_inclusion_block"})
+                        }
+                        BatchRejectReason::NonMonotonicSafeBlocks => {
+                            json!({"reason": "non_monotonic_safe_blocks"})
+                        }
+                        BatchRejectReason::FeePriceOutOfRange => {
+                            json!({"reason": "fee_price_out_of_range"})
+                        }
+                        BatchRejectReason::FirstFrameBelowClock { safe_block, clock } => json!({
+                            "reason": "first_frame_below_clock",
+                            "safe_block": safe_block,
+                            "clock": clock,
+                        }),
+                    }),
+                ),
+            };
+            let txs: Vec<Value> = txs
+                .iter()
+                .map(|scheduled| match &scheduled.tx {
+                    L2Tx::Direct(direct) => {
+                        json!({"direct": direct.input_index, "batch_nonce": scheduled.batch_nonce})
+                    }
+                    L2Tx::UserOp(_) => panic!("the scheduler-only scenarios carry no user ops"),
+                })
+                .collect();
+            let mut step = json!({
+                "outcome": name,
+                "txs": txs,
+                "scheduler": rendered_state(h.state()),
+            });
+            if let Some(reject) = reject {
+                step["reject"] = reject;
+            }
+            step
+        }
+
+        fn expected_step(step: &Value) -> Value {
+            let mut expected = json!({
+                "outcome": step["outcome"].clone(),
+                "txs": step["txs"].clone(),
+                "scheduler": step["scheduler"].clone(),
+            });
+            if let Some(reject) = step.get("reject") {
+                expected["reject"] = reject.clone();
+            }
+            expected
+        }
+
+        fn refusal(error: &ResumeError) -> &'static str {
+            match error {
+                ResumeError::FirstQueuedAfterCount { .. } => "first_queued_after_count",
+                ResumeError::OutOfSequence { .. } => "out_of_sequence",
+                ResumeError::BeyondInputCount { .. } => "beyond_input_count",
+                ResumeError::MissingInputs { .. } => "missing_inputs",
+                ResumeError::BlockDecreases { .. } => "block_decreases",
+                ResumeError::FirstQueuedNotADirect { .. } => "first_queued_not_a_direct",
+                ResumeError::DirectNotAboveClock { .. } => "direct_not_above_clock",
+                ResumeError::FridgeLenMismatch { .. } => "fridge_len_mismatch",
+            }
+        }
+
+        #[test]
+        fn the_reference_reproduces_every_scheduler_only_scenario() {
+            let vectors = crate::consensus_vectors::raw_vectors();
+            let guest = &vectors["guest"];
+            let inputs = Inputs {
+                guest,
+                chain_id: number(&guest["chain_id"]),
+                app_contract: address(&guest["app_contract"]),
+            };
+            let section = &vectors["scheduler_only"];
+            let pinned_config = &section["config"];
+            let config = SchedulerConfig {
+                sequencer_address: address(&pinned_config["sequencer_address"]),
+                max_wait_blocks: number(&pinned_config["max_wait_blocks"]),
+                fridge_bound: number(&pinned_config["fridge_bound"]),
+                max_direct_payload_bytes: number(&pinned_config["max_direct_payload_bytes"]),
+            };
+
+            let scenarios = section["scenarios"].as_array().expect("pinned scenarios");
+            assert!(!scenarios.is_empty());
+            for scenario in scenarios {
+                let name = text(&scenario["name"]);
+                let mut h = Harness::new(config);
+                for (index, step) in (0_u64..).zip(scenario["steps"].as_array().expect("steps")) {
+                    let rendered = rendered_step(&mut h, inputs.input(index, step));
+                    assert_eq!(rendered, expected_step(step), "{name}, step {index}");
+                }
+            }
+
+            let cases = section["resume"].as_array().expect("pinned resume cases");
+            assert!(!cases.is_empty());
+            for case in cases {
+                let name = text(&case["name"]);
+                let state = pinned_state(&case["state"]);
+                let queued = case["queued"]
+                    .as_array()
+                    .expect("pinned range")
+                    .iter()
+                    .map(|record| inputs.input(number(&record["index"]), record))
+                    .collect();
+                let resumed = Harness::resumed(config, state, queued);
+                let mut h = match (resumed, text(&case["result"])) {
+                    (Ok(h), "resumed") => h,
+                    (Err(error), "refused") => {
+                        assert_eq!(refusal(&error), text(&case["refusal"]), "{name}");
+                        continue;
+                    }
+                    (Ok(_), pinned) => panic!("{name}: pinned {pinned}, but it resumed"),
+                    (Err(error), pinned) => panic!("{name}: pinned {pinned}, but {error}"),
+                };
+                assert_eq!(h.state(), state, "{name}");
+                let then = case["then"]
+                    .as_array()
+                    .expect("pinned steps after a resume");
+                for (index, step) in (state.l1_input_count..).zip(then) {
+                    let rendered = rendered_step(&mut h, inputs.input(index, step));
+                    assert_eq!(rendered, expected_step(step), "{name}, step {index}");
+                }
+            }
+        }
+    }
 }

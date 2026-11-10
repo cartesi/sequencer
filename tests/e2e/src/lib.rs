@@ -36,21 +36,11 @@ pub struct Scenario {
     pub run: ScenarioFn,
     /// Overrides applied to the host's default spawn config.
     pub configure: fn(&mut ManagedSequencerConfig),
-    /// Left out of a default run because it needs something the default
-    /// devnet does not build; `--include-ignored` runs it.
-    pub ignored: bool,
 }
 
 impl Scenario {
     pub fn with(self, configure: fn(&mut ManagedSequencerConfig)) -> Self {
         Self { configure, ..self }
-    }
-
-    pub fn ignored(self) -> Self {
-        Self {
-            ignored: true,
-            ..self
-        }
     }
 
     pub fn spawn_config(&self) -> ManagedSequencerConfig {
