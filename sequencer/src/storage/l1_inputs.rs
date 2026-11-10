@@ -10,9 +10,7 @@ use sequencer_core::scheduler::L1Input;
 
 use super::Storage;
 use super::acceptance::record_accepted_batches;
-use super::convert::{
-    external_u64_to_i64, i64_to_u64, now_unix_ms, saturating_query_bound, u64_to_i64,
-};
+use super::convert::{external_u64_to_i64, i64_to_u64, saturating_query_bound, u64_to_i64};
 use super::queries::{
     DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block,
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
@@ -213,10 +211,9 @@ impl Storage {
     ///
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
     /// the current MAX+1) with their per-input L1 provenance, advance
-    /// `l1_safe_head.block_number` to `safe_block`, stamp `synced_at_ms` as
-    /// the wall-clock time when the safe frontier advanced, and record
-    /// `batches.accepted_input` via `timing` so the scheduler-accepted
-    /// frontier stays consistent with the safe head.
+    /// `l1_safe_head.block_number` to `safe_block`, stamp `synced_at_ms` with
+    /// `now_ms`, and record `batches.accepted_input` via `timing` so the
+    /// scheduler-accepted frontier stays consistent with the safe head.
     ///
     /// Once the era exists, the accepted frontier is an invariant of this
     /// operation while no divergence exists: every safe input up to
@@ -229,14 +226,17 @@ impl Storage {
     /// terminal fact. Readers (submitter, recovery, danger checks) never
     /// populate separately.
     ///
-    /// Asserts `safe_block` is monotonic and that it strictly advances when
-    /// `inputs` is non-empty.
+    /// `now_ms` is the caller's wall-clock reading taken just before this
+    /// call, so it is at most the commit time: the staleness arms can only
+    /// err toward "stale" (I12). Asserts `safe_block` is monotonic and that
+    /// it strictly advances when `inputs` is non-empty.
     pub(crate) fn append_ingested_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[IngestedSafeInput],
         timing: &ProtocolTiming,
+        now_ms: u64,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -264,7 +264,7 @@ impl Storage {
                 params![
                     external_u64_to_i64(safe_block, "L1 safe block")?,
                     external_u64_to_i64(safe_block_timestamp, "L1 safe block timestamp")?,
-                    now_unix_ms()
+                    external_u64_to_i64(now_ms, "safe-head sync time")?
                 ],
             )?;
             if changed != 1 {
@@ -838,6 +838,7 @@ mod tests {
                     transaction_hash: B256::ZERO,
                 }],
                 &protocol,
+                crate::clock::unix_now_ms(),
             )
             .expect_err("unrepresentable provider input timestamp must be refused");
         assert!(matches!(

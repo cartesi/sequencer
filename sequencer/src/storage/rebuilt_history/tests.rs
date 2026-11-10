@@ -58,6 +58,7 @@ fn setup_storage(name: &str) -> (TestDb, Storage) {
             109,
             &[input(SENDER_B, 5), input(SENDER_A, 6), input(SENDER_B, 9)],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
     (db, storage)

@@ -1970,6 +1970,7 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
                 ingested_direct(5, 1_005, vec![0xa3]),
             ],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .expect("append directs around the payload cap");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -2006,6 +2007,7 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
             1_010,
             &[ingested_direct(10, 1_010, vec![0xb1])],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .expect("append a later direct");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -2079,6 +2081,7 @@ async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
             1_016,
             &[later],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .expect("land a direct after the root frame");
     let head = |db_path: &str| {

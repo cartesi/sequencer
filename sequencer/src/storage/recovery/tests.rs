@@ -1989,9 +1989,13 @@ mod check_danger {
 
         let protocol = default_protocol_timing();
         let landed = local_batch_payload(&mut storage, 0);
+        // Safe progress recorded 25 blocks' worth of wall-clock ago.
+        let now_ms = unix_now_ms();
         storage
-            .append_safe_inputs(
+            .append_safe_inputs_observed_at(
                 1200,
+                now_ms / 1000,
+                now_ms.saturating_sub(25 * 12 * 1000),
                 &[StoredSafeInput {
                     sender: SENDER_A,
                     payload: landed,
@@ -2001,16 +2005,6 @@ mod check_danger {
                 &protocol,
             )
             .expect("append accepted batch 0");
-
-        // Pretend safe-progress was recorded 25 blocks' worth of wall-clock ago.
-        let now_ms = unix_now_ms();
-        storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
-            )
-            .expect("rewind safe-progress timestamp");
 
         let status = storage
             .check_danger(&protocol, now_ms)
@@ -2039,21 +2033,21 @@ mod check_danger {
         // Advance safe head so batch 0 is past `danger_threshold` (1125):
         // current=1200 - first_frame=10 = 1190 >= 1125.
         // No safe_input ingested for batch 0, so it stays non-gold.
-        storage
-            .append_safe_inputs(1200, &[], SENDER_A, &protocol)
-            .expect("advance safe head past observed danger threshold");
-
-        // Pretend safe-progress was recorded 25 blocks' worth of wall-clock
-        // ago. With the wall-clock correction, the adjusted threshold is
-        // 1100 — batch 0's age (1190) also clears that, so wall-clock fires.
+        //
+        // Safe progress recorded 25 blocks' worth of wall-clock ago. With the
+        // wall-clock correction, the adjusted threshold is 1100 — batch 0's
+        // age (1190) also clears that, so wall-clock fires.
         let now_ms = unix_now_ms();
         storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
+            .append_safe_inputs_observed_at(
+                1200,
+                now_ms / 1000,
+                now_ms.saturating_sub(25 * 12 * 1000),
+                &[],
+                SENDER_A,
+                &protocol,
             )
-            .expect("rewind safe-progress timestamp");
+            .expect("advance safe head past observed danger threshold");
 
         let status = storage
             .check_danger(&protocol, now_ms)
@@ -2081,9 +2075,15 @@ mod check_danger {
 
         let protocol = default_protocol_timing();
         let landed = local_batch_payload(&mut storage, 0);
+        // The Tip's observed age is 1190 >= 1125, and the wall-clock-adjusted
+        // arm would also fire (progress recorded 25 blocks ago). Observed Tip
+        // danger must win.
+        let now_ms = unix_now_ms();
         storage
-            .append_safe_inputs(
+            .append_safe_inputs_observed_at(
                 1200,
+                now_ms / 1000,
+                now_ms.saturating_sub(25 * 12 * 1000),
                 &[StoredSafeInput {
                     sender: SENDER_A,
                     payload: landed,
@@ -2093,17 +2093,6 @@ mod check_danger {
                 &protocol,
             )
             .expect("append accepted batch 0");
-
-        // The Tip's observed age is 1190 >= 1125, and the wall-clock-adjusted
-        // arm would also fire. Observed Tip danger must win.
-        let now_ms = unix_now_ms();
-        storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
-            )
-            .expect("rewind safe-progress timestamp");
 
         let status = storage
             .check_danger(&protocol, now_ms)
@@ -2154,15 +2143,8 @@ mod check_danger {
         // A full block-time (12 s) ahead of the local clock: unusable. Sub-block
         // ahead-ness is NTP-scale skew and tolerated (see the companion assert).
         storage
-            .append_safe_inputs_with_timestamp(10, 1_012, &[], SENDER_A, &protocol)
+            .append_safe_inputs_observed_at(10, 1_012, now_ms, &[], SENDER_A, &protocol)
             .expect("record future L1 timestamp");
-        storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms).expect("test time fits")],
-            )
-            .expect("make local progress baseline usable");
 
         assert_eq!(
             storage
@@ -2194,19 +2176,12 @@ mod check_danger {
         let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
-        storage
-            .append_safe_inputs_with_timestamp(10, 1_000, &[], SENDER_A, &protocol)
-            .expect("record safe head");
         // One full block-time (12 s) of regression: the wall-clock
         // extrapolation is genuinely invalid — refuse. A sub-block step is
         // tolerated (companion assert below).
         storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms + 12_000).expect("test time fits")],
-            )
-            .expect("move local progress baseline into future");
+            .append_safe_inputs_observed_at(10, 1_000, now_ms + 12_000, &[], SENDER_A, &protocol)
+            .expect("record safe head with a progress baseline in the future");
 
         assert_eq!(
             storage
@@ -2217,12 +2192,8 @@ mod check_danger {
 
         // A 1 ms step is quantization noise for a block-granular estimate.
         storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms + 1).expect("test time fits")],
-            )
-            .expect("move baseline a sub-block step into the future");
+            .append_safe_inputs_observed_at(10, 1_000, now_ms + 1, &[], SENDER_A, &protocol)
+            .expect("re-stamp the baseline a sub-block step into the future");
         assert_eq!(
             storage
                 .check_danger(&protocol, now_ms)
@@ -2244,21 +2215,14 @@ mod check_danger {
         let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
-        storage
-            .append_safe_inputs_with_timestamp(1200, 1_000, &[], SENDER_A, &protocol)
-            .expect("advance observed safe block past danger");
         // Even a full-block clock regression (a real fault, not noise) must
         // not suppress the observed arm: batch age here is pure block
         // arithmetic on persisted L1 observations, valid regardless of the
         // local clock. The refusal only wins when no observed danger stands
         // (2026-07-31 review of the containment commit).
         storage
-            .conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms + 12_000).expect("test time fits")],
-            )
-            .expect("move local progress baseline into future");
+            .append_safe_inputs_observed_at(1200, 1_000, now_ms + 12_000, &[], SENDER_A, &protocol)
+            .expect("advance observed safe block past danger, progress baseline in the future");
 
         assert_eq!(
             storage

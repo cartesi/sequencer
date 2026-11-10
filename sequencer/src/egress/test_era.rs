@@ -79,6 +79,7 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
             1_000 + STOP_BLOCK,
             &(0..4).map(safe_input).collect::<Vec<_>>(),
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .expect("sync through the stop block");
     let direct = |index: u64, batch_nonce| Scheduled {

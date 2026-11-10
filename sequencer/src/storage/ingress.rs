@@ -1739,6 +1739,7 @@ mod tests {
                     row(Address::repeat_byte(0x44), vec![0xcc], 4),
                 ],
                 &default_protocol_timing(),
+                crate::clock::unix_now_ms(),
             )
             .expect("persist direct inputs");
     }

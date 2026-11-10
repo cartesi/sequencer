@@ -99,6 +99,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
                 },
             ],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
     storage
@@ -275,6 +276,7 @@ fn seed_two_table_era(storage: &mut Storage) {
             1_010,
             &[input(5, 0xa0), input(6, 0xa1), input(10, 0xa2)],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
     // The op at nonce 5 is skipped, so it has no row.

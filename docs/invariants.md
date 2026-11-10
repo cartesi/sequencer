@@ -264,8 +264,12 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 
 - **Holds:** the reader early-returns when the fetched head doesn't advance;
   `append_ingested_safe_inputs_with_timestamp` asserts monotonicity and stamps
-  `synced_at_ms` only on commit.
-- **Enforced by:** reader floor check + asserts (`storage/l1_inputs.rs`).
+  `synced_at_ms` only on commit, with a clock reading taken before the commit,
+  so the stamp errs only toward "stale".
+- **Enforced by:** reader floor check + asserts (`storage/l1_inputs.rs`); the
+  reader's append (`append_safe_inputs` in `l1/reader.rs`) reads
+  `clock::unix_now_ms` inside its blocking closure immediately before the
+  append and passes it as `now_ms`.
 - **Depended on by:** the wall-clock danger arms (`L1ViewStale`,
   `EstimatedBatchInDanger`) — their baseline must be true progress time, or
   outages are masked.

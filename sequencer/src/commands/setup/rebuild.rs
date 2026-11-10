@@ -368,6 +368,7 @@ mod tests {
                 1_700_000_000 + safe_block,
                 inputs,
                 &default_protocol_timing(),
+                crate::clock::unix_now_ms(),
             )
             .unwrap();
         (db, storage)
@@ -1188,6 +1189,7 @@ mod tests {
                 now_ms / 1000,
                 &inputs,
                 &default_protocol_timing(),
+                now_ms,
             )
             .unwrap();
         let data_dir = tempfile::tempdir().unwrap();

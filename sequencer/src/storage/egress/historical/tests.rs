@@ -48,6 +48,7 @@ fn append(storage: &mut Storage, safe_block: u64, inputs: &[IngestedSafeInput]) 
             safe_block * 12,
             inputs,
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
 }
@@ -168,6 +169,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
                 input(30, SENDER_A, payloads[1].clone()),
             ],
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
     storage
@@ -271,6 +273,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             now / 1000,
             &[input(110, SENDER_B, vec![1])],
             &protocol,
+            now,
         )
         .unwrap();
     storage

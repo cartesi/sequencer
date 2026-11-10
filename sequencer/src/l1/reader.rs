@@ -594,12 +594,16 @@ impl InputReader {
         let process_lock = self.process_lock.clone();
         spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open_writer(&db_path)?;
+            // Read right before the append, so the stamp is at most the
+            // commit time and staleness can only err toward "stale" (I12).
+            let now_ms = crate::clock::unix_now_ms();
             storage
                 .append_ingested_safe_inputs_with_timestamp(
                     current_safe_head.block_number,
                     current_safe_head.block_timestamp,
                     &batch,
                     &timing,
+                    now_ms,
                 )
                 .map_err(InputReaderError::from)
         })

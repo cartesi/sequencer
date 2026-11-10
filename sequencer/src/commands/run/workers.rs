@@ -992,15 +992,27 @@ mod tests {
         // Simulate time moving behind the persisted local-progress baseline
         // while preparation was in flight. The final reducer invocation must
         // classify the new clock refusal before durable Live or launch.
-        let future_ms = i64::try_from(crate::clock::unix_now_ms()).expect("clock fits")
-            + i64::try_from(timing.seconds_per_block() * 2_000).expect("offset fits");
-        crate::storage::Storage::open_connection(&db_path)
-            .expect("open raw test connection")
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [future_ms],
+        // The persisted safe head is re-stamped as synced two blocks ahead.
+        let future_ms = crate::clock::unix_now_ms() + timing.seconds_per_block() * 2_000;
+        let mut storage = crate::storage::Storage::open_writer(&db_path).expect("open test writer");
+        let safe_block = storage
+            .current_safe_block()
+            .expect("read safe block")
+            .expect("prepared runtime has a safe head");
+        let safe_block_timestamp = storage
+            .current_safe_block_timestamp()
+            .expect("read safe block timestamp")
+            .expect("prepared runtime has a safe head");
+        storage
+            .append_ingested_safe_inputs_with_timestamp(
+                safe_block,
+                safe_block_timestamp,
+                &[],
+                &timing,
+                future_ms,
             )
             .expect("move progress baseline into the future");
+        drop(storage);
 
         let error = crate::recovery::admit_runtime(&db_path, &timing)
             .expect_err("aged clean decision must not admit");

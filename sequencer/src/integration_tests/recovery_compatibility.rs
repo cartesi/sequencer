@@ -346,6 +346,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
             crate::clock::unix_now_ms() / 1000,
             &directs,
             &default_protocol_timing(),
+            crate::clock::unix_now_ms(),
         )
         .unwrap();
     let mut executions = Vec::new();

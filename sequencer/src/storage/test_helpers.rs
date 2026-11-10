@@ -325,8 +325,7 @@ impl Storage {
     }
 
     /// A raw connection with [`Storage::open`]'s pragmas, for tests that reach
-    /// past the typed API (rewinding `synced_at_ms`, installing failure
-    /// triggers).
+    /// past the typed API (raw reads, installing failure triggers).
     pub(crate) fn open_connection(path: &str) -> Result<rusqlite::Connection, StorageOpenError> {
         super::open::open_writer_connection(path)
     }
@@ -362,6 +361,27 @@ impl Storage {
         batch_submitter: Address,
         timing: &ProtocolTiming,
     ) -> rusqlite::Result<()> {
+        self.append_safe_inputs_observed_at(
+            safe_block,
+            safe_block_timestamp,
+            crate::clock::unix_now_ms(),
+            inputs,
+            batch_submitter,
+            timing,
+        )
+    }
+
+    /// [`Storage::append_safe_inputs_with_timestamp`] synced at `now_ms`, the
+    /// reader's wall-clock reading that becomes `l1_safe_head.synced_at_ms`.
+    pub(crate) fn append_safe_inputs_observed_at(
+        &mut self,
+        safe_block: u64,
+        safe_block_timestamp: u64,
+        now_ms: u64,
+        inputs: &[StoredSafeInput],
+        batch_submitter: Address,
+        timing: &ProtocolTiming,
+    ) -> rusqlite::Result<()> {
         match self.deployment_identity()? {
             Some(identity) => assert_eq!(
                 identity.batch_submitter_address, batch_submitter,
@@ -375,6 +395,7 @@ impl Storage {
             safe_block_timestamp,
             rows.as_slice(),
             timing,
+            now_ms,
         )
     }
 

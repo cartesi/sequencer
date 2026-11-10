@@ -1021,6 +1021,7 @@ mod tests {
                     transaction_hash: alloy_primitives::B256::repeat_byte(0x01),
                 }],
                 &default_protocol_timing(),
+                crate::clock::unix_now_ms(),
             )
             .expect_err("the era's frontier needs the pinned submitter");
         assert!(

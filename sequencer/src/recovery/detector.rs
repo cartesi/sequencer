@@ -177,7 +177,7 @@ fn map_storage_task_join(err: tokio::task::JoinError) -> DangerDetectorError {
 mod tests {
     use super::*;
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, set_up_storage};
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::storage::{SafeInputRange, StoredSafeInput};
     use crate::test_support::temp_db;
     use std::time::Duration;
 
@@ -294,9 +294,20 @@ mod tests {
 
         let protocol = default_protocol_timing();
         let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
+        // Observed check: batch 1's first_frame_safe_block = 100, current
+        // safe = 1200. age = 1100 < danger_threshold (MAX_WAIT_BLOCKS 1200 -
+        // margin 75 = 1125), so observed
+        // closed-batch danger would NOT fire.
+        //
+        // The sync is stamped 25 blocks' worth of wall-clock time ago, so the
+        // wall-clock arm shaves 25 off the threshold (1125 → 1100). At 1100,
+        // batch 1's age = 1100 trips `>=`. Estimated batch danger fires.
+        let now_ms = crate::clock::unix_now_ms();
         storage
-            .append_safe_inputs(
+            .append_safe_inputs_observed_at(
                 1200,
+                now_ms / 1000,
+                now_ms.saturating_sub(25 * 12 * 1000),
                 &[StoredSafeInput {
                     sender: SENDER_A,
                     payload: landed,
@@ -306,26 +317,7 @@ mod tests {
                 &protocol,
             )
             .expect("append accepted batch 0");
-
-        // Observed check: batch 1's first_frame_safe_block = 100, current
-        // safe = 1200. age = 1100 < danger_threshold (MAX_WAIT_BLOCKS 1200 -
-        // margin 75 = 1125), so observed
-        // closed-batch danger would NOT fire.
-        //
-        // Rewind synced_at_ms by 25 blocks' worth of wall-clock time so the
-        // wall-clock arm shaves 25 off the threshold (1125 → 1100). At 1100,
-        // batch 1's age = 1100 trips `>=`. Estimated batch danger fires.
-        let now_ms = crate::clock::unix_now_ms();
         drop(storage);
-        let rewind_conn =
-            Storage::open_connection(&db.path).expect("open raw connection to rewind synced_at_ms");
-        rewind_conn
-            .execute(
-                "UPDATE l1_safe_head SET synced_at_ms = ?1 WHERE singleton_id = 0",
-                [i64::try_from(now_ms.saturating_sub(25 * 12 * 1000)).unwrap_or(i64::MAX)],
-            )
-            .expect("rewind safe-progress timestamp");
-        drop(rewind_conn);
 
         let shutdown = ShutdownSignal::default();
         let detector = DangerDetector::new(

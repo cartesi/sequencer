@@ -990,16 +990,22 @@ mod tests {
     #[tokio::test]
     async fn observed_tip_repair_still_refuses_a_surviving_clock_fault() {
         let (db, protocol) = danger_fixture("recovery-tip-clock", false);
+        // Re-stamp the fixture's safe head as synced two blocks ahead of the
+        // clock: a clock fault the observed Tip repair does not clear.
         let ahead = crate::clock::unix_now_ms() + protocol.seconds_per_block() * 2_000;
-        storage::Storage::open_writer(&db.path)
-            .unwrap()
-            .raw_write(|tx| {
-                tx.execute(
-                    "UPDATE l1_safe_head SET synced_at_ms = ?1",
-                    [i64::try_from(ahead).unwrap()],
-                )
-            })
+        let mut storage = storage::Storage::open_writer(&db.path).unwrap();
+        let safe_block = storage.current_safe_block().unwrap().unwrap();
+        let safe_block_timestamp = storage.current_safe_block_timestamp().unwrap().unwrap();
+        storage
+            .append_ingested_safe_inputs_with_timestamp(
+                safe_block,
+                safe_block_timestamp,
+                &[],
+                &protocol,
+                ahead,
+            )
             .unwrap();
+        drop(storage);
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
         let error = recover_startup(&db.path, &protocol, &mut l1)
             .await
