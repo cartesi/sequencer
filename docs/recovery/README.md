@@ -28,8 +28,11 @@ order (`batch_index`) and its nonces.
 
 “Accepted” (also called **Gold** in code and models) means the safe-input
 projection applied the scheduler's acceptance rules and matched the landed
-bytes to a valid local closed batch. It does not mean an independent canonical
-machine was observed executing it. A foreign or different accepted payload
+bytes to a valid local closed batch, recorded on that batch as
+`accepted_input`. It does not mean an independent canonical
+machine was observed executing it. The schema keeps the accepted batches a
+prefix of the valid path and refuses invalidating one, so a cascade starts past
+them ([I9](../invariants.md#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)). A foreign or different accepted payload
 records canonical divergence and forbids automatic repair.
 
 Keep three identities separate:
@@ -364,11 +367,11 @@ just -f docs/recovery/justfile check-all
 |---|---|
 | Startup dispatch, error classification, final admission | [`recovery/mod.rs`](../../sequencer/src/recovery/mod.rs); procedure tests substitute only L1 sync/flush, keeping real SQLite inspections and repairs. |
 | Detection, mutation guards, pivot and atomic cascade | [`storage/recovery.rs`](../../sequencer/src/storage/recovery.rs), [`recovery/tests.rs`](../../sequencer/src/storage/recovery/tests.rs); exact Tip guard, safe-view floor, unconditional post-flush policy, generation rollback, root nonce, and direct replay. |
-| Observed danger versus estimates, accepted frontier and content identity | [`recovery/tests.rs`](../../sequencer/src/storage/recovery/tests.rs) (`check_danger`): stale-view precedence, clock faults; [`safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) tests: accepted frontier, content identity, divergence freeze; [`l1_submission.rs`](../../sequencer/src/storage/l1_submission.rs) tests: reused nonces. |
+| Observed danger versus estimates, accepted frontier and content identity | [`recovery/tests.rs`](../../sequencer/src/storage/recovery/tests.rs) (`check_danger`): stale-view precedence, clock faults; [`acceptance.rs`](../../sequencer/src/storage/acceptance.rs) tests: accepted frontier, content identity, divergence freeze; [`schema_tests.rs`](../../sequencer/src/storage/open/schema_tests.rs): acceptance order and write-once rules; [`l1_submission.rs`](../../sequencer/src/storage/l1_submission.rs) tests: reused nonces. |
 | Slot settlement and broadcast coverage | [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs), [`l1/watermark.rs`](../../sequencer/src/l1/watermark.rs), [`submitter/poster.rs`](../../sequencer/src/l1/submitter/poster.rs). |
 | Task-free preparation, launch, restore and catch-up | [`commands/run/`](../../sequencer/src/commands/run/), [`inclusion_lane/mod.rs`](../../sequencer/src/ingress/inclusion_lane/mod.rs). |
 
-The accepted-frontier cache stores acceptances, not scan progress. Rejected
+The accepted frontier stores acceptances, not scan progress. Rejected
 inputs after the frontier may be rescanned on later syncs; a separate persistent
 cursor would need nonce-reuse reasoning and tests. This is a storage performance
 tradeoff, not an extra recovery phase or a modeled TLA+ invariant.

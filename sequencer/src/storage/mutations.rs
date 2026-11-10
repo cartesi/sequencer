@@ -18,7 +18,7 @@ use super::{DirectInputExecution, SafeInputRange};
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
 /// The explicit form pins the very first genesis batch at `batch_index = 0`.
-/// `trg_enforce_nonce_contiguity` checks the same rule, so caller and schema agree.
+/// `trg_batch_insert` checks the same rule, so caller and schema agree.
 pub(super) fn insert_new_batch(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
@@ -44,7 +44,7 @@ pub(super) fn insert_new_batch(
 }
 
 /// The last valid nonce + 1, or the era's anchor when no batch is valid: the
-/// rule of `trg_enforce_nonce_contiguity`. With neither, reading the era fails.
+/// rule of `trg_batch_insert`. With neither, reading the era fails.
 fn compute_next_nonce(tx: &Transaction<'_>) -> Result<u64> {
     let last_valid: Option<i64> =
         tx.query_row("SELECT MAX(nonce) FROM valid_batches", [], |row| row.get(0))?;

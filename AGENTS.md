@@ -66,7 +66,7 @@ This section is the map.
 Scheduler-acceptance semantics exist in exactly three implementations that must agree:
 
 1. the canonical scheduler — `Scheduler` ([`sequencer-core/src/scheduler/mod.rs`](sequencer-core/src/scheduler/mod.rs)), driven with the executor by `CanonicalRunner` ([`scheduler/driver.rs`](sequencer-core/src/scheduler/driver.rs)): the same source the on-chain machine compiles;
-2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), which feeds `safe_accepted_batches`;
+2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), whose results `record_accepted_batches` writes to `batches.accepted_input`;
 3. the inclusion lane's live prediction (drain + execution order).
 
 [I1](docs/invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)

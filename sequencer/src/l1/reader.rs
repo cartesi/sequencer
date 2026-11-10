@@ -163,7 +163,7 @@ pub struct InputReader {
     /// 0 and the InputBox count at the scanned safe head.
     app_deployment_block: u64,
     db_path: String,
-    /// Protocol timing used to keep `safe_accepted_batches` consistent with
+    /// Protocol timing used to keep the accepted batches consistent with
     /// every safe-input write; storage reads the batch submitter from the
     /// pinned deployment identity.
     timing: ProtocolTiming,

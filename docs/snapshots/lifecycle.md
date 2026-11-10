@@ -33,7 +33,7 @@ SQLite separates artifact ownership from snapshot boundaries:
 | `dumps` | Artifact path and active reader lease count |
 | `snapshots` | Artifact's immutable application count and local batch identity |
 | Baseline snapshot (`batch_index IS NULL`) | The application at the end of the era's stop block, at its rebuilt history end |
-| `safe_accepted_batches` | Scheduler-accepted, content-matched local batch landings |
+| `batches.accepted_input` | The safe input whose scheduler-accepted, content-matched landing accepted the batch |
 
 The application count is the next canonical input position, never a physical
 SQLite cursor. The batch identity disambiguates empty batches, which can share

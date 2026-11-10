@@ -488,7 +488,7 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 
 ## Storage Model
 
-- `batches`: batch metadata
+- `batches`: batch metadata, including the safe input that carried its accepted landing (`accepted_input`)
 - `frames`: frame boundaries within each batch
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
@@ -497,7 +497,7 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
 - `history_generation_cuts`: one immutable cut per standard-recovery transition; the greatest is the recovery generation
 - `rebuilt_history`: the transactions setup executed from the base through the stop block, each with its count; the feed serves them before the live rows
-- `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is derived from `safe_accepted_batches`
+- `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is read from `batches.accepted_input`
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.
 
 ## Project Layout

@@ -39,7 +39,7 @@ const PROMOTION_POLL_ATTEMPTS: usize = 40;
 const PROMOTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Poll budget for waiting until a landed batch reaches the reader's
-/// `safe_accepted_batches` frontier.
+/// accepted frontier (`batches.accepted_input`).
 const ACCEPTANCE_POLL_ATTEMPTS: usize = 40;
 
 /// Per-attempt pause while waiting for batch submission and safe-head ingestion.
@@ -552,7 +552,7 @@ async fn mine_until_batch_is_safe_accepted(
             return Ok(accepted);
         }
     }
-    Err("timed out waiting for a batch to reach safe_accepted_batches".into())
+    Err("timed out waiting for a batch to be accepted".into())
 }
 
 /// Advance Anvil only as far as the next semantic live-frame tick needs, then
@@ -2952,7 +2952,7 @@ async fn run_first_boot_l1_unreachable_never_synced_refuses_boot_test(
 // gateway dropped it, mempool evicted it, whatever). Blocks accumulate. On
 // the sequencer's next startup recovery, the batch's first frame is >
 // `MAX_WAIT_BLOCKS` behind current_safe_block, so the scheduler skips it
-// in `populate_safe_accepted_batches` and `find_first_batch_in_danger`
+// in `record_accepted_batches` and `find_first_batch_in_danger`
 // flags it — cascade fires.
 //
 // This is the closed-and-submitted sibling of `run_recovery_after_stale_batches_test`
@@ -3786,15 +3786,15 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
 //     batches invalidated" natively.
 //   - Reused nonce acceptance: after recovery, the recovery batch (with
 //     nonce 0 reused)
-//     submits to L1, gets accepted by `populate_safe_accepted_batches`,
-//     and lands in `safe_accepted_batches` — proving the scheduler-
+//     submits to L1, gets accepted by `record_accepted_batches`,
+//     and its `batches.accepted_input` is set — proving the scheduler-
 //     simulation cursor handles a reused nonce after cascade correctly.
 //
 // The structural invariants are validated by
 // `assert_schema_invariants` (post-test hook in `tests/e2e/src/main.rs`):
 // it checks that the valid nonces form a contiguous `0..N` from the
 // anchor. So this test asserts those
-// observable consequences plus the explicit `safe_accepted_batches`
+// observable consequences plus the explicit accepted-batch
 // post-condition for reused-nonce acceptance.
 //
 // Setup turns auto-mining off and drops the mempool so the first batch's L1
@@ -3895,7 +3895,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     // drive enough work into the recovery batch that the
     // submitter closes it by size and submits to L1. With auto-mining
     // back on, the submission lands and the input reader picks it up
-    // into `safe_inputs`; `populate_safe_accepted_batches` accepts it
+    // into `safe_inputs`; `record_accepted_batches` accepts it
     // at the expected nonce (0, reused).
     for _ in 0..TRANSFERS_TO_FORCE_CLOSE {
         alice_l2_fresh
@@ -3909,7 +3909,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
     let (accepted_count, min_accepted_nonce) = mine_until_batch_is_safe_accepted(runtime).await?;
     assert!(
         accepted_count >= 1,
-        "expected at least one batch to land in safe_accepted_batches \
+        "expected at least one batch to be accepted \
          post-recovery (proves  reused-nonce-0 was accepted): \
          count={accepted_count}",
     );

@@ -282,7 +282,7 @@ pub struct DrainReport {
     pub drain_secs: Option<f64>,
 }
 
-/// Time from now, with the load stopped, until `safe_accepted_batches` holds
+/// Time from now, with the load stopped, until the accepted batches reach
 /// the highest valid sealed batch nonce read now. The open batch is excluded,
 /// so this measures the submission backlog, not the batch-open window. Mines
 /// one L1 block per second at Anvil's own clock.

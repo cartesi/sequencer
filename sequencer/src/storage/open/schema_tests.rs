@@ -14,8 +14,10 @@ use super::super::test_helpers::{
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 
 const NONCE_RULE: &str = "a batch nonce is the last valid nonce + 1, or the era anchor";
-const LIFECYCLE_RULE: &str =
-    "a batch changes only by sealing once with its hash, or by invalidating once";
+const LIFECYCLE_RULE: &str = "a batch changes only by sealing once with its hash, by being \
+                              accepted once while sealed, or by invalidating once while unaccepted";
+const ACCEPTANCE_RULE: &str = "an acceptance extends the accepted prefix of the valid path";
+const FROZEN_RULE: &str = "batch tree frozen: canonical divergence marker present";
 
 fn assert_refused(storage: &Storage, sql: &str, message: &str) {
     let err = storage.conn.execute(sql, []);
@@ -196,7 +198,7 @@ fn schema_rejects_a_second_valid_batch_at_an_existing_nonce() {
     assert_refused(&storage, duplicate, NONCE_RULE);
     storage
         .conn
-        .execute_batch("DROP TRIGGER trg_enforce_nonce_contiguity")
+        .execute_batch("DROP TRIGGER trg_batch_insert")
         .expect("isolate the index");
     let msg = format!("{:?}", storage.conn.execute(duplicate, []));
     assert!(
@@ -373,6 +375,195 @@ fn lifecycle_rejects_seal_and_invalidate_in_one_statement() {
     );
 }
 
+// ── Acceptance (`trg_batch_acceptance_extends_the_prefix`, `trg_batch_lifecycle`) ──
+//
+// The fixture's era is anchored at 7: batches 0, 1, 2 are sealed (nonces 7,
+// 8, 9), batch 3 is the open Tip (nonce 10), and safe inputs 0..=5 exist.
+
+fn acceptance_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
+    let db = crate::test_support::temp_db(name);
+    let mut storage = Storage::open_with_era(
+        db.path.as_str(),
+        &crate::storage::NewEra {
+            anchor_batch_nonce: 7,
+            ..crate::storage::NewEra::EMPTY_GENESIS
+        },
+    );
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    for _ in 0..3 {
+        storage.close_batch_at(&mut head, 0).expect("close a batch");
+    }
+    for index in 0..=5 {
+        storage
+            .conn
+            .execute(
+                "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (?1, zeroblob(20), X'', 10, 0, zeroblob(32))",
+                [index],
+            )
+            .expect("insert a safe input");
+    }
+    (db, storage)
+}
+
+fn accept(storage: &Storage, batch_index: i64, input: i64) -> rusqlite::Result<usize> {
+    storage.conn.execute(
+        "UPDATE batches SET accepted_input = ?1 WHERE batch_index = ?2",
+        [input, batch_index],
+    )
+}
+
+#[test]
+fn acceptance_extends_the_prefix_from_the_anchor() {
+    let (_db, storage) = acceptance_fixture("acceptance-prefix");
+    assert_eq!(accept(&storage, 0, 1).expect("the batch at the anchor"), 1);
+    assert_eq!(accept(&storage, 1, 3).expect("the next batch, later"), 1);
+}
+
+#[test]
+fn a_batch_is_never_inserted_accepted() {
+    let (_db, storage) = acceptance_fixture("acceptance-insert");
+    // Nonce 11 follows the Tip's 10, so only the acceptance arm can refuse.
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash, accepted_input) \
+         VALUES (11, 0, 1, zeroblob(32), 1)",
+        "a batch is inserted unaccepted",
+    );
+    // Without the trigger, the table still refuses an acceptance on a batch
+    // that is not sealed.
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER trg_batch_insert")
+        .expect("drop the insert trigger");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, accepted_input) VALUES (11, 0, 1)",
+        "CHECK constraint failed",
+    );
+}
+
+#[test]
+fn acceptance_rejects_skipping_a_nonce() {
+    let (_db, storage) = acceptance_fixture("acceptance-skip");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 1",
+        ACCEPTANCE_RULE,
+    );
+    accept(&storage, 0, 1).expect("the batch at the anchor");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 2 WHERE batch_index = 2",
+        ACCEPTANCE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_rejects_an_input_not_after_the_last_acceptance() {
+    let (_db, storage) = acceptance_fixture("acceptance-earlier-input");
+    accept(&storage, 0, 3).expect("the batch at the anchor");
+    for input in [2, 3] {
+        assert_refused(
+            &storage,
+            &format!("UPDATE batches SET accepted_input = {input} WHERE batch_index = 1"),
+            ACCEPTANCE_RULE,
+        );
+    }
+}
+
+#[test]
+fn acceptance_rejects_an_unsealed_batch() {
+    let (_db, storage) = acceptance_fixture("acceptance-unsealed");
+    accept(&storage, 0, 1).expect("accept nonce 7");
+    accept(&storage, 1, 2).expect("accept nonce 8");
+    accept(&storage, 2, 3).expect("accept nonce 9");
+    // The Tip carries the frontier nonce 10, so only the lifecycle refuses.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 4 WHERE batch_index = 3",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_rejects_an_invalidated_batch() {
+    let (_db, storage) = acceptance_fixture("acceptance-invalidated");
+    storage
+        .conn
+        .execute("UPDATE batches SET invalidated_at_ms = 100", [])
+        .expect("a full tear of unaccepted batches");
+    // Batch 0 carries the anchor nonce, so only the lifecycle refuses.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_is_written_once() {
+    let (_db, storage) = acceptance_fixture("acceptance-twice");
+    accept(&storage, 0, 1).expect("the batch at the anchor");
+    for sql in [
+        "UPDATE batches SET accepted_input = 2 WHERE batch_index = 0",
+        "UPDATE batches SET accepted_input = NULL WHERE batch_index = 0",
+    ] {
+        assert_refused(&storage, sql, LIFECYCLE_RULE);
+    }
+}
+
+#[test]
+fn acceptance_changes_nothing_else() {
+    let (_db, storage) = acceptance_fixture("acceptance-alone");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1, invalidated_at_ms = 100 WHERE batch_index = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn an_accepted_batch_is_never_invalidated() {
+    let (_db, storage) = acceptance_fixture("acceptance-invalidate");
+    accept(&storage, 0, 1).expect("the batch at the anchor");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET invalidated_at_ms = 100 WHERE batch_index = 0",
+        LIFECYCLE_RULE,
+    );
+    // The cascade from the first unaccepted batch is admitted.
+    let changed = storage
+        .conn
+        .execute(
+            "UPDATE batches SET invalidated_at_ms = 100 \
+             WHERE batch_index >= 1 AND invalidated_at_ms IS NULL",
+            [],
+        )
+        .expect("the cascade past the accepted prefix");
+    assert_eq!(changed, 3);
+}
+
+#[test]
+fn the_divergence_freeze_answers_an_acceptance_first() {
+    let (_db, mut storage) = acceptance_fixture("acceptance-frozen");
+    crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 1);
+    // A well-formed acceptance, then one that breaks both other rules.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 0",
+        FROZEN_RULE,
+    );
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 3",
+        FROZEN_RULE,
+    );
+}
+
 #[test]
 fn schema_rejects_frame_insert_into_sealed_batch() {
     // This is the bug class we've been fighting: writer holds a stale
@@ -449,7 +640,7 @@ fn nonce_reuse_after_partial_cascade() {
     // batch's `nonce + 1` — the same nonce the invalidated suffix's first
     // batch had. Nonce reuse is automatic.
     //
-    // Scenario: batch 0 is accepted (safe_accepted_batches advances past
+    // Scenario: batch 0 is accepted (the accepted frontier advances past
     // nonce 0). Batch 1 is stale and triggers cascade. Batches 1, 2, 3
     // invalidated; batch 0 remains valid.
     let (_db, mut storage) = open_temp_storage("nonce-reuse-partial-cascade");

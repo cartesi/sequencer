@@ -456,8 +456,8 @@ pub(crate) fn local_batch_payload(storage: &mut Storage, nonce: u64) -> Vec<u8> 
 
 /// Insert safe inputs whose payloads are SSZ-encoded batches with the given
 /// nonces, all attributed to `sender`. `sender` doubles as the
-/// batch-submitter address passed to `append_safe_inputs`, so the populated
-/// `safe_accepted_batches` view matches this sender.
+/// batch-submitter address passed to `append_safe_inputs`, so the recorded
+/// acceptances follow this sender.
 ///
 /// Nonces with a valid closed local batch land with that batch's real wire
 /// bytes (the landing will be *accepted* — the content-identity check

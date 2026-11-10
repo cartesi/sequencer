@@ -12,6 +12,7 @@ use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, named_params, params};
 use sequencer_core::l2_tx::Direct;
 
+use super::acceptance::canonical_divergence_in;
 use super::convert::{
     from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
     u64_to_i64,
@@ -25,7 +26,6 @@ use super::queries::{
     DIRECT_EXECUTES_SQL, current_safe_block_required, load_current_write_head, query_batch_policy,
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
-use super::safe_accepted_batches::canonical_divergence_in;
 use super::snapshot_dumps::insert_batch_snapshot_in;
 use super::{
     BatchPolicy, DirectInputExecution, L2TxCount, SafeFrontierState, SafeInputFrontier,

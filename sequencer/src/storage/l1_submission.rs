@@ -9,16 +9,16 @@
 use rusqlite::{Result, params};
 
 use super::Storage;
+use super::acceptance::frontier_nonce;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::queries::current_safe_block_required;
-use super::safe_accepted_batches::frontier_nonce;
 use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
 
 impl Storage {
     /// Read-only frontier view used by the submitter each tick to derive the
     /// next batch nonce. `accepted_next_nonce` is the next nonce the scheduler
-    /// is expected to accept, derived from `safe_accepted_batches`.
+    /// is expected to accept, derived from `batches.accepted_input`.
     ///
     /// The scheduler-accepted frontier is maintained by
     /// `Storage::append_ingested_safe_inputs_with_timestamp` once the era
@@ -362,13 +362,12 @@ mod tests {
 
     #[test]
     fn submitter_frontier_uses_anchor_when_no_batches_accepted() {
-        // A cockroach-recovered deployment boots with an empty
-        // safe_accepted_batches and a non-zero era anchor (N'). The
-        // submitter's start frontier must be N', not 0 — otherwise it would
-        // re-submit its first post-recovery batch (nonce N') on every tick
-        // until the first accepted row lands. Regression test for the
-        // frontier_nonce/anchor asymmetry (frontier_nonce defaulted to 0 while
-        // populate_safe_accepted_batches seeds `expected` from the anchor).
+        // A cockroach-recovered deployment boots with no accepted batch and
+        // a non-zero era anchor (N'). The submitter's start frontier must be
+        // N', not 0 — otherwise it would re-submit its first post-recovery
+        // batch (nonce N') on every tick until the first acceptance.
+        // `frontier_nonce` and `record_accepted_batches` both start from the
+        // anchor.
         let db = temp_db("submitter-frontier-anchor");
         let mut storage = Storage::open_with_era(
             db.path.as_str(),
@@ -401,7 +400,7 @@ mod tests {
             .close_frame_and_batch(&mut head, 10)
             .expect("close 1");
         // seed_safe_inputs_with_batch_nonces already calls append_safe_inputs,
-        // which auto-populates safe_accepted_batches.
+        // which records the accepted batches.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 10, &[0, 1, 3, 4, 5]);
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");

@@ -57,7 +57,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 | Writer | Writes |
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
-| input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
+| input reader | `safe_inputs`, `l1_safe_head`, `batches.accepted_input`, `canonical_divergence` (the divergence poison marker) |
 | recovery (startup) | the era's first Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
 | history metadata (setup/recovery) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades, whose greatest key is the recovery generation |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
@@ -132,6 +132,8 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   schema trigger. The cascade, generation cut/increment, and replacement Tip commit
   together. Original source records and immutable snapshots remain; snapshot
   selection excludes invalidated batches and GC retires their unleased artifacts.
+  The cascade never touches an accepted batch: `trg_batch_lifecycle` refuses
+  invalidating one, and the pivot is the first unaccepted closed batch or the Tip.
 - **Enforced by:** `cascade_and_reopen`, application-input constraints, valid views.
 - **Breaks:** loading invalidated state or leaving a hole in current history.
 
@@ -187,7 +189,14 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   closed batch at that nonce — `keccak256(landed bytes)` vs the hash stamped at
   seal by the same encode path the submitter broadcasts. The exhaustive local
   outcomes are `Match`, `Foreign` (no local valid closed batch), and `Mismatch`
-  (different bytes); the last two record divergence.
+  (different bytes); the last two record divergence. A `Match` is recorded on
+  the batch itself, as `batches.accepted_input`: the input reader's one
+  write-once update, which the schema admits only on a sealed valid batch
+  (`trg_batch_lifecycle`) whose nonce follows the greatest accepted batch's
+  (the anchor before any), at a later input
+  (`trg_batch_acceptance_extends_the_prefix`). A batch is inserted unaccepted
+  (`trg_batch_insert`). The accepted batches are a prefix of the valid path
+  and are never invalidated.
 - **Why content, not identity, suffices:** batches deliberately carry no
   identifier because content-equal copies are *effect-equal* — an accepted
   batch's application effects depend on its inclusion block only through the
@@ -197,7 +206,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 - **Enforced by:** prevention — the flush resolving every wallet-nonce slot
   before a cascade reuses a nonce, anchored by the persisted watermark (I14);
   detection — the content-identity check in
-  `populate_safe_accepted_batches`, which on violation persists the
+  `record_accepted_batches`, which on violation persists the
   `canonical_divergence` marker and freezes the frontier (I15).
 - **Depended on by:** the gold frontier, cascade pivot selection, checkpoint selection,
   local-state ↔ canonical-state agreement.
@@ -300,14 +309,15 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 
 - **Holds:** a fully accepted landing that fails the content-identity check
   writes the `canonical_divergence` singleton **in the detecting sync's
-  transaction**, and `populate_safe_accepted_batches` returns early while the
-  marker exists, so no acceptance row or gold-frontier advance follows a
+  transaction**, and `record_accepted_batches` returns early while the
+  marker exists, so no acceptance or gold-frontier advance follows a
   detected divergence.
 - **Enforced by:** the `trg_*_frozen_on_divergence` triggers
-  (`0001_schema.sql`) make batch-tree writes and snapshot collection RAISE
-  while the marker exists: an immediate, persisted freeze of those tables, not
-  a user-op hot-path barrier. The accepted frontier has no trigger; its single
-  writer's guard refuses. `check_danger`'s first arm is `CanonicalDivergence`.
+  (`0001_schema.sql`) make batch-tree writes, acceptance
+  (`batches.accepted_input`) included, and snapshot collection RAISE while the
+  marker exists: an immediate, persisted freeze of those tables, not a user-op
+  hot-path barrier. Created after every other BEFORE trigger on `batches`, the
+  freeze answers first. `check_danger`'s first arm is `CanonicalDivergence`.
   Startup inspection refuses before any provider query, and each repair
   transaction reasserts its preconditions and the marker's absence before
   writing. A clean worker drain waits for in-flight reader appends; `run` then
@@ -367,7 +377,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   A cascade that keeps a valid prefix reuses the pivot's nonce. At most one
   valid batch carries each nonce; invalidated batches keep theirs. No batch
   exists before the era does.
-- **Enforced by:** `trg_enforce_nonce_contiguity`, a BEFORE INSERT check that
+- **Enforced by:** `trg_batch_insert`, a BEFORE INSERT check that
   `nonce IS COALESCE(last valid nonce + 1, era anchor)` (with neither, it
   compares against NULL and aborts); `compute_next_nonce` computes the same
   rule and fails when the era is absent; the partial unique index
@@ -377,7 +387,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   `trg_era_single_insert`), so a live deployment is never re-anchored.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
-  defaults to the anchor while `safe_accepted_batches` is still empty, so the
+  defaults to the anchor while no batch is accepted, so the
   submitter starts at the anchor; nonce lookups such as the content-identity
   check (I9), which expect one valid batch per nonce.
 - **Breaks:** valid batches mis-anchored at the wrong nonce ⇒ `run`'s first

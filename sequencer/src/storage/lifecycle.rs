@@ -378,7 +378,7 @@ mod tests {
         storage
             .conn
             .execute_batch(
-                "DROP TRIGGER trg_enforce_nonce_contiguity; \
+                "DROP TRIGGER trg_batch_insert; \
                  INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (0, 0, 0);",
             )
             .expect("seed a batch");

@@ -441,7 +441,7 @@ mod recover_post_flush {
     // ── recover_post_flush: cascade from first non-gold ────────────────
     //
     // These tests simulate the post-flush state directly: append safe-inputs
-    // to drive `populate_safe_accepted_batches`, then call
+    // to drive `record_accepted_batches`, then call
     // `recover_post_flush()`. The cascade is unconditional (no threshold) —
     // any closed batch past the gold frontier is doomed and gets cascaded
     // along with everything after it.
@@ -528,7 +528,7 @@ mod recover_post_flush {
         // Post-flush contract: `recover_post_flush` is called only after the
         // gold frontier has been re-synced. If the recovery batch from a
         // previous cycle landed on L1 fresh (within MAX_WAIT) and was
-        // accepted by `populate_safe_accepted_batches`, the new generation
+        // accepted by `record_accepted_batches`, the new generation
         // is gold and a fresh `recover_post_flush` call should be a no-op —
         // the stale ancestor's safe-input must not false-match the
         // nonce-reused gen-2 batch.
@@ -563,7 +563,7 @@ mod recover_post_flush {
         let landed = local_batch_payload(&mut storage, 0);
         storage.land(1310, &[(SENDER_A, landed)]); // append fresh safe input for recovery batch
 
-        // populate_safe_accepted_batches accepts the gen-2 batch (nonce 0 at
+        // record_accepted_batches accepts the gen-2 batch (nonce 0 at
         // first_frame=1300, inclusion=1310 → inclusion-staleness 10 < MAX_WAIT).
         // Gold advances. A fresh recover_post_flush is a no-op: the only
         // closed-non-gold candidate would have to be past the new frontier,
@@ -826,7 +826,7 @@ mod tip_staleness {
     #[test]
     fn closed_unsubmitted_stale_and_open_stale_both_cascade() {
         // Scenario: batch 0 is closed and nonced but never submitted to L1
-        // (safe_accepted_batches is empty). Batch 1 is open and also stale.
+        // (nothing is accepted). Batch 1 is open and also stale.
         // `find_first_batch_in_danger` should return closed batch 0 at the
         // frontier (nonce 0, no acceptance yet) and cascade through batch 1.
         let (_db, mut storage) = open_temp_storage("closed-unsubmitted-and-open-stale");
@@ -1617,6 +1617,45 @@ mod boundary {
     }
 
     #[test]
+    fn cascade_never_touches_the_accepted_prefix() {
+        // Batches 0 and 1 are accepted; 2 is closed past the frontier and
+        // stale. The pivot is batch 2, so the accepted prefix stays valid
+        // and accepted, and the new Tip reuses nonce 2.
+        let (_db, mut storage) = open_temp_storage("cascade-spares-accepted-prefix");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        for _ in 0..3 {
+            storage.close_batch_at(&mut head, 10).expect("close batch");
+        }
+        let first = local_batch_payload(&mut storage, 0);
+        let second = local_batch_payload(&mut storage, 1);
+        storage.land(20, &[(SENDER_A, first), (SENDER_A, second)]);
+        storage.advance_safe_head(1500);
+
+        let invalidated = storage.recover_post_flush(1200).expect("recover");
+        assert_eq!(
+            invalidated,
+            vec![2, 3],
+            "the cascade starts past the prefix"
+        );
+        let accepted: Vec<(i64, i64, bool)> = storage
+            .conn
+            .prepare(
+                "SELECT batch_index, accepted_input, invalidated_at_ms IS NULL \
+                 FROM batches WHERE accepted_input IS NOT NULL ORDER BY batch_index",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(accepted, vec![(0, 0, true), (1, 1, true)]);
+        let tip = storage.open_state().expect("load").expect("a fresh Tip");
+        assert_eq!(storage.batch_nonce(tip.batch_index).expect("nonce"), 2);
+    }
+
+    #[test]
     fn large_cascade_50_batches() {
         let (_db, mut storage) = open_temp_storage("detect-large-cascade");
 
@@ -1663,7 +1702,7 @@ mod valid_batch_invariants {
     fn valid_batch_invariants_hold_across_mixed_workload() {
         // Exercises every mutating code path: genesis, rotations, partial
         // cascades (a valid prefix survives), cascades across accepted frontier,
-        // torn cascades (no valid batch left), and back-to-back generations.
+        // torn cascades (no Tip left), and back-to-back generations.
         // Every write is checked by the schema triggers (an ABORT fails its
         // expect); the valid spine is asserted after each step.
         let (_db, mut storage) = open_temp_storage("valid-batch-invariants-workload");
@@ -1694,18 +1733,59 @@ mod valid_batch_invariants {
             assert_valid_spine_from_anchor(&mut storage);
         }
 
-        // Phase 4: torn cascade — invalidate everything including batch 0.
-        let latest = storage.latest_batch_index().expect("latest").unwrap();
-        for bi in 0..=latest {
+        // Phase 4: torn cascade — invalidate every unaccepted batch, Tip
+        // included; the accepted batch 0 stays valid (the schema refuses
+        // invalidating it).
+        for bi in unaccepted_valid_batches(&storage) {
             storage.insert_invalid_batch(bi).expect("invalidate");
         }
         storage.recover_post_flush(1200).expect("recover from torn");
         assert_valid_spine_from_anchor(&mut storage);
 
-        // Phase 5: rotations after torn cascade — the new Tip carries the anchor, 0.
+        // Phase 5: rotations after torn cascade — the new Tip follows batch 0.
         let mut head = storage.open_state().expect("load").unwrap();
+        assert_eq!(storage.batch_nonce(head.batch_index).expect("nonce"), 1);
         for _ in 0..5 {
             storage.close_batch_at(&mut head, 2000).expect("close gen3");
+            assert_valid_spine_from_anchor(&mut storage);
+        }
+    }
+
+    fn unaccepted_valid_batches(storage: &Storage) -> Vec<u64> {
+        storage
+            .conn
+            .prepare("SELECT batch_index FROM valid_batches WHERE accepted_input IS NULL")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query")
+            .map(|index| index.map(crate::storage::convert::i64_to_u64))
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect")
+    }
+
+    #[test]
+    fn valid_batch_invariants_hold_across_a_full_tear() {
+        // With nothing accepted, a torn cascade can leave no valid batch: the
+        // next Tip carries the era anchor again.
+        let (_db, mut storage) = open_temp_storage("valid-batch-invariants-full-tear");
+        let mut head = storage
+            .initialize_open_state(10, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        for _ in 0..4 {
+            storage.close_batch_at(&mut head, 100).expect("close");
+            assert_valid_spine_from_anchor(&mut storage);
+        }
+        for bi in unaccepted_valid_batches(&storage) {
+            storage.insert_invalid_batch(bi).expect("invalidate");
+        }
+        storage.advance_safe_head(100);
+        storage.recover_post_flush(1200).expect("recover from torn");
+        assert_valid_spine_from_anchor(&mut storage);
+
+        let mut head = storage.open_state().expect("load").unwrap();
+        assert_eq!(storage.batch_nonce(head.batch_index).expect("nonce"), 0);
+        for _ in 0..5 {
+            storage.close_batch_at(&mut head, 2000).expect("close gen2");
             assert_valid_spine_from_anchor(&mut storage);
         }
     }

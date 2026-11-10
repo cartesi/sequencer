@@ -10,13 +10,13 @@ use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBe
 use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
 
 use super::Storage;
+use super::acceptance::{canonical_divergence_in, frontier_nonce};
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::advance_recovery_generation_in;
 use super::ingress::open_fresh_tip_in_tx;
 use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
 };
-use super::safe_accepted_batches::{canonical_divergence_in, frontier_nonce};
 use super::snapshot_dumps::has_rollback_safe_snapshot_in;
 
 /// Outcome of [`Storage::check_danger`]. The runtime detector exits on any
@@ -392,10 +392,11 @@ fn cascade_and_reopen(
 /// accept). Used by [`recover_post_flush_inner`] as the cascade pivot, and
 /// by [`find_closed_frontier_batch_in_danger`] as the candidate to age-check.
 ///
-/// `>=`, not `>`: `frontier_nonce` is the *next-expected* nonce
-/// (`latest_accepted.nonce + 1`, or the anchor before any acceptance), so the
+/// `>=`, not `>`: `frontier_nonce` is the *next-expected* nonce (the greatest
+/// accepted batch's nonce + 1, or the anchor before any acceptance), so the
 /// actual cascade-pivot batch carries `nonce == frontier_nonce`. Using `>`
-/// would skip it.
+/// would skip it. The nonce seek, not `accepted_input IS NULL`, keeps this
+/// off the accepted prefix: the danger detector calls it every tick.
 ///
 /// Valid-path nonce contiguity (I16) makes the first match exactly
 /// `frontier_nonce`. Returns `None` if all closed batches are accepted.
@@ -420,7 +421,7 @@ fn first_non_gold_closed_batch(conn: &Connection) -> Result<Option<u64>> {
 /// Closed-frontier wins: frame `safe_block`s are non-decreasing along the
 /// spine, so an existing closed frontier is at least as old as the Tip.
 ///
-/// Reads `safe_accepted_batches`, which every
+/// Reads `batches.accepted_input`, which every
 /// `Storage::append_ingested_safe_inputs_with_timestamp` call maintains
 /// atomically once the era exists.
 pub(super) fn find_first_batch_in_danger(conn: &Connection, threshold: u64) -> Result<Option<u64>> {

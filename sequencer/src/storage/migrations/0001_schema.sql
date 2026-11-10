@@ -1,15 +1,18 @@
 -- ---------------------------------------------------------------------------
 -- Batch lifecycle
 --
--- A batch has two monotonic events in its lifetime, each stored as a nullable
--- write-once timestamp on the row:
+-- A batch has three monotonic events in its lifetime, each stored as a
+-- nullable write-once column on the row:
 --
 --   * `sealed_at_ms`      — inclusion lane closed the batch (no more ops).
+--   * `accepted_input`    — input reader saw the scheduler accept the batch's
+--                           landing at that safe input (I9).
 --   * `invalidated_at_ms` — recovery cascade-invalidated the batch.
 --
 -- NULL means the event hasn't happened. `trg_batch_lifecycle` below makes each
--- write-once. The only "mutable" state on the row is these two NULL→value
--- transitions, each owned by exactly one writer (inclusion lane vs recovery).
+-- write-once. The only "mutable" state on the row is these three NULL→value
+-- transitions, each owned by exactly one writer (inclusion lane, input reader,
+-- recovery). An accepted batch is never invalidated.
 --
 -- The **Tip** is the one batch currently accepting ops: sealed_at_ms IS NULL
 -- AND invalidated_at_ms IS NULL. A partial unique index enforces at-most-one.
@@ -31,6 +34,10 @@
 -- compares an accepted L1 landing against it; because the sealing code computed
 -- it, it survives wire-format upgrades. NULL exactly on a never-sealed batch
 -- (the open Tip, or a Tip a cascade invalidated).
+-- `accepted_input` is the safe input whose landing of this batch the scheduler
+-- accepted; the accepted batches are a prefix of the valid path, in input
+-- order, and the greatest one is the accepted frontier. Its UNIQUE index
+-- serves the frontier reads.
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     nonce              INTEGER NOT NULL CHECK (nonce >= 0),
@@ -38,7 +45,9 @@ CREATE TABLE IF NOT EXISTS batches (
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
     payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32),
-    CHECK ((sealed_at_ms IS NULL) = (payload_hash IS NULL))
+    accepted_input     INTEGER UNIQUE REFERENCES safe_inputs(safe_input_index),
+    CHECK ((sealed_at_ms IS NULL) = (payload_hash IS NULL)),
+    CHECK (accepted_input IS NULL OR (sealed_at_ms IS NOT NULL AND invalidated_at_ms IS NULL))
 ) STRICT;
 
 -- "At most one valid Tip" — structural via partial unique index. The predicate
@@ -83,31 +92,61 @@ CREATE VIEW IF NOT EXISTS valid_open_batch AS
 -- every column before any trigger runs, so trigger arithmetic, frontier folds
 -- and comparisons only ever see the declared class (integers where they count).
 
--- Nonce contiguity: a new batch carries the last valid nonce + 1, or the era's
+-- A batch is inserted unaccepted (acceptance is an UPDATE, which the triggers
+-- below order), carrying the last valid nonce + 1, or the era's
 -- `anchor_batch_nonce` (its next batch nonce at the stop block) when no batch
 -- is valid. With neither the right side is NULL, `IS NOT` holds and the insert
 -- aborts: no batch exists before the era. SQLite fires the most recently
 -- created BEFORE trigger first, so the divergence freeze (created below) answers
 -- before this one while its marker exists.
-CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
+CREATE TRIGGER IF NOT EXISTS trg_batch_insert
 BEFORE INSERT ON batches FOR EACH ROW
-WHEN NEW.nonce IS NOT COALESCE(
-    (SELECT MAX(nonce) + 1 FROM batches WHERE invalidated_at_ms IS NULL),
-    (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0))
-BEGIN SELECT RAISE(ABORT, 'a batch nonce is the last valid nonce + 1, or the era anchor'); END;
+BEGIN
+    SELECT CASE
+        WHEN NEW.accepted_input IS NOT NULL
+            THEN RAISE(ABORT, 'a batch is inserted unaccepted')
+        WHEN NEW.nonce IS NOT COALESCE(
+                (SELECT MAX(nonce) + 1 FROM batches WHERE invalidated_at_ms IS NULL),
+                (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0))
+            THEN RAISE(ABORT, 'a batch nonce is the last valid nonce + 1, or the era anchor')
+    END;
+END;
 
--- A batch row changes only by sealing once, with its hash, while valid, or by
--- being invalidated once. The divergence freeze (created below) answers first.
+-- A batch row changes only by sealing once, with its hash, while valid and
+-- unaccepted; by being accepted once while sealed and valid; or by being
+-- invalidated once while unaccepted. SQLite fires the most recently created
+-- BEFORE trigger first: the divergence freeze (created below) answers first,
+-- then the acceptance order, then this one.
 CREATE TRIGGER IF NOT EXISTS trg_batch_lifecycle
 BEFORE UPDATE ON batches FOR EACH ROW
 WHEN NOT (NEW.batch_index IS OLD.batch_index AND NEW.nonce IS OLD.nonce
       AND NEW.created_at_ms IS OLD.created_at_ms
       AND ( (OLD.sealed_at_ms IS NULL AND NEW.sealed_at_ms IS NOT NULL
              AND OLD.payload_hash IS NULL AND NEW.payload_hash IS NOT NULL
-             AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NULL)
+             AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NULL
+             AND OLD.accepted_input IS NULL AND NEW.accepted_input IS NULL)
+         OR (OLD.sealed_at_ms IS NOT NULL
+             AND NEW.sealed_at_ms IS OLD.sealed_at_ms AND NEW.payload_hash IS OLD.payload_hash
+             AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NULL
+             AND OLD.accepted_input IS NULL AND NEW.accepted_input IS NOT NULL)
          OR (NEW.sealed_at_ms IS OLD.sealed_at_ms AND NEW.payload_hash IS OLD.payload_hash
+             AND OLD.accepted_input IS NULL AND NEW.accepted_input IS NULL
              AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NOT NULL)))
-BEGIN SELECT RAISE(ABORT, 'a batch changes only by sealing once with its hash, or by invalidating once'); END;
+BEGIN SELECT RAISE(ABORT, 'a batch changes only by sealing once with its hash, by being accepted once while sealed, or by invalidating once while unaccepted'); END;
+
+-- Acceptance extends the accepted prefix of the valid path: the accepted
+-- batch carries the greatest accepted batch's nonce + 1 (the era anchor
+-- before any acceptance) and a later input than every earlier acceptance.
+-- With no accepted batch and no era the right side is NULL, `IS NOT` holds and
+-- the update aborts.
+CREATE TRIGGER IF NOT EXISTS trg_batch_acceptance_extends_the_prefix
+BEFORE UPDATE OF accepted_input ON batches FOR EACH ROW
+WHEN OLD.accepted_input IS NULL AND NEW.accepted_input IS NOT NULL AND (
+     NEW.nonce IS NOT COALESCE(
+         (SELECT nonce + 1 FROM batches WHERE accepted_input = (SELECT MAX(accepted_input) FROM batches)),
+         (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0))
+  OR NEW.accepted_input <= COALESCE((SELECT MAX(accepted_input) FROM batches), -1))
+BEGIN SELECT RAISE(ABORT, 'an acceptance extends the accepted prefix of the valid path'); END;
 
 -- ---------------------------------------------------------------------------
 -- Frames and user ops: must target the current Tip.
@@ -227,23 +266,6 @@ CREATE INDEX IF NOT EXISTS idx_application_inputs_frame
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
     ON safe_inputs(block_number, safe_input_index);
 
--- Derived log of batch submissions the scheduler would actually execute.
--- Unlike a raw log of all safe submissions, this only contains the accepted
--- prefix: batches whose nonce matched the expected sequence and were not stale.
--- Maintained atomically by Storage::append_ingested_safe_inputs_with_timestamp
--- (via populate_safe_accepted_batches), which simulates the scheduler's
--- acceptance logic over new safe_inputs rows from the pinned batch submitter.
--- Empty until the era exists: setup's syncs leave it unwritten, and the first
--- append after the era judges every submitter input past the stop block.
-CREATE TABLE IF NOT EXISTS safe_accepted_batches (
-    safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
-    -- CHECK aligns this column with its siblings (batches.nonce, anchor nonce);
-    -- the writer is u64-sourced, so a negative value is corruption.
-    nonce                INTEGER NOT NULL CHECK (nonce >= 0),
-    first_frame_safe_block INTEGER NOT NULL,
-    inclusion_block      INTEGER NOT NULL
-) STRICT;
-
 CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     -- Highest L1 safe block the input reader has observed and atomically synced into storage.
@@ -288,13 +310,12 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
 ) STRICT;
 
 -- I15 structural enforcement: while the divergence marker exists, the batch
--- tree and snapshot collection are frozen in the engine
+-- tree, its accepted frontier and snapshot collection are frozen in the engine
 -- itself. Standard recovery is forbidden on a diverged frontier; the typed
 -- Rust refusals (the local-first startup recovery procedure plus guarded Tip/Cascade
 -- mutations and atomic runtime admission) remain the friendly error surface, but these
--- triggers are the enforcement a forgotten call site cannot bypass. The accepted
--- frontier (`safe_accepted_batches`) has no trigger: its single writer refuses
--- past the marker in Rust.
+-- triggers are the enforcement a forgotten call site cannot bypass. Created
+-- after every other BEFORE trigger on `batches`, so they answer first.
 CREATE TRIGGER IF NOT EXISTS trg_batches_frozen_on_divergence_insert
 BEFORE INSERT ON batches FOR EACH ROW
 WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
@@ -635,7 +656,7 @@ FROM batch_policy;
 -- Snapshot dumps
 --
 -- Immutable snapshots belong to one local batch, or to the era baseline.
--- Acceptance is derived from safe_accepted_batches; it never mutates snapshots.
+-- Acceptance is read from `batches.accepted_input`; it never mutates snapshots.
 -- Lease acquisition and garbage collection serialize in SQLite. Files are
 -- durable before insertion; database rows are deleted before filesystem cleanup.
 -- ---------------------------------------------------------------------------

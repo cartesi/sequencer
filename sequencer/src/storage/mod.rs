@@ -6,6 +6,7 @@
 //! shared reads in `queries` and shared writes in `mutations`. The schema and
 //! `valid_*` views live in `migrations/0001_schema.sql`.
 
+mod acceptance;
 mod convert;
 mod egress;
 mod fee_oracle;
@@ -19,7 +20,6 @@ mod open;
 mod queries;
 mod rebuilt_history;
 mod recovery;
-mod safe_accepted_batches;
 mod snapshot_dumps;
 
 #[cfg(test)]

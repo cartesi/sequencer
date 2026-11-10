@@ -126,18 +126,18 @@ impl Storage {
         self.write(|tx| {
             let anchor = rollback_snapshot_in(tx)?;
             let anchor_id = anchor.as_ref().map(|s| s.dump.id);
-            let accepted_nonce =
-                latest_accepted_boundary_in(tx)?.map(|(_, nonce, _)| u64_to_i64(nonce));
+            // Collectible: not the rollback snapshot, and its batch is not a
+            // valid closed batch (the baseline included) or is accepted.
             let candidates = {
                 let mut stmt = tx.prepare(
                     "SELECT d.id, d.prefix FROM dumps d \
                      LEFT JOIN snapshots s ON s.dump_id = d.id \
                      LEFT JOIN valid_closed_batches b ON b.batch_index = s.batch_index \
                      WHERE d.lease_count = 0 AND (?1 IS NULL OR d.id != ?1) \
-                       AND (b.batch_index IS NULL OR (?2 IS NOT NULL AND b.nonce <= ?2)) \
+                       AND (b.batch_index IS NULL OR b.accepted_input IS NOT NULL) \
                      ORDER BY d.id",
                 )?;
-                stmt.query_map(params![anchor_id, accepted_nonce], row_to_dump_row)?
+                stmt.query_map(params![anchor_id], row_to_dump_row)?
                     .collect::<Result<Vec<_>>>()?
             };
             for dump in &candidates {
@@ -298,11 +298,13 @@ fn rollback_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     }
 }
 
+/// The greatest accepted batch: `(batch_index, nonce, inclusion block)`, the
+/// block of the safe input that carried its accepted landing.
 fn latest_accepted_boundary_in(conn: &Connection) -> Result<Option<(u64, u64, u64)>> {
     conn.query_row(
-        "SELECT b.batch_index, a.nonce, a.inclusion_block FROM safe_accepted_batches a \
-         LEFT JOIN valid_closed_batches b ON b.nonce = a.nonce \
-         ORDER BY a.safe_input_index DESC LIMIT 1",
+        "SELECT b.batch_index, b.nonce, s.block_number FROM batches b \
+         JOIN safe_inputs s ON s.safe_input_index = b.accepted_input \
+         WHERE b.accepted_input = (SELECT MAX(accepted_input) FROM batches)",
         [],
         |row| {
             Ok((
@@ -339,7 +341,7 @@ pub(super) fn finalized_dump_in(
 ) -> std::result::Result<Option<FinalizedDump>, FinalizedSelectionError> {
     // A matched batch can precede a divergent accepted batch in the same L1
     // block. Its snapshot cannot represent that complete block boundary.
-    if super::safe_accepted_batches::canonical_divergence_in(conn)?.is_some() {
+    if super::acceptance::canonical_divergence_in(conn)?.is_some() {
         return Err(FinalizedSelectionError::CanonicalDivergence);
     }
     if let Some((batch_index, nonce, inclusion_block)) = latest_accepted_boundary_in(conn)? {

@@ -103,7 +103,7 @@ pub struct BatchCounts {
 pub struct BatchNonceFrontier {
     /// Highest nonce among valid sealed batches.
     pub sealed: Option<u64>,
-    /// Highest nonce in `safe_accepted_batches`.
+    /// Highest accepted batch nonce (`batches.accepted_input` set).
     pub safe_accepted: Option<u64>,
 }
 
@@ -633,15 +633,14 @@ impl ManagedSequencer {
         Ok(())
     }
 
-    /// Read-only snapshot of the `safe_accepted_batches` view: rows
-    /// recovered from the L1-side scheduler frontier (i.e., batches the
-    /// sequencer has *observed accepted on chain*). Returns `(count,
-    /// min_nonce)` — count is the row count, min_nonce is `MIN(nonce)` or
-    /// `None` if empty.
+    /// Read-only snapshot of the accepted batches (`batches.accepted_input`
+    /// set): the batches the sequencer has *observed accepted on chain*.
+    /// Returns `(count, min_nonce)` — the accepted batch count and their
+    /// `MIN(nonce)`, or `None` if none.
     ///
     /// Used by the nonce-0 recovery test to confirm a recovery batch (which reuses nonce 0)
     /// actually lands and gets accepted on L1 — proving the
-    /// `populate_safe_accepted_batches` cursor handles
+    /// `record_accepted_batches` cursor handles
     /// reused-nonce-after-cascade correctly.
     pub fn count_safe_accepted_batches(&self) -> HarnessResult<(u64, Option<u64>)> {
         let db_path = self.data_dir_path.join("sequencer.db");
@@ -652,14 +651,18 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
-            .map_err(|err| io_other(format!("count safe_accepted_batches: {err}")))?;
+            .query_row(
+                "SELECT COUNT(*) FROM batches WHERE accepted_input IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| io_other(format!("count accepted batches: {err}")))?;
         let min_nonce: Option<i64> = conn
-            .query_row("SELECT MIN(nonce) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT MIN(nonce) FROM batches WHERE accepted_input IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|err| io_other(format!("min nonce: {err}")))?;
         Ok((count as u64, min_nonce.map(|n| n as u64)))
     }
@@ -681,9 +684,11 @@ impl ManagedSequencer {
             )
             .map_err(|err| io_other(format!("max sealed batch nonce: {err}")))?;
         let safe_accepted: Option<i64> = conn
-            .query_row("SELECT MAX(nonce) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT MAX(nonce) FROM batches WHERE accepted_input IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|err| io_other(format!("max safe-accepted batch nonce: {err}")))?;
         Ok(BatchNonceFrontier {
             sealed: sealed.map(|n| n as u64),
@@ -858,7 +863,7 @@ impl ManagedSequencer {
 
         // The era's anchor: the first valid nonce (0 for a genesis deployment,
         // N' for a cockroach-recovered one). Mirrors
-        // `trg_enforce_nonce_contiguity`. Reuses the `batch_tree_anchor()`
+        // `trg_batch_insert`. Reuses the `batch_tree_anchor()`
         // accessor (its own short-lived read-only handle) rather than
         // re-issuing the query against `conn`.
         let anchor = self.batch_tree_anchor()? as i64;

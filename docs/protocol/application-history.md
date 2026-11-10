@@ -19,7 +19,7 @@ These facts answer different questions:
 |---|---|
 | `L2TxCount` | Number of L2 transactions already executed; at count `N`, entry `N` executes next. |
 | Latest surviving frame's `safe_block` | Complete L1 interval accounted for by local ordering, bounded below by the era baseline. |
-| `safe_accepted_batches` | Safe L1 landings accepted by the scheduler rules and matched to local sealed bytes. |
+| `batches.accepted_input` | The safe L1 landing of a local sealed batch, accepted by the scheduler rules and matched to its bytes. |
 
 A frame can account for an empty interval or only batch envelopes, advancing
 L1 accounting without executing an application input. An accepted batch can
