@@ -27,9 +27,10 @@ instance kept down.
   the scheduler's: its counts, its batch nonce, its clock and where its queue
   of directs starts. L1 holds the queued directs themselves. Nothing below the
   machine is rebuilt.
-- **The scheduler alone rebuilds the history.** From the machine's scheduler
+- **The scheduler never reads the application.** From the machine's scheduler
   state and the L1 inputs after it, the scheduler decides which transactions
-  run, in order, without the application. The application then executes them.
+  are handed out, in order. Setup feeds it one input at a time and the
+  application executes each transaction as it is handed out.
 - **Setup is one procedure from any base.** A new deployment starts from
   genesis, a recovery from a machine. Recovery is needed exactly when L1 shows
   the old submitter's activity past the base.

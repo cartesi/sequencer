@@ -124,8 +124,9 @@ pub struct PublishedEra {
     pub next_batch_nonce: u64,
 }
 
-/// The rows setup's rebuild stored, and how many of them executed (a skipped
-/// user op keeps no count). Returned by [`ManagedSequencer::rebuilt_history_rows`].
+/// The rows setup's rebuild stored, and how many carry a count. Only an
+/// executed transaction is stored, with its count, so the two agree.
+/// Returned by [`ManagedSequencer::rebuilt_history_rows`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuiltHistoryRows {
     pub total: u64,
@@ -749,7 +750,7 @@ impl ManagedSequencer {
         })
     }
 
-    /// How many rows setup's rebuild stored, and how many executed.
+    /// How many rows setup's rebuild stored, and how many carry a count.
     pub fn rebuilt_history_rows(&self) -> HarnessResult<RebuiltHistoryRows> {
         let conn = self.read_only_connection()?;
         let (total, executed): (i64, i64) = conn

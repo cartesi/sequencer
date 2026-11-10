@@ -501,15 +501,19 @@ pub enum SetupError {
         synced_safe_block: u64,
         stop_block: u64,
     },
-    /// The application failed on a rebuilt transaction. Replaying a trusted
-    /// machine to that input says whether the application is dead on chain.
+    /// The application failed on a rebuilt transaction: the `position`-th
+    /// the scheduler handed out for input `l1_input_index`, skipped ones
+    /// included. Replaying a trusted machine to that input says whether the
+    /// application is dead on chain.
     #[error(
         "the application failed on the rebuilt transaction at input {l1_input_index}, \
-         position {position}: {source}"
+         position {position} ({transaction}): {source}"
     )]
     HistoryExecution {
         l1_input_index: u64,
         position: u64,
+        /// A direct's input index, or a user op's sender and nonce.
+        transaction: String,
         #[source]
         source: AppError,
     },
@@ -1229,6 +1233,7 @@ mod tests {
                 CommandError::from(SetupError::HistoryExecution {
                     l1_input_index: 7,
                     position: 2,
+                    transaction: "direct input 4".to_owned(),
                     source: AppError::Io(std::io::Error::other("disk unavailable")),
                 }),
                 "an application failure on the rebuilt history",

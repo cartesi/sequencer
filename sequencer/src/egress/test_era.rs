@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::egress::l2_tx_feed::BroadcastTxMessage;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::test_helpers::default_protocol_timing;
-use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra, RebuiltKey, Storage};
+use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra, Storage};
 use crate::test_support::pin_test_deployment_identity;
 
 pub(crate) const BASE: u64 = 41;
@@ -95,27 +95,15 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
         batch_nonce: 3,
         tx: L2Tx::UserOp(rebuilt_op(nonce)),
     };
+    // The op at nonce 5 is skipped, so it has no row.
     storage
         .append_rebuilt_history(&[
-            (0, direct(0, 3)),
-            (1, op(0)),
-            (1, op(5)),
-            (1, op(1)),
-            (2, direct(2, 4)),
+            (L2TxCount::new(41), direct(0, 3)),
+            (L2TxCount::new(42), op(0)),
+            (L2TxCount::new(43), op(1)),
+            (L2TxCount::new(44), direct(2, 4)),
         ])
         .expect("store the rebuilt history");
-    let key = |l1_input_index, position| RebuiltKey {
-        l1_input_index,
-        position,
-    };
-    storage
-        .record_rebuilt_counts(&[
-            (key(0, 0), L2TxCount::new(41)),
-            (key(1, 0), L2TxCount::new(42)),
-            (key(1, 2), L2TxCount::new(43)),
-            (key(2, 0), L2TxCount::new(44)),
-        ])
-        .expect("record the executed rows' counts");
     storage
         .publish_era(
             baseline_prefix,
@@ -134,7 +122,7 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
 /// The feed message for each count from the base through the root frame's
 /// queued direct, as JSON: a direct carries its input's block, timestamp and
 /// transaction hash with its own row's batch nonce, and the skipped op has
-/// no count, so it never appears.
+/// no row, so it never appears.
 pub(crate) fn expected_feed_message(offset: u64) -> serde_json::Value {
     let direct = |index: u64, batch_nonce| {
         let input = safe_input(index);

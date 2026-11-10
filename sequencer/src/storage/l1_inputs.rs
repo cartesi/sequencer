@@ -17,7 +17,7 @@ use super::queries::{
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput};
+use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange};
 use sequencer_core::protocol::ProtocolTiming;
 
 /// What a base's export is checked against: the admitted directs above its
@@ -181,6 +181,33 @@ impl Storage {
                         first_index: row.get::<_, Option<i64>>(1)?.map(i64_to_u64),
                     })
                 },
+            )
+        })
+    }
+
+    /// How many inputs with an index in `range` execute as directs, by the
+    /// predicate every drain uses. Setup checks its executed directs against it.
+    pub fn admitted_directs_in(
+        &mut self,
+        range: SafeInputRange,
+        max_direct_payload_bytes: u64,
+    ) -> Result<u64> {
+        self.read(|tx| {
+            let identity =
+                query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            tx.prepare_cached(&format!(
+                "SELECT COUNT(*) FROM safe_inputs \
+                 WHERE safe_input_index >= :start AND safe_input_index < :end \
+                   AND {DIRECT_EXECUTES_SQL}"
+            ))?
+            .query_row(
+                named_params! {
+                    ":start": saturating_query_bound(range.start()),
+                    ":end": saturating_query_bound(range.end()),
+                    ":batch_submitter": identity.batch_submitter_address.as_slice(),
+                    ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
+                },
+                |row| Ok(i64_to_u64(row.get(0)?)),
             )
         })
     }
@@ -403,7 +430,8 @@ fn insert_safe_inputs_batch(
 mod tests {
     use super::AdmittedDirects;
     use crate::storage::{
-        DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, Storage, StoredSafeInput,
+        DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange, Storage,
+        StoredSafeInput,
         test_helpers::{
             SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
         },
@@ -642,6 +670,27 @@ mod tests {
                 .expect("count"),
             5
         );
+    }
+
+    #[test]
+    fn counts_the_admitted_directs_in_an_index_range() {
+        let db = temp_db("admitted-in-range");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        seed_classified_inputs(&mut storage);
+        let count = |storage: &mut Storage, start, end| {
+            storage
+                .admitted_directs_in(
+                    SafeInputRange::new(start, end),
+                    TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                )
+                .expect("count")
+        };
+        // Input 1 is the submitter's and input 2 is over the cap.
+        assert_eq!(count(&mut storage, 0, 5), 3);
+        assert_eq!(count(&mut storage, 1, 3), 0);
+        assert_eq!(count(&mut storage, 1, 4), 1);
+        assert_eq!(count(&mut storage, 4, 4), 0);
+        assert_eq!(count(&mut storage, 0, u64::MAX), 3);
     }
 
     #[test]

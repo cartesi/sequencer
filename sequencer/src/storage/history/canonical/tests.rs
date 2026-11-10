@@ -11,7 +11,6 @@ use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::insert_era_in;
-use crate::storage::rebuilt_history::RebuiltKey;
 use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
@@ -278,26 +277,17 @@ fn seed_two_table_era(storage: &mut Storage) {
             &default_protocol_timing(),
         )
         .unwrap();
+    // The op at nonce 5 is skipped, so it has no row.
     storage
         .append_rebuilt_history(&[
-            (0, scheduled_direct(0, 3)),
-            (1, scheduled_op(0, 3)),
-            (1, scheduled_op(5, 3)),
+            (L2TxCount::new(41), scheduled_direct(0, 3)),
+            (L2TxCount::new(42), scheduled_op(0, 3)),
         ])
         .unwrap();
     storage
-        .append_rebuilt_history(&[(1, scheduled_op(1, 3)), (2, scheduled_direct(2, 4))])
-        .unwrap();
-    let key = |l1_input_index, position| RebuiltKey {
-        l1_input_index,
-        position,
-    };
-    storage
-        .record_rebuilt_counts(&[
-            (key(0, 0), L2TxCount::new(41)),
-            (key(1, 0), L2TxCount::new(42)),
-            (key(1, 2), L2TxCount::new(43)),
-            (key(2, 0), L2TxCount::new(44)),
+        .append_rebuilt_history(&[
+            (L2TxCount::new(43), scheduled_op(1, 3)),
+            (L2TxCount::new(44), scheduled_direct(2, 4)),
         ])
         .unwrap();
     storage
@@ -372,7 +362,7 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
         }
         other => panic!("expected the rebuilt direct, got {other:?}"),
     }
-    // The skipped op (nonce 5) has no count, so the feed leaves it out.
+    // The skipped op (nonce 5) has no row, so the feed leaves it out.
     let rebuilt_ops: Vec<_> = whole.rows[1..3]
         .iter()
         .map(|row| match &row.context {
@@ -422,15 +412,15 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
 
 #[test]
 #[should_panic(expected = "canonical history page has an attribution gap")]
-fn a_missing_rebuilt_count_below_the_end_fails_loud() {
+fn a_missing_rebuilt_row_below_the_end_fails_loud() {
     let db = temp_db("canonical-page-rebuilt-hole");
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     seed_two_table_era(&mut storage);
     storage
         .conn
         .execute_batch(
-            "DROP TRIGGER trg_rebuilt_history_count_once; \
-             UPDATE rebuilt_history SET l2_tx_count = NULL WHERE l2_tx_count = 42;",
+            "DROP TRIGGER trg_rebuilt_history_not_deletable; \
+             DELETE FROM rebuilt_history WHERE l2_tx_count = 42;",
         )
         .unwrap();
     let bounds = storage.history_bounds().unwrap();

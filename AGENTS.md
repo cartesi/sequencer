@@ -95,7 +95,8 @@ so invalidation cascades through the suffix, open batch included
 - **Cockroach recovery** rebuilds a new data directory from a trusted
   canonical machine and L1 history, including after a sequencer bug:
   `setup --base <machine>` rebuilds the history through a stop block with the
-  scheduler alone, executes it, and publishes a new era
+  scheduler, executing each transaction as it is handed out, and publishes a
+  new era
   ([cockroach recovery](docs/recovery/cockroach.md)).
 
 ## Threat Model (brief)

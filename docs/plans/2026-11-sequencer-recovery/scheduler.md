@@ -90,7 +90,7 @@ inputs; the application affects them only by halting the machine. Whether the
 application executes a user op changes none of them. The scheduler runs no
 application code either: the fridge admits by sender and payload length. A
 port must keep this property: it is what lets the sequencer run the scheduler
-without the application during a recovery.
+apart from the application during a recovery.
 
 **The fridge is a queue.** Directs join at the back in input order and leave
 only from the front, whichever rule drains them. So the fridge always holds
@@ -449,10 +449,11 @@ application supplies only its own state.
 
 ## The scheduler's interface
 
-During a recovery the sequencer runs the scheduler without the application:
-first it schedules the whole rebuilt range, then the application executes it.
-That needs a free-standing scheduler with an interface of its own, as the
-application has its trait and its C binding.
+During a recovery the sequencer runs the scheduler apart from the
+application: it feeds the scheduler one input, then executes each
+transaction the scheduler hands out for it. The scheduler never reads the
+application. That needs a free-standing scheduler with an interface of its
+own, as the application has its trait and its C binding.
 [Interfaces](interfaces.md#the-scheduler) proposes it, in Rust and in C, to
 settle with Bart. This page fixes the scheduler's behavior whatever the
 interface.

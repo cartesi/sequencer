@@ -310,6 +310,14 @@ fn feed(storage: &mut Storage, from: u64) -> Vec<Row> {
         .collect()
 }
 
+/// How many rows the rebuilt history holds.
+fn rebuilt_rows(storage: &mut Storage) -> u64 {
+    storage
+        .read(|tx| tx.query_row("SELECT COUNT(*) FROM rebuilt_history", [], |row| row.get(0)))
+        .map(|count: i64| u64::try_from(count).unwrap())
+        .unwrap()
+}
+
 fn genesis_wallet(chain: &Chain) -> impl FnOnce() -> Result<WalletApp, AppError> {
     let app = chain.wallet();
     move || Ok(app)
@@ -434,13 +442,23 @@ async fn setup_from_genesis_rebuilds_a_chain_with_batches() {
             .any(|(_, tx, _)| matches!(tx, L2Tx::UserOp(_))),
         "the rebuilt history holds the accepted batches' ops"
     );
-    let skipped = Storage::open(&db_path)
-        .unwrap()
-        .rebuilt_history_after(None, 1024)
-        .unwrap()
-        .len()
-        - usize::try_from(runner.app().l2_tx_count().get()).unwrap();
-    assert_eq!(skipped, 1, "the skipped op is stored without a count");
+    let skipped = {
+        let mut storage = Storage::open(&db_path).unwrap();
+        let mut reference = CanonicalRunner::genesis(chain.wallet(), chain.scheduler_config());
+        storage
+            .l1_inputs_page(0, 7, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .flat_map(|input| reference.process_input(input).unwrap().txs)
+            .filter(|record| matches!(record.fate, TxFate::Skipped(_)))
+            .count()
+    };
+    assert_eq!(skipped, 1, "the canonical run of this chain skips one op");
+    assert_eq!(
+        rebuilt_rows(&mut Storage::open(&db_path).unwrap()),
+        runner.app().l2_tx_count().get(),
+        "only executed transactions are stored: the skipped op has no row"
+    );
     let left: Vec<String> = std::fs::read_dir(data_dir.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -604,7 +622,7 @@ async fn setup_refuses_an_export_that_disagrees_with_l1_before_publishing() {
         !storage.is_setup_complete().unwrap(),
         "nothing is published"
     );
-    assert!(storage.rebuilt_history_after(None, 1).unwrap().is_empty());
+    assert_eq!(rebuilt_rows(&mut storage), 0);
     assert!(
         storage
             .latest_terminal_fault()

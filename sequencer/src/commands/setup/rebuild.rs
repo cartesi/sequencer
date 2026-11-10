@@ -2,20 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Steps 4 to 6 of setup, over an input table synced through the stop block:
-//! check the base's export against L1, rebuild the history with the scheduler
-//! alone, then execute it. Every pass streams the tables in pages, so memory
-//! stays bounded however long the rebuilt range is.
+//! check the base's export against L1, then rebuild the history with the
+//! scheduler, executing each transaction as it is handed out. Inputs and rows
+//! move in pages, so memory stays bounded however long the range is.
 
 use alloy_primitives::Address;
 use sequencer_core::application::{Application, Executed, execute};
+use sequencer_core::history::L2TxCount;
+use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::scheduler::{
     L1Input, Scheduled, Scheduler, SchedulerConfig, SchedulerExport, SchedulerState,
 };
 
 use crate::commands::error::{CommandError, SetupError};
-use crate::storage::{RebuiltKey, Storage};
+use crate::storage::{SafeInputRange, Storage};
 
-/// Rows per page in every pass. Tests use a tiny page, so their few rows
+/// Inputs and rows per page. Tests use a tiny page, so their few rows
 /// already cross page boundaries inside one input and inside the resume range.
 #[cfg(not(test))]
 const PAGE: usize = 1024;
@@ -94,22 +96,25 @@ pub(crate) fn check_clock(state: &SchedulerState, stop_block: u64) -> Result<(),
     Ok(())
 }
 
-/// Step 5: resume the scheduler from the export with the inputs it still had
-/// queued, feed it every input it has not consumed through the stop block,
-/// and store each transaction it hands out, in order and without a count.
-/// Returns the scheduler's state at the end of the stop block.
-pub(crate) fn rebuild_history(
+/// Steps 5 and 6: resume the scheduler from the export with the inputs it
+/// still had queued, feed it every input it has not consumed through the stop
+/// block, and execute each transaction it hands out through the shared executor.
+/// An executed one is stored with its count; a skipped user op is not. An
+/// application error stops setup at that transaction. Returns the
+/// scheduler's state at the end of the stop block.
+pub(crate) fn rebuild_history<A: Application>(
     storage: &mut Storage,
+    app: &mut A,
     config: SchedulerConfig,
     export: &SchedulerExport,
     inputs_through_stop: u64,
     stop_block: u64,
 ) -> Result<SchedulerState, CommandError> {
     let mut scheduler = resume_from_export(storage, config, export)?;
-    let state = export.scheduler_state();
+    check_clock(&scheduler.state(), stop_block)?;
 
-    let mut rows: Vec<(u64, Scheduled)> = Vec::with_capacity(PAGE);
-    let mut next = state.l1_input_count;
+    let mut rows: Vec<(L2TxCount, Scheduled)> = Vec::with_capacity(PAGE);
+    let mut next = export.l1_input_count;
     while next < inputs_through_stop {
         let page = storage.l1_inputs_page(next, inputs_through_stop, PAGE)?;
         assert!(
@@ -118,16 +123,39 @@ pub(crate) fn rebuild_history(
              through the stop block"
         );
         for input in page {
-            let index = input.index;
+            let l1_input_index = input.index;
             scheduler.feed(input);
+            // Every transaction the input released, skipped ones included.
+            let mut position: u64 = 0;
             while let Some(scheduled) = scheduler.next_tx() {
-                rows.push((index, scheduled));
-                if rows.len() == PAGE {
-                    storage.append_rebuilt_history(&rows)?;
-                    rows.clear();
+                let executed = execute(app, &scheduled.tx);
+                match (executed, &scheduled.tx) {
+                    (Ok(Executed::Done { index, .. }), _) => {
+                        rows.push((index, scheduled));
+                        if rows.len() == PAGE {
+                            storage.append_rebuilt_history(&rows)?;
+                            rows.clear();
+                        }
+                    }
+                    (Ok(Executed::Skipped(_)), L2Tx::UserOp(_)) => {}
+                    (Ok(Executed::Skipped(_)), L2Tx::Direct(_)) => {
+                        unreachable!("a direct never skips")
+                    }
+                    (Err(source), tx) => {
+                        return Err(SetupError::HistoryExecution {
+                            l1_input_index,
+                            position,
+                            transaction: describe(tx),
+                            source,
+                        }
+                        .into());
+                    }
                 }
+                position = position
+                    .checked_add(1)
+                    .expect("an input's transaction count fits u64");
             }
-            next = index
+            next = l1_input_index
                 .checked_add(1)
                 .expect("an input index has a successor");
         }
@@ -136,39 +164,45 @@ pub(crate) fn rebuild_history(
 
     let end = scheduler.state();
     check_clock(&end, stop_block)?;
+    assert_drained_directs_stored(
+        storage,
+        export.first_queued_input,
+        &end,
+        config.max_direct_payload_bytes,
+    )?;
     Ok(end)
 }
 
-/// Step 6: run the stored rows in order through the shared executor and
-/// record each executed row's count; a skipped user op keeps none. An
-/// application error stops setup at that row.
-pub(crate) fn execute_history<A: Application>(
+/// The stored rows hold only what executed, so the directs are checked against
+/// the input table. The queue is FIFO and holds every admitted direct from the
+/// base's first queued input on, so the drained ones are exactly the admitted
+/// inputs before the final first queued input, and a direct always executes:
+/// the stored directs must be those inputs, each one and no other.
+fn assert_drained_directs_stored(
     storage: &mut Storage,
-    app: &mut A,
+    base_first_queued_input: u64,
+    end: &SchedulerState,
+    max_direct_payload_bytes: u64,
 ) -> Result<(), CommandError> {
-    let mut after: Option<RebuiltKey> = None;
-    loop {
-        let page = storage.rebuilt_history_after(after, PAGE)?;
-        let Some(last) = page.last() else {
-            return Ok(());
-        };
-        after = Some(last.key);
-        let mut counts = Vec::with_capacity(page.len());
-        for row in &page {
-            match execute(app, &row.tx) {
-                Ok(Executed::Done { index, .. }) => counts.push((row.key, index)),
-                Ok(Executed::Skipped(_)) => {}
-                Err(source) => {
-                    return Err(SetupError::HistoryExecution {
-                        l1_input_index: row.key.l1_input_index,
-                        position: row.key.position,
-                        source,
-                    }
-                    .into());
-                }
-            }
-        }
-        storage.record_rebuilt_counts(&counts)?;
+    let drained = SafeInputRange::new(base_first_queued_input, end.first_queued_input);
+    let admitted = storage.admitted_directs_in(drained, max_direct_payload_bytes)?;
+    let rebuilt = storage.rebuilt_directs(drained, max_direct_payload_bytes)?;
+    assert!(
+        rebuilt.stored == admitted && rebuilt.admitted_in_range == admitted,
+        "the rebuild stored {} directs, {} of them admitted inputs in [{base_first_queued_input}, {}), \
+         where {admitted} admitted inputs lie",
+        rebuilt.stored,
+        rebuilt.admitted_in_range,
+        end.first_queued_input
+    );
+    Ok(())
+}
+
+/// The failing transaction for an error: it has no row to point at.
+fn describe(tx: &L2Tx) -> String {
+    match tx {
+        L2Tx::Direct(direct) => format!("direct input {}", direct.input_index),
+        L2Tx::UserOp(op) => format!("user op of {} at nonce {}", op.sender, op.nonce),
     }
 }
 
@@ -376,54 +410,91 @@ mod tests {
         runner
     }
 
-    /// Every stored row and its count, in order.
-    fn stored(storage: &mut Storage) -> Vec<(u64, Scheduled, Option<L2TxCount>)> {
-        let rows = storage.rebuilt_history_after(None, usize::MAX).unwrap();
-        let counts: Vec<Option<i64>> = storage
+    /// Every stored row with its count, in count order. A direct reads its
+    /// fields back from the input table.
+    fn stored(storage: &mut Storage) -> Vec<(L2TxCount, Scheduled)> {
+        let to_u64 = |value: i64| u64::try_from(value).unwrap();
+        storage
             .read(|tx| {
                 let mut statement = tx.prepare(
-                    "SELECT l2_tx_count FROM rebuilt_history ORDER BY l1_input_index, position",
+                    "SELECT r.l2_tx_count, r.batch_nonce, r.safe_input_index, r.sender, \
+                            r.nonce, r.fee, r.safe_block, r.data, \
+                            d.sender, d.block_number, d.block_timestamp, d.payload \
+                     FROM rebuilt_history r \
+                     LEFT JOIN safe_inputs d ON d.safe_input_index = r.safe_input_index \
+                     ORDER BY r.l2_tx_count",
                 )?;
                 statement
-                    .query_map([], |row| row.get(0))?
+                    .query_map([], |row| {
+                        let tx = match row.get::<_, Option<i64>>(2)? {
+                            Some(input_index) => L2Tx::Direct(Direct {
+                                input_index: to_u64(input_index),
+                                sender: Address::from_slice(&row.get::<_, Vec<u8>>(8)?),
+                                block: to_u64(row.get(9)?),
+                                timestamp: to_u64(row.get(10)?),
+                                payload: row.get(11)?,
+                            }),
+                            None => L2Tx::UserOp(UserOpTx {
+                                sender: Address::from_slice(&row.get::<_, Vec<u8>>(3)?),
+                                nonce: u32::try_from(row.get::<_, i64>(4)?).unwrap(),
+                                fee: u16::try_from(row.get::<_, i64>(5)?).unwrap(),
+                                block: to_u64(row.get(6)?),
+                                data: row.get(7)?,
+                            }),
+                        };
+                        Ok((
+                            L2TxCount::new(to_u64(row.get(0)?)),
+                            Scheduled {
+                                batch_nonce: to_u64(row.get(1)?),
+                                tx,
+                            },
+                        ))
+                    })?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
-            .unwrap();
-        assert_eq!(rows.len(), counts.len());
-        rows.into_iter()
-            .zip(counts)
-            .map(|(row, count)| {
-                (
-                    row.key.l1_input_index,
-                    Scheduled {
-                        batch_nonce: row.batch_nonce,
-                        tx: row.tx,
-                    },
-                    count.map(|count| L2TxCount::new(u64::try_from(count).unwrap())),
-                )
-            })
-            .collect()
+            .unwrap()
     }
 
-    /// What the reference hands out and executes for `inputs[from..to]`.
+    /// What the reference does with `inputs[from..to]`: the transactions it
+    /// executes, each with its count, and the user ops it skips.
+    struct Expected {
+        executed: Vec<(L2TxCount, Scheduled)>,
+        skipped: Vec<Scheduled>,
+    }
+
     fn expected(
         runner: &mut CanonicalRunner<WalletApp>,
         inputs: &[IngestedSafeInput],
         from: usize,
         to: usize,
-    ) -> Vec<(u64, Scheduled, Option<L2TxCount>)> {
-        let mut rows = Vec::new();
+    ) -> Expected {
+        let mut expected = Expected {
+            executed: Vec::new(),
+            skipped: Vec::new(),
+        };
         for (index, input) in (u64::try_from(from).unwrap()..).zip(&inputs[from..to]) {
             let advanced = runner.process_input(l1_input(index, input)).unwrap();
             for record in advanced.txs {
-                let count = match record.fate {
-                    TxFate::Done { index: l2_tx_index } => Some(l2_tx_index),
-                    TxFate::Skipped(_) => None,
-                };
-                rows.push((index, record.scheduled, count));
+                match record.fate {
+                    TxFate::Done { index } => expected.executed.push((index, record.scheduled)),
+                    TxFate::Skipped(_) => expected.skipped.push(record.scheduled),
+                }
             }
         }
-        rows
+        expected
+    }
+
+    /// The stored rows are the executed ones, in order, with their counts,
+    /// batch nonces and contents; no skipped op is stored.
+    fn assert_stored(storage: &mut Storage, expected: &Expected) {
+        let stored = stored(storage);
+        assert_eq!(stored, expected.executed);
+        for skipped in &expected.skipped {
+            assert!(
+                stored.iter().all(|(_, row)| row != skipped),
+                "a skipped op is stored: {skipped:?}"
+            );
+        }
     }
 
     #[test]
@@ -436,14 +507,14 @@ mod tests {
         let export = runner.export();
 
         check_export(&mut storage, &export, through_stop, 30, cap()).unwrap();
-        let state = rebuild_history(&mut storage, config(), &export, through_stop, 30).unwrap();
         let mut app = wallet();
-        execute_history(&mut storage, &mut app).unwrap();
+        let state =
+            rebuild_history(&mut storage, &mut app, config(), &export, through_stop, 30).unwrap();
 
         let expected = expected(&mut runner, &inputs, 0, 9);
-        assert_eq!(stored(&mut storage), expected);
+        assert_stored(&mut storage, &expected);
         assert!(
-            expected.iter().any(|(_, _, count)| count.is_none()),
+            !expected.skipped.is_empty(),
             "the fixture holds a skipped op"
         );
         assert_eq!(state, runner.scheduler().state());
@@ -497,29 +568,28 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let summary = finish(&mut storage, STOP, STOP, (3, 3), data_dir.path()).unwrap();
 
-        // Each row: the L1 input that released it, the direct's input index
-        // (`None` for a user op), and its L2 tx index.
-        let rows: Vec<(u64, Option<u64>, u64)> = stored(&mut storage)
+        // Each row: its L2 tx index, and the direct's input index (`None`
+        // for a user op). Every transaction of this trace executes.
+        let rows: Vec<(u64, Option<u64>)> = stored(&mut storage)
             .into_iter()
-            .map(|(l1_input_index, scheduled, count)| {
+            .map(|(count, scheduled)| {
                 let direct = match scheduled.tx {
                     L2Tx::Direct(direct) => Some(direct.input_index),
                     L2Tx::UserOp(_) => None,
                 };
-                let count = count.expect("every row of this trace executes");
-                (l1_input_index, direct, count.get())
+                (count.get(), direct)
             })
             .collect();
         assert_eq!(
             rows,
             vec![
-                (2, Some(0), 0),
-                (2, None, 1),
-                (5, Some(1), 2),
-                (5, Some(3), 3),
-                (5, Some(4), 4),
-                (7, Some(6), 5),
-                (7, None, 6),
+                (0, Some(0)),
+                (1, None),
+                (2, Some(1)),
+                (3, Some(3)),
+                (4, Some(4)),
+                (5, Some(6)),
+                (6, None),
             ]
         );
         assert_eq!(summary.inputs_to_replay, 8);
@@ -538,7 +608,9 @@ mod tests {
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 8);
 
         let mut runner = reference(&inputs, 0);
-        assert_eq!(stored(&mut storage), expected(&mut runner, &inputs, 0, 8));
+        let expected = expected(&mut runner, &inputs, 0, 8);
+        assert!(expected.skipped.is_empty());
+        assert_stored(&mut storage, &expected);
     }
 
     /// A base in the middle with two directs queued: the rebuild resumes with
@@ -552,12 +624,11 @@ mod tests {
         assert_eq!((export.fridge_len, export.first_queued_input), (2, 1));
 
         check_export(&mut storage, &export, 9, 30, cap()).unwrap();
-        let state = rebuild_history(&mut storage, config(), &export, 9, 30).unwrap();
         let mut app = runner.app().clone();
-        execute_history(&mut storage, &mut app).unwrap();
+        let state = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30).unwrap();
 
         let expected = expected(&mut runner, &inputs, 5, 9);
-        assert_eq!(stored(&mut storage), expected);
+        assert_stored(&mut storage, &expected);
         assert_eq!(state, runner.scheduler().state());
         assert_eq!(
             app.canonical_snapshot_bytes().unwrap(),
@@ -575,15 +646,13 @@ mod tests {
         let mut runner = reference(&inputs, 0);
         let export = runner.export();
 
-        let state = rebuild_history(&mut storage, config(), &export, through_stop, 17).unwrap();
+        let mut app = wallet();
+        let state =
+            rebuild_history(&mut storage, &mut app, config(), &export, through_stop, 17).unwrap();
 
-        // Unexecuted, the rows carry no count yet.
-        let expected: Vec<_> = expected(&mut runner, &inputs, 0, 8)
-            .into_iter()
-            .map(|(index, scheduled, _)| (index, scheduled, None))
-            .collect();
-        assert_eq!(stored(&mut storage), expected);
+        assert_stored(&mut storage, &expected(&mut runner, &inputs, 0, 8));
         assert_eq!(state, runner.scheduler().state());
+        assert_eq!(app.l2_tx_count(), runner.app().l2_tx_count());
         assert_eq!(state.l1_input_count, 8);
     }
 
@@ -692,7 +761,8 @@ mod tests {
             ..reference(&inputs, 5).export()
         };
         check_export(&mut storage, &export, 9, 30, cap()).unwrap();
-        let error = rebuild_history(&mut storage, config(), &export, 9, 30)
+        let mut app = reference(&inputs, 5).app().clone();
+        let error = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30)
             .expect_err("a range that does not match the state is refused");
         assert!(
             matches!(
@@ -712,11 +782,12 @@ mod tests {
         assert!(stored(&mut storage).is_empty());
     }
 
-    /// An application that fails on its second direct.
+    /// An application that fails on its direct number `fail_at` (from 0).
     struct FailingApp {
         count: L2TxCount,
         nonce: u32,
         directs: u32,
+        fail_at: u32,
     }
 
     impl Application for FailingApp {
@@ -729,7 +800,7 @@ mod tests {
             Ok(Vec::new())
         }
         fn apply_direct(&mut self, _direct: &Direct) -> Result<AppOutputs, AppError> {
-            if self.directs == 1 {
+            if self.directs == self.fail_at {
                 return Err(AppError::Internal {
                     reason: "injected".into(),
                 });
@@ -772,44 +843,117 @@ mod tests {
         }
     }
 
-    /// The rows run in pages: an error stops setup at its row, the pages
-    /// before it keep their counts, and its own page records none.
+    /// An error stops setup at the transaction, named by its input, its
+    /// position among the transactions that input released, and what it is,
+    /// since it has no row. Pages flushed before it stay.
     #[test]
-    fn an_application_error_names_the_row_and_keeps_earlier_counts() {
+    fn an_application_error_names_the_input_position_and_transaction() {
         let inputs = chain();
         let (_db, mut storage) = synced("execute-fails", &inputs, 30);
         let export = reference(&inputs, 0).export();
-        rebuild_history(&mut storage, config(), &export, 9, 30).unwrap();
-
         let mut app = FailingApp {
             count: L2TxCount::ZERO,
             nonce: 0,
             directs: 0,
+            fail_at: 2,
         };
-        let error = execute_history(&mut storage, &mut app).expect_err("the application fails");
-        // The second direct is input 1, drained first by the batch at input 7.
+        let error = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30)
+            .expect_err("the application fails");
+        // The third direct is input 4, the second drained by the batch at
+        // input 7, after input 1.
         let CommandError::Bootstrap(crate::commands::BootstrapError::Setup(error)) = error else {
             panic!("expected a setup refusal, got {error:?}");
         };
         assert!(
             matches!(
-                *error,
+                &*error,
                 SetupError::HistoryExecution {
                     l1_input_index: 7,
-                    position: 0,
+                    position: 1,
+                    transaction,
                     ..
-                }
+                } if transaction == "direct input 4"
             ),
             "{error:?}"
         );
-        let counts: Vec<(u64, Option<u64>)> = stored(&mut storage)
+        assert!(
+            error
+                .to_string()
+                .contains("at input 7, position 1 (direct input 4): "),
+            "{error}"
+        );
+        let counts: Vec<u64> = stored(&mut storage)
             .into_iter()
-            .map(|(index, _, count)| (index, count.map(L2TxCount::get)))
+            .map(|(count, _)| count.get())
             .collect();
         assert_eq!(
             counts,
-            vec![(2, Some(0)), (2, Some(1)), (7, None), (7, None), (7, None)],
-            "the first page keeps its counts; the failed page records none"
+            vec![0, 1],
+            "the first page is stored, the second not"
+        );
+
+        let op = L2Tx::UserOp(UserOpTx {
+            sender: DEPOSITOR,
+            nonce: 3,
+            fee: 0,
+            block: 0,
+            data: Vec::new(),
+        });
+        assert_eq!(describe(&op), format!("user op of {DEPOSITOR} at nonce 3"));
+    }
+
+    /// The cross-check reads the stored rows: a drained direct with no row
+    /// leaves the stored directs short of the input table's. No input makes the
+    /// loop drop a direct, so this drives the check on a tampered table; every
+    /// rebuild test above passes through the same check untampered.
+    #[test]
+    #[should_panic(
+        expected = "the rebuild stored 2 directs, 2 of them admitted inputs in [0, 6), \
+                    where 3 admitted inputs lie"
+    )]
+    fn a_drained_direct_without_a_row_trips_the_cross_check() {
+        let inputs = chain();
+        let (_db, mut storage) = synced("cross-check", &inputs, 30);
+        let export = reference(&inputs, 0).export();
+        let mut app = wallet();
+        let end = rebuild_history(&mut storage, &mut app, config(), &export, 9, 30).unwrap();
+        // Inputs 0, 1 and 4 drained; 2 is the submitter's and 3 is over the cap.
+        assert_eq!(end.first_queued_input, 6);
+        assert_drained_directs_stored(&mut storage, 0, &end, cap()).unwrap();
+        storage
+            .write(|tx| {
+                tx.execute_batch(
+                    "DROP TRIGGER trg_rebuilt_history_not_deletable;
+                     DELETE FROM rebuilt_history WHERE safe_input_index = 4;",
+                )
+            })
+            .unwrap();
+        let _ = assert_drained_directs_stored(&mut storage, 0, &end, cap());
+    }
+
+    /// A fridge at its bound drains whole blocks on arrival, and those
+    /// directs execute too: the rebuild still matches the reference, and the
+    /// cross-check counts them.
+    #[test]
+    fn an_overflowing_fridge_rebuilds_like_the_reference() {
+        let inputs = chain();
+        let (_db, mut storage) = synced("rebuild-overflow", &inputs, 30);
+        let bounded = SchedulerConfig {
+            fridge_bound: 1,
+            ..config()
+        };
+        let mut runner = CanonicalRunner::genesis(wallet(), bounded);
+        let export = runner.export();
+        let mut app = wallet();
+        let state = rebuild_history(&mut storage, &mut app, bounded, &export, 9, 30).unwrap();
+
+        let expected = expected(&mut runner, &inputs, 0, 9);
+        assert_stored(&mut storage, &expected);
+        assert_eq!(state, runner.scheduler().state());
+        assert_eq!(
+            (state.first_queued_input, state.fridge_len),
+            (8, 1),
+            "every direct but the last drained"
         );
     }
 
@@ -826,7 +970,8 @@ mod tests {
             ..reference(&inputs, 5).export()
         };
         check_export(&mut storage, &past, 9, 30, cap()).unwrap();
-        let error = rebuild_history(&mut storage, config(), &past, 9, 30)
+        let mut app = reference(&inputs, 5).app().clone();
+        let error = rebuild_history(&mut storage, &mut app, config(), &past, 9, 30)
             .expect_err("the clock is past the stop block");
         assert!(
             matches!(
@@ -840,7 +985,8 @@ mod tests {
         // At the stop block itself the clock is admissible.
         let (_db, mut storage) = synced("clock-at-stop", &inputs, 30);
         let at = SchedulerExport { clock: 30, ..past };
-        rebuild_history(&mut storage, config(), &at, 9, 30).unwrap();
+        let mut app = reference(&inputs, 5).app().clone();
+        rebuild_history(&mut storage, &mut app, config(), &at, 9, 30).unwrap();
     }
 
     /// A batch whose frame drains every queued direct, then one more direct.
@@ -871,7 +1017,8 @@ mod tests {
         // Past the base, a direct that only queues.
         let (_db, mut storage) = synced("empty-fridge-base", &inputs, 13);
         check_export(&mut storage, &export, 3, 13, cap()).unwrap();
-        let state = rebuild_history(&mut storage, config(), &export, 3, 13).unwrap();
+        let mut app = base.app().clone();
+        let state = rebuild_history(&mut storage, &mut app, config(), &export, 3, 13).unwrap();
         assert!(stored(&mut storage).is_empty());
         assert_eq!(state, reference(&inputs, 3).scheduler().state());
 
@@ -959,9 +1106,10 @@ mod tests {
         let published = storage.era().unwrap();
         assert_eq!(published.stop_block, 17);
         assert_eq!(published.anchor_batch_nonce, state.next_batch_nonce);
-        assert!(
-            stored(&mut storage).iter().all(|(index, _, _)| *index < 8),
-            "no row comes from an input past the stop block"
+        // No row comes from an input past the stop block.
+        assert_stored(
+            &mut storage,
+            &expected(&mut reference(&inputs, 0), &inputs, 0, 8),
         );
     }
 

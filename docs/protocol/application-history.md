@@ -145,21 +145,21 @@ invalidation and baseline artifact GC.
 
 ### The rebuilt history
 
-`rebuilt_history` holds one row per transaction the scheduler handed out
-while setup fed it the inputs from the base's position through the last input
-at or below `C`
+`rebuilt_history` holds one row per transaction that executed while setup fed
+the scheduler the inputs from the base's position through the last input at
+or below `C`, keyed by its count
 ([what setup does](../recovery/cockroach.md#what-setup-does)).
 A direct row keeps its input index, and the feed takes its sender, payload,
 block, timestamp and transaction hash from `safe_inputs`. A user op row keeps
 its sender, nonce, fee, data and safe block. Each row keeps the scheduler's
 next batch nonce when it handed the row out: the batch whose frame holds or
-drained it, or the next batch to come. An executed row has its
-count; a skipped user op stays in the table without one and is never served.
+drained it, or the next batch to come. A user op the executor skipped has no
+row.
 
 Setup is the table's only writer, and only before it publishes the era: the
-schema refuses an insert or a count after that, a deletion at any time, and a
-count out of row order or with a gap. The era's `K` and `E` are exactly the
-span of the counted rows.
+schema refuses an insert after that, any update, any deletion, a count that
+does not follow the last, and a direct out of input order. The era's `K` and
+`E` are exactly the span of the rows.
 
 ### Adopting a new era
 
@@ -248,10 +248,10 @@ result can authorize a saved prefix within the same era, and `adopt_current_era`
 one from an older era.
 
 One durable page reader handles both backlog and live delivery, so there is no
-separate cursor to switch at the live boundary. It serves the executed rebuilt
-rows in count order up to `E`, then the live rows, and a page may span that
+separate cursor to switch at the live boundary. It serves the rebuilt rows in
+count order up to `E`, then the live rows, and a page may span that
 seam. Each page reads identity, bounds, and rows in one SQLite transaction.
-Interior gaps, a missing rebuilt count below `E`, and invalid source context
+Interior gaps, a missing rebuilt row below `E`, and invalid source context
 fail loudly. Page size and send queues bound memory; available backlog
 has no total replay cap. The [API contract](../../README.md#api) owns exact
 resource limits and handshake errors.
@@ -268,7 +268,7 @@ writers become supported.
 |---|---|
 | Coordinates and claim ordering | [`sequencer-core/src/history.rs`](../../sequencer-core/src/history.rs) — identity before position, inclusive head, checked counts. |
 | Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, the rebuilt/live seam, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
-| Rebuilt history | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs) and its tests — ordered insertion, counts set once and contiguous, sealing at publication; [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs) — the export check, the rebuild and its execution. |
+| Rebuilt history | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs) and its tests — contiguous counts, directs in input order, immutability, sealing at publication; [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs) — the export check, and the rebuild executing as it goes. |
 | Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |

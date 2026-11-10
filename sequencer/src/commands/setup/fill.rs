@@ -18,8 +18,8 @@ use crate::ingress::inclusion_lane::dump_info::{
 use crate::storage::{NewEra, Storage};
 
 /// Publish the era: `app` has executed the whole rebuilt history, and
-/// `scheduler` is the scheduler at the end of the stop block. Every rebuilt
-/// row must already carry its count: publishing seals the table.
+/// `scheduler` is the scheduler at the end of the stop block. Publishing
+/// seals the rebuilt rows.
 pub(crate) fn publish<A: Application>(
     app: &mut A,
     storage: &mut Storage,

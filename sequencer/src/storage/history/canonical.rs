@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Canonical application history: version-checked pages read with their
-//! boundaries in one transaction. The era's history is setup's executed
-//! rebuilt rows up to the rebuilt history's end, then the live rows; a page
-//! may span the seam. Native restart catch-up and the WS feed read it.
+//! boundaries in one transaction. The era's history is setup's rebuilt rows,
+//! every one executed, up to the rebuilt history's end, then the live rows; a
+//! page may span the seam. Native restart catch-up and the WS feed read it.
 
 use alloy_primitives::{Address, B256};
 use rusqlite::{Connection, Row, Transaction, params};
@@ -140,8 +140,8 @@ fn history_bounds_from(
 const REBUILT_PAGE_SQL: &str = "
     SELECT
         r.l2_tx_count,
-        CASE r.kind WHEN 'user_op' THEN 0 ELSE 1 END,
-        CASE r.kind WHEN 'user_op' THEN r.sender ELSE d.sender END,
+        CASE WHEN r.safe_input_index IS NULL THEN 0 ELSE 1 END,
+        CASE WHEN r.safe_input_index IS NULL THEN r.sender ELSE d.sender END,
         r.data,
         r.fee,
         d.payload,
@@ -154,7 +154,7 @@ const REBUILT_PAGE_SQL: &str = "
         d.transaction_hash
     FROM rebuilt_history r
     LEFT JOIN safe_inputs d ON d.safe_input_index = r.safe_input_index
-    WHERE r.l2_tx_count IS NOT NULL AND r.l2_tx_count >= ?1
+    WHERE r.l2_tx_count >= ?1
     ORDER BY r.l2_tx_count
     LIMIT ?2
 ";
@@ -203,7 +203,7 @@ fn canonical_page_in(
     // H can be i64::MAX + 1, the boundary after the last representable row.
     // An empty-at-head request must never clamp back onto that last input.
     if expected_len > 0 {
-        // The executed rebuilt rows cover [base, rebuilt_end) without gaps,
+        // The rebuilt rows cover [base, rebuilt_end) without gaps,
         // and the live rows start at rebuilt_end, so one cursor spans both.
         let rebuilt_len = expected_len.min(rebuilt_end.get().saturating_sub(from.get()));
         for (sql, start, len) in [

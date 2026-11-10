@@ -355,87 +355,55 @@ WHEN EXISTS (SELECT 1 FROM canonical_divergence WHERE singleton_id = 0)
 BEGIN SELECT RAISE(ABORT, 'batch tree frozen: canonical divergence marker present'); END;
 
 -- The history setup rebuilds from L1, from its base through the stop block:
--- one row per transaction the scheduler handed out, in the order it handed
--- them out. A direct keeps only its input index (safe_inputs holds its
--- sender, payload, block, timestamp and hash); a user op keeps what executes.
--- `batch_nonce` is the scheduler's next batch nonce when it handed the row
--- out. `l2_tx_count` is the row's history offset once it executed, and stays
--- NULL for a skipped user op. Only setup writes here, and only before it
--- publishes the era: rows from safe blocks never change afterwards.
+-- one row per transaction that executed, keyed by its L2 tx count. A direct
+-- keeps only its input index (safe_inputs holds the rest); a user op keeps what
+-- executed. `batch_nonce` is the scheduler's next batch nonce when it handed
+-- the row out. A user op the executor skipped has no row. Only setup writes
+-- here, and only before it publishes the era.
 CREATE TABLE IF NOT EXISTS rebuilt_history (
-    l1_input_index   INTEGER NOT NULL CHECK (l1_input_index >= 0),
-    position         INTEGER NOT NULL CHECK (position >= 0),
-    kind             TEXT NOT NULL CHECK (kind IN ('direct', 'user_op')),
-    safe_input_index INTEGER REFERENCES safe_inputs(safe_input_index),
-    sender           BLOB CHECK (sender IS NULL OR length(sender) = 20),
+    l2_tx_count      INTEGER PRIMARY KEY CHECK (l2_tx_count >= 0),
+    batch_nonce      INTEGER NOT NULL CHECK (batch_nonce >= 0),
+    safe_input_index INTEGER UNIQUE REFERENCES safe_inputs(safe_input_index),
+    sender           BLOB    CHECK (sender IS NULL OR length(sender) = 20),
     nonce            INTEGER CHECK (nonce IS NULL OR nonce BETWEEN 0 AND 4294967295),
     fee              INTEGER CHECK (fee IS NULL OR fee BETWEEN 0 AND 65535),
-    data             BLOB,
     safe_block       INTEGER CHECK (safe_block IS NULL OR safe_block >= 0),
-    batch_nonce      INTEGER NOT NULL CHECK (batch_nonce >= 0),
-    l2_tx_count      INTEGER CHECK (l2_tx_count IS NULL OR l2_tx_count >= 0),
-    PRIMARY KEY (l1_input_index, position),
-    -- A direct drains while the scheduler processes its own input or a later one.
-    CHECK ((kind = 'direct' AND safe_input_index IS NOT NULL
-            AND safe_input_index <= l1_input_index
-            AND sender IS NULL AND nonce IS NULL AND fee IS NULL
-            AND data IS NULL AND safe_block IS NULL)
-        OR (kind = 'user_op' AND safe_input_index IS NULL
-            AND sender IS NOT NULL AND nonce IS NOT NULL AND fee IS NOT NULL
-            AND data IS NOT NULL AND safe_block IS NOT NULL)),
-    UNIQUE (safe_input_index)
+    data             BLOB,
+    CHECK ((safe_input_index IS NOT NULL AND sender IS NULL AND nonce IS NULL AND fee IS NULL
+            AND safe_block IS NULL AND data IS NULL)
+        OR (safe_input_index IS NULL AND sender IS NOT NULL AND nonce IS NOT NULL AND fee IS NOT NULL
+            AND safe_block IS NOT NULL AND data IS NOT NULL))
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS ux_rebuilt_history_count
-    ON rebuilt_history(l2_tx_count) WHERE l2_tx_count IS NOT NULL;
 
--- Rows are appended in scheduling order, uncounted, until the era is
--- published. Positions count up from 0 within each input.
+-- Rows are inserted in execution order until the era is published. The key
+-- is a rowid alias: an insert without a count would be numbered by SQLite,
+-- and a BEFORE trigger sees that count as -1. The first row may carry any
+-- count; `trg_era_fits` ties it to the base count. A direct's input index
+-- rises row over row because the scheduler's queue is FIFO; with no earlier
+-- direct the MAX is NULL, the comparison is NULL and the row passes.
 CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_insert
 BEFORE INSERT ON rebuilt_history FOR EACH ROW
 BEGIN
     SELECT CASE
         WHEN EXISTS (SELECT 1 FROM era)
             THEN RAISE(ABORT, 'rebuilt history is sealed once its era is published')
-        WHEN NEW.l2_tx_count IS NOT NULL
-            THEN RAISE(ABORT, 'a rebuilt row is inserted before it executes')
-        WHEN NEW.l1_input_index < COALESCE((SELECT MAX(l1_input_index) FROM rebuilt_history), 0)
-          OR NEW.position != COALESCE((SELECT MAX(position) + 1 FROM rebuilt_history
-                                       WHERE l1_input_index = NEW.l1_input_index), 0)
-            THEN RAISE(ABORT, 'rebuilt history rows are appended in order')
-        WHEN NEW.kind = 'direct'
+        WHEN NEW.l2_tx_count IS NULL OR NEW.l2_tx_count < 0
+            THEN RAISE(ABORT, 'a rebuilt row carries its L2 tx count')
+        WHEN EXISTS (SELECT 1 FROM rebuilt_history)
+         AND NEW.l2_tx_count IS NOT (SELECT MAX(l2_tx_count) + 1 FROM rebuilt_history)
+            THEN RAISE(ABORT, 'rebuilt counts follow one another without gaps')
+        WHEN NEW.safe_input_index IS NOT NULL
          AND (SELECT sender FROM safe_inputs WHERE safe_input_index = NEW.safe_input_index)
            = (SELECT batch_submitter_address FROM deployment_identity WHERE singleton_id = 0)
             THEN RAISE(ABORT, 'a batch submitter input never executes as a direct')
+        WHEN NEW.safe_input_index IS NOT NULL
+         AND NEW.safe_input_index <= (SELECT MAX(safe_input_index) FROM rebuilt_history)
+            THEN RAISE(ABORT, 'rebuilt directs drain in input order')
     END;
 END;
-
--- Execution records a row's count once, in row order, each one past the
--- last; skipped rows stay NULL. Nothing else about a row ever changes. Every
--- MAX names `l2_tx_count IS NOT NULL`, so it reads the partial count index:
--- a full scan per counted row would make the execute pass quadratic.
-CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_count_once
+CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_immutable
 BEFORE UPDATE ON rebuilt_history FOR EACH ROW
-BEGIN
-    SELECT CASE
-        WHEN EXISTS (SELECT 1 FROM era)
-          OR OLD.l2_tx_count IS NOT NULL OR NEW.l2_tx_count IS NULL
-          OR NEW.l1_input_index IS NOT OLD.l1_input_index
-          OR NEW.position IS NOT OLD.position
-          OR NEW.kind IS NOT OLD.kind OR NEW.safe_input_index IS NOT OLD.safe_input_index
-          OR NEW.sender IS NOT OLD.sender OR NEW.nonce IS NOT OLD.nonce
-          OR NEW.fee IS NOT OLD.fee OR NEW.data IS NOT OLD.data
-          OR NEW.safe_block IS NOT OLD.safe_block OR NEW.batch_nonce IS NOT OLD.batch_nonce
-            THEN RAISE(ABORT, 'a rebuilt row only gains its count, once, before its era is published')
-        WHEN EXISTS (SELECT 1 FROM rebuilt_history WHERE l2_tx_count IS NOT NULL)
-         AND (NEW.l2_tx_count != (SELECT MAX(l2_tx_count) + 1 FROM rebuilt_history
-                                   WHERE l2_tx_count IS NOT NULL)
-              OR (NEW.l1_input_index, NEW.position) <= (
-                  SELECT l1_input_index, position FROM rebuilt_history
-                   WHERE l2_tx_count = (SELECT MAX(l2_tx_count) FROM rebuilt_history
-                                         WHERE l2_tx_count IS NOT NULL)))
-            THEN RAISE(ABORT, 'rebuilt counts follow the row order without gaps')
-    END;
-END;
+BEGIN SELECT RAISE(ABORT, 'rebuilt history rows are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_not_deletable
 BEFORE DELETE ON rebuilt_history FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'rebuilt history is retained for the database lifetime'); END;
@@ -459,27 +427,22 @@ CREATE TABLE IF NOT EXISTS era (
     first_queued_input  INTEGER NOT NULL CHECK (first_queued_input >= 0),
     anchor_batch_nonce  INTEGER NOT NULL CHECK (anchor_batch_nonce >= 0)
 ) STRICT;
--- The era's counts are exactly the span of the executed rebuilt rows, and its
--- first queued input lies among the inputs through the stop block. A direct
--- never skips, and the scheduler drains its queue in input order, so every
--- rebuilt direct is counted and lies before the first one still queued: an
--- uncounted one would vanish from the feed, and a queued one would run twice.
+-- The era's counts are exactly the span of the rebuilt rows, and its first
+-- queued input lies among the inputs through the stop block. The scheduler
+-- drains its queue in input order, so every rebuilt direct lies before the
+-- first one still queued: a queued one would run twice.
 CREATE TRIGGER IF NOT EXISTS trg_era_fits
 BEFORE INSERT ON era FOR EACH ROW
 BEGIN
     SELECT CASE
         WHEN NEW.base_l2_tx_count != COALESCE(
-                (SELECT MIN(l2_tx_count) FROM rebuilt_history WHERE l2_tx_count IS NOT NULL),
-                NEW.base_l2_tx_count)
+                (SELECT MIN(l2_tx_count) FROM rebuilt_history), NEW.base_l2_tx_count)
           OR NEW.rebuilt_history_end != COALESCE(
-                (SELECT MAX(l2_tx_count) + 1 FROM rebuilt_history WHERE l2_tx_count IS NOT NULL),
-                NEW.base_l2_tx_count)
+                (SELECT MAX(l2_tx_count) + 1 FROM rebuilt_history), NEW.base_l2_tx_count)
             THEN RAISE(ABORT, 'the era must span exactly its executed rebuilt rows')
         WHEN EXISTS (SELECT 1 FROM rebuilt_history
-                      WHERE kind = 'direct' AND l2_tx_count IS NULL)
-            THEN RAISE(ABORT, 'a rebuilt direct always executes')
-        WHEN EXISTS (SELECT 1 FROM rebuilt_history
-                      WHERE kind = 'direct' AND safe_input_index >= NEW.first_queued_input)
+                      WHERE safe_input_index IS NOT NULL
+                        AND safe_input_index >= NEW.first_queued_input)
             THEN RAISE(ABORT, 'a rebuilt direct is never still queued')
         WHEN NEW.first_queued_input > COALESCE(
                 (SELECT safe_input_index + 1 FROM safe_inputs

@@ -1,7 +1,7 @@
 # Inside the sequencer: what remains
 
 The sequencer's side of this plan is built: loading a machine, the rebuild
-with the scheduler alone, the rebuilt history table, the era, the feed across
+with the free-standing scheduler, the rebuilt history table, the era, the feed across
 the rebuilt and live rows, and the lane draining from the first queued input.
 [Cockroach recovery](../../recovery/cockroach.md) describes them, with a code
 map. This page keeps only what is not built yet.

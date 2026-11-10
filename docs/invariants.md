@@ -227,11 +227,12 @@ by writer and are write-once (`0001_schema.sql`).
 ### I10. Replay uses an inclusive application-history boundary
 
 - **Holds:** `L2TxCount = X` means entry `X` executes next. The
-  executed rebuilt rows cover `[K, E)` and the live rows `[E, H)`; a snapshot
+  rebuilt rows cover `[K, E)` and the live rows `[E, H)`; a snapshot
   is never below `E`, so native restart replays only live rows with
   `offset >= X`. `H` waits.
 - **Enforced by:** integer primary key, contiguous insertion from `E`
-  (`trg_application_inputs_contiguous`), the rebuilt-count triggers, coherent
+  (`trg_application_inputs_contiguous`), contiguous rebuilt counts
+  (`trg_rebuilt_history_insert`, `trg_era_fits`), coherent
   versioned pages spanning the seam, and pre-execution catch-up count checks.
 - **Depended on by:** restart and replica resume without skipping or duplication.
 
@@ -423,11 +424,13 @@ by writer and are write-once (`0001_schema.sql`).
   none), and a cut cannot exist without an era. If the cut ledger is ever
   retired, a log of generations must remain, because the generation has no
   other home.
-- **Rebuilt history:** `rebuilt_history` gains rows, in scheduling order, and
-  their counts, once each, contiguous in row order, only while the era row
-  is absent; no row is ever deleted. The era's `K` and `E` are exactly the
-  span of the counted rows, its first queued input is at most the input count
-  through `C`, and the live rows continue at `E`. A client of an older era
+- **Rebuilt history:** `rebuilt_history` gains one row per executed
+  transaction, written once with its count, each count the last one plus one
+  and each direct after every earlier direct in input order, only while the
+  era row is absent; no row is ever updated or deleted, and a skipped user op
+  has none. The era's `K` and `E` are exactly the span of the rows, no rebuilt
+  direct lies at or past its first queued input, which is at most the input
+  count through `C`, and the live rows continue at `E`. A client of an older era
   adopts this one only at a count in `[K, E]`
   ([adopting a new era](protocol/application-history.md#adopting-a-new-era)).
 - **Standard recovery:** one generation increment iff a valid batch is
@@ -439,7 +442,9 @@ by writer and are write-once (`0001_schema.sql`).
   `trg_era_single_insert`, `trg_era_immutable`, `trg_era_not_deletable`), the
   `history_generation_cuts` triggers (`trg_history_generation_cuts_contiguous`
   admits only the next generation, and only within an era; the others make
-  cuts immutable and undeletable), the `trg_rebuilt_history_*` triggers, and
+  cuts immutable and undeletable), the rebuilt-history triggers
+  (`trg_rebuilt_history_insert`, `trg_rebuilt_history_immutable`,
+  `trg_rebuilt_history_not_deletable`), and
   `cascade_and_reopen`. `preserved_input_count_in` asserts that
   every intervening generation has a cut before computing compatibility.
 - **Depended on by:** mandatory snapshot-derived WS claims, `/history`

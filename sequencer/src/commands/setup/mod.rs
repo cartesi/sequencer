@@ -268,7 +268,7 @@ pub(crate) fn finish_setup<A: Application>(
 }
 
 /// Steps 4 to 7 over an input table synced through `stop_block`: check the
-/// export, rebuild the history, execute it, and publish the era.
+/// export, rebuild and execute the history, and publish the era.
 pub(crate) fn rebuild_and_publish<A: Application>(
     storage: &mut Storage,
     base: Base<A>,
@@ -294,6 +294,7 @@ pub(crate) fn rebuild_and_publish<A: Application>(
     )?;
     let scheduler = rebuild::rebuild_history(
         storage,
+        &mut app,
         scheduler_config,
         &export,
         inputs_through_stop,
@@ -305,7 +306,6 @@ pub(crate) fn rebuild_and_publish<A: Application>(
         scheduler.l1_input_count, inputs_through_stop,
         "the rebuilt scheduler consumed every input through the stop block, and no other"
     );
-    rebuild::execute_history(storage, &mut app)?;
     let era = fill::publish(
         &mut app,
         storage,

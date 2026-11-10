@@ -38,7 +38,7 @@ pub(crate) use history::{HistoryReadError, L2TxContext};
 pub use l1_inputs::AdmittedDirects;
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
 pub use open::Storage;
-pub use rebuilt_history::{RebuiltKey, RebuiltRow};
+pub use rebuilt_history::RebuiltDirects;
 pub use recovery::DangerStatus;
 pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};

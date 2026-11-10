@@ -133,26 +133,27 @@ empty but for the lock file, so retrying in the same directory is safe.
    resume from the export over its queued inputs, with its clock at or below
    the stop block. A mismatch means the machine is not canonical, or its
    scheduler drained wrongly.
-5. **Rebuilds the history, with the scheduler alone.** It resumes the scheduler
-   from the export, re-supplying the inputs from the first queued input up to
-   the base's position, then feeds it every later input through the stop
-   block, never the sync's overshoot. It stores each transaction the scheduler
-   hands out, in order, in the `rebuilt_history` table, without a count. The
-   scheduler needs no application: what it hands out depends only on its state
-   and the inputs. After the last input its clock must lie at or below the
-   stop block.
-6. **Executes the history.** The application runs the stored rows in order
-   through `sequencer_core::application::execute`, the boundary the lane and
-   the guest share. A direct always executes; a user op executes or is skipped
-   ([a user op's fate](../protocol/scheduler-semantics.md#a-user-ops-fate)).
-   An executed row records its L2 tx count; a skipped one keeps none. An
-   application error stops setup with the row's input index and position.
+5. **Rebuilds the history with the scheduler.** It resumes the scheduler from
+   the export, re-supplying the inputs from the first queued input up to the
+   base's position, then feeds it every later input through the stop block,
+   never the sync's overshoot. The scheduler never reads the application:
+   what it hands out depends only on its state and the inputs. After the last
+   input its clock must lie at or below the stop block.
+6. **Executes each transaction as it is handed out.** The application runs it
+   at once through `sequencer_core::application::execute`, the boundary the
+   lane and the guest share. A direct always executes; a user op executes or
+   is skipped ([a user op's fate](../protocol/scheduler-semantics.md#a-user-ops-fate)).
+   An executed transaction is stored in the `rebuilt_history` table with its
+   L2 tx count; a skipped user op is not stored. An application error stops
+   setup naming the input, the transaction's position among those the input
+   released, and the transaction. At the end, the directs executed must number
+   the admitted directs the scheduler drained, counted in the input table.
 7. **Publishes the new era.** It writes the baseline dump, then one transaction
    inserts the era row, which carries the batch tree's anchor and whose
    existence marks setup complete, and registers the baseline. Setup opens no
    root frame and no Tip.
 
-Every pass reads and writes the tables in pages of 1024 rows, so memory stays
+The rebuild reads inputs and writes rows in pages of 1024, so memory stays
 bounded however long the rebuilt range is. Nothing is published until step 7.
 A setup that fails after writes begin leaves a directory to discard, whatever
 its exit code: another setup there exits 30.
@@ -192,8 +193,8 @@ in the input table for `run`.
   ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
   The watchdog compares it on its next tick, once no latch holds it; a mismatch
   there means the base machine was not canonical.
-- **The feed serves the new era from the base count**: the executed rebuilt
-  rows up to the rebuilt history end, then the live rows, in one read
+- **The feed serves the new era from the base count**: the rebuilt rows up
+  to the rebuilt history end, then the live rows, in one read
   transaction. A direct's row takes its sender, payload, block, timestamp and
   transaction hash from the input table. A claim from an older era is refused
   with `ERA_CHANGED`; its client adopts the new era
@@ -204,7 +205,7 @@ in the input table for `run`.
   `422` bad-nonce rejection names the expected nonce.
 - **The rebuilt history is permanent.** Its rows come from safe blocks, so they
   never change: no standard recovery cuts below the stop block, and storage
-  triggers refuse a deletion or a second count.
+  triggers refuse an update or a deletion.
 
 ## How long a recovery takes
 
@@ -219,8 +220,8 @@ the numbers for the reference wallet.
 - **The flush** returns at once on a settled wallet, and otherwise waits until
   its no-ops are safe.
 - **The rebuild** recovers each user op's signature, one op after another on
-  one core, and that is almost all of its time; writing the rows, executing
-  them and publishing take the rest. Its time therefore follows the user ops
+  one core, and that is almost all of its time; executing the transactions,
+  writing the rows and publishing take the rest. Its time therefore follows the user ops
   past the base, not the length of the history: a recent base keeps a
   recovery short, and genesis costs the whole history. The dry run prints how
   many inputs the rebuild replays; the measured rate per user op turns the ops
@@ -354,7 +355,7 @@ it exist only on L1.
 | The RPC node lags the base, so the base lies past the stop block | Setup's export check, exit 30 | Let the node catch up, discard the directory, run setup again. |
 | The base's export disagrees with L1 | Setup's export check, exit 30 | Recover from a trusted machine; if this one is canonical, its scheduler drained wrongly. |
 | A failure after writes began, retryable or not | Setup's exit code, then exit 30 on any retry in place | Discard the directory and run setup again. |
-| The application fails on a rebuilt transaction | Setup stops naming the input index and position, exit 30 | Replay a trusted machine to that input: if it halts there too, the application is dead; if not, fix the native engine or its projection. |
+| The application fails on a rebuilt transaction | Setup stops naming the input index, the position and the transaction, exit 30 | Replay a trusted machine to that input: if it halts there too, the application is dead; if not, fix the native engine or its projection. |
 | The base machine is not canonical | The new era's first watchdog comparison | Recover from a trusted machine. |
 | The base is newer than a client's state | The client's `BelowBase`, or `HISTORY_UNAVAILABLE` on subscribe | Recover again from an older machine. |
 | A client's state holds rows that never landed | The client's `PastRebuiltEnd` | The client restores an older state. |
@@ -367,7 +368,7 @@ it exist only on L1.
 | Arguments and the key | [`commands/config.rs`](../../sequencer/src/commands/config.rs) `SetupConfig`; its `setup_*` tests. |
 | The procedure, the empty-directory rule, the dry run and the escape check | [`commands/setup/mod.rs`](../../sequencer/src/commands/setup/mod.rs); [`chain_tests.rs`](../../sequencer/src/commands/setup/chain_tests.rs) runs setup against Anvil on a chain with history and compares it with `CanonicalRunner`. |
 | The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, whose unit tests drive every failure arm through a scripted emulator, and `canonical-test`'s `export` cases run on the built image. |
-| Export check, rebuild and execution | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs). |
+| Export check, and the rebuild executing as it goes | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs); `admitted_directs_in` in [`storage/l1_inputs.rs`](../../sequencer/src/storage/l1_inputs.rs) for the closing direct count. |
 | Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
 | The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`, `history_version_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
 | The root frame's drain from the first queued input | `next_undrained_safe_input_index_in` in [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs). |

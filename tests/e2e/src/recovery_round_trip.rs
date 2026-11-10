@@ -351,9 +351,12 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     );
     let rebuilt = runtime.rebuilt_history_rows()?;
     assert_eq!(
-        rebuilt.executed,
-        trusted - base_count,
-        "every rebuilt row past the base executed"
+        rebuilt,
+        RebuiltHistoryRows {
+            total: trusted - base_count,
+            executed: trusted - base_count,
+        },
+        "one row per transaction executed past the base"
     );
     assert_eq!(runtime.canonical_divergence()?, None);
 
