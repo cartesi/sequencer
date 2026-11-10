@@ -36,6 +36,7 @@ pub(crate) use history::ApplicationInputRow;
 pub use history::{DirectInputExecution, NewEra};
 pub(crate) use history::{HistoryReadError, L2TxContext};
 pub(crate) use ingress::ExecutedUserOp;
+pub use ingress::FeeQuote;
 pub use lifecycle::{LifecycleCommand, LifecycleError};
 pub use open::Storage;
 pub use recovery::DangerStatus;
@@ -175,10 +176,46 @@ pub struct FrameHeader {
     pub safe_block: u64,
 }
 
+/// A batch's local key, `batches.batch_index`. Invalidated batches keep their
+/// rows, so one key names one batch; a batch nonce does not, since a cascade's
+/// replacement reuses it. Opaque outside storage, with no arithmetic; it
+/// prints as the bare number.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BatchId(u64);
+
+impl BatchId {
+    fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// For tests outside storage that read the database with raw SQL.
+    #[cfg(test)]
+    pub(crate) fn to_raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for BatchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
 /// A batch ready for L1 submission: its local index, assigned nonce, and SSZ-encoded payload.
 #[derive(Debug)]
 pub struct PendingBatch {
-    pub batch_index: u64,
+    pub batch_index: BatchId,
     pub nonce: u64,
     pub encoded: Vec<u8>,
 }
@@ -285,8 +322,8 @@ pub struct WriteHead {
 }
 
 impl WriteHead {
-    pub(crate) fn batch_index(&self) -> u64 {
-        self.batch_index
+    pub(crate) fn batch_index(&self) -> BatchId {
+        BatchId::new(self.batch_index)
     }
 
     pub(crate) fn batch_nonce(&self) -> u64 {

@@ -859,10 +859,17 @@ mod tests {
     fn expect_recovery() -> Vec<Row> {
         vec![
             (
-                danger(DangerStatus::ClosedBatchInDanger(0)),
+                danger(DangerStatus::ClosedBatchInDanger(
+                    crate::storage::BatchId::from_raw(0),
+                )),
                 "a doomed closed batch",
             ),
-            (danger(DangerStatus::TipInDanger(3)), "an aging Tip"),
+            (
+                danger(DangerStatus::TipInDanger(
+                    crate::storage::BatchId::from_raw(3),
+                )),
+                "an aging Tip",
+            ),
         ]
     }
 
@@ -891,7 +898,9 @@ mod tests {
                 "a stale L1 view at runtime",
             ),
             (
-                danger(DangerStatus::EstimatedBatchInDanger(2)),
+                danger(DangerStatus::EstimatedBatchInDanger(
+                    crate::storage::BatchId::from_raw(2),
+                )),
                 "an estimated batch in danger",
             ),
             (
@@ -1444,10 +1453,10 @@ mod tests {
     #[test]
     fn danger_exit_aborts_only_on_canonical_divergence() {
         for status in [
-            DangerStatus::ClosedBatchInDanger(1),
-            DangerStatus::TipInDanger(1),
+            DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(1)),
+            DangerStatus::TipInDanger(crate::storage::BatchId::from_raw(1)),
             DangerStatus::L1ViewStale,
-            DangerStatus::EstimatedBatchInDanger(1),
+            DangerStatus::EstimatedBatchInDanger(crate::storage::BatchId::from_raw(1)),
             DangerStatus::CanonicalDivergence(1),
         ] {
             let terminal = matches!(status, DangerStatus::CanonicalDivergence(_));

@@ -82,13 +82,13 @@ impl BatchPoster for TestMock {
 
         let mut tx_hashes = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let batch_index = ssz::Decode::from_ssz_bytes(payload.as_slice())
+            let batch_nonce = ssz::Decode::from_ssz_bytes(payload.as_slice())
                 .map(|b: Batch| b.nonce)
                 .unwrap_or(0);
             self.submissions
                 .lock()
                 .expect("lock")
-                .push((batch_index, payload.len()));
+                .push((batch_nonce, payload.len()));
             tx_hashes.push(TxHash::ZERO);
         }
         Ok(SubmitBatchesOutcome::Submitted(tx_hashes))

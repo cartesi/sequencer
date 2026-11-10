@@ -206,7 +206,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
         for batch in &pending {
             debug!(
-                batch_index = batch.batch_index,
+                batch_index = %batch.batch_index,
                 nonce = batch.nonce,
                 "queueing batch for L1 submission"
             );

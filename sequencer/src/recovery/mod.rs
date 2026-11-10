@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::l1::L1Config;
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::storage::{
-    self, DangerStatus, RecoveryInspection, RecoveryMutationError, StorageOpenError,
+    self, BatchId, DangerStatus, RecoveryInspection, RecoveryMutationError, StorageOpenError,
 };
 pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
 pub use flusher::{FlushError, MempoolFlusher};
@@ -66,7 +66,7 @@ pub enum RecoveryRetryReason {
     #[error("the persisted L1 view is stale")]
     L1ViewStale,
     #[error("batch {batch_index} is in danger only under wall-clock estimation")]
-    EstimatedBatchInDanger { batch_index: u64 },
+    EstimatedBatchInDanger { batch_index: BatchId },
     #[error("danger persists after repair: {status:?}")]
     DangerPersists { status: DangerStatus },
     #[error(
@@ -128,7 +128,7 @@ impl RecoveryError {
 enum RecoveryAction {
     Ready,
     EnsureOpenTip,
-    RecoverTip { batch_index: u64 },
+    RecoverTip { batch_index: BatchId },
     Flush,
 }
 

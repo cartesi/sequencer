@@ -14,8 +14,10 @@ use rusqlite::{OptionalExtension, Result, Transaction, named_params, params};
 use sequencer_core::l2_tx::Direct;
 use sequencer_core::user_op::SignedUserOp;
 
-use super::acceptance::canonical_divergence_in;
-use super::convert::{from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, to_unix_ms, u64_to_i64};
+use super::acceptance::{Divergence, canonical_divergence_in};
+use super::convert::{
+    from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, to_unix_ms, u64_to_i64,
+};
 use super::history::{era_in, next_l2_tx_count_in};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence,
@@ -40,6 +42,15 @@ pub(crate) struct ExecutedUserOp<'a> {
     pub l2_tx_index: L2TxCount,
 }
 
+/// The `/fee` quote. Both fees are log-space exponents (base 129/128).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeQuote {
+    /// The fee committed for the Tip's open frame.
+    pub frame_fee: u16,
+    /// The fee the next frame opens at under the current policy.
+    pub recommended_fee: u16,
+}
+
 const LAST_VALID_USER_NONCE_SQL: &str = "SELECT u.nonce FROM user_ops u
      WHERE u.sender = ?1
        AND EXISTS (SELECT 1 FROM valid_batches b WHERE b.batch_index = u.batch_index)
@@ -59,14 +70,29 @@ impl Storage {
         self.read(load_current_write_head)
     }
 
-    /// Open-frame fee and current `recommended_fee`. `None` if there is no Tip.
-    pub fn current_fee_quote(&mut self) -> Result<Option<(u16, u16)>> {
+    /// The `/fee` quote: the fee of the Tip's latest frame and the policy's
+    /// current `recommended_fee`, in one read. `None` if there is no Tip.
+    pub fn current_fee_quote(&mut self) -> Result<Option<FeeQuote>> {
         self.read(|tx| {
-            let Some(head) = load_current_write_head(tx)? else {
+            let tip: Option<i64> = tx
+                .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let Some(tip) = tip else {
                 return Ok(None);
             };
-            let policy = query_batch_policy(tx)?;
-            Ok(Some((head.frame_fee, policy.recommended_fee)))
+            // Every valid batch has a frame; a missing one fails loud.
+            let frame_fee: i64 = tx.query_row(
+                "SELECT fee FROM frames WHERE batch_index = ?1 \
+                 ORDER BY frame_in_batch DESC LIMIT 1",
+                params![tip],
+                |row| row.get(0),
+            )?;
+            Ok(Some(FeeQuote {
+                frame_fee: i64_to_u16(frame_fee),
+                recommended_fee: query_batch_policy(tx)?.recommended_fee,
+            }))
         })
     }
 
@@ -100,7 +126,11 @@ impl Storage {
     /// which guarantees this in production.
     pub fn safe_frontier_state(&mut self) -> Result<SafeFrontierState> {
         self.read(|tx| {
-            if let Some((nonce, safe_input_index)) = canonical_divergence_in(tx)? {
+            if let Some(Divergence {
+                nonce,
+                safe_input_index,
+            }) = canonical_divergence_in(tx)?
+            {
                 return Ok(SafeFrontierState::CanonicalDivergence {
                     nonce,
                     safe_input_index,
@@ -546,8 +576,8 @@ fn insert_executed_user_ops_batch<'a>(
 mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
-        DirectInputExecution, IngestedSafeInput, L2TxCount, LifecycleCommand, SafeFrontierState,
-        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
+        DirectInputExecution, FeeQuote, IngestedSafeInput, L2TxCount, LifecycleCommand,
+        SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
         test_helpers::{
             SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, WriteHeadParts, default_protocol_timing,
             record_canonical_divergence,
@@ -779,7 +809,7 @@ mod tests {
                 count,
             )
             .expect("the live head still closes");
-        assert_eq!(head.batch_index(), 2);
+        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(2));
     }
 
     /// The head carries its batch's nonce from the loader and through every
@@ -1046,7 +1076,7 @@ mod tests {
             storage
                 .recover_aging_tip(1_200)
                 .expect("invalidate stale Tip"),
-            vec![1]
+            crate::storage::test_helpers::batch_ids(&[1])
         );
         assert_eq!(
             storage.next_l2_tx_count().expect("rewound count"),
@@ -1165,7 +1195,10 @@ mod tests {
             .conn
             .query_row(
                 "SELECT fee FROM frames WHERE batch_index = ?1 AND frame_in_batch = ?2",
-                rusqlite::params![original_batch_index as i64, original_frame_in_batch as i64,],
+                rusqlite::params![
+                    original_batch_index.to_raw() as i64,
+                    original_frame_in_batch as i64,
+                ],
                 |row| row.get(0),
             )
             .expect("query open frame fee");
@@ -1183,7 +1216,10 @@ mod tests {
         );
         assert_eq!(
             storage.current_fee_quote().expect("quote"),
-            Some((1356, 1456)),
+            Some(FeeQuote {
+                frame_fee: 1356,
+                recommended_fee: 1456
+            }),
             "quote splits the frozen open-frame fee from the advanced recommended_fee",
         );
 
@@ -1200,7 +1236,10 @@ mod tests {
         );
         assert_eq!(
             storage.current_fee_quote().expect("quote"),
-            Some((1456, 1456)),
+            Some(FeeQuote {
+                frame_fee: 1456,
+                recommended_fee: 1456
+            }),
             "after rotation the quote's two fees agree again",
         );
     }
@@ -1335,7 +1374,7 @@ mod tests {
             .initialize_open_state(12, SafeInputRange::empty_at(0))
             .expect("initialize open state");
 
-        assert_eq!(head.batch_index(), 0);
+        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(0));
         assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(head.safe_block(), 12);
 
@@ -1343,7 +1382,7 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("open state should exist");
-        assert_eq!(loaded.batch_index(), 0);
+        assert_eq!(loaded.batch_index(), crate::storage::BatchId::from_raw(0));
         assert_eq!(loaded.frame_in_batch(), 0);
         assert_eq!(loaded.safe_block(), 12);
     }
@@ -1432,7 +1471,11 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("genesis tip exists");
-        assert_eq!(head.batch_index(), 0, "genesis batch is index 0");
+        assert_eq!(
+            head.batch_index(),
+            crate::storage::BatchId::from_raw(0),
+            "genesis batch is index 0"
+        );
         assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(
             head.safe_block(),
@@ -1620,7 +1663,9 @@ mod tests {
         assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
 
         // A cascade rolls Alice back; her invalidated rows stay for audit.
-        storage.insert_invalid_batch(head.batch_index()).unwrap();
+        storage
+            .insert_invalid_batch(head.batch_index().to_raw())
+            .unwrap();
         assert_eq!(storage.next_user_nonce(alice).unwrap(), 2);
         assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
 

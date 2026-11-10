@@ -12,7 +12,7 @@ use super::Storage;
 use super::acceptance::frontier_nonce;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::queries::current_safe_block_required;
-use super::{FrameHeader, PendingBatch, SubmitterFrontier};
+use super::{BatchId, FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
 
 impl Storage {
@@ -103,7 +103,7 @@ impl Storage {
             let batch = Batch { nonce, frames };
             let encoded = ssz::Encode::as_ssz_bytes(&batch);
             batches.push(PendingBatch {
-                batch_index,
+                batch_index: BatchId::new(batch_index),
                 nonce,
                 encoded,
             });
@@ -203,7 +203,7 @@ mod tests {
         let pending = storage.pending_batches(0).expect("load pending batches");
         assert_eq!(pending.len(), 1);
         let entry = &pending[0];
-        assert_eq!(entry.batch_index, 0);
+        assert_eq!(entry.batch_index, crate::storage::BatchId::from_raw(0));
         assert_eq!(entry.nonce, 0, "genesis batch has nonce 0");
 
         // The wire bytes must decode back to the authoritative nonce AND the
@@ -301,7 +301,10 @@ mod tests {
             1,
             "exactly one batch should be eligible after the first close",
         );
-        assert_eq!(pending_after[0].batch_index, 0);
+        assert_eq!(
+            pending_after[0].batch_index,
+            crate::storage::BatchId::from_raw(0)
+        );
         assert_eq!(
             pending_after[0].nonce, 0,
             "closed batch 0 must carry nonce 0 (genesis, the era's anchor)",
@@ -309,7 +312,9 @@ mod tests {
         // The new open Tip (batch 1) must NOT be eligible even though it
         // exists — eligibility requires sealed_at_ms NOT NULL.
         assert!(
-            pending_after.iter().all(|b| b.batch_index != 1),
+            pending_after
+                .iter()
+                .all(|b| b.batch_index != crate::storage::BatchId::from_raw(1)),
             "open batch 1 (the new Tip) must not be eligible: {pending_after:?}",
         );
     }
@@ -462,7 +467,7 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("recovery batch");
-        assert_eq!(head.batch_index(), 2);
+        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(2));
 
         // No valid batch remains → the recovery Tip carries the anchor, 0.
         let recovery_nonce: i64 = storage

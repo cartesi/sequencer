@@ -29,6 +29,13 @@ pub struct AdmittedDirects {
     pub first_index: Option<u64>,
 }
 
+/// A batch-submitter input on the InputBox: its index and inclusion block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitterInput {
+    pub safe_input_index: u64,
+    pub block_number: u64,
+}
+
 type FeeOracleIdentitySql = (
     &'static str,
     Option<i64>,
@@ -55,9 +62,9 @@ impl Storage {
     }
 
     /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
-    /// ascending `safe_input_index` — returns `(safe_input_index, block_number)`
-    /// or `None`. Read-only; `setup`'s detection gate uses it
-    /// to find any previous-instance batch past the checkpoint block.
+    /// ascending `safe_input_index`, or `None`. Read-only; `setup`'s detection
+    /// gate uses it to find any previous-instance batch past the checkpoint
+    /// block.
     ///
     /// Queries the reader-synced `safe_inputs` table rather than issuing its own
     /// `get_logs`, so it inherits the reader's input-completeness witness (a
@@ -74,7 +81,7 @@ impl Storage {
         &mut self,
         batch_submitter: Address,
         after_block: u64,
-    ) -> Result<Option<(u64, u64)>> {
+    ) -> Result<Option<SubmitterInput>> {
         self.conn
             .query_row(
                 "SELECT safe_input_index, block_number FROM safe_inputs \
@@ -85,9 +92,10 @@ impl Storage {
                     saturating_query_bound(after_block)
                 ],
                 |row| {
-                    let index: i64 = row.get(0)?;
-                    let block: i64 = row.get(1)?;
-                    Ok((i64_to_u64(index), i64_to_u64(block)))
+                    Ok(SubmitterInput {
+                        safe_input_index: i64_to_u64(row.get(0)?),
+                        block_number: i64_to_u64(row.get(1)?),
+                    })
                 },
             )
             .optional()
@@ -428,7 +436,7 @@ fn insert_safe_inputs_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::AdmittedDirects;
+    use super::{AdmittedDirects, SubmitterInput};
     use crate::storage::{
         DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange, Storage,
         StoredSafeInput,
@@ -519,7 +527,10 @@ mod tests {
             storage
                 .first_batch_submitter_input_after_block(SENDER_A, 0)
                 .expect("scan"),
-            Some((0, 5))
+            Some(SubmitterInput {
+                safe_input_index: 0,
+                block_number: 5
+            })
         );
         // Strictly past: block 5 is excluded; the non-submitter @12 is skipped;
         // next submitter is index 2 @18.
@@ -527,7 +538,10 @@ mod tests {
             storage
                 .first_batch_submitter_input_after_block(SENDER_A, 5)
                 .expect("scan"),
-            Some((2, 18))
+            Some(SubmitterInput {
+                safe_input_index: 2,
+                block_number: 18
+            })
         );
         // Past the last submitter input: nothing.
         assert_eq!(

@@ -177,12 +177,8 @@ at `6b2a233`.
   pays a file open, a schema parse on its first statement, and cold page and
   statement caches: about 0.2 ms per request against about 2 µs for the nonce
   query itself ([measurement](2026-09-25-sender-index-commit-cost.md#read-cost)).
-  A small pool of long-lived read connections would remove that cost. Separately,
-  `current_fee_quote` builds a full `WriteHead`, including two `COUNT(*)` scans
-  of the Tip's user ops, to return two numbers; that cost is bounded by batch
-  size and unmeasured. Evidence:
-  [`ingress/api.rs`](../../sequencer/src/ingress/api.rs),
-  [`storage/queries.rs`](../../sequencer/src/storage/queries.rs).
+  A small pool of long-lived read connections would remove that cost. Evidence:
+  [`ingress/api.rs`](../../sequencer/src/ingress/api.rs).
 - **Per-batch snapshots run on the lane.** Every batch close writes its
   snapshot before the sealing commit, so admission waits for
   `Application::create_dump` and the sequencer's fsyncs. Closes fire on the fee

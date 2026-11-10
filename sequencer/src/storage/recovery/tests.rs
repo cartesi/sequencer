@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
-    make_stale_batch_payload, open_temp_storage, seed_closed_batches,
+    RecoveryFixture, SENDER_A, all_ordered_l2_txs, batch_ids, default_protocol_timing,
+    local_batch_payload, make_stale_batch_payload, open_temp_storage, seed_closed_batches,
     seed_safe_inputs_with_batch_nonces,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
-use crate::storage::{DirectInputExecution, L2TxCount, SafeInputRange, Storage};
+use crate::storage::{BatchId, DirectInputExecution, L2TxCount, SafeInputRange, Storage};
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::protocol::ProtocolTiming;
@@ -255,14 +255,14 @@ mod guarded_phases {
             .expect("seed finalized snapshot");
 
         let error = storage
-            .recover_aging_tip_for_recovery(1, &protocol, 1_000_000)
+            .recover_aging_tip_for_recovery(BatchId::from_raw(1), &protocol, 1_000_000)
             .expect_err("a stale expected Tip must not mutate");
         assert!(matches!(
             error,
             RecoveryMutationError::StaleDecision {
-                expected: crate::storage::DangerStatus::TipInDanger(1),
-                actual: crate::storage::DangerStatus::TipInDanger(0),
-            }
+                expected: crate::storage::DangerStatus::TipInDanger(expected),
+                actual: crate::storage::DangerStatus::TipInDanger(actual),
+            } if expected == BatchId::from_raw(1) && actual == BatchId::from_raw(0)
         ));
         assert_eq!(invalidated_count(&storage), 0);
     }
@@ -279,7 +279,7 @@ mod guarded_phases {
             .expect("advance safe head");
 
         let error = storage
-            .recover_aging_tip_for_recovery(0, &protocol, 1_000_000)
+            .recover_aging_tip_for_recovery(BatchId::from_raw(0), &protocol, 1_000_000)
             .expect_err("missing finalized state must refuse Tip recovery");
         assert!(matches!(
             error,
@@ -426,7 +426,7 @@ mod recover_post_flush {
         let invalidated = storage
             .recover_post_flush(1200)
             .expect("detect and recover");
-        assert_eq!(invalidated, vec![0, 1, 2, 3]);
+        assert_eq!(invalidated, batch_ids(&[0, 1, 2, 3]));
 
         let head = storage.open_state().expect("load open state");
         assert!(head.is_some(), "recovery should have opened a fresh batch");
@@ -446,7 +446,7 @@ mod recover_post_flush {
 
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let first = storage.recover_post_flush(1200).expect("first detect");
-        assert_eq!(first, vec![0, 1]);
+        assert_eq!(first, batch_ids(&[0, 1]));
         assert_eq!(
             generation_cuts(&storage),
             [(1, 0)],
@@ -510,7 +510,7 @@ mod recover_post_flush {
         // Gen 1 cascade. Stale batch 0 + open Tip 1 invalidated; recovery
         // batch 2 opened with nonce reused (= 0).
         let first = storage.recover_post_flush(1200).expect("gen1 recovery");
-        assert_eq!(first, vec![0, 1]);
+        assert_eq!(first, batch_ids(&[0, 1]));
         assert_eq!(
             storage
                 .history_version()
@@ -555,7 +555,7 @@ mod recover_post_flush {
         // Append gen1 stale safe input.
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let first = storage.recover_post_flush(1200).expect("gen1 recovery");
-        assert_eq!(first, vec![0, 1]);
+        assert_eq!(first, batch_ids(&[0, 1]));
 
         let mut head = storage.open_state().expect("load").unwrap();
         storage
@@ -567,7 +567,7 @@ mod recover_post_flush {
         let second = storage.recover_post_flush(1200).expect("gen2 recovery");
         assert_eq!(
             second,
-            vec![2, 3],
+            batch_ids(&[2, 3]),
             "stale reused nonce in gen2 must still be detected"
         );
         assert_eq!(
@@ -625,13 +625,13 @@ mod recover_post_flush {
             .expect("recover_post_flush with danger_threshold=1000");
         assert_eq!(
             invalidated,
-            vec![1],
+            batch_ids(&[1]),
             "Tip (batch 1) cascaded via danger_threshold fall-through"
         );
 
         // A fresh recovery Tip exists with a higher batch_index.
         let head = storage.open_state().expect("load").expect("recovery Tip");
-        assert_eq!(head.batch_index(), 2);
+        assert_eq!(head.batch_index(), BatchId::from_raw(2));
     }
 
     #[test]
@@ -662,7 +662,7 @@ mod recover_post_flush {
 
         // Tip preserved.
         let head = storage.open_state().expect("load").expect("Tip");
-        assert_eq!(head.batch_index(), 1);
+        assert_eq!(head.batch_index(), BatchId::from_raw(1));
     }
 }
 
@@ -707,7 +707,7 @@ mod tip_staleness {
             .expect("recover from stale open batch");
         assert_eq!(
             invalidated,
-            vec![0],
+            batch_ids(&[0]),
             "open batch 0 should be invalidated by current staleness"
         );
         assert_eq!(
@@ -722,7 +722,11 @@ mod tip_staleness {
 
         // A fresh recovery batch must be opened at batch_index=1.
         let head = storage.open_state().expect("load").expect("head");
-        assert_eq!(head.batch_index(), 1, "recovery batch is the next index");
+        assert_eq!(
+            head.batch_index(),
+            BatchId::from_raw(1),
+            "recovery batch is the next index"
+        );
     }
 
     #[test]
@@ -750,7 +754,7 @@ mod tip_staleness {
         let head = storage.open_state().expect("load").expect("head");
         assert_eq!(
             head.batch_index(),
-            0,
+            BatchId::from_raw(0),
             "original open batch 0 must still be the head"
         );
     }
@@ -768,7 +772,11 @@ mod tip_staleness {
         storage.advance_safe_head(1210); // advance safe head to exact threshold
 
         let invalidated = storage.recover_aging_tip(1200).expect("recover");
-        assert_eq!(invalidated, vec![0], "boundary (>= threshold) invalidates");
+        assert_eq!(
+            invalidated,
+            batch_ids(&[0]),
+            "boundary (>= threshold) invalidates"
+        );
     }
 
     #[test]
@@ -810,7 +818,7 @@ mod tip_staleness {
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
-            vec![0, 1],
+            batch_ids(&[0, 1]),
             "closed unsubmitted batch 0 and subsequent open batch 1 cascade together"
         );
     }
@@ -1149,7 +1157,7 @@ mod tip_staleness {
         let batch_submitter = SENDER_A;
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let invalidated = storage.recover_post_flush(1200).expect("recover");
-        assert_eq!(invalidated, vec![0, 1]);
+        assert_eq!(invalidated, batch_ids(&[0, 1]));
 
         let recovery = storage.open_state().expect("load").unwrap();
         let recovery_txs = storage
@@ -1186,7 +1194,7 @@ mod tip_staleness {
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
-            vec![0, 1],
+            batch_ids(&[0, 1]),
             "closed batch 0 and open batch 1 must both invalidate",
         );
 
@@ -1233,7 +1241,7 @@ mod tip_staleness {
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         // First call: full recovery runs to completion and opens a new Tip.
         let invalidated = storage.recover_post_flush(1200).expect("recover");
-        assert_eq!(invalidated, vec![0, 1]);
+        assert_eq!(invalidated, batch_ids(&[0, 1]));
         let recovery_index = storage
             .open_state()
             .expect("load open")
@@ -1490,7 +1498,11 @@ mod boundary {
 
         storage.land(1300, &[(SENDER_A, make_stale_batch_payload(0, 100))]);
         let invalidated = storage.recover_post_flush(1200).expect("detect");
-        assert_eq!(invalidated, vec![0, 1], "exactly at max_wait must be stale");
+        assert_eq!(
+            invalidated,
+            batch_ids(&[0, 1]),
+            "exactly at max_wait must be stale"
+        );
         assert_eq!(storage.open_state().expect("load").unwrap().batch_index, 2);
     }
 
@@ -1525,7 +1537,7 @@ mod boundary {
 
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]);
         let inv = storage.recover_post_flush(1200).expect("detect");
-        assert_eq!(inv, vec![0, 1, 2, 3]);
+        assert_eq!(inv, batch_ids(&[0, 1, 2, 3]));
         assert!(storage.open_state().expect("open").is_some());
     }
 
@@ -1540,7 +1552,7 @@ mod boundary {
 
         storage.land(1210, &[(SENDER_A, make_stale_batch_payload(0, 10))]); // append gen1
         let inv1 = storage.recover_post_flush(1200).expect("recover gen1");
-        assert_eq!(inv1, vec![0, 1]);
+        assert_eq!(inv1, batch_ids(&[0, 1]));
 
         let mut head2 = storage.open_state().expect("load").unwrap();
         storage
@@ -1549,7 +1561,7 @@ mod boundary {
 
         storage.land(2410, &[(SENDER_A, make_stale_batch_payload(0, 1210))]); // append gen2
         let inv2 = storage.recover_post_flush(1200).expect("recover gen2");
-        assert_eq!(inv2, vec![2, 3]);
+        assert_eq!(inv2, batch_ids(&[2, 3]));
         assert!(storage.open_state().expect("open").is_some());
     }
 
@@ -1601,7 +1613,7 @@ mod boundary {
         let invalidated = storage.recover_post_flush(1200).expect("recover");
         assert_eq!(
             invalidated,
-            vec![2, 3],
+            batch_ids(&[2, 3]),
             "the cascade starts past the prefix"
         );
         let accepted: Vec<(i64, i64, bool)> = storage
@@ -1788,7 +1800,7 @@ mod recovery_snapshot_selection {
         storage.advance_safe_head(1500); // safe head
         assert_eq!(
             storage.recover_post_flush(1200).expect("cascade"),
-            vec![0, 1, 2, 3]
+            batch_ids(&[0, 1, 2, 3])
         );
         assert_eq!(storage.latest_snapshot().unwrap().unwrap().id, baseline_id);
         assert!(
@@ -1829,7 +1841,7 @@ mod recovery_snapshot_selection {
         );
         assert_eq!(
             storage.recover_post_flush(1200).expect("cascade suffix"),
-            vec![1, 2]
+            batch_ids(&[1, 2])
         );
         assert_eq!(storage.latest_snapshot().unwrap().unwrap().id, accepted_id);
         assert_eq!(
@@ -1899,7 +1911,7 @@ mod recovery_snapshot_selection {
 mod check_danger {
     use crate::clock::unix_now_ms;
     use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, local_batch_payload};
-    use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
+    use crate::storage::{BatchId, SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
 
     #[test]
@@ -1934,7 +1946,10 @@ mod check_danger {
         let status = storage
             .check_danger(&protocol, unix_now_ms())
             .expect("check_danger");
-        assert_eq!(status, crate::storage::DangerStatus::ClosedBatchInDanger(1));
+        assert_eq!(
+            status,
+            crate::storage::DangerStatus::ClosedBatchInDanger(BatchId::from_raw(1))
+        );
     }
 
     #[test]
@@ -1986,7 +2001,7 @@ mod check_danger {
             .expect("check_danger");
         assert_eq!(
             status,
-            crate::storage::DangerStatus::EstimatedBatchInDanger(1)
+            crate::storage::DangerStatus::EstimatedBatchInDanger(BatchId::from_raw(1))
         );
     }
 
@@ -2029,7 +2044,7 @@ mod check_danger {
             .expect("check_danger");
         assert_eq!(
             status,
-            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            crate::storage::DangerStatus::ClosedBatchInDanger(BatchId::from_raw(0)),
             "observed closed-batch danger must win once safe-state has crossed danger",
         );
     }
@@ -2079,7 +2094,7 @@ mod check_danger {
             .expect("check_danger");
         assert_eq!(
             status,
-            crate::storage::DangerStatus::TipInDanger(1),
+            crate::storage::DangerStatus::TipInDanger(BatchId::from_raw(1)),
             "Tip must win when observed safe-state has already crossed danger",
         );
     }
@@ -2233,7 +2248,7 @@ mod check_danger {
             storage
                 .check_danger(&protocol, now_ms)
                 .expect("check danger"),
-            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            crate::storage::DangerStatus::ClosedBatchInDanger(BatchId::from_raw(0)),
             "observed danger stands on L1 observation alone; a wall-clock \
              fault must not delay recovery of a batch aging toward staleness"
         );
@@ -2251,7 +2266,7 @@ mod check_danger {
             storage
                 .check_danger(&protocol, now_ms)
                 .expect("check danger"),
-            crate::storage::DangerStatus::ClosedBatchInDanger(0),
+            crate::storage::DangerStatus::ClosedBatchInDanger(BatchId::from_raw(0)),
             "both clock-fault baselines together still yield to observed danger"
         );
     }

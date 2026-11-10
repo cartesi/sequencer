@@ -651,13 +651,13 @@ pub(crate) mod mock {
             let waiting_after = *self.waiting_after.lock().expect("lock");
             let mut tx_hashes = Vec::with_capacity(payloads.len());
             for (index, payload) in payloads.into_iter().enumerate() {
-                let batch_index = ssz::Decode::from_ssz_bytes(payload.as_ref())
+                let batch_nonce = ssz::Decode::from_ssz_bytes(payload.as_ref())
                     .map(|b: Batch| b.nonce)
                     .unwrap_or(0);
                 self.submissions
                     .lock()
                     .expect("lock")
-                    .push((batch_index, payload.len()));
+                    .push((batch_nonce, payload.len()));
                 if waiting_after.is_none_or(|k| index < k) {
                     tx_hashes.push(TxHash::ZERO);
                 }

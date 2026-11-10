@@ -86,8 +86,11 @@ where
 
 fn refuse_divergence_on_clean_exit(db_path: &str) -> Result<(), CommandError> {
     let mut storage = storage::Storage::open_read_only(db_path)?;
-    if let Some((nonce, _)) = storage.canonical_divergence()? {
-        return Err(storage::LifecycleError::CanonicalDivergence { nonce }.into());
+    if let Some(divergence) = storage.canonical_divergence()? {
+        return Err(storage::LifecycleError::CanonicalDivergence {
+            nonce: divergence.nonce,
+        }
+        .into());
     }
     Ok(())
 }

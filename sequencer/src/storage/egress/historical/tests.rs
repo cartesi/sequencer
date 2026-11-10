@@ -297,7 +297,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
         storage
             .recover_aging_tip_for_recovery(head.batch_index(), &protocol, now,)
             .unwrap(),
-        [0]
+        crate::storage::test_helpers::batch_ids(&[0])
     );
 
     let after = storage

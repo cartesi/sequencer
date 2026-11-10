@@ -22,10 +22,15 @@ use super::queries::{load_current_write_head, query_batch_policy};
 use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
 use super::snapshots::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
-    BatchPolicy, IngestedSafeInput, L2TxCount, SafeInputRange, Storage, StorageOpenError,
+    BatchId, BatchPolicy, IngestedSafeInput, L2TxCount, SafeInputRange, Storage, StorageOpenError,
     StoredSafeInput, WriteHead,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
+
+/// Batch ids from raw indices, to compare against a cascade's invalidated list.
+pub(crate) fn batch_ids(raw: &[u64]) -> Vec<BatchId> {
+    raw.iter().copied().map(BatchId::from_raw).collect()
+}
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
@@ -343,7 +348,7 @@ impl Storage {
     pub(crate) fn recover_post_flush(
         &mut self,
         danger_threshold: u64,
-    ) -> rusqlite::Result<Vec<u64>> {
+    ) -> rusqlite::Result<Vec<BatchId>> {
         self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
     }
 
@@ -351,7 +356,7 @@ impl Storage {
     pub(crate) fn recover_aging_tip(
         &mut self,
         danger_threshold: u64,
-    ) -> rusqlite::Result<Vec<u64>> {
+    ) -> rusqlite::Result<Vec<BatchId>> {
         self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
     }
 

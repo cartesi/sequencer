@@ -986,7 +986,7 @@ mod tests {
         assert_eq!(status_at(&mut storage, last_safe), DangerStatus::Safe);
         assert_eq!(
             status_at(&mut storage, last_safe + 1),
-            DangerStatus::ClosedBatchInDanger(0)
+            DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(0))
         );
     }
 

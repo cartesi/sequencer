@@ -182,7 +182,10 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replace
     let before = storage.history_bounds().unwrap();
     assert_eq!(before.head, L2TxCount::new(2));
 
-    assert_eq!(storage.recover_aging_tip(1_200).unwrap(), vec![1]);
+    assert_eq!(
+        storage.recover_aging_tip(1_200).unwrap(),
+        crate::storage::test_helpers::batch_ids(&[1])
+    );
     let recovered = storage.history_bounds().unwrap();
     assert_eq!(recovered.version.era_id, before.version.era_id);
     assert_eq!(recovered.version.recovery_generation.get(), 1);

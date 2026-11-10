@@ -773,7 +773,7 @@ mod tests {
         let deleted = conn
             .execute(
                 "DELETE FROM snapshots WHERE batch_index = ?1",
-                [batch_index as i64],
+                [batch_index.to_raw() as i64],
             )
             .expect("remove the accepted batch's snapshot row");
         assert_eq!(deleted, 1);

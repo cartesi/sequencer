@@ -683,13 +683,13 @@ fn check_escape(
     }
     // The scan reads the reader-synced table, which carries the reader's
     // completeness witness; see `first_batch_submitter_input_after_block`.
-    if let Some((safe_input_index, found_block)) =
+    if let Some(found) =
         storage.first_batch_submitter_input_after_block(batch_submitter, stop_block)?
     {
         return Err(SetupRefuse::SubmitterInputPastStop {
             stop_block,
-            found_block,
-            safe_input_index,
+            found_block: found.block_number,
+            safe_input_index: found.safe_input_index,
         }
         .into());
     }

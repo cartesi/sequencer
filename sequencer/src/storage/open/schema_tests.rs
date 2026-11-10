@@ -668,7 +668,11 @@ fn nonce_reuse_after_partial_cascade() {
 
     let inv = storage.recover_post_flush(1200).expect("recover");
     // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
-    assert_eq!(inv, vec![1, 2, 3], "only the suffix cascades, got {inv:?}");
+    assert_eq!(
+        inv,
+        crate::storage::test_helpers::batch_ids(&[1, 2, 3]),
+        "only the suffix cascades, got {inv:?}"
+    );
 
     // The new Tip (batch 4) reuses the pivot's nonce 1: the last valid
     // nonce (0) + 1.

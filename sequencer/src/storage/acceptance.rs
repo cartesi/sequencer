@@ -240,16 +240,24 @@ fn content_identity_violation(
     }
 }
 
-/// The persisted divergence marker, if any: `(nonce, safe_input_index)`.
-pub(super) fn canonical_divergence_in(conn: &Connection) -> Result<Option<(u64, u64)>> {
+/// The persisted canonical-divergence marker (I15): the diverged landing's
+/// batch nonce and the safe input that carried it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Divergence {
+    pub nonce: u64,
+    pub safe_input_index: u64,
+}
+
+/// The persisted divergence marker, if any.
+pub(super) fn canonical_divergence_in(conn: &Connection) -> Result<Option<Divergence>> {
     conn.query_row(
         "SELECT nonce, safe_input_index FROM canonical_divergence WHERE singleton_id = 0",
         [],
         |row| {
-            Ok((
-                i64_to_u64(row.get::<_, i64>(0)?),
-                i64_to_u64(row.get::<_, i64>(1)?),
-            ))
+            Ok(Divergence {
+                nonce: i64_to_u64(row.get::<_, i64>(0)?),
+                safe_input_index: i64_to_u64(row.get::<_, i64>(1)?),
+            })
         },
     )
     .optional()
@@ -1072,7 +1080,10 @@ mod tests {
             .expect("run's first sync");
         assert_eq!(
             storage.canonical_divergence().expect("marker"),
-            Some((1, 1)),
+            Some(super::Divergence {
+                nonce: 1,
+                safe_input_index: 1
+            }),
             "the post-stop landing is judged; the baseline one is not"
         );
         assert_eq!(accepted_count(&storage), 0);

@@ -260,7 +260,10 @@ mod tests {
             .expect("detector result");
         match exit {
             DetectorExit::RecoveryRequired { status } => {
-                assert_eq!(status, DangerStatus::ClosedBatchInDanger(1));
+                assert_eq!(
+                    status,
+                    DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(1))
+                );
             }
             other => panic!("expected recovery-required exit, got {other:?}"),
         }
@@ -340,7 +343,10 @@ mod tests {
             .expect("detector result");
         match exit {
             DetectorExit::RecoveryRequired { status } => {
-                assert_eq!(status, DangerStatus::EstimatedBatchInDanger(1));
+                assert_eq!(
+                    status,
+                    DangerStatus::EstimatedBatchInDanger(crate::storage::BatchId::from_raw(1))
+                );
             }
             other => {
                 panic!("expected recovery-required exit from wall-clock fallback, got {other:?}")

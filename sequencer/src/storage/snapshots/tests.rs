@@ -18,7 +18,7 @@ fn prefix(n: u64) -> PathBuf {
 
 /// Close the open batch with a snapshot at `prefix(batch_index + 1)`.
 fn close(storage: &mut Storage, head: &mut WriteHead) -> i64 {
-    let index = head.batch_index();
+    let index = head.batch_index().to_raw();
     let count = storage.next_l2_tx_count().unwrap();
     storage
         .close_frame_and_batch_with_snapshot(head, &prefix(index + 1), count)

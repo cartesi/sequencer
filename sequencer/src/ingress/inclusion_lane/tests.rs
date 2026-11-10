@@ -1290,7 +1290,10 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     let invalidated = storage
         .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
         .expect("standard recovery cascade");
-    assert_eq!(invalidated, vec![1, 2]);
+    assert_eq!(
+        invalidated,
+        crate::storage::test_helpers::batch_ids(&[1, 2])
+    );
     let recovered_history = storage.history_version().expect("recovered history");
     assert_eq!(
         recovered_history.era_id, initial_history.era_id,
@@ -1610,7 +1613,7 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
     ));
     assert_eq!(head.batch_index(), tip);
     assert_eq!(storage.open_state().unwrap().unwrap().batch_index(), tip);
-    assert_eq!(storage.latest_batch_index().unwrap(), Some(tip));
+    assert_eq!(storage.latest_batch_index().unwrap(), Some(tip.to_raw()));
     assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
     assert_eq!(storage.list_snapshots().unwrap().len(), dump_count);
 }

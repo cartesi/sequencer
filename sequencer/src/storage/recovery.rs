@@ -9,8 +9,7 @@
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
 use sequencer_core::protocol::{ProtocolTiming, age_exceeds};
 
-use super::Storage;
-use super::acceptance::{canonical_divergence_in, frontier_nonce};
+use super::acceptance::{Divergence, canonical_divergence_in, frontier_nonce};
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::advance_recovery_generation_in;
 use super::ingress::open_fresh_tip_in_tx;
@@ -18,6 +17,7 @@ use super::queries::{
     current_safe_block_required, current_safe_block_timestamp, last_safe_progress_ms,
 };
 use super::snapshots::has_rollback_safe_snapshot_in;
+use super::{BatchId, Storage};
 
 /// Outcome of [`Storage::check_danger`]. The runtime detector exits on any
 /// non-`Safe` variant; startup maps each variant to one action
@@ -34,11 +34,11 @@ pub enum DangerStatus {
     L1ViewStale,
     /// A closed batch past the accepted frontier is past the danger threshold at
     /// the observed safe block.
-    ClosedBatchInDanger(u64),
+    ClosedBatchInDanger(BatchId),
     /// The open Tip is past the danger threshold and no closed batch is.
-    TipInDanger(u64),
+    TipInDanger(BatchId),
     /// A batch is past the threshold only by wall-clock estimate.
-    EstimatedBatchInDanger(u64),
+    EstimatedBatchInDanger(BatchId),
 }
 
 /// One transactionally consistent local view consumed by the startup
@@ -103,10 +103,10 @@ impl DangerStatus {
         }
     }
 
-    /// The batch nonce a danger arm points at, if any (log context). The
-    /// `CanonicalDivergence` nonce is deliberately not reported here — it is a
-    /// diverged-state nonce, not a batch in the danger pipeline.
-    pub(crate) fn batch_index(self) -> Option<u64> {
+    /// The local batch a danger arm points at, if any (log context). The
+    /// `CanonicalDivergence` arm carries a batch nonce, not a local batch, so
+    /// it reports none.
+    pub(crate) fn batch_index(self) -> Option<BatchId> {
         match self {
             DangerStatus::ClosedBatchInDanger(batch_index)
             | DangerStatus::TipInDanger(batch_index)
@@ -119,11 +119,10 @@ impl DangerStatus {
 }
 
 impl Storage {
-    /// Whether the canonical-divergence marker (I15) is present, and the
-    /// recorded `(nonce, safe_input_index)` if so. Standard
+    /// The canonical-divergence marker (I15), if present. Standard
     /// recovery is forbidden while the marker exists; callers on the recovery
     /// path must check this before any batch mutation.
-    pub fn canonical_divergence(&mut self) -> Result<Option<(u64, u64)>> {
+    pub fn canonical_divergence(&mut self) -> Result<Option<Divergence>> {
         self.read(|tx| canonical_divergence_in(tx))
     }
 
@@ -184,10 +183,10 @@ impl Storage {
     /// Tip drains the undrained directs.
     pub(crate) fn recover_aging_tip_for_recovery(
         &mut self,
-        expected_batch_index: u64,
+        expected_batch_index: BatchId,
         protocol: &ProtocolTiming,
         now_ms: u64,
-    ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
+    ) -> std::result::Result<Vec<BatchId>, RecoveryMutationError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -218,7 +217,7 @@ impl Storage {
         flush_observed_safe_block: u64,
         protocol: &ProtocolTiming,
         now_ms: u64,
-    ) -> std::result::Result<Vec<u64>, RecoveryMutationError> {
+    ) -> std::result::Result<Vec<BatchId>, RecoveryMutationError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -264,8 +263,8 @@ fn check_danger_in(
 ) -> Result<DangerStatus> {
     // The divergence marker outranks everything — including the L1-staleness
     // gate. It records an already-confirmed canonical fact.
-    if let Some((nonce, _)) = canonical_divergence_in(conn)? {
-        return Ok(DangerStatus::CanonicalDivergence(nonce));
+    if let Some(divergence) = canonical_divergence_in(conn)? {
+        return Ok(DangerStatus::CanonicalDivergence(divergence.nonce));
     }
 
     let safe_block_timestamp = current_safe_block_timestamp(conn)?;
@@ -276,10 +275,10 @@ fn check_danger_in(
 
     let danger_threshold = protocol.danger_threshold();
     if let Some(idx) = find_closed_frontier_batch_in_danger(conn, danger_threshold)? {
-        return Ok(DangerStatus::ClosedBatchInDanger(idx));
+        return Ok(DangerStatus::ClosedBatchInDanger(BatchId::new(idx)));
     }
     if let Some(idx) = find_tip_batch_in_danger(conn, danger_threshold)? {
-        return Ok(DangerStatus::TipInDanger(idx));
+        return Ok(DangerStatus::TipInDanger(BatchId::new(idx)));
     }
 
     if protocol.clock_cannot_age_l1_view(safe_block_timestamp, now_ms) {
@@ -293,7 +292,7 @@ fn check_danger_in(
     if let Some(adjusted) = adjusted_danger_threshold
         && let Some(idx) = find_first_batch_in_danger(conn, adjusted)?
     {
-        return Ok(DangerStatus::EstimatedBatchInDanger(idx));
+        return Ok(DangerStatus::EstimatedBatchInDanger(BatchId::new(idx)));
     }
     Ok(DangerStatus::Safe)
 }
@@ -321,7 +320,7 @@ fn refuse_divergence(danger: DangerStatus) -> std::result::Result<(), RecoveryMu
 pub(super) fn recover_post_flush_inner(
     tx: &Transaction<'_>,
     danger_threshold: u64,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<BatchId>> {
     // Path 1: any closed batch past gold cascades unconditionally.
     let pivot = match first_non_gold_closed_batch(tx)? {
         Some(batch_index) => Some(batch_index),
@@ -342,7 +341,7 @@ pub(super) fn recover_post_flush_inner(
 pub(super) fn recover_aging_tip_inner(
     tx: &Transaction<'_>,
     danger_threshold: u64,
-) -> Result<Vec<u64>> {
+) -> Result<Vec<BatchId>> {
     let pivot = find_tip_batch_in_danger(tx, danger_threshold)?;
     cascade_and_reopen(tx, pivot)
 }
@@ -362,7 +361,7 @@ pub(super) fn recover_aging_tip_inner(
 /// 4. **Reopen the Tip** the cascade just invalidated (or one a torn crash
 ///    left missing), atomically with the cascade. Same mechanism the
 ///    runtime's genesis path uses — see `ingress::open_fresh_tip_in_tx`.
-fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<u64>> {
+fn cascade_and_reopen(tx: &Transaction<'_>, pivot: Option<u64>) -> Result<Vec<BatchId>> {
     let invalidated = match pivot {
         Some(batch_index) => cascade_invalidate_from(tx, batch_index)?,
         None => Vec::new(),
@@ -483,16 +482,17 @@ fn first_frame_safe_block_of(conn: &Connection, batch_index: i64) -> Result<u64>
 /// Reads the list BEFORE mutating — the SELECT must see the rows the UPDATE
 /// will then mark invalid. The `invalidated_at_ms IS NULL` guard on the UPDATE
 /// keeps this idempotent: rows already invalid are untouched.
-fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Result<Vec<u64>> {
+fn cascade_invalidate_from(tx: &Transaction<'_>, from_batch_index: u64) -> Result<Vec<BatchId>> {
     let from_i64 = u64_to_i64(from_batch_index);
 
-    let invalidated: Vec<u64> = {
+    let invalidated: Vec<BatchId> = {
         let mut stmt = tx.prepare(
             "SELECT batch_index FROM valid_batches \
              WHERE batch_index >= ?1 ORDER BY batch_index ASC",
         )?;
         stmt.query_map(params![from_i64], |row| {
-            row.get::<_, i64>(0).map(i64_to_u64)
+            row.get::<_, i64>(0)
+                .map(|index| BatchId::new(i64_to_u64(index)))
         })?
         .collect::<rusqlite::Result<_>>()?
     };

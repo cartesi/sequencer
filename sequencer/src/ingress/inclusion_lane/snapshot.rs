@@ -58,14 +58,14 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     let snapshot_ms = snapshot_elapsed.as_millis();
     if snapshot_elapsed >= SLOW_SNAPSHOT {
         tracing::warn!(
-            batch_index,
+            %batch_index,
             nonce,
             snapshot_ms,
             "slow batch-close snapshot blocked user-op admission"
         );
     } else {
         tracing::debug!(
-            batch_index,
+            %batch_index,
             nonce,
             snapshot_ms,
             "batch closed with snapshot"

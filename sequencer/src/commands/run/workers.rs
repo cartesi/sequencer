@@ -685,13 +685,13 @@ mod tests {
     #[test]
     fn detector_recovery_required_maps_to_danger_detected() {
         let result: DetectorJoinResult = Ok(Ok(DetectorExit::RecoveryRequired {
-            status: DangerStatus::ClosedBatchInDanger(7),
+            status: DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(7)),
         }));
         assert!(matches!(
             FirstExit::detector(result),
             FirstExit::Worker(WorkerExit::DangerDetected {
-                status: DangerStatus::ClosedBatchInDanger(7)
-            })
+                status: DangerStatus::ClosedBatchInDanger(index)
+            }) if index == crate::storage::BatchId::from_raw(7)
         ));
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
 
         let err = workers
             .finish(FirstExit::Worker(WorkerExit::DangerDetected {
-                status: DangerStatus::TipInDanger(3),
+                status: DangerStatus::TipInDanger(crate::storage::BatchId::from_raw(3)),
             }))
             .await
             .expect_err("danger exit must fail run");

@@ -68,17 +68,18 @@ The recovery cycle crosses a process boundary:
    `RuntimeAdmission` witness, consumed synchronously by worker launch.
 
 Startup first refuses a persisted canonical divergence or a missing rollback-safe
-checkpoint. After initial sync, one consistent `RecoveryInspection` selects:
+checkpoint. After initial sync, one consistent `RecoveryInspection` selects
+(`batch` is a local batch index, `nonce` a batch nonce):
 
 | Local fact | Action |
 |---|---|
 | `Safe` + open Tip | Ready for runtime preparation. |
 | `Safe` + no Tip | `EnsureOpenTip`: create it under a transaction guard; the first `run` after setup opens the era's first batch this way. |
-| `TipInDanger(N)` | `RecoverTip { N }`: invalidate that Tip and reopen, without flushing. |
-| `ClosedBatchInDanger(N)` | Flush → sync → guarded post-flush cascade. |
+| `TipInDanger(batch)` | `RecoverTip { batch }`: invalidate that Tip and reopen, without flushing. |
+| `ClosedBatchInDanger(batch)` | Flush → sync → guarded post-flush cascade. |
 | `L1ViewStale` | Retry; the persisted view or clock cannot authorize serving. |
-| `EstimatedBatchInDanger(N)` | Retry; an estimate alone cannot authorize invalidation. |
-| `CanonicalDivergence(N)` or missing recovery checkpoint | Refuse; automatic recovery cannot repair this trust failure. |
+| `EstimatedBatchInDanger(batch)` | Retry; an estimate alone cannot authorize invalidation. |
+| `CanonicalDivergence(nonce)` or missing recovery checkpoint | Refuse; automatic recovery cannot repair this trust failure. |
 
 Only an initial-sync **provider failure** may fall back to a still-usable
 persisted view. Other failures keep their typed retry/refuse classification.
@@ -217,9 +218,9 @@ accepted liveness limits belong to the [L1 fee policy](../l1-fee-policy.md).
 ### Open Tip: repair without flushing
 
 An open Tip has never been submitted, so invalidating it creates no L1-slot
-race. `RecoverTip { N }` rechecks divergence, checkpoint availability, and
-**exactly** `TipInDanger(N)` inside its transaction, then invalidates that Tip
-and opens a fresh one. It does not invalidate closed batches or fall back to
+race. `RecoverTip { batch }` rechecks divergence, checkpoint availability, and
+**exactly** `TipInDanger(batch)` inside its transaction, then invalidates that
+Tip and opens a fresh one. It does not invalidate closed batches or fall back to
 repairing a changed decision.
 
 The threshold is a policy choice: retaining an aging Tip would make the

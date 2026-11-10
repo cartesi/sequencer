@@ -313,7 +313,10 @@ mod tests {
         storage
             .append_safe_inputs(2800, &[], SUBMITTER, &default_protocol_timing())
             .unwrap();
-        assert_eq!(storage.recover_aging_tip(1200).unwrap(), vec![0]);
+        assert_eq!(
+            storage.recover_aging_tip(1200).unwrap(),
+            crate::storage::test_helpers::batch_ids(&[0])
+        );
         assert_eq!(
             storage.history_version().unwrap().recovery_generation.get(),
             generation.get() + 1
