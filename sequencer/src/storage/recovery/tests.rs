@@ -1207,7 +1207,7 @@ mod tip_staleness {
     fn first_batch_stale_recovery_reuses_nonce_zero() {
         // first-ever batch (nonce 0) goes stale before reaching
         // Gold. Cascade invalidates it; recovery opens a fresh batch that
-        // reuses nonce 0 (no valid ancestor exists to advance the nonce).
+        // reuses nonce 0 (no valid batch remains: it carries the anchor).
         let (db, mut storage) = open_temp_storage("first-batch-stale-nonce-zero");
 
         let mut head = storage
@@ -1229,8 +1229,8 @@ mod tip_staleness {
         assert_eq!(recovery.batch_index, 2, "batch_index is monotonic (PK)");
         drop(storage);
 
-        // Read the new Tip's nonce and parent pointer via raw SQL — no
-        // public accessor surfaces them.
+        // Read the new Tip's nonce via raw SQL — no public accessor
+        // surfaces it.
         let conn = Storage::open_connection(db.path.as_str()).expect("open read conn");
         let recovery_i64 = recovery.batch_index as i64;
         let nonce: i64 = conn
@@ -1243,17 +1243,6 @@ mod tip_staleness {
         assert_eq!(
             nonce, 0,
             "recovery batch must reuse nonce 0 after torn cascade",
-        );
-        let parent: Option<i64> = conn
-            .query_row(
-                "SELECT parent_batch_index FROM batches WHERE batch_index = ?1",
-                [recovery_i64],
-                |row| row.get(0),
-            )
-            .expect("query parent");
-        assert_eq!(
-            parent, None,
-            "torn recovery has no valid ancestor; parent_batch_index is NULL",
         );
     }
 
@@ -1644,16 +1633,15 @@ mod boundary {
     }
 }
 
-mod tree_invariants {
+mod valid_batch_invariants {
     use super::*;
 
-    // ── Parent-pointer tree invariants ──────────────────────────────
-    use crate::storage::convert::{i64_to_u64, u64_to_i64};
-    use rusqlite::params;
+    use crate::storage::convert::u64_to_i64;
 
-    /// The schema triggers check parent links, the root and the single Tip on
-    /// every write; invalidation is an UPDATE no trigger checks, so assert the
-    /// valid spine here. The e2e harness asserts the same on the binary's DB.
+    /// The schema checks each insert's nonce and the single Tip on every
+    /// write; the cascade's invalidation chooses which batches stay valid, so
+    /// assert the valid spine here. The e2e harness asserts the same on the
+    /// binary's DB.
     fn assert_valid_spine_from_anchor(storage: &mut Storage) {
         let anchor = u64_to_i64(storage.era().expect("era").anchor_batch_nonce);
         let nonces: Vec<i64> = storage
@@ -1672,13 +1660,13 @@ mod tree_invariants {
     }
 
     #[test]
-    fn tree_invariants_hold_across_mixed_workload() {
+    fn valid_batch_invariants_hold_across_mixed_workload() {
         // Exercises every mutating code path: genesis, rotations, partial
-        // cascades (ancestor survives), cascades across accepted frontier,
-        // torn cascades (no valid ancestor), and back-to-back generations.
+        // cascades (a valid prefix survives), cascades across accepted frontier,
+        // torn cascades (no valid batch left), and back-to-back generations.
         // Every write is checked by the schema triggers (an ABORT fails its
         // expect); the valid spine is asserted after each step.
-        let (_db, mut storage) = open_temp_storage("tree-invariants-workload");
+        let (_db, mut storage) = open_temp_storage("valid-batch-invariants-workload");
 
         // Phase 1: genesis + 4 rotations. Simple chain.
         let mut head = storage
@@ -1689,9 +1677,9 @@ mod tree_invariants {
             storage.close_batch_at(&mut head, 100).expect("close");
             assert_valid_spine_from_anchor(&mut storage);
         }
-        // Tree: 0(Gold sentinel in concept)→1→2→3→4 (Tip)
+        // Valid batches: 0→1→2→3→4 (Tip)
 
-        // Phase 2: cascade with a valid ancestor. Batch 0 is accepted first.
+        // Phase 2: cascade with a valid prefix. Batch 0 is accepted first.
         let landed = local_batch_payload(&mut storage, 0);
         storage.land(20, &[(SENDER_A, landed)]); // append accepted
         storage.advance_safe_head(1400); // advance past threshold
@@ -1714,92 +1702,11 @@ mod tree_invariants {
         storage.recover_post_flush(1200).expect("recover from torn");
         assert_valid_spine_from_anchor(&mut storage);
 
-        // Phase 5: rotations after torn cascade — new Tip has parent=NULL, nonce=0.
+        // Phase 5: rotations after torn cascade — the new Tip carries the anchor, 0.
         let mut head = storage.open_state().expect("load").unwrap();
         for _ in 0..5 {
             storage.close_batch_at(&mut head, 2000).expect("close gen3");
             assert_valid_spine_from_anchor(&mut storage);
-        }
-    }
-
-    #[test]
-    fn subtree_by_batch_index_equals_subtree_by_parent_walk() {
-        // cascade queries use `batch_index >= N` as a shortcut for
-        // "subtree rooted at N". This test asserts the equivalence on a
-        // realistic scenario with multiple cascade generations.
-        let (_db, mut storage) = open_temp_storage("subtree-equivalence");
-
-        // Build: 5 batches, cascade from 2 (partial), 3 more, cascade from 1 (torn-ish).
-        let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        for _ in 0..4 {
-            storage.close_batch_at(&mut head, 100).expect("close");
-        }
-        let landed = local_batch_payload(&mut storage, 0);
-        storage.land(20, &[(SENDER_A, landed)]); // append accepted
-        storage.advance_safe_head(1400); // advance
-        let _ = storage.recover_post_flush(1200).expect("cascade 1");
-
-        let mut head = storage.open_state().expect("load").unwrap();
-        for _ in 0..2 {
-            storage.close_batch_at(&mut head, 1500).expect("close");
-        }
-
-        // Assert equivalence among VALID batches for every valid N.
-        // Restricting both sides to `valid_batches` is the invariant cascade
-        // relies on: its WHERE filters invalidated rows, so the two sets need
-        // only agree on the valid subset.
-        let valid_bi: Vec<u64> = {
-            let mut stmt = storage
-                .conn
-                .prepare("SELECT batch_index FROM valid_batches ORDER BY batch_index")
-                .expect("prepare");
-            stmt.query_map([], |row| row.get::<_, i64>(0).map(i64_to_u64))
-                .expect("query")
-                .collect::<rusqlite::Result<_>>()
-                .expect("collect")
-        };
-        for &n in &valid_bi {
-            let by_index: Vec<u64> = {
-                let mut stmt = storage
-                    .conn
-                    .prepare(
-                        "SELECT batch_index FROM valid_batches \
-                         WHERE batch_index >= ?1 ORDER BY batch_index",
-                    )
-                    .expect("prepare");
-                stmt.query_map(params![u64_to_i64(n)], |row| {
-                    row.get::<_, i64>(0).map(i64_to_u64)
-                })
-                .expect("query")
-                .collect::<rusqlite::Result<_>>()
-                .expect("collect")
-            };
-            let by_subtree: Vec<u64> = {
-                let mut stmt = storage
-                    .conn
-                    .prepare(
-                        "WITH RECURSIVE subtree(batch_index) AS ( \
-                           SELECT batch_index FROM valid_batches WHERE batch_index = ?1 \
-                           UNION ALL \
-                           SELECT b.batch_index FROM valid_batches b \
-                           JOIN subtree s ON b.parent_batch_index = s.batch_index \
-                         ) \
-                         SELECT batch_index FROM subtree ORDER BY batch_index",
-                    )
-                    .expect("prepare");
-                stmt.query_map(params![u64_to_i64(n)], |row| {
-                    row.get::<_, i64>(0).map(i64_to_u64)
-                })
-                .expect("query")
-                .collect::<rusqlite::Result<_>>()
-                .expect("collect")
-            };
-            assert_eq!(
-                by_index, by_subtree,
-                "cascade root {n}: valid batch_index >= N diverged from valid parent-walk subtree"
-            );
         }
     }
 }

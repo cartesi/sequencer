@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn decide_submit_start_advances_once_per_matching_nonce_across_recovery_generations() {
         // Batch nonces repeat across recovery generations (a cascade reuses the
-        // last valid ancestor's `nonce + 1`), so the stream can carry one twice;
+        // last valid batch's `nonce + 1`), so the stream can carry one twice;
         // only the occurrence that matches `expected` advances.
         let from_nonce = decide_submit_start(
             SubmitterFrontier {

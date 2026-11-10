@@ -15,7 +15,7 @@ invalidated by the recovery cases below; L1 remains canonical truth.
 
 ## Two Chains Synchronizing
 
-The sequencer maintains an optimistic chain of batches — a tree that normally degenerates into a list. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
+The sequencer maintains an optimistic list of batches; recovery replaces an invalid suffix. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
 
 ```
 Sequencer (off-chain)              Scheduler (on-chain)

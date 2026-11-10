@@ -70,7 +70,7 @@ impl Storage {
                 load_current_write_head(tx)?.is_none(),
                 "open state already exists"
             );
-            let batch_index = insert_tip_rows(tx, Some(0), None, safe_block)?;
+            let batch_index = insert_tip_rows(tx, Some(0), safe_block)?;
             persist_frame_direct_sequence_derived(
                 tx,
                 batch_index,

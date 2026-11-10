@@ -7,18 +7,19 @@
 --   * `sealed_at_ms`      — inclusion lane closed the batch (no more ops).
 --   * `invalidated_at_ms` — recovery cascade-invalidated the batch.
 --
--- NULL means the event hasn't happened. Once set, triggers below make the
--- column write-once. The only "mutable" state on the row is these two NULL→value
+-- NULL means the event hasn't happened. `trg_batch_lifecycle` below makes each
+-- write-once. The only "mutable" state on the row is these two NULL→value
 -- transitions, each owned by exactly one writer (inclusion lane vs recovery).
 --
 -- The **Tip** is the one batch currently accepting ops: sealed_at_ms IS NULL
 -- AND invalidated_at_ms IS NULL. A partial unique index enforces at-most-one.
 --
--- `nonce` is structural: equal to `parent.nonce + 1`, or the era's
--- `anchor_batch_nonce` for the parentless root (0 at genesis). Enforced by
--- trigger on INSERT. The scheduler's view of a batch's identity; reused across
--- recovery cascades (new Tip forks from last valid ancestor, inheriting nonce
--- via the +1 rule).
+-- The valid batches form a list in `batch_index` order. `nonce` is the
+-- scheduler's view of a batch's identity: the last valid nonce + 1, or the
+-- era's `anchor_batch_nonce` (0 at genesis) when no batch is valid. Enforced by
+-- trigger on INSERT, and unique among valid batches. A recovery cascade
+-- invalidates a suffix; the replacement batch follows the last valid batch and
+-- reuses the first invalidated nonce.
 -- ---------------------------------------------------------------------------
 -- `sealed_at_ms` / `invalidated_at_ms` are write-once observability stamps from
 -- the wall clock, deliberately not cross-checked against `created_at_ms`:
@@ -28,16 +29,16 @@
 -- `payload_hash` is the keccak256 of the batch's SSZ wire bytes, stamped at
 -- seal time by the encode path the submitter uses. The content-identity check
 -- compares an accepted L1 landing against it; because the sealing code computed
--- it, it survives wire-format upgrades. NULL only on a never-sealed batch (the
--- open Tip, or a Tip a cascade invalidated).
+-- it, it survives wire-format upgrades. NULL exactly on a never-sealed batch
+-- (the open Tip, or a Tip a cascade invalidated).
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
-    parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
     nonce              INTEGER NOT NULL CHECK (nonce >= 0),
     created_at_ms      INTEGER NOT NULL,
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
-    payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32)
+    payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32),
+    CHECK ((sealed_at_ms IS NULL) = (payload_hash IS NULL))
 ) STRICT;
 
 -- "At most one valid Tip" — structural via partial unique index. The predicate
@@ -51,10 +52,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_single_valid_tip
     ON batches(COALESCE(sealed_at_ms, 0))
     WHERE sealed_at_ms IS NULL AND invalidated_at_ms IS NULL;
 
--- Submitter hot path: "give me valid closed batches with nonce >= N", ordered.
-CREATE INDEX IF NOT EXISTS idx_batches_valid_closed_by_nonce
+-- At most one valid batch per nonce. Also the submitter's hot path ("valid
+-- closed batches with nonce >= N", ordered): its predicate implies this one's.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_valid_batch_nonce
     ON batches(nonce)
-    WHERE invalidated_at_ms IS NULL AND sealed_at_ms IS NOT NULL;
+    WHERE invalidated_at_ms IS NULL;
 
 -- ── Views ──────────────────────────────────────────────────────────────────
 -- Readers over batch data go through these `valid_*` views, which exclude
@@ -81,82 +83,31 @@ CREATE VIEW IF NOT EXISTS valid_open_batch AS
 -- every column before any trigger runs, so trigger arithmetic, frontier folds
 -- and comparisons only ever see the declared class (integers where they count).
 
--- Nonce contiguity: `nonce = parent.nonce + 1`, or the era's
--- `anchor_batch_nonce` (its next batch nonce at the stop block) for the
--- parentless root. With no era the anchor subquery is NULL, `IS NOT` holds, and
--- a parentless root aborts: the batch tree never roots before the era exists.
+-- Nonce contiguity: a new batch carries the last valid nonce + 1, or the era's
+-- `anchor_batch_nonce` (its next batch nonce at the stop block) when no batch
+-- is valid. With neither the right side is NULL, `IS NOT` holds and the insert
+-- aborts: no batch exists before the era. SQLite fires the most recently
+-- created BEFORE trigger first, so the divergence freeze (created below) answers
+-- before this one while its marker exists.
 CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
-AFTER INSERT ON batches
-FOR EACH ROW
-BEGIN
-    SELECT CASE
-        -- A parentless root must carry exactly the deployment's anchor nonce,
-        -- so a buggy root at any other nonce ABORTs.
-        WHEN NEW.parent_batch_index IS NULL
-         AND NEW.nonce IS NOT (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0)
-            THEN RAISE(ABORT, 'parentless root must carry the batch-tree anchor nonce')
-        -- At most one *valid* parentless root. A fully-torn cascade invalidates
-        -- the old root, then re-roots parentless at the anchor (the documented
-        -- `open_fresh_tip_in_tx` parent=None path) — leaving exactly one valid
-        -- root again, with the invalidated old root(s) coexisting. (Counts the
-        -- just-inserted row, hence `> 1`.)
-        WHEN NEW.parent_batch_index IS NULL
-         AND (SELECT COUNT(*) FROM batches
-              WHERE parent_batch_index IS NULL AND invalidated_at_ms IS NULL) > 1
-            THEN RAISE(ABORT, 'at most one valid parentless root per deployment')
-        WHEN NEW.parent_batch_index IS NOT NULL
-         AND NEW.nonce != (SELECT nonce + 1 FROM batches WHERE batch_index = NEW.parent_batch_index)
-            THEN RAISE(ABORT, 'batch nonce must equal parent.nonce + 1')
-    END;
-END;
+BEFORE INSERT ON batches FOR EACH ROW
+WHEN NEW.nonce IS NOT COALESCE(
+    (SELECT MAX(nonce) + 1 FROM batches WHERE invalidated_at_ms IS NULL),
+    (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0))
+BEGIN SELECT RAISE(ABORT, 'a batch nonce is the last valid nonce + 1, or the era anchor'); END;
 
--- Write-once: sealed_at_ms transitions only NULL → non-NULL.
-CREATE TRIGGER IF NOT EXISTS trg_sealed_at_ms_write_once
-BEFORE UPDATE OF sealed_at_ms ON batches
-FOR EACH ROW
-WHEN OLD.sealed_at_ms IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'sealed_at_ms is write-once');
-END;
-
--- Write-once: invalidated_at_ms transitions only NULL → non-NULL.
-CREATE TRIGGER IF NOT EXISTS trg_invalidated_at_ms_write_once
-BEFORE UPDATE OF invalidated_at_ms ON batches
-FOR EACH ROW
-WHEN OLD.invalidated_at_ms IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'invalidated_at_ms is write-once');
-END;
-
--- Write-once: payload_hash transitions only NULL → non-NULL (stamped in the
--- same UPDATE that seals the batch).
-CREATE TRIGGER IF NOT EXISTS trg_payload_hash_write_once
-BEFORE UPDATE OF payload_hash ON batches
-FOR EACH ROW
-WHEN OLD.payload_hash IS NOT NULL
-BEGIN
-    SELECT RAISE(ABORT, 'payload_hash is write-once');
-END;
-
--- parent_batch_index is immutable after insert.
-CREATE TRIGGER IF NOT EXISTS trg_parent_batch_index_immutable
-BEFORE UPDATE OF parent_batch_index ON batches
-FOR EACH ROW
-WHEN (OLD.parent_batch_index IS NULL) != (NEW.parent_batch_index IS NULL)
-   OR OLD.parent_batch_index IS NOT NULL AND NEW.parent_batch_index IS NOT NULL
-      AND OLD.parent_batch_index != NEW.parent_batch_index
-BEGIN
-    SELECT RAISE(ABORT, 'parent_batch_index is immutable');
-END;
-
--- nonce is immutable after insert.
-CREATE TRIGGER IF NOT EXISTS trg_nonce_immutable
-BEFORE UPDATE OF nonce ON batches
-FOR EACH ROW
-WHEN OLD.nonce != NEW.nonce
-BEGIN
-    SELECT RAISE(ABORT, 'nonce is immutable');
-END;
+-- A batch row changes only by sealing once, with its hash, while valid, or by
+-- being invalidated once. The divergence freeze (created below) answers first.
+CREATE TRIGGER IF NOT EXISTS trg_batch_lifecycle
+BEFORE UPDATE ON batches FOR EACH ROW
+WHEN NOT (NEW.batch_index IS OLD.batch_index AND NEW.nonce IS OLD.nonce
+      AND NEW.created_at_ms IS OLD.created_at_ms
+      AND ( (OLD.sealed_at_ms IS NULL AND NEW.sealed_at_ms IS NOT NULL
+             AND OLD.payload_hash IS NULL AND NEW.payload_hash IS NOT NULL
+             AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NULL)
+         OR (NEW.sealed_at_ms IS OLD.sealed_at_ms AND NEW.payload_hash IS OLD.payload_hash
+             AND OLD.invalidated_at_ms IS NULL AND NEW.invalidated_at_ms IS NOT NULL)))
+BEGIN SELECT RAISE(ABORT, 'a batch changes only by sealing once with its hash, or by invalidating once'); END;
 
 -- ---------------------------------------------------------------------------
 -- Frames and user ops: must target the current Tip.
@@ -412,7 +363,7 @@ BEGIN SELECT RAISE(ABORT, 'rebuilt history is retained for the database lifetime
 -- at the base count; setup's rebuild covers [base_l2_tx_count,
 -- rebuilt_history_end) and the live rows follow. The lane drains directs from
 -- `first_queued_input` until a frame of the era accounts for more.
--- `anchor_batch_nonce` is the nonce the batch tree's parentless root carries
+-- `anchor_batch_nonce` is the nonce a batch carries when no batch is valid
 -- (I16). A database is set up exactly when this row exists.
 CREATE TABLE IF NOT EXISTS era (
     singleton_id        INTEGER PRIMARY KEY CHECK (singleton_id = 0),

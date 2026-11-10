@@ -691,10 +691,10 @@ impl ManagedSequencer {
         })
     }
 
-    /// The batch-tree anchor nonce (the era's `anchor_batch_nonce`), read
-    /// from the run DB read-only: the resume nonce of a rebuilt deployment,
-    /// `0` for a genesis one. The batch-tree checks state root and contiguity
-    /// relative to it (I16). Fails when the era is absent.
+    /// The era's anchor nonce (`anchor_batch_nonce`), read from the run DB
+    /// read-only: the resume nonce of a rebuilt deployment, `0` for a genesis
+    /// one. The valid nonces are contiguous from it (I16). Fails when the era
+    /// is absent.
     pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
         let db_path = self.data_dir_path.join("sequencer.db");
         let conn = rusqlite::Connection::open_with_flags(
@@ -833,7 +833,7 @@ impl ManagedSequencer {
         })
     }
 
-    /// Assert the schema-level tree invariants on the sequencer's DB. Runs
+    /// Assert the schema-level batch invariants on the sequencer's DB. Runs
     /// against the DB file read-only; safe to call whether the sequencer is
     /// running or stopped (SQLite WAL + read-only flag handles concurrent
     /// writers).
@@ -842,12 +842,8 @@ impl ManagedSequencer {
     ///   1. At most one `valid_open_batch` row (partial unique index
     ///      `ux_single_valid_tip` should guarantee this structurally —
     ///      we verify it in case the index ever regressed).
-    ///   2. Every valid batch's `nonce` equals `parent.nonce + 1`, or 0 if
-    ///      `parent_batch_index IS NULL`.
-    ///   3. Every `parent_batch_index` is NULL or references an existing
-    ///      batch (FK-backed, verified explicitly for cross-DB-tool
-    ///      portability).
-    ///   4. The nonces on the valid path form a contiguous `0..N` sequence.
+    ///   2. The valid batches' nonces are unique and contiguous from the
+    ///      era's anchor (I16).
     ///
     /// Panics with a specific violation message if any invariant fails.
     /// Harness-only check (no sequencer changes) that catches regressions
@@ -860,13 +856,11 @@ impl ManagedSequencer {
         )
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
-        // The batch-tree anchor: the nonce the single parentless root carries
-        // (0 for a genesis deployment, N' for a cockroach-recovered one). The
-        // root/contiguity invariants below are stated relative to it, so a
-        // recovered tree (rooted at N') passes the same checks a genesis tree
-        // (rooted at 0) does. Mirrors `trg_enforce_nonce_contiguity`. Reuses the
-        // `batch_tree_anchor()` accessor (its own short-lived read-only handle)
-        // rather than re-issuing the query against `conn`.
+        // The era's anchor: the first valid nonce (0 for a genesis deployment,
+        // N' for a cockroach-recovered one). Mirrors
+        // `trg_enforce_nonce_contiguity`. Reuses the `batch_tree_anchor()`
+        // accessor (its own short-lived read-only handle) rather than
+        // re-issuing the query against `conn`.
         let anchor = self.batch_tree_anchor()? as i64;
 
         // 1. At most one valid open batch.
@@ -879,60 +873,7 @@ impl ManagedSequencer {
             panic!("schema invariant: more than one valid Tip ({open_count} rows)");
         }
 
-        // 1b. At most one *valid* parentless root (the anchored root).
-        let valid_root_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM valid_batches WHERE parent_batch_index IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("count valid roots: {err}")))?;
-        if valid_root_count > 1 {
-            panic!(
-                "schema invariant: more than one valid parentless root ({valid_root_count} rows)"
-            );
-        }
-
-        // 2. Nonce contiguity via parent.
-        let mut stmt = conn
-            .prepare(
-                "SELECT b.batch_index, b.parent_batch_index, b.nonce, p.nonce \
-                 FROM batches b LEFT JOIN batches p ON p.batch_index = b.parent_batch_index",
-            )
-            .map_err(|err| io_other(format!("prepare nonce-check: {err}")))?;
-        let rows: Vec<(i64, Option<i64>, i64, Option<i64>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .map_err(|err| io_other(format!("query nonce-check: {err}")))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|err| io_other(format!("collect nonce-check: {err}")))?;
-        for (bi, parent, nonce, parent_nonce) in &rows {
-            match (parent, parent_nonce) {
-                (None, _) => {
-                    if *nonce != anchor {
-                        panic!(
-                            "schema invariant: batch {bi} has NULL parent but nonce {nonce} (expected anchor {anchor})"
-                        );
-                    }
-                }
-                (Some(p), None) => {
-                    panic!(
-                        "schema invariant: batch {bi}'s parent {p} doesn't exist (FK violation)"
-                    );
-                }
-                (Some(_), Some(pn)) => {
-                    if *nonce != pn + 1 {
-                        panic!(
-                            "schema invariant: batch {bi} nonce={nonce}, expected parent.nonce+1 = {}",
-                            pn + 1
-                        );
-                    }
-                }
-            }
-        }
-
-        // 3. Valid-path nonce uniqueness and contiguity.
+        // 2. Valid nonce uniqueness and contiguity from the anchor.
         let mut stmt = conn
             .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")
             .map_err(|err| io_other(format!("prepare valid-nonces: {err}")))?;

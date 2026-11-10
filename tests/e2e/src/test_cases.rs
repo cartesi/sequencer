@@ -3777,14 +3777,13 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
 // Nonce-0 first batch recovery edge.
 //
 // Two coupled invariants:
-//   - Cascade from no valid ancestor: if the first-ever batch (nonce 0)
+//   - Cascade with no valid batch left: if the first-ever batch (nonce 0)
 //     goes stale before any
 //     batch reaches `Gold` (i.e., before any batch is L1-accepted),
 //     recovery cascades it and opens a fresh recovery batch that itself
-//     has nonce 0 (parent NULL — there's no valid ancestor to point
-//     at). No genesis sentinel exists in the implementation; the
-//     parent-pointer schema must handle "all batches invalidated"
-//     natively.
+//     has nonce 0 (the era's anchor: no valid batch remains). No genesis
+//     sentinel exists in the implementation; the schema handles "all
+//     batches invalidated" natively.
 //   - Reused nonce acceptance: after recovery, the recovery batch (with
 //     nonce 0 reused)
 //     submits to L1, gets accepted by `populate_safe_accepted_batches`,
@@ -3793,8 +3792,8 @@ async fn run_chain_id_mismatch_via_live_rpc_refuses_boot_test(
 //
 // The structural invariants are validated by
 // `assert_schema_invariants` (post-test hook in `tests/e2e/src/main.rs`):
-// it checks that NULL-parent batches have nonce 0 and that valid-path
-// nonces form a contiguous `0..N`. So this test asserts those
+// it checks that the valid nonces form a contiguous `0..N` from the
+// anchor. So this test asserts those
 // observable consequences plus the explicit `safe_accepted_batches`
 // post-condition for reused-nonce acceptance.
 //
@@ -3862,7 +3861,7 @@ async fn run_nonce_zero_recovery_invalidates_then_accepts_at_nonce_zero_test(
 
     // Nonce-0 recovery assertions: the only existing batch (the original nonce-0
     // one) was cascaded, and a recovery batch was opened. The recovery
-    // batch's invariants (NULL parent → nonce 0) are checked structurally
+    // batch's invariants (no valid batch → anchor nonce 0) are checked structurally
     // by the post-test `assert_schema_invariants` hook.
     let counts = runtime.count_batches()?;
     assert!(

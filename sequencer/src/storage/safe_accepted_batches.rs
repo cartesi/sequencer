@@ -45,12 +45,12 @@ pub(super) fn query_latest_safe_accepted_batch(
 /// Returns `latest_accepted.nonce + 1` if any batch has been accepted, else the
 /// deployment anchor (the era's next batch nonce at its stop block, `N'`).
 /// Equivalently, the nonce that the very next valid closed batch (the cascade
-/// pivot, when one exists) will carry, by the contiguity invariant on the
-/// valid path (`trg_enforce_nonce_contiguity`).
+/// pivot, when one exists) will carry, by the contiguity of the valid
+/// batches' nonces (`trg_enforce_nonce_contiguity`).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     match query_latest_safe_accepted_batch(conn)? {
         Some(row) => Ok(next_expected_nonce(i64_to_u64(row.nonce))),
-        // Empty accepted table ⇒ the frontier sits at the batch-tree anchor
+        // Empty accepted table ⇒ the frontier sits at the era's anchor
         // N', the era's next batch nonce at its stop block. Reading
         // the anchor (not a hard-coded 0) keeps this in step with
         // `populate_safe_accepted_batches`, which seeds `expected` from the same
@@ -807,8 +807,8 @@ mod tests {
         let protocol = default_protocol_timing();
         let submitter = SENDER_A;
 
-        // The tree roots at N' = 7: build + seal one local batch — it carries
-        // nonce 7 (compute_next_nonce(None) reads the anchor).
+        // The era is anchored at N' = 7: build + seal one local batch — with
+        // no valid batch before it, it carries nonce 7 (the anchor).
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(
             storage.batch_nonce(0).expect("nonce"),
             7,
-            "the root tip carries the anchor nonce N'"
+            "the era's first batch carries the anchor nonce N'"
         );
 
         // Its genuine wire bytes (looked up by nonce N'=7) land from the
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn populate_skips_below_anchor_collapsed_history_without_divergence() {
-        // Below the anchor the local tree has no batches (that history was folded
+        // Below the anchor the local list has no batches (that history was folded
         // into S'). Old-generation L1 landings at nonces < N' are trusted
         // collapsed history: skipped by nonce-mismatch BEFORE the content-identity
         // check, so they must NOT be flagged Foreign (which would freeze the

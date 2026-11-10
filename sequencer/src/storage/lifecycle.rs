@@ -77,7 +77,7 @@ impl Storage {
     /// Publish the new era with its durable baseline dump, in one transaction:
     /// the era row (which also makes the database set up) and the baseline
     /// snapshot at the rebuilt history's end. Setup opens no Tip; `run`'s
-    /// startup roots the batch tree at the era's anchor.
+    /// startup opens the era's first batch at its anchor nonce.
     pub(crate) fn publish_era(
         &mut self,
         baseline_prefix: &std::path::Path,
@@ -373,14 +373,13 @@ mod tests {
     #[test]
     fn publish_era_refuses_a_directory_with_a_batch() {
         let (_db, mut storage) = seeded(LifecycleCommand::Setup);
-        // The schema refuses a parentless root before the era exists, so the
-        // seed drops that arm: the Rust guard is what this test exercises.
+        // The schema refuses any batch before the era exists, so the seed
+        // drops that trigger: the Rust guard is what this test exercises.
         storage
             .conn
             .execute_batch(
                 "DROP TRIGGER trg_enforce_nonce_contiguity; \
-                 INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-                 VALUES (0, NULL, 0, 0);",
+                 INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (0, 0, 0);",
             )
             .expect("seed a batch");
         assert!(matches!(

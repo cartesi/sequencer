@@ -81,8 +81,8 @@ impl Storage {
     /// each one fully assembled and SSZ-encoded with its authoritative nonce.
     ///
     /// Authoritative because the nonce stamped into the wire payload is the
-    /// one the DB persists on the batch row (via the `parent.nonce + 1`
-    /// structural invariant). The caller never sees an unstamped batch —
+    /// one the DB persists on the batch row (the last valid nonce + 1 at
+    /// insert, I16). The caller never sees an unstamped batch —
     /// there is no way to accidentally encode with the wrong nonce.
     pub fn pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
         const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
@@ -268,7 +268,7 @@ mod tests {
     fn closed_batch_becomes_eligible_for_submission_with_assigned_nonce() {
         // : closing a batch transitions it from "open Tip" to "eligible
         // for L1 submission" — it appears in `valid_closed_batches` with a
-        // nonce derived from its parent pointer. Pins the submitter's
+        // nonce derived at insert. Pins the submitter's
         // contract: open batches are NOT pulled into the submission pipeline,
         // and closed batches ARE, at the schema-guaranteed nonce.
         let db = temp_db("closed-batch-eligible");
@@ -293,8 +293,8 @@ mod tests {
             .close_frame_and_batch(&mut head, safe_block)
             .expect("close batch 0");
 
-        // After close: batch 0 is eligible with nonce 0 (genesis, parent
-        // NULL → trigger assigns nonce 0).
+        // After close: batch 0 is eligible with nonce 0 (genesis: no valid
+        // batch, so it carries the era's anchor, 0).
         let pending_after = storage
             .pending_batches(0)
             .expect("load pending batches (post-close)");
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(pending_after[0].batch_index, 0);
         assert_eq!(
             pending_after[0].nonce, 0,
-            "closed batch 0 must carry nonce 0 (genesis, no parent)",
+            "closed batch 0 must carry nonce 0 (genesis, the era's anchor)",
         );
         // The new open Tip (batch 1) must NOT be eligible even though it
         // exists — eligibility requires sealed_at_ms NOT NULL.
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn submitter_frontier_uses_anchor_when_no_batches_accepted() {
         // A cockroach-recovered deployment boots with an empty
-        // safe_accepted_batches and a non-zero batch-tree anchor (N'). The
+        // safe_accepted_batches and a non-zero era anchor (N'). The
         // submitter's start frontier must be N', not 0 — otherwise it would
         // re-submit its first post-recovery batch (nonce N') on every tick
         // until the first accepted row lands. Regression test for the
@@ -443,9 +443,8 @@ mod tests {
     #[test]
     fn nonce_is_reused_after_torn_cascade() {
         // After a torn cascade invalidates every batch (including genesis),
-        // the recovery batch has no valid ancestor. Its parent is NULL,
-        // so its nonce resets to 0 — effectively reusing the nonce of the
-        // original genesis. The scheduler's "expected next nonce" also
+        // no batch is valid, so the recovery batch carries the era's anchor,
+        // 0 — reusing the nonce of the original genesis. The scheduler's "expected next nonce" also
         // resets to 0, since no accepted batches were ever submitted.
         let db = temp_db("nonce-reuse-after-torn-cascade");
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
@@ -472,7 +471,7 @@ mod tests {
             .expect("recovery batch");
         assert_eq!(head.batch_index, 2);
 
-        // Recovery Tip has no valid ancestor → parent NULL → nonce 0.
+        // No valid batch remains → the recovery Tip carries the anchor, 0.
         let recovery_nonce: i64 = storage
             .conn
             .query_row(

@@ -149,7 +149,7 @@ empty but for the lock file, so retrying in the same directory is safe.
    released, and the transaction. At the end, the directs executed must number
    the admitted directs the scheduler drained, counted in the input table.
 7. **Publishes the new era.** It writes the baseline dump, then one transaction
-   inserts the era row, which carries the batch tree's anchor and whose
+   inserts the era row, which carries the batches' anchor nonce and whose
    existence marks setup complete, and registers the baseline. Setup opens no
    root frame and no Tip.
 

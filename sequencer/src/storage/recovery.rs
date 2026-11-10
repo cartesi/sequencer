@@ -122,7 +122,7 @@ impl Storage {
     /// Whether the canonical-divergence marker (I15) is present, and the
     /// recorded `(nonce, safe_input_index)` if so. Standard
     /// recovery is forbidden while the marker exists; callers on the recovery
-    /// path must check this before any batch-tree mutation.
+    /// path must check this before any batch mutation.
     pub fn canonical_divergence(&mut self) -> Result<Option<(u64, u64)>> {
         self.read(|tx| canonical_divergence_in(tx))
     }
@@ -214,7 +214,7 @@ impl Storage {
     /// Execute post-flush Cascade. The boot-local flush observation is
     /// represented by its observed safe-block floor; this transaction
     /// reasserts both I15 and the post-flush resync coherence check
-    /// immediately before changing the batch tree. The reopened Tip drains
+    /// immediately before changing the batches. The reopened Tip drains
     /// under the application's `max_direct_payload_bytes`.
     pub(crate) fn recover_post_flush_for_recovery(
         &mut self,

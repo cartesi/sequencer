@@ -12,73 +12,52 @@ use super::l1_inputs::query_deployment_identity;
 use super::queries::DIRECT_EXECUTES_SQL;
 use super::{DirectInputExecution, SafeInputRange};
 
-/// Insert a new batch. Nonce is derived from `parent_batch_index`:
-/// `parent.nonce + 1`, or the era's anchor for a parentless root
-/// (genesis, cockroach recovery, or a fully invalidated branch).
+/// Insert a new batch after the last valid one. Its nonce is the last valid
+/// nonce + 1, or the era's anchor when no batch is valid (the era's first
+/// batch, or after a cascade that tore every valid batch).
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
-/// The explicit form is used only by `initialize_open_state` to pin the
-/// very first genesis batch at `batch_index = 0`.
-///
-/// The `trg_enforce_nonce_contiguity` trigger verifies the nonce matches
-/// `parent.nonce + 1`, so caller and schema agree.
+/// The explicit form pins the very first genesis batch at `batch_index = 0`.
+/// `trg_enforce_nonce_contiguity` checks the same rule, so caller and schema agree.
 pub(super) fn insert_new_batch(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
-    parent_batch_index: Option<u64>,
     created_at_ms: i64,
 ) -> Result<u64> {
-    let nonce = compute_next_nonce(tx, parent_batch_index)?;
+    let nonce = compute_next_nonce(tx)?;
     match batch_index_opt {
         Some(bi) => {
             tx.execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    u64_to_i64(bi),
-                    parent_batch_index.map(u64_to_i64),
-                    u64_to_i64(nonce),
-                    created_at_ms
-                ],
+                "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (?1, ?2, ?3)",
+                params![u64_to_i64(bi), u64_to_i64(nonce), created_at_ms],
             )?;
             Ok(bi)
         }
         None => {
             tx.execute(
-                "INSERT INTO batches (parent_batch_index, nonce, created_at_ms) \
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    parent_batch_index.map(u64_to_i64),
-                    u64_to_i64(nonce),
-                    created_at_ms
-                ],
+                "INSERT INTO batches (nonce, created_at_ms) VALUES (?1, ?2)",
+                params![u64_to_i64(nonce), created_at_ms],
             )?;
             Ok(i64_to_u64(tx.last_insert_rowid()))
         }
     }
 }
 
-fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
-    match parent_batch_index {
-        // A parentless root carries the era's anchor nonce: its next batch
-        // nonce at the stop block. Mirrored by `trg_enforce_nonce_contiguity`'s
-        // parentless arm; with no era both refuse.
+/// The last valid nonce + 1, or the era's anchor when no batch is valid: the
+/// rule of `trg_enforce_nonce_contiguity`. With neither, reading the era fails.
+fn compute_next_nonce(tx: &Transaction<'_>) -> Result<u64> {
+    let last_valid: Option<i64> =
+        tx.query_row("SELECT MAX(nonce) FROM valid_batches", [], |row| row.get(0))?;
+    match last_valid {
+        Some(nonce) => Ok(i64_to_u64(nonce)
+            .checked_add(1)
+            .expect("batch nonce overflow: contract-impossible")),
         None => Ok(era_in(tx)?.anchor_batch_nonce),
-        Some(parent_bi) => {
-            let parent_nonce: i64 = tx.query_row(
-                "SELECT nonce FROM batches WHERE batch_index = ?1",
-                params![u64_to_i64(parent_bi)],
-                |row| row.get(0),
-            )?;
-            Ok(i64_to_u64(parent_nonce)
-                .checked_add(1)
-                .expect("batch nonce overflow: contract-impossible"))
-        }
     }
 }
 
-/// Mark a batch as sealed (inclusion lane closed it). Write-once per the
-/// `trg_sealed_at_ms_write_once` / `trg_payload_hash_write_once` triggers.
+/// Mark a batch as sealed (inclusion lane closed it). Write-once per
+/// `trg_batch_lifecycle`.
 /// The payload hash is stamped in the same UPDATE: a sealed batch always
 /// carries the hash the content-identity check compares accepted L1
 /// landings against (hash-at-seal).

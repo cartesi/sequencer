@@ -248,12 +248,11 @@ impl Storage {
 pub(super) fn insert_tip_rows(
     tx: &Transaction<'_>,
     batch_index_opt: Option<u64>,
-    parent: Option<u64>,
     safe_block: u64,
 ) -> Result<u64> {
     let now_ms = now_unix_ms();
     let policy = query_batch_policy(tx)?;
-    let batch_index = insert_new_batch(tx, batch_index_opt, parent, now_ms)?;
+    let batch_index = insert_new_batch(tx, batch_index_opt, now_ms)?;
     insert_open_frame(
         tx,
         batch_index,
@@ -273,12 +272,11 @@ pub(super) fn insert_tip_rows(
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
 /// startup recovery's guarded Tip creation (genesis / first startup) and
 /// recovery's cascade (reopening the Tip it just invalidated, atomically — see
-/// `storage/recovery.rs`). Lineage is derived from the tree: `parent` is the
-/// highest-indexed valid batch — `None` when the valid path is empty (genesis,
-/// or a fully-torn cascade), rooting a batch at the deployment anchor; `batch_index` is the
-/// explicit genesis `0` only when the `batches` table is empty, otherwise the
-/// monotonic PK (so recovery batches keep climbing and indices are never
-/// reused).
+/// `storage/recovery.rs`). The new Tip follows the last valid batch, at the
+/// era's anchor nonce when none is valid (genesis, or a fully-torn cascade);
+/// `batch_index` is the explicit genesis `0` only when the `batches` table is
+/// empty, otherwise the monotonic PK (so recovery batches keep climbing and
+/// indices are never reused).
 pub(super) fn open_fresh_tip_in_tx(
     tx: &Transaction<'_>,
     max_direct_payload_bytes: u64,
@@ -289,16 +287,10 @@ pub(super) fn open_fresh_tip_in_tx(
             row.get::<_, Option<i64>>(0)
         })?
         .is_none();
-    let parent = tx
-        .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?
-        .map(i64_to_u64);
     let batch_index_opt = if table_empty { Some(0) } else { None };
     insert_draining_tip_with_executions(
         tx,
         batch_index_opt,
-        parent,
         safe_block,
         query_latest_safe_input_index_exclusive(tx)?,
         max_direct_payload_bytes,
@@ -311,14 +303,13 @@ pub(super) fn open_fresh_tip_in_tx(
 fn insert_draining_tip_with_executions(
     tx: &Transaction<'_>,
     batch_index: Option<u64>,
-    parent: Option<u64>,
     safe_block: u64,
     drain_upper: u64,
     max_direct_payload_bytes: u64,
 ) -> Result<()> {
     let leading_direct_range =
         SafeInputRange::new(next_undrained_safe_input_index_in(tx)?, drain_upper);
-    let batch_index = insert_tip_rows(tx, batch_index, parent, safe_block)?;
+    let batch_index = insert_tip_rows(tx, batch_index, safe_block)?;
     persist_frame_direct_sequence_derived(
         tx,
         batch_index,
@@ -382,7 +373,7 @@ pub(super) fn seal_and_open_next_batch(
     let encoded = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch { nonce, frames });
     let payload_hash = alloy_primitives::keccak256(&encoded);
     seal_batch(tx, closing_batch_index, now_ms, &payload_hash.0)?;
-    let next_batch_index = insert_new_batch(tx, None, Some(closing_batch_index), now_ms)?;
+    let next_batch_index = insert_new_batch(tx, None, now_ms)?;
     insert_open_frame(
         tx,
         next_batch_index,

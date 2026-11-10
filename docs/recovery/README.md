@@ -19,10 +19,12 @@ cross-module enforcement.
 
 ## The state being repaired
 
-The local batch tree has one valid path: an **accepted prefix**, followed by an
-**optimistic suffix** ending at the open **Tip**. Recovery invalidates a suffix
-and opens a new Tip from the surviving path. Invalidated batch, frame, and
-user-op source facts remain available for audit.
+The valid local batches form one list in creation order: an **accepted
+prefix**, followed by an **optimistic suffix** ending at the open **Tip**.
+Recovery invalidates a suffix and opens a new Tip after the last valid batch;
+there is no parent pointer. Invalidated batch, frame, and user-op source facts
+remain available for audit, and a dead branch is recoverable from creation
+order (`batch_index`) and its nonces.
 
 “Accepted” (also called **Gold** in code and models) means the safe-input
 projection applied the scheduler's acceptance rules and matched the landed
@@ -38,10 +40,10 @@ Keep three identities separate:
 | Scheduler batch nonce | Ordering identity; derived when storage creates the batch. A replacement branch reuses the invalidated suffix's nonces. |
 | L1 wallet nonce | Transaction slot; a batch transaction and a flush no-op may compete for it. Covered slots must be consumed at safe depth before post-flush repair. |
 
-A parentless root uses the era's immutable anchor nonce: the scheduler's next
-batch nonce at the stop block, which setup writes. Production needs no
-accepted ancestor or submitted sentinel to repair a fully invalidated branch
-([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
+With no valid batch, the next batch uses the era's immutable anchor nonce: the
+scheduler's next batch nonce at the stop block, which setup writes. Production
+needs no accepted batch or submitted sentinel to repair a fully invalidated branch
+([I16](../invariants.md#i16-valid-batches-carry-contiguous-unique-nonces-from-the-eras-anchor)).
 
 ## Lifecycle and startup dispatch
 
@@ -68,7 +70,7 @@ checkpoint. After initial sync, one consistent `RecoveryInspection` selects:
 | Local fact | Action |
 |---|---|
 | `Safe` + open Tip | Ready for runtime preparation. |
-| `Safe` + no Tip | `EnsureOpenTip`: create it under a transaction guard; the first `run` after setup opens the era's root this way. |
+| `Safe` + no Tip | `EnsureOpenTip`: create it under a transaction guard; the first `run` after setup opens the era's first batch this way. |
 | `TipInDanger(N)` | `RecoverTip { N }`: invalidate that Tip and reopen, without flushing. |
 | `ClosedBatchInDanger(N)` | Flush → sync → guarded post-flush cascade. |
 | `L1ViewStale` | Retry; the persisted view or clock cannot authorize serving. |
@@ -298,7 +300,7 @@ change. Thus flush alone does not imply invalidation.
 accepted wire bytes against the local valid closed batch. A foreign or different
 payload persists divergence and freezes the acceptance frontier. Startup checks
 that marker before L1 access, after sync, inside repair transactions, and before
-admission. Repairing the tree's shape cannot recover missing canonical effects;
+admission. Repairing the batch list cannot recover missing canonical effects;
 investigate the fault and use [cockroach recovery](cockroach.md). Check scope
 and enforcement are owned by [I9 and I15](../invariants.md).
 
@@ -320,7 +322,7 @@ Several details must not be read as literal production behavior:
 
 | Model | Production mapping or limit |
 |---|---|
-| A Gold genesis sentinel at nonce zero | Production opens a parentless root at its stored anchor, without a submitted sentinel. Root/anchor cases are tested in Rust. |
+| A Gold genesis sentinel at nonce zero | Production opens the first batch at its stored anchor, without a submitted sentinel. Anchor cases are tested in Rust. |
 | `SubmitBatch` assigns the pending suffix with `max(walletNonce, nextL1Slot)` | The poster derives the suffix and Latest account nonce, and raises the durable watermark before sending. The model expression is not a Rust nonce-allocation recipe. |
 | Tip advancement and submission can interleave with recovery; dead batches can race after model invalidation | Production stops workers and settles covered slots before the closed cascade. These additional modeled interleavings do not establish coverage of different production actions. |
 | `Resolve` handles a stale Silver frontier or a Tip at `MAX_WAIT_BLOCKS` | Production also invalidates a killed/unsubmitted closed suffix after flush and repairs a Tip at the earlier danger threshold. Those actions need the arguments above and Rust tests. |

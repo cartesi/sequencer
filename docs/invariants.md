@@ -52,13 +52,13 @@ don't.
 One writer role per fact. Reads over batch data go through the `valid_*`
 views (`valid_batches`, `valid_closed_batches`, `valid_open_batch`), which encapsulate the "exclude invalidated rows"
 filter; writers target the base tables. The batch lifecycle columns partition
-by writer and are write-once (`0001_schema.sql`).
+by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 
 | Writer | Writes |
 |---|---|
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
-| recovery (startup) | the era's root Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
+| recovery (startup) | the era's first Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
 | history metadata (setup/recovery) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades, whose greatest key is the recovery generation |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
@@ -171,8 +171,8 @@ by writer and are write-once (`0001_schema.sql`).
   state at the end of stop block `C`, which the canonical machine reaches too,
   so until a batch of the era is accepted it is the comparison checkpoint
   (inclusion block `C`, count `E`, the anchor nonce), genesis base or not.
-  Setup opens no Tip; `run`'s startup recovery opens the era's root before the
-  lane starts.
+  Setup opens no Tip; `run`'s startup recovery opens the era's first batch
+  before the lane starts.
 - **Enforced by:** `publish_era`, `finalized_dump_in`'s assertion that the
   baseline sits at `E`, recovery admission, atomic Tip reopen, and
   `PreparedRuntime::prepare` artifact checks.
@@ -355,36 +355,36 @@ by writer and are write-once (`0001_schema.sql`).
   The first append after `publish_era`, `run`'s first sync, judges every
   submitter input past `C`, whichever sync ingested it.
 
-### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
+### I16. Valid batches carry contiguous, unique nonces from the era's anchor
 
-- **Holds:** every batch's nonce is
-  `parent.nonce + 1`, except the single parentless root, which carries the
-  era's `anchor_batch_nonce` — the scheduler's next batch nonce at the end of
-  the era's stop block, which setup's rebuild ends with and publishes in the
-  era row. No root exists before the era does. The first
-  Tip is that root (there is no separate sentinel batch): setup leaves its
-  creation to startup recovery. A fully-torn cascade re-roots parentless at the
-  same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
-  invalidating the old root — so only one *valid* parentless root ever exists,
-  invalidated ones coexisting.
-- **Enforced by:** the parent foreign key (enabled on every writer) rejects
-  dangling parents; `trg_enforce_nonce_contiguity` checks nonce succession.
-  Its parentless arm is an
-  *exact* match `nonce IS (SELECT anchor_batch_nonce FROM era)` (tighter
-  than a bare "must be 0"; with no era it compares against NULL and aborts),
-  plus an at-most-one-valid-parentless-root guard scoped to
-  `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the same
-  anchor and fails when the era is absent; the era row is immutable
-  (`trg_era_immutable`, `trg_era_not_deletable`, `trg_era_single_insert`), so
-  a live deployment is never re-anchored.
+- **Holds:** the valid batches, in `batch_index` order, carry the nonces
+  `N'`, `N' + 1`, … where `N'` is the era's `anchor_batch_nonce` — the
+  scheduler's next batch nonce at the end of the era's stop block, which
+  setup's rebuild ends with and publishes in the era row. A new batch carries
+  the last valid nonce + 1, or the anchor when no batch is valid: the era's
+  first batch (setup leaves its creation to startup recovery; there is no
+  sentinel batch), and the batch after a cascade that tore every valid batch.
+  A cascade that keeps a valid prefix reuses the pivot's nonce. At most one
+  valid batch carries each nonce; invalidated batches keep theirs. No batch
+  exists before the era does.
+- **Enforced by:** `trg_enforce_nonce_contiguity`, a BEFORE INSERT check that
+  `nonce IS COALESCE(last valid nonce + 1, era anchor)` (with neither, it
+  compares against NULL and aborts); `compute_next_nonce` computes the same
+  rule and fails when the era is absent; the partial unique index
+  `ux_valid_batch_nonce`; `trg_batch_lifecycle`, which keeps a nonce fixed
+  once inserted; the cascade invalidating a whole `batch_index` suffix; and
+  the era row's immutability (`trg_era_immutable`, `trg_era_not_deletable`,
+  `trg_era_single_insert`), so a live deployment is never re-anchored.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
   defaults to the anchor while `safe_accepted_batches` is still empty, so the
-  submitter starts at the anchor.
-- **Breaks:** a tree mis-anchored at the wrong nonce ⇒ `run`'s first batch
-  carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
-  submits), or — worse, if defenses were absent — a recovered tree silently
-  diverging from canonical L1 state.
+  submitter starts at the anchor; nonce lookups such as the content-identity
+  check (I9), which expect one valid batch per nonce.
+- **Breaks:** valid batches mis-anchored at the wrong nonce ⇒ `run`'s first
+  batch carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
+  submits), or — worse, if defenses were absent — a recovered deployment
+  silently diverging from canonical L1 state; two valid batches at one nonce ⇒
+  a nonce lookup picks an arbitrary one.
 
 ### I17. `WriteHead` is a coherent cache of the durable open Tip/frame
 

@@ -154,7 +154,7 @@ Paths below are relative to `sequencer/src/`:
 - **Chunk** — bounded list of user ops processed and persisted together to amortize SQLite cost.
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
-- **Tip** — the open batch at the end of the valid branch; recovery invalidates a suffix and opens a new Tip ([automatic recovery](docs/recovery/README.md#the-state-being-repaired)).
+- **Tip** — the open batch at the end of the valid batches; recovery invalidates a suffix and opens a new Tip after the last valid batch ([automatic recovery](docs/recovery/README.md#the-state-being-repaired)).
 - **Inclusion lane** — the single ordering lane ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
 - **Snapshot** — immutable artifact registered at every batch close; acceptance selects the comparison and recovery checkpoint ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
