@@ -14,7 +14,7 @@ use k256::ecdsa::SigningKey;
 use sequencer::storage::{Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
 use sequencer_core::application::Application;
-use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
+use sequencer_core::history::{HistoryClaim, L2TxCount};
 use sequencer_core::test_support::sign_user_op;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
@@ -1036,7 +1036,7 @@ async fn over_cap_direct_never_executes_and_survives_restart() {
     );
     let after = all_ordered_l2_txs(db.path.as_str());
     assert_eq!(after.len(), 4);
-    assert_eq!(after[3].offset, ExecutedInputCount::new(3));
+    assert_eq!(after[3].offset, L2TxCount::new(3));
     restarted.shutdown().await;
 }
 
@@ -1437,6 +1437,6 @@ fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
             .history_state()
             .unwrap()
             .version,
-        next_input: ExecutedInputCount::new(next),
+        next_input: L2TxCount::new(next),
     }
 }

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use sequencer_core::application::Application;
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::scheduler::SchedulerState;
 
 use crate::commands::error::CommandError;
@@ -24,13 +24,13 @@ pub(crate) fn publish<A: Application>(
     app: &mut A,
     storage: &mut Storage,
     dumps_dir: &Path,
-    base_count: ExecutedInputCount,
+    base_count: L2TxCount,
     stop_block: u64,
     scheduler: SchedulerState,
 ) -> Result<EraRecord, CommandError> {
     let era = EraRecord {
         base_count,
-        rebuilt_history_end: app.executed_input_count(),
+        rebuilt_history_end: app.l2_tx_count(),
         stop_block,
         first_queued_input: scheduler.first_queued_input,
         next_batch_nonce: scheduler.next_batch_nonce,
@@ -84,11 +84,11 @@ mod tests {
 
     /// Counts the directs it executes and persists only that count.
     #[derive(Clone)]
-    struct CountedSweepTestApp(ExecutedInputCount);
+    struct CountedSweepTestApp(L2TxCount);
 
     impl CountedSweepTestApp {
-        fn new(executed_input_count: u64) -> Self {
-            Self(ExecutedInputCount::new(executed_input_count))
+        fn new(l2_tx_count: u64) -> Self {
+            Self(L2TxCount::new(l2_tx_count))
         }
     }
 
@@ -106,7 +106,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.0
         }
 
@@ -147,7 +147,7 @@ mod tests {
 
         fn from_canonical_state(
             _state_file: &Path,
-            _executed_input_count: ExecutedInputCount,
+            _l2_tx_count: L2TxCount,
         ) -> Result<Self, AppError> {
             unreachable!("not used by setup-fill tests")
         }
@@ -213,7 +213,7 @@ mod tests {
             &mut app,
             &mut storage,
             dumps.path(),
-            ExecutedInputCount::new(41),
+            L2TxCount::new(41),
             100,
             queued_at_stop(3),
         )
@@ -222,8 +222,8 @@ mod tests {
         assert_eq!(
             era,
             EraRecord {
-                base_count: ExecutedInputCount::new(41),
-                rebuilt_history_end: ExecutedInputCount::new(41),
+                base_count: L2TxCount::new(41),
+                rebuilt_history_end: L2TxCount::new(41),
                 stop_block: 100,
                 first_queued_input: 1,
                 next_batch_nonce: 3,
@@ -232,7 +232,7 @@ mod tests {
         assert!(storage.is_setup_complete().unwrap());
         assert_eq!(storage.batch_tree_anchor().unwrap(), 3);
         let history = storage.history_state().unwrap();
-        assert_eq!(history.base_executed_input_count, 41);
+        assert_eq!(history.base_l2_tx_count, 41);
         assert_eq!(history.rebuilt_history_end, 41);
         assert_eq!(history.base_safe_block, 100);
         assert_eq!(history.first_queued_input, 1);
@@ -243,18 +243,18 @@ mod tests {
         // The baseline is canonical at the stop block: the first checkpoint.
         let checkpoint = storage.finalized_dump().unwrap().expect("era baseline");
         assert_eq!(checkpoint.inclusion_block, 100);
-        assert_eq!(checkpoint.executed_input_count, ExecutedInputCount::new(41));
+        assert_eq!(checkpoint.l2_tx_count, L2TxCount::new(41));
         assert_eq!(checkpoint.next_batch_nonce, 3);
         let snapshot = storage.latest_snapshot().unwrap().expect("baseline");
         let restored =
             CountedSweepTestApp::from_dump(&dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
-        assert_eq!(restored.executed_input_count(), ExecutedInputCount::new(41));
+        assert_eq!(restored.l2_tx_count(), L2TxCount::new(41));
 
         let err = publish(
             &mut CountedSweepTestApp::new(41),
             &mut storage,
             dumps.path(),
-            ExecutedInputCount::new(41),
+            L2TxCount::new(41),
             150,
             queued_at_stop(4),
         )
@@ -276,7 +276,7 @@ mod tests {
             &mut CountedSweepTestApp::new(41),
             &mut storage,
             dumps.path(),
-            ExecutedInputCount::new(41),
+            L2TxCount::new(41),
             100,
             queued_at_stop(3),
         )
@@ -297,7 +297,7 @@ mod tests {
                 .canonical_history_page(
                     HistoryClaim {
                         version: current.version,
-                        next_input: ExecutedInputCount::new(41),
+                        next_input: L2TxCount::new(41),
                     },
                     16,
                 )
@@ -389,7 +389,7 @@ mod tests {
                 &mut base,
                 &mut storage,
                 dumps_dir.path(),
-                ExecutedInputCount::new(3),
+                L2TxCount::new(3),
                 100,
                 SchedulerState {
                     l1_input_count: 3,
@@ -452,7 +452,7 @@ mod tests {
                 deposit_value,
                 "credited once"
             );
-            assert_eq!(app.executed_input_count(), ExecutedInputCount::new(4));
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(4));
         }
 
         shutdown_lane(&shutdown, handle).await;

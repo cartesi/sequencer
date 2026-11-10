@@ -18,8 +18,8 @@ use rollups_harness::{
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::scheduler::{SCHEDULER_INSPECT_QUERY, SchedulerExport};
 use sequencer_rust_client::{
-    AdoptEraError, AdoptError, ExecutedInputCount, HistoryClaim, HistoryPolicyError,
-    SequencerClient, SubscribeError,
+    AdoptEraError, AdoptError, HistoryClaim, HistoryPolicyError, L2TxCount, SequencerClient,
+    SubscribeError,
 };
 
 use crate::ScenarioResult;
@@ -147,7 +147,7 @@ impl WalletClient {
     }
 
     fn count(&self) -> u64 {
-        self.app.executed_input_count()
+        self.app.l2_tx_count()
     }
 
     /// The client restored from its backup at `count`.
@@ -397,15 +397,13 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
         old.head
     );
     assert!(matches!(
-        sequencer
-            .adopt_current_era(ExecutedInputCount::new(old.head))
-            .await,
+        sequencer.adopt_current_era(L2TxCount::new(old.head)).await,
         Err(AdoptEraError::Adopt(AdoptError::PastRebuiltEnd { .. }))
     ));
     if base_count > 0 {
         assert!(matches!(
             sequencer
-                .adopt_current_era(ExecutedInputCount::new(base_count - 1))
+                .adopt_current_era(L2TxCount::new(base_count - 1))
                 .await,
             Err(AdoptEraError::Adopt(AdoptError::BelowBase { .. }))
         ));
@@ -646,7 +644,7 @@ async fn check_rebuilt_rows(
 ) -> ScenarioResult<()> {
     let sequencer: SequencerClient = runtime.sequencer_client()?;
     let claim = sequencer
-        .adopt_current_era(ExecutedInputCount::new(base_count))
+        .adopt_current_era(L2TxCount::new(base_count))
         .await?;
     let mut ws = WsClient::connect(&sequencer, claim).await?;
     for count in base_count..trusted {

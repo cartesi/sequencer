@@ -177,8 +177,8 @@ The [application contract](docs/protocol/application-contract.md) owns the `Appl
 - `SignedUserOp` — ingress/API signature domain (post-validation, pre-execution).
 - `UserOpTx` — a user op as the application executes it: the recovered sender, its signed nonce, the frame's fee and safe block.
 - `L2Tx` — what the scheduler hands out and the executor takes (`Direct | UserOp`).
-- `ExecutedInputCount` — canonical application-history boundary (`X` means the
-  next input is entry `X`), never a SQLite cursor. Checked arithmetic only.
+- `L2TxCount` — the L2 tx count, how many L2 transactions have executed (at `X`,
+  history entry `X` executes next), never a SQLite cursor. Checked arithmetic only.
 - `ApplicationInputRow` — crate-private pairing of a mandatory application offset
   and source context. Every row executes; batch envelopes stay in `safe_inputs`.
 - Keep DB-only helper types private to storage modules; prefer shared domain types at module boundaries.

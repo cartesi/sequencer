@@ -20,7 +20,7 @@ use rollups_types::alloy_primitives::{Address, U256, address};
 use sequencer::machine::read_machine_export;
 use sequencer_core::application::{Application, CanonicalState};
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::scheduler::{CanonicalRunner, L1Input, SchedulerExport, TxFate};
 use testsi::{InputBuilder, TestResult};
 
@@ -48,7 +48,7 @@ pub fn export_of_the_template_image_is_genesis() -> TestResult {
         std::fs::read(&state_file)?,
         genesis.canonical_snapshot_bytes()?
     );
-    let projected = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::ZERO)?;
+    let projected = WalletApp::from_canonical_state(&state_file, L2TxCount::ZERO)?;
     assert_eq!(
         projected.canonical_snapshot_bytes()?,
         genesis.canonical_snapshot_bytes()?
@@ -115,11 +115,11 @@ pub fn export_of_a_stored_machine_matches_the_native_runner() -> TestResult {
         .inspect(STATE_INSPECT_QUERY)
         .expect("the wallet encodes its state");
     assert_eq!(std::fs::read(&state_file)?, native_state);
-    let count = ExecutedInputCount::new(export.l2_tx_count);
+    let count = L2TxCount::new(export.l2_tx_count);
     let projected = WalletApp::from_canonical_state(&state_file, count)?;
     assert_eq!(projected.canonical_snapshot_bytes()?, native_state);
-    assert_eq!(projected.executed_input_count(), count);
-    let off_by_one = ExecutedInputCount::new(export.l2_tx_count + 1);
+    assert_eq!(projected.l2_tx_count(), count);
+    let off_by_one = L2TxCount::new(export.l2_tx_count + 1);
     assert!(WalletApp::from_canonical_state(&state_file, off_by_one).is_err());
 
     // A second read finds the same machine: the first one changed nothing.

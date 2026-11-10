@@ -11,7 +11,7 @@ use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, WALLET_SCHEDULER_LIMITS};
 use sequencer_core::application::{
     Admission, AppError, AppOutputs, Application, PolicyRefusal, SchedulerLimits,
 };
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -38,7 +38,7 @@ pub(crate) enum ReplayEvent {
 /// so a test observes what the lane executed through the dumps it writes.
 #[derive(Default)]
 pub(crate) struct StubApp {
-    pub(crate) count: ExecutedInputCount,
+    pub(crate) count: L2TxCount,
     /// Each sender's next nonce; an absent sender is at zero.
     pub(crate) nonces: BTreeMap<Address, u32>,
     /// Transactions this instance executed; not persisted.
@@ -63,9 +63,9 @@ pub(crate) struct StubApp {
 }
 
 impl StubApp {
-    pub(crate) fn with_progress(executed_input_count: u64) -> Self {
+    pub(crate) fn with_progress(l2_tx_count: u64) -> Self {
         Self {
-            count: ExecutedInputCount::new(executed_input_count),
+            count: L2TxCount::new(l2_tx_count),
             ..Self::default()
         }
     }
@@ -123,7 +123,7 @@ impl Application for StubApp {
         Ok(Vec::new())
     }
 
-    fn executed_input_count(&self) -> ExecutedInputCount {
+    fn l2_tx_count(&self) -> L2TxCount {
         self.count
     }
 
@@ -170,17 +170,14 @@ impl Application for StubApp {
         prefix.join("state")
     }
 
-    fn from_canonical_state(
-        state_file: &Path,
-        executed_input_count: ExecutedInputCount,
-    ) -> Result<Self, AppError> {
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError> {
         let app = decode_state(&std::fs::read(state_file)?)?;
-        if app.count != executed_input_count {
+        if app.count != l2_tx_count {
             return Err(AppError::Internal {
                 reason: format!(
                     "StubApp state holds count {}, but the machine reports {}",
                     app.count.get(),
-                    executed_input_count.get()
+                    l2_tx_count.get()
                 ),
             });
         }
@@ -220,7 +217,7 @@ fn decode_state(bytes: &[u8]) -> Result<StubApp, AppError> {
         })
         .collect();
     Ok(StubApp {
-        count: ExecutedInputCount::new(u64::from_le_bytes(*count)),
+        count: L2TxCount::new(u64::from_le_bytes(*count)),
         nonces,
         ..StubApp::default()
     })

@@ -133,7 +133,7 @@ mod tests {
     use sequencer_core::application::{Admission, AppError, AppOutputs, SchedulerLimits};
     use sequencer_core::batch::{Batch, Frame, WireUserOp};
     use sequencer_core::fee::fee_to_linear;
-    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::history::L2TxCount;
     use sequencer_core::l2_tx::{Direct, UserOpTx};
     use sequencer_core::scheduler::SchedulerExport;
     use sequencer_core::user_op::UserOp;
@@ -778,7 +778,7 @@ mod tests {
     #[derive(Default)]
     struct ProbeApp {
         seen: Vec<(u64, u64)>,
-        count: ExecutedInputCount,
+        count: L2TxCount,
         snapshot_fails: bool,
     }
 
@@ -802,7 +802,7 @@ mod tests {
             Ok(vec![AppOutput::Notice(direct.payload.clone())])
         }
 
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.count
         }
 
@@ -837,7 +837,7 @@ mod tests {
 
         fn from_canonical_state(
             _state_file: &Path,
-            _executed_input_count: ExecutedInputCount,
+            _l2_tx_count: L2TxCount,
         ) -> Result<Self, AppError> {
             unreachable!("the guest starts from genesis")
         }

@@ -89,7 +89,7 @@ async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -
     match result {
         Ok(Some(finalized)) => Json(InclusionBlockResponse {
             inclusion_block: finalized.inclusion_block,
-            executed_input_count: finalized.executed_input_count.get(),
+            executed_input_count: finalized.l2_tx_count.get(),
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -117,7 +117,7 @@ async fn finalized_state_digest(State(state): State<Arc<SnapshotApiState>>) -> R
         Err(err) => return finalized_error("acquire finalized lease", err),
     };
     let path = state_file_path(&state.snapshot, &leased.prefix);
-    let executed_input_count = leased.executed_input_count.get();
+    let l2_tx_count = leased.l2_tx_count.get();
     let LeasedDump { guard, .. } = leased;
     let scope = state.shutdown.clone();
     let hashed = tokio::task::spawn_blocking(move || {
@@ -129,7 +129,7 @@ async fn finalized_state_digest(State(state): State<Arc<SnapshotApiState>>) -> R
     match hashed {
         Ok(Ok(digest)) => Json(DigestResponse {
             inclusion_block,
-            executed_input_count,
+            executed_input_count: l2_tx_count,
             sha256: alloy_primitives::hex::encode(digest),
         })
         .into_response(),
@@ -169,7 +169,7 @@ async fn finalized_state(
     }
 
     let path = state_file_path(&state.snapshot, &leased.prefix);
-    let executed_input_count = leased.executed_input_count.get();
+    let l2_tx_count = leased.l2_tx_count.get();
     let history = leased.history_version;
     let LeasedDump { guard, .. } = leased;
 
@@ -179,7 +179,7 @@ async fn finalized_state(
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::ETAG, etag)
             .header("X-Inclusion-Block", inclusion_block.to_string())
-            .header("X-Executed-Input-Count", executed_input_count.to_string())
+            .header("X-Executed-Input-Count", l2_tx_count.to_string())
             .header("X-History-Era", history.era_id.to_string())
             .header(
                 "X-Recovery-Generation",
@@ -231,7 +231,7 @@ fn archive_response(
 ) -> Response {
     let LeasedDump {
         prefix,
-        executed_input_count,
+        l2_tx_count,
         history_version,
         next_batch_nonce,
         guard,
@@ -281,10 +281,7 @@ fn archive_response(
             "X-Recovery-Generation",
             history_version.recovery_generation.get().to_string(),
         )
-        .header(
-            "X-Executed-Input-Count",
-            executed_input_count.get().to_string(),
-        );
+        .header("X-Executed-Input-Count", l2_tx_count.get().to_string());
     if let Some(block) = inclusion_block {
         response = response.header("X-Inclusion-Block", block.to_string());
     }
@@ -481,7 +478,7 @@ mod tests {
         let db = temp_db("corrupt-comparison-path");
         let mut storage = Storage::open(&db.path).unwrap();
         storage
-            .insert_baseline_snapshot(path, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(path, crate::storage::L2TxCount::ZERO)
             .unwrap();
         let state = Arc::new(SnapshotApiState {
             snapshot: SnapshotState {
@@ -568,7 +565,7 @@ mod tests {
         std::fs::write(dump_dir.join("state"), contents).expect("write comparison file");
         let mut storage = Storage::open(&db.path).expect("open storage");
         storage
-            .insert_baseline_snapshot(&dump_dir, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&dump_dir, crate::storage::L2TxCount::ZERO)
             .expect("insert baseline snapshot");
         drop(storage);
         let state = Arc::new(SnapshotApiState {
@@ -641,7 +638,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/panicking-snapshot-path"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert baseline snapshot");
         drop(storage);
@@ -673,7 +670,7 @@ mod tests {
             .expect("write immutable dump metadata");
         let mut storage = Storage::open(&db.path).expect("open storage");
         storage
-            .insert_baseline_snapshot(&dump_dir, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&dump_dir, crate::storage::L2TxCount::ZERO)
             .expect("insert baseline snapshot");
         drop(storage);
         let state = Arc::new(SnapshotApiState {
@@ -716,7 +713,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/corrupt-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert finalized snapshot");
         drop(storage);
@@ -758,7 +755,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/gate-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert finalized snapshot");
         drop(storage);
@@ -793,7 +790,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/dangling-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert finalized snapshot");
         drop(storage);
@@ -848,7 +845,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/lease-probe"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("register finalized dump");
         drop(storage);

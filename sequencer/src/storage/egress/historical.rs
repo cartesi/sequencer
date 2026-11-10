@@ -6,7 +6,7 @@
 use alloy_primitives::{Address, B256};
 use rusqlite::{Connection, OptionalExtension, params};
 use sequencer_core::history::{
-    EraId, ExecutedInputCount, HistoryBounds, HistoryPolicyError, RecoveryGeneration,
+    EraId, HistoryBounds, HistoryPolicyError, L2TxCount, RecoveryGeneration,
 };
 use sequencer_core::history_api::{
     AcceptedCheckpoint, HISTORICAL_INPUT_MAX_ITEMS, HISTORICAL_INPUT_PAYLOAD_TARGET_BYTES,
@@ -16,9 +16,7 @@ use sequencer_core::history_api::{
 
 use crate::storage::Storage;
 use crate::storage::convert::{i64_to_u64, u64_to_i64};
-use crate::storage::history::{
-    next_executed_input_count_in, preserved_input_count_in, query_history_state,
-};
+use crate::storage::history::{next_l2_tx_count_in, preserved_input_count_in, query_history_state};
 use crate::storage::l1_inputs::query_deployment_identity;
 use crate::storage::mutations::batch_tree_anchor_in;
 use crate::storage::queries::safe_input_count_through_block_in;
@@ -74,7 +72,7 @@ impl Storage {
                     "history has no rollback-safe snapshot"
                 );
             }
-            let head = next_executed_input_count_in(tx)?;
+            let head = next_l2_tx_count_in(tx)?;
             let compatibility = from_generation
                 .map(|from| {
                     preserved_input_count_in(tx, from, state.version.recovery_generation, head).map(
@@ -95,7 +93,7 @@ impl Storage {
                 },
                 history: HistoryBounds {
                     version: state.version,
-                    available_from: ExecutedInputCount::new(state.base_executed_input_count),
+                    available_from: L2TxCount::new(state.base_l2_tx_count),
                     head,
                 },
                 baseline: HistoryBaseline {
@@ -105,11 +103,11 @@ impl Storage {
                         state.base_safe_block,
                     )?,
                     next_batch_nonce: batch_tree_anchor_in(tx)?,
-                    rebuilt_history_end: ExecutedInputCount::new(state.rebuilt_history_end),
+                    rebuilt_history_end: L2TxCount::new(state.rebuilt_history_end),
                 },
                 accepted_checkpoint: accepted.map(|snapshot| AcceptedCheckpoint {
                     inclusion_block: snapshot.inclusion_block,
-                    executed_input_count: snapshot.executed_input_count,
+                    executed_input_count: snapshot.l2_tx_count,
                     next_batch_nonce: snapshot.next_batch_nonce,
                 }),
                 compatibility,

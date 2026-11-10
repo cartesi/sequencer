@@ -21,7 +21,7 @@ use cartesi_rollups_contracts::application_factory::ApplicationFactory;
 use cartesi_rollups_contracts::input_box::InputBox;
 use sequencer_core::application::{AppError, Application, CanonicalState};
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
-use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
+use sequencer_core::history::{HistoryClaim, L2TxCount};
 use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::scheduler::{CanonicalRunner, SchedulerConfig, SchedulerExport, TxFate};
 use ssz::Encode;
@@ -263,9 +263,9 @@ impl Chain {
         let mut rows = Vec::new();
         for input in storage.l1_inputs_page(0, count, usize::MAX).unwrap() {
             for record in runner.process_input(input).unwrap().txs {
-                if let TxFate::Done { offset } = record.fate {
+                if let TxFate::Done { index } = record.fate {
                     rows.push((
-                        offset.get(),
+                        index.get(),
                         record.scheduled.tx,
                         record.scheduled.batch_nonce,
                     ));
@@ -292,7 +292,7 @@ fn feed(storage: &mut Storage, from: u64) -> Vec<Row> {
         .canonical_history_page(
             HistoryClaim {
                 version,
-                next_input: ExecutedInputCount::new(from),
+                next_input: L2TxCount::new(from),
             },
             1024,
         )
@@ -357,10 +357,10 @@ fn assert_matches_reference(
     let (runner, reference) = chain.reference(&mut storage, through_stop);
     let state = runner.scheduler().state();
 
-    assert_eq!(history.base_executed_input_count, base_count);
+    assert_eq!(history.base_l2_tx_count, base_count);
     assert_eq!(
         history.rebuilt_history_end,
-        runner.app().executed_input_count().get()
+        runner.app().l2_tx_count().get()
     );
     assert_eq!(history.first_queued_input, state.first_queued_input);
     assert_eq!((state.first_queued_input, state.fridge_len), (4, 2));
@@ -369,8 +369,8 @@ fn assert_matches_reference(
     assert_eq!(
         era,
         EraRecord {
-            base_count: ExecutedInputCount::new(base_count),
-            rebuilt_history_end: runner.app().executed_input_count(),
+            base_count: L2TxCount::new(base_count),
+            rebuilt_history_end: runner.app().l2_tx_count(),
             stop_block,
             first_queued_input: 4,
             next_batch_nonce: 2,
@@ -395,10 +395,7 @@ fn assert_matches_reference(
     );
     let checkpoint = storage.finalized_dump().unwrap().expect("era baseline");
     assert_eq!(checkpoint.inclusion_block, stop_block);
-    assert_eq!(
-        checkpoint.executed_input_count,
-        runner.app().executed_input_count()
-    );
+    assert_eq!(checkpoint.l2_tx_count, runner.app().l2_tx_count());
     assert_eq!(checkpoint.next_batch_nonce, 2);
     assert!(
         storage.open_state().unwrap().is_none(),
@@ -445,7 +442,7 @@ async fn setup_from_genesis_rebuilds_a_chain_with_batches() {
         .rebuilt_history_after(None, 1024)
         .unwrap()
         .len()
-        - usize::try_from(runner.app().executed_input_count().get()).unwrap();
+        - usize::try_from(runner.app().l2_tx_count().get()).unwrap();
     assert_eq!(skipped, 1, "the skipped op is stored without a count");
     let left: Vec<String> = std::fs::read_dir(data_dir.path())
         .unwrap()
@@ -524,7 +521,7 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
     );
     assert_eq!(summary.inputs_to_replay, 2);
     let runner = assert_matches_reference(&chain, &db_path, export.l2_tx_count, &summary);
-    let rebuilt_end = runner.app().executed_input_count().get();
+    let rebuilt_end = runner.app().l2_tx_count().get();
 
     // `run`'s startup: sync with the frontier on, then the root frame at its
     // own safe head.
@@ -667,10 +664,7 @@ async fn a_deployment_not_yet_safe_exits_20_and_leaves_the_directory_empty() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        summary.era.unwrap().rebuilt_history_end,
-        ExecutedInputCount::ZERO
-    );
+    assert_eq!(summary.era.unwrap().rebuilt_history_end, L2TxCount::ZERO);
 }
 
 /// The dry run needs no key, reports the base and the old instance's

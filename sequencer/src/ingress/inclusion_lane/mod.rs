@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{SafeFrontierState, SafeInputRange, Storage, WriteHead};
 use sequencer_core::application::{Application, Executed, check_live_user_op, execute};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::SignedUserOp;
 
@@ -87,12 +87,12 @@ impl<A: Application + 'static> InclusionLane<A> {
                 storage,
                 config,
             };
-            lane.run_forever(checkpoint.executed_input_count)
+            lane.run_forever(checkpoint.l2_tx_count)
         });
         (tx, handle)
     }
 
-    fn run_forever(&mut self, catch_up_from: ExecutedInputCount) -> Result<(), InclusionLaneError> {
+    fn run_forever(&mut self, catch_up_from: L2TxCount) -> Result<(), InclusionLaneError> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
@@ -149,7 +149,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         }
     }
 
-    fn run_catch_up(&mut self, start_offset: ExecutedInputCount) -> Result<(), InclusionLaneError> {
+    fn run_catch_up(&mut self, start_offset: L2TxCount) -> Result<(), InclusionLaneError> {
         catch_up_application(&mut self.app, &mut self.storage, start_offset)
             .map_err(|source| InclusionLaneError::CatchUp { source })
     }
@@ -262,17 +262,17 @@ impl<A: Application + 'static> InclusionLane<A> {
                 .fill_direct_inputs(chunk_range, max_direct_payload_bytes, chunk)?;
             for direct in chunk.drain(..) {
                 let safe_input_index = direct.input_index;
-                let offset = match execute(&mut self.app, &L2Tx::Direct(direct))
+                let l2_tx_index = match execute(&mut self.app, &L2Tx::Direct(direct))
                     .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?
                 {
-                    Executed::Done { offset, .. } => offset,
+                    Executed::Done { index, .. } => index,
                     Executed::Skipped(reason) => {
                         unreachable!("the executor never skips a direct, got {reason}")
                     }
                 };
                 executions.push(crate::storage::DirectInputExecution {
                     safe_input_index,
-                    executed_input_offset: offset,
+                    l2_tx_index,
                 });
             }
         }
@@ -390,9 +390,9 @@ fn execute_user_op(
         frame_safe_block,
     ));
     match execute(app, &tx) {
-        Ok(Executed::Done { offset, .. }) => included.push(IncludedUserOp {
+        Ok(Executed::Done { index, .. }) => included.push(IncludedUserOp {
             pending: item,
-            executed_input_offset: offset,
+            l2_tx_index: index,
         }),
         Ok(Executed::Skipped(reason)) => {
             return Err(fail_user_op(

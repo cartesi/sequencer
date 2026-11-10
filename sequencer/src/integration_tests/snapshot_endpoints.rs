@@ -58,7 +58,7 @@ fn register_accepted(
             &mut head,
             safe_block,
             &prefix,
-            crate::storage::ExecutedInputCount::ZERO,
+            crate::storage::L2TxCount::ZERO,
         )
         .unwrap();
     crate::storage::test_helpers::seed_safe_inputs_with_batch_nonces(
@@ -87,7 +87,7 @@ fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonc
                 &mut head,
                 safe_block,
                 &prefix,
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .unwrap();
     }
@@ -106,7 +106,7 @@ fn archive_state(bytes: &[u8]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_block_divergence_refuses_every_finalized_endpoint() {
     use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
-    use crate::storage::{ExecutedInputCount, SafeInputRange, StoredSafeInput};
+    use crate::storage::{L2TxCount, SafeInputRange, StoredSafeInput};
     use crate::test_support::pin_test_deployment_identity;
     use sequencer_core::batch::{Batch, Frame};
     use sequencer_core::scheduler::{CanonicalRunner, L1Input, SchedulerConfig};
@@ -122,7 +122,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
         .unwrap();
     let prefix = write_state(root.path(), "local", b"local checkpoint", 1);
     storage
-        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, ExecutedInputCount::ZERO)
+        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, L2TxCount::ZERO)
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     let inputs = vec![
@@ -178,7 +178,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
     assert_eq!(export.next_batch_nonce, 2);
     assert_eq!(export.l2_tx_count, 1);
     assert_eq!(export.fridge_len, 0);
-    assert_eq!(snapshot.executed_input_count, ExecutedInputCount::ZERO);
+    assert_eq!(snapshot.l2_tx_count, L2TxCount::ZERO);
 
     let server = TestServer::start(&db.path).await;
     let client = reqwest::Client::new();
@@ -830,7 +830,7 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
         .unpack(restored_dir.path())
         .unwrap();
     let restored = WalletApp::from_dump(&dump_info::app_prefix(restored_dir.path())).unwrap();
-    assert_eq!(restored.executed_input_count(), claim.next_input);
+    assert_eq!(restored.l2_tx_count(), claim.next_input);
     assert!(!restored_dir.path().join("checkpoint.toml").exists());
     let mut stream = client.subscribe(claim).await.unwrap();
     stream.close(None).await.unwrap();
@@ -853,7 +853,7 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
         receipt.next_batch_nonce
     );
     let exported = WalletApp::from_dump(&dump_info::app_prefix(export_dir.path())).unwrap();
-    assert_eq!(exported.executed_input_count(), app.executed_input_count());
+    assert_eq!(exported.l2_tx_count(), app.l2_tx_count());
     assert_eq!(
         exported.canonical_snapshot_bytes().unwrap(),
         app.canonical_snapshot_bytes().unwrap()

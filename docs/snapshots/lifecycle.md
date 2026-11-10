@@ -4,7 +4,7 @@ Snapshots preserve application state at a declared execution boundary. Their
 contents and boundary are immutable. L1 acceptance is a separate durable fact:
 there is no promotion operation and no mutable finalized pointer.
 
-Keep three boundaries separate: the engine embeds its executed-input count;
+Keep three boundaries separate: the engine embeds its L2 tx count;
 SQLite associates an artifact with a local batch or era baseline; safe L1
 acceptance selects a comparison checkpoint. A count alone does not establish
 acceptance. The [history guide](../protocol/application-history.md)
@@ -110,7 +110,7 @@ These endpoints are operator-only and require network isolation:
   opaque `state` artifact. It may describe optimistic state.
 - `/finalized_state` streams only the canonical comparison file for the latest
   accepted checkpoint. `/finalized_state/inclusion_block` provides its block and
-  executed-input count for the watchdog's idle poll, and
+  L2 tx count for the watchdog's idle poll, and
   `/finalized_state/digest` adds the file's SHA-256 under the same lease.
 - `/finalized_snapshot` streams a complete recovery tar archive containing
   `info.toml`, `state`, and a generated `checkpoint.toml` acceptance receipt.

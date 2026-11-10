@@ -7,7 +7,7 @@
 use rusqlite::{Connection, Result, Transaction, named_params, params};
 
 use super::convert::{i64_to_u64, saturating_query_bound, u64_to_i64};
-use super::history::next_executed_input_count_in;
+use super::history::next_l2_tx_count_in;
 use super::l1_inputs::query_deployment_identity;
 use super::queries::DIRECT_EXECUTES_SQL;
 use super::{DirectInputExecution, SafeInputRange};
@@ -197,7 +197,7 @@ fn persist_direct_executions(
     )?;
     for execution in executions {
         stmt.execute(params![
-            u64_to_i64(execution.executed_input_offset.get()),
+            u64_to_i64(execution.l2_tx_index.get()),
             u64_to_i64(batch_index),
             i64::from(frame_in_batch),
             u64_to_i64(execution.safe_input_index)
@@ -219,7 +219,7 @@ fn derive_direct_input_executions_in(
     }
 
     let identity = query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-    let mut next = next_executed_input_count_in(tx)?;
+    let mut next = next_l2_tx_count_in(tx)?;
     // Every input in the range is read, so the range's completeness is
     // checked even where none of its inputs executes.
     let mut stmt = tx.prepare_cached(&format!(
@@ -254,11 +254,11 @@ fn derive_direct_input_executions_in(
         if executes {
             executions.push(DirectInputExecution {
                 safe_input_index,
-                executed_input_offset: next,
+                l2_tx_index: next,
             });
             next = next
                 .checked_next()
-                .expect("executed input count overflow: contract-impossible");
+                .expect("L2 tx count overflow: contract-impossible");
         }
         fetched = fetched
             .checked_add(1)

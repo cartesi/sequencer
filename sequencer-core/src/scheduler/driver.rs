@@ -9,7 +9,7 @@ use super::{InputOutcome, L1Input, Scheduled, Scheduler, SchedulerConfig, Schedu
 use crate::application::{
     AppError, AppOutputs, Application, CanonicalState, Executed, SkipReason, execute,
 };
-use crate::history::ExecutedInputCount;
+use crate::history::L2TxCount;
 
 /// The `state` inspect query: the application's comparison bytes, whole. An
 /// empty query means the same.
@@ -45,8 +45,8 @@ pub struct TxRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxFate {
-    /// It executed; `offset` is the count before it, its history offset.
-    Done { offset: ExecutedInputCount },
+    /// It executed; `index` is the L2 tx count before it, its index in the history.
+    Done { index: L2TxCount },
     /// The executor skipped a user op for its nonce. Nothing changed.
     Skipped(SkipReason),
 }
@@ -64,9 +64,9 @@ impl<A: Application> CanonicalRunner<A> {
     /// The genesis machine: both sides at zero.
     pub fn genesis(app: A, config: SchedulerConfig) -> Self {
         assert_eq!(
-            app.executed_input_count(),
-            ExecutedInputCount::ZERO,
-            "a genesis application must start at executed_input_count = 0"
+            app.l2_tx_count(),
+            L2TxCount::ZERO,
+            "a genesis application must start at l2_tx_count = 0"
         );
         Self::from_parts(Scheduler::genesis(config), app)
     }
@@ -99,7 +99,7 @@ impl<A: Application> CanonicalRunner<A> {
 
     /// The machine's `scheduler` report.
     pub fn export(&self) -> SchedulerExport {
-        SchedulerExport::new(self.scheduler.state(), self.app.executed_input_count())
+        SchedulerExport::new(self.scheduler.state(), self.app.l2_tx_count())
     }
 
     /// Feed one input and execute every transaction it hands out. An
@@ -118,11 +118,11 @@ impl<A: Application> CanonicalRunner<A> {
                 execute(&mut self.app, &scheduled.tx).inspect_err(|_| self.failed = true)?;
             let fate = match executed {
                 Executed::Done {
-                    offset,
+                    index,
                     outputs: tx_outputs,
                 } => {
                     outputs.extend(tx_outputs);
-                    TxFate::Done { offset }
+                    TxFate::Done { index }
                 }
                 Executed::Skipped(reason) => TxFate::Skipped(reason),
             };
@@ -178,7 +178,7 @@ mod tests {
         events: Vec<Event>,
         balances: BTreeMap<Address, U256>,
         nonces: BTreeMap<Address, u32>,
-        count: ExecutedInputCount,
+        count: L2TxCount,
         fail_on: Option<Event>,
     }
 
@@ -227,7 +227,7 @@ mod tests {
             self.record(Event::Direct(direct.payload.first().copied().unwrap_or(0)))
         }
 
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.count
         }
 
@@ -274,7 +274,7 @@ mod tests {
 
         fn from_canonical_state(
             _state_file: &Path,
-            _executed_input_count: ExecutedInputCount,
+            _l2_tx_count: L2TxCount,
         ) -> Result<Self, AppError> {
             unimplemented!("not used")
         }
@@ -316,10 +316,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a genesis application must start at executed_input_count = 0")]
+    #[should_panic(expected = "a genesis application must start at l2_tx_count = 0")]
     fn genesis_rejects_an_application_past_zero() {
         let app = RecordingApp {
-            count: ExecutedInputCount::new(1),
+            count: L2TxCount::new(1),
             ..RecordingApp::default()
         };
         let _ = runner(app, 100);
@@ -351,7 +351,7 @@ mod tests {
                     got: 1
                 }),
                 TxFate::Done {
-                    offset: ExecutedInputCount::ZERO
+                    index: L2TxCount::ZERO
                 },
                 TxFate::Skipped(SkipReason::WrongNonce {
                     expected: 1,
@@ -397,22 +397,19 @@ mod tests {
                 vec![b'u', 11]
             ]
         );
-        let offsets: Vec<TxFate> = (0..5)
-            .map(|offset| TxFate::Done {
-                offset: ExecutedInputCount::new(offset),
+        let executed: Vec<TxFate> = (0..5)
+            .map(|index| TxFate::Done {
+                index: L2TxCount::new(index),
             })
             .collect();
-        assert_eq!(fates(&advanced), offsets);
+        assert_eq!(fates(&advanced), executed);
         assert!(
             advanced
                 .txs
                 .iter()
                 .all(|record| record.scheduled.batch_nonce == 0)
         );
-        assert_eq!(
-            runner.app().executed_input_count(),
-            ExecutedInputCount::new(5)
-        );
+        assert_eq!(runner.app().l2_tx_count(), L2TxCount::new(5));
     }
 
     #[test]
@@ -434,10 +431,7 @@ mod tests {
         };
         assert_eq!(reason, "refusing UserOp(1)");
         assert!(runner.app().events.is_empty());
-        assert_eq!(
-            runner.app().executed_input_count(),
-            ExecutedInputCount::ZERO
-        );
+        assert_eq!(runner.app().l2_tx_count(), L2TxCount::ZERO);
     }
 
     #[test]
@@ -519,10 +513,7 @@ mod tests {
         });
         assert_eq!(message, "batch nonce overflow: no canonical successor");
         assert!(runner.app().events.is_empty());
-        assert_eq!(
-            runner.app().executed_input_count(),
-            ExecutedInputCount::ZERO
-        );
+        assert_eq!(runner.app().l2_tx_count(), L2TxCount::ZERO);
     }
 
     #[test]
@@ -589,7 +580,7 @@ mod tests {
         let app = RecordingApp {
             events: original.app().events.clone(),
             nonces: original.app().nonces.clone(),
-            count: ExecutedInputCount::new(export.l2_tx_count),
+            count: L2TxCount::new(export.l2_tx_count),
             ..RecordingApp::default()
         };
         let mut resumed = CanonicalRunner::from_parts(scheduler, app);

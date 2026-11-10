@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use crate::history::ExecutedInputCount;
+use crate::history::L2TxCount;
 use crate::l2_tx::{Direct, L2Tx, UserOpTx};
 use crate::user_op::UserOp;
 use alloy_primitives::{Address, U256};
@@ -122,9 +122,9 @@ impl fmt::Display for Refusal {
 /// What became of one L2 transaction handed to [`execute`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Executed {
-    /// It executed; `offset` is the count before it, its history offset.
+    /// It executed; `index` is the L2 tx count before it, its index in the history.
     Done {
-        offset: ExecutedInputCount,
+        index: L2TxCount,
         outputs: AppOutputs,
     },
     /// A user op whose nonce is not its sender's next. Nothing changed.
@@ -154,10 +154,10 @@ pub trait Application: Send + Sized {
     /// advances by exactly one and no nonce moves. `AppError` is fatal.
     fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError>;
 
-    /// Canonical history boundary: starts at zero and advances by exactly one
-    /// per executed transaction, so an application at `X` is ready for
-    /// history input `X`. It must survive dump round-trips.
-    fn executed_input_count(&self) -> ExecutedInputCount;
+    /// The L2 tx count: starts at zero and advances by exactly one per
+    /// executed transaction, so an application at `X` executes history entry
+    /// `X` next. It must survive dump round-trips.
+    fn l2_tx_count(&self) -> L2TxCount;
 
     // Admission: the sequencer's lane only. Policy, never consensus.
 
@@ -222,10 +222,7 @@ pub trait Application: Send + Sized {
     /// Build an instance from a canonical machine's comparison bytes, held in
     /// `state_file`, at the machine's count, whether or not those bytes hold
     /// it. A dump of the result holds the same comparison bytes.
-    fn from_canonical_state(
-        state_file: &Path,
-        executed_input_count: ExecutedInputCount,
-    ) -> Result<Self, AppError>;
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError>;
 }
 
 /// Canonical inspection for applications hosted by the shared Rust scheduler.
@@ -256,12 +253,12 @@ fn nonce_skip(expected: u32, got: u32) -> Option<SkipReason> {
 pub fn execute<A: Application>(app: &mut A, tx: &L2Tx) -> Result<Executed, AppError> {
     match tx {
         L2Tx::Direct(direct) => {
-            let offset = preflight_count(app);
+            let index = preflight_count(app);
             let outputs = app.apply_direct(direct)?;
-            assert_count_advanced(app, offset);
+            assert_count_advanced(app, index);
             // A direct's no-nonce rule is not checked: the executor cannot
             // enumerate the senders whose nonces it might have moved.
-            Ok(Executed::Done { offset, outputs })
+            Ok(Executed::Done { index, outputs })
         }
         L2Tx::UserOp(op) => {
             let expected = app.user_nonce(op.sender)?;
@@ -271,15 +268,15 @@ pub fn execute<A: Application>(app: &mut A, tx: &L2Tx) -> Result<Executed, AppEr
             let nonce_after = expected
                 .checked_add(1)
                 .expect("nonce_skip lets no op through at u32::MAX");
-            let offset = preflight_count(app);
+            let index = preflight_count(app);
             let outputs = app.apply_user_op(op)?;
-            assert_count_advanced(app, offset);
+            assert_count_advanced(app, index);
             assert_eq!(
                 app.user_nonce(op.sender)?,
                 nonce_after,
                 "an executed user op must advance its sender's nonce exactly once"
             );
-            Ok(Executed::Done { offset, outputs })
+            Ok(Executed::Done { index, outputs })
         }
     }
 }
@@ -310,18 +307,18 @@ pub fn check_live_user_op<A: Application>(
 
 /// The count before execution. Panics before the hook runs when the count
 /// has no successor, so an exhausted history never mutates the application.
-fn preflight_count<A: Application>(app: &A) -> ExecutedInputCount {
-    let offset = app.executed_input_count();
-    offset
+fn preflight_count<A: Application>(app: &A) -> L2TxCount {
+    let count = app.l2_tx_count();
+    count
         .checked_next()
-        .expect("executed input count overflow: no canonical successor");
-    offset
+        .expect("L2 tx count overflow: no canonical successor");
+    count
 }
 
-fn assert_count_advanced<A: Application>(app: &A, offset: ExecutedInputCount) {
+fn assert_count_advanced<A: Application>(app: &A, before: L2TxCount) {
     assert_eq!(
-        Some(app.executed_input_count()),
-        offset.checked_next(),
+        Some(app.l2_tx_count()),
+        before.checked_next(),
         "successful application execution must advance the count exactly once"
     );
 }
@@ -334,7 +331,7 @@ mod tests {
     /// One sender's worth of state with knobs for every way an application can
     /// misbehave. The nonce is shared by all senders, which suffices here.
     struct ProgressApp {
-        count: ExecutedInputCount,
+        count: L2TxCount,
         nonce: u32,
         applied: u64,
         admit_calls: Cell<u64>,
@@ -348,7 +345,7 @@ mod tests {
     impl ProgressApp {
         fn new(count: u64) -> Self {
             Self {
-                count: ExecutedInputCount::new(count),
+                count: L2TxCount::new(count),
                 nonce: 0,
                 applied: 0,
                 admit_calls: Cell::new(0),
@@ -402,7 +399,7 @@ mod tests {
             self.apply()
         }
 
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.assert_usable();
             self.count
         }
@@ -439,7 +436,7 @@ mod tests {
         }
         fn from_canonical_state(
             _state_file: &Path,
-            _executed_input_count: ExecutedInputCount,
+            _l2_tx_count: L2TxCount,
         ) -> Result<Self, AppError> {
             unreachable!("not used")
         }
@@ -528,28 +525,25 @@ mod tests {
     }
 
     #[test]
-    fn the_count_defines_offsets_and_only_user_ops_move_the_nonce() {
+    fn the_count_defines_indexes_and_only_user_ops_move_the_nonce() {
         let mut app = ProgressApp::new(0);
-        let Executed::Done { offset, .. } = execute(&mut app, &user_tx(0)).unwrap() else {
+        let Executed::Done { index, .. } = execute(&mut app, &user_tx(0)).unwrap() else {
             panic!("a user op at its sender's nonce executes")
         };
-        assert_eq!(offset, ExecutedInputCount::ZERO);
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(1));
+        assert_eq!(index, L2TxCount::ZERO);
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(1));
         assert_eq!(app.nonce, 1);
 
         for expected in [1, 2] {
-            let Executed::Done { offset, outputs } = execute(&mut app, &direct(12)).unwrap() else {
+            let Executed::Done { index, outputs } = execute(&mut app, &direct(12)).unwrap() else {
                 panic!("a direct always executes")
             };
-            assert_eq!(offset, ExecutedInputCount::new(expected));
+            assert_eq!(index, L2TxCount::new(expected));
             assert!(
                 outputs.is_empty(),
                 "executed no-ops still advance the count"
             );
-            assert_eq!(
-                app.executed_input_count(),
-                ExecutedInputCount::new(expected + 1)
-            );
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(expected + 1));
         }
         assert_eq!(app.nonce, 1, "a direct never moves a nonce");
     }
@@ -574,7 +568,7 @@ mod tests {
                 Executed::Skipped(reason)
             );
             assert_eq!(app.applied, 0);
-            assert_eq!(app.executed_input_count(), ExecutedInputCount::new(7));
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(7));
             assert_eq!(app.nonce, app_nonce);
         }
     }
@@ -603,7 +597,7 @@ mod tests {
         ));
         assert_eq!(app.applied, 0);
         assert_eq!(app.admit_calls.get(), 0);
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(7));
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(7));
     }
 
     #[test]
@@ -691,7 +685,7 @@ mod tests {
         );
         assert_eq!(app.admit_calls.get(), 1);
         assert_eq!(app.applied, 0);
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(4));
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(4));
         assert_eq!(app.nonce, 0);
 
         app.admission = Admission::Admit;
@@ -735,15 +729,9 @@ mod tests {
             let message = panic_message(|| {
                 let _ = execute(&mut app, &tx);
             });
-            assert_eq!(
-                message,
-                "executed input count overflow: no canonical successor"
-            );
+            assert_eq!(message, "L2 tx count overflow: no canonical successor");
             assert_eq!(app.applied, 0, "overflow must preflight the app hook");
-            assert_eq!(
-                app.executed_input_count(),
-                ExecutedInputCount::new(u64::MAX)
-            );
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(u64::MAX));
         }
     }
 

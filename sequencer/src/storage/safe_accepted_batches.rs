@@ -337,7 +337,7 @@ mod tests {
         use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
         use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
         use crate::test_support::pin_test_deployment_identity;
-        use sequencer_core::{batch::Batch, history::ExecutedInputCount};
+        use sequencer_core::{batch::Batch, history::L2TxCount};
         use ssz::Encode;
 
         // At C itself, the future nonce must precede nonce 0 in L1 order:
@@ -413,8 +413,8 @@ mod tests {
                     super::super::history::initialize_history_in(
                         tx,
                         &crate::storage::EraRecord {
-                            base_count: ExecutedInputCount::new(41),
-                            rebuilt_history_end: ExecutedInputCount::new(41),
+                            base_count: L2TxCount::new(41),
+                            rebuilt_history_end: L2TxCount::new(41),
                             stop_block: 30,
                             first_queued_input: 2,
                             next_batch_nonce: 1,

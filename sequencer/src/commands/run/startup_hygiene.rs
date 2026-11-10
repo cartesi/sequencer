@@ -143,7 +143,7 @@ mod tests {
         let root = tempfile::tempdir().expect("snapshot parent");
         let missing = root.path().join("missing");
         storage
-            .insert_baseline_snapshot(&missing, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&missing, crate::storage::L2TxCount::ZERO)
             .expect("register missing fixture");
 
         let err = require_rollback_snapshot(&mut storage, "/data")
@@ -166,7 +166,7 @@ mod tests {
         std::fs::write(corrupt.join("info.toml"), "not = valid = toml")
             .expect("write corrupt metadata");
         storage
-            .insert_baseline_snapshot(&corrupt, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&corrupt, crate::storage::L2TxCount::ZERO)
             .expect("register corrupt fixture");
 
         let err = require_rollback_snapshot(&mut storage, "/data")
@@ -189,7 +189,7 @@ mod tests {
         let tracked = dumps_dir.path().join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .expect("register tracked");
 
         // Two orphans (NOT in SQLite). One is fully formed; the other
@@ -244,7 +244,7 @@ mod tests {
             storage
                 .insert_baseline_snapshot(
                     &stored_dir.join("tracked"),
-                    crate::storage::ExecutedInputCount::ZERO,
+                    crate::storage::L2TxCount::ZERO,
                 )
                 .unwrap();
             // A literal match must not hide the other row's aliased spelling.
@@ -295,7 +295,7 @@ mod tests {
                 tracked.clone()
             };
             storage
-                .insert_baseline_snapshot(&stored, crate::storage::ExecutedInputCount::ZERO)
+                .insert_baseline_snapshot(&stored, crate::storage::L2TxCount::ZERO)
                 .unwrap();
             let orphan = dumps.join("orphan");
             create_structured_dump(&orphan);
@@ -327,7 +327,7 @@ mod tests {
         let tracked = dumps.join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .unwrap();
 
         // This alias survives realpath resolution, unlike an ordinary symlink.
@@ -379,7 +379,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 &dumps.path().join(".").join("tracked"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .unwrap();
         let missing = dumps.path().join("missing");
@@ -458,7 +458,7 @@ mod tests {
         let tracked = dumps.join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .unwrap();
         let outside = root.path().join("outside");
         create_structured_dump(&outside);
@@ -491,7 +491,7 @@ mod tests {
         let baseline = dumps.path().join("baseline");
         create_structured_dump(&baseline);
         let baseline_id = storage
-            .insert_baseline_snapshot(&baseline, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&baseline, crate::storage::L2TxCount::ZERO)
             .unwrap();
         let obsolete = dumps.path().join("obsolete");
         create_structured_dump(&obsolete);

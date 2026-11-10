@@ -9,7 +9,7 @@
 
 use alloy_primitives::Address;
 use rusqlite::{OptionalExtension, Result, Transaction, params};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::scheduler::Scheduled;
 
@@ -144,10 +144,7 @@ impl Storage {
     /// Record the counts of executed rows, in execution order, in one
     /// transaction. A skipped row gets none; the schema refuses a count out
     /// of row order, a gap, or a second count for a row.
-    pub fn record_rebuilt_counts(
-        &mut self,
-        counts: &[(RebuiltKey, ExecutedInputCount)],
-    ) -> Result<()> {
+    pub fn record_rebuilt_counts(&mut self, counts: &[(RebuiltKey, L2TxCount)]) -> Result<()> {
         if counts.is_empty() {
             return Ok(());
         }

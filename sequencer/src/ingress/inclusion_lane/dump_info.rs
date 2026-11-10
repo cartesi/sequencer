@@ -254,14 +254,14 @@ mod tests {
     use super::*;
     use alloy_primitives::Address;
     use sequencer_core::application::{Admission, AppOutputs, SchedulerLimits, execute};
-    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::history::L2TxCount;
     use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
     use sequencer_core::user_op::UserOp;
 
     /// Persists only its count, as a single file or inside a directory.
     #[derive(Default)]
     struct PrefixDumpApp<const DIRECTORY: bool> {
-        count: ExecutedInputCount,
+        count: L2TxCount,
         flushes: usize,
     }
 
@@ -279,7 +279,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.count
         }
 
@@ -307,7 +307,7 @@ mod tests {
                 assert_eq!(std::fs::read(prefix.join("manifest"))?, b"complete");
             }
             Ok(Self {
-                count: ExecutedInputCount::new(count),
+                count: L2TxCount::new(count),
                 flushes: 0,
             })
         }
@@ -339,7 +339,7 @@ mod tests {
 
         fn from_canonical_state(
             _state_file: &Path,
-            _executed_input_count: ExecutedInputCount,
+            _l2_tx_count: L2TxCount,
         ) -> Result<Self, AppError> {
             unreachable!("dump-prefix tests never adopt a canonical state")
         }
@@ -357,14 +357,14 @@ mod tests {
         });
         let mut app = PrefixDumpApp::<DIRECTORY>::default();
         execute(&mut app, &input).unwrap();
-        let checkpoint = app.executed_input_count();
+        let checkpoint = app.l2_tx_count();
         create_dump_dir_with_info(&mut app, &dump, &sample()).unwrap();
         assert_eq!(
             app.flushes, 1,
             "dump creation can flush mutable runtime state"
         );
         assert_eq!(
-            app.executed_input_count(),
+            app.l2_tx_count(),
             checkpoint,
             "dumping preserves logical state"
         );
@@ -380,14 +380,14 @@ mod tests {
         assert_eq!(
             PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&sibling))
                 .unwrap()
-                .executed_input_count(),
+                .l2_tx_count(),
             checkpoint,
             "other checkpoints survive deletion"
         );
         execute(&mut first, &input).unwrap();
-        assert_eq!(app.executed_input_count(), checkpoint);
+        assert_eq!(app.l2_tx_count(), checkpoint);
         assert_eq!(
-            second.executed_input_count(),
+            second.l2_tx_count(),
             checkpoint,
             "restored instances own independent state"
         );
@@ -395,8 +395,8 @@ mod tests {
         create_dump_dir_with_info(&mut first, &successor, &sample()).unwrap();
         let reloaded = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&successor)).unwrap();
         assert_eq!(
-            reloaded.executed_input_count(),
-            first.executed_input_count(),
+            reloaded.l2_tx_count(),
+            first.l2_tx_count(),
             "restored state survives source deletion"
         );
         delete_dump_dir(&successor).unwrap();
@@ -437,7 +437,7 @@ mod tests {
             assert_eq!(read_checkpoint_info(&destination).unwrap(), receipt);
             let restored =
                 PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&destination)).unwrap();
-            assert_eq!(restored.executed_input_count(), app.executed_input_count());
+            assert_eq!(restored.l2_tx_count(), app.l2_tx_count());
         }
         check::<false>();
         check::<true>();

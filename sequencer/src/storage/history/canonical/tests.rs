@@ -39,14 +39,14 @@ fn included(nonce: u32, offset: u64, payload: u8) -> IncludedUserOp {
             respond_to,
             received_at: SystemTime::now(),
         },
-        executed_input_offset: ExecutedInputCount::new(offset),
+        l2_tx_index: L2TxCount::new(offset),
     }
 }
 
 fn claim(bounds: HistoryBounds, next: u64) -> HistoryClaim {
     HistoryClaim {
         version: bounds.version,
-        next_input: ExecutedInputCount::new(next),
+        next_input: L2TxCount::new(next),
     }
 }
 
@@ -115,7 +115,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::new(1),
+                l2_tx_index: L2TxCount::new(1),
             }],
         )
         .unwrap();
@@ -124,13 +124,13 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         .unwrap();
 
     let bounds = storage.history_bounds().unwrap();
-    assert_eq!(bounds.available_from, ExecutedInputCount::ZERO);
-    assert_eq!(bounds.head, ExecutedInputCount::new(3));
+    assert_eq!(bounds.available_from, L2TxCount::ZERO);
+    assert_eq!(bounds.head, L2TxCount::new(3));
     let first = storage.canonical_history_page(claim(bounds, 0), 2).unwrap();
     assert_eq!(first.bounds, bounds);
     assert_eq!(first.next_claim(), claim(bounds, 2));
     assert_eq!(first.rows.len(), 2);
-    assert_eq!(first.rows[0].offset, ExecutedInputCount::ZERO);
+    assert_eq!(first.rows[0].offset, L2TxCount::ZERO);
     match &first.rows[0].context {
         L2TxContext::UserOp { tx, batch_nonce } => {
             assert_eq!(tx.sender, SENDER_B);
@@ -140,7 +140,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         }
         other => panic!("expected user op, got {other:?}"),
     }
-    assert_eq!(first.rows[1].offset, ExecutedInputCount::new(1));
+    assert_eq!(first.rows[1].offset, L2TxCount::new(1));
     match &first.rows[1].context {
         L2TxContext::Direct {
             tx,
@@ -159,7 +159,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
         .canonical_history_page(first.next_claim(), 2)
         .unwrap();
     assert_eq!(last.rows.len(), 1);
-    assert_eq!(last.rows[0].offset, ExecutedInputCount::new(2));
+    assert_eq!(last.rows[0].offset, L2TxCount::new(2));
     match &last.rows[0].context {
         L2TxContext::UserOp { tx, batch_nonce } => {
             assert_eq!(tx.data, vec![0x33]);
@@ -185,13 +185,13 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replace
     let mut storage = Storage::open(&db.path).unwrap();
     seed_aging_tip(&mut storage);
     let before = storage.history_bounds().unwrap();
-    assert_eq!(before.head, ExecutedInputCount::new(2));
+    assert_eq!(before.head, L2TxCount::new(2));
 
     assert_eq!(storage.recover_aging_tip(1_200).unwrap(), vec![1]);
     let recovered = storage.history_bounds().unwrap();
     assert_eq!(recovered.version.era_id, before.version.era_id);
     assert_eq!(recovered.version.recovery_generation.get(), 1);
-    assert_eq!(recovered.head, ExecutedInputCount::new(1));
+    assert_eq!(recovered.head, L2TxCount::new(1));
     for limit in [0, 2] {
         assert!(matches!(
             storage.canonical_history_page(claim(before, 2), limit),
@@ -214,7 +214,7 @@ fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replace
         .canonical_history_page(claim(recovered, 1), 2)
         .unwrap();
     assert_eq!(page.rows.len(), 1);
-    assert_eq!(page.rows[0].offset, ExecutedInputCount::new(1));
+    assert_eq!(page.rows[0].offset, L2TxCount::new(1));
     assert_eq!(page.next_input, before.head);
     match &page.rows[0].context {
         L2TxContext::UserOp { tx, .. } => assert_eq!(tx.data, vec![0xcc]),
@@ -299,18 +299,18 @@ fn seed_two_table_era(storage: &mut Storage) {
     };
     storage
         .record_rebuilt_counts(&[
-            (key(0, 0), ExecutedInputCount::new(41)),
-            (key(1, 0), ExecutedInputCount::new(42)),
-            (key(1, 2), ExecutedInputCount::new(43)),
-            (key(2, 0), ExecutedInputCount::new(44)),
+            (key(0, 0), L2TxCount::new(41)),
+            (key(1, 0), L2TxCount::new(42)),
+            (key(1, 2), L2TxCount::new(43)),
+            (key(2, 0), L2TxCount::new(44)),
         ])
         .unwrap();
     storage
         .publish_era(
             std::path::Path::new("/snapshot/era"),
             &EraRecord {
-                base_count: ExecutedInputCount::new(41),
-                rebuilt_history_end: ExecutedInputCount::new(45),
+                base_count: L2TxCount::new(41),
+                rebuilt_history_end: L2TxCount::new(45),
                 stop_block: 10,
                 first_queued_input: 3,
                 next_batch_nonce: 5,
@@ -326,8 +326,8 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     seed_two_table_era(&mut storage);
     let bounds = storage.history_bounds().unwrap();
-    assert_eq!(bounds.available_from, ExecutedInputCount::new(41));
-    assert_eq!(bounds.head, ExecutedInputCount::new(45));
+    assert_eq!(bounds.available_from, L2TxCount::new(41));
+    assert_eq!(bounds.head, L2TxCount::new(45));
     assert!(
         storage
             .canonical_history_page(claim(bounds, 45), 10)
@@ -347,7 +347,7 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
         .append_executed_user_ops_chunk(&mut head, &[included(2, 45, 0xcc), included(3, 46, 0xdd)])
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
-    assert_eq!(bounds.head, ExecutedInputCount::new(47));
+    assert_eq!(bounds.head, L2TxCount::new(47));
 
     let whole = storage
         .canonical_history_page(claim(bounds, 41), 100)
@@ -421,7 +421,7 @@ fn a_page_spans_the_rebuilt_history_and_the_live_rows_without_gaps() {
     assert!(matches!(
         storage.canonical_history_page(claim(bounds, 40), 10),
         Err(HistoryReadError::Policy(HistoryPolicyError::HistoryUnavailable { available_from }))
-            if available_from == ExecutedInputCount::new(41)
+            if available_from == L2TxCount::new(41)
     ));
 }
 
@@ -456,7 +456,7 @@ fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
         .append_executed_user_ops_chunk(&mut head, &inputs)
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
-    assert_eq!(bounds.head, ExecutedInputCount::new(50_001));
+    assert_eq!(bounds.head, L2TxCount::new(50_001));
     for from in [0, 25_000, 49_999] {
         let page = storage
             .canonical_history_page(claim(bounds, from), 2)
@@ -487,7 +487,7 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
         .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xcc)])
         .unwrap();
     let state = query_history_state(&tx).unwrap();
-    let retained = canonical_page_in(&tx, &state, before, ExecutedInputCount::new(1), 2).unwrap();
+    let retained = canonical_page_in(&tx, &state, before, L2TxCount::new(1), 2).unwrap();
     assert_eq!(retained.bounds, before);
     assert_eq!(history_bounds_in(&tx).unwrap(), before);
     assert_eq!(retained.rows.len(), 1);
@@ -524,12 +524,12 @@ fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
         .append_executed_user_ops_chunk(&mut head, &[included(0, last, 0xaa)])
         .unwrap();
     let bounds = storage.history_bounds().unwrap();
-    assert_eq!(bounds.head, ExecutedInputCount::new(last + 1));
+    assert_eq!(bounds.head, L2TxCount::new(last + 1));
     let page = storage
         .canonical_history_page(claim(bounds, last), 1)
         .unwrap();
     assert_eq!(page.rows.len(), 1);
-    assert_eq!(page.rows[0].offset, ExecutedInputCount::new(last));
+    assert_eq!(page.rows[0].offset, L2TxCount::new(last));
     let tail = storage
         .canonical_history_page(page.next_claim(), usize::MAX)
         .unwrap();

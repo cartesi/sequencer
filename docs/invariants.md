@@ -226,7 +226,7 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I10. Replay uses an inclusive application-history boundary
 
-- **Holds:** `ExecutedInputCount = X` means input `X` executes next. The
+- **Holds:** `L2TxCount = X` means entry `X` executes next. The
   executed rebuilt rows cover `[K, E)` and the live rows `[E, H)`; a snapshot
   is never below `E`, so native restart replays only live rows with
   `offset >= X`. `H` waits.
@@ -446,9 +446,9 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I19. Application progress follows the shared execution contract
 
-- **Holds:** the application's progress is its `ExecutedInputCount` alone.
-  An executed transaction returns its pre-execution count as the offset
-  (`Executed::Done { offset, .. }`) and leaves the count at exactly
+- **Holds:** the application's progress is its L2 tx count (`L2TxCount`) alone.
+  An executed transaction returns its pre-execution count as its index
+  (`Executed::Done { index, .. }`) and leaves the count at exactly
   `count + 1`; an executed user op also leaves its sender's nonce at exactly
   `nonce + 1`. A skipped op (wrong nonce) changes nothing. `AppError` is fatal
   and defines no canonical successor.

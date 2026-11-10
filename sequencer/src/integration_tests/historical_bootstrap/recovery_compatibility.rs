@@ -33,7 +33,7 @@ impl Backup {
     ) -> Self {
         let claim = HistoryClaim {
             version,
-            next_input: app.executed_input_count(),
+            next_input: app.l2_tx_count(),
         };
         let path = directory.join(name);
         std::fs::create_dir(&path).unwrap();
@@ -52,7 +52,7 @@ impl Backup {
             serde_json::from_slice(&std::fs::read(self.path.join("projection.json")).unwrap())
                 .unwrap();
         assert_eq!(claim, self.claim);
-        assert_eq!(app.executed_input_count(), claim.next_input);
+        assert_eq!(app.l2_tx_count(), claim.next_input);
         (app, history)
     }
 }
@@ -93,7 +93,7 @@ fn append_transfer(
             respond_to,
             received_at: SystemTime::now(),
         },
-        executed_input_offset: offset,
+        l2_tx_index: offset,
     };
     storage
         .append_executed_user_ops_chunk(head, &[included])
@@ -120,12 +120,7 @@ fn close_and_accept(
     )
     .unwrap();
     storage
-        .close_frame_and_batch_with_snapshot(
-            head,
-            head.safe_block,
-            &prefix,
-            app.executed_input_count(),
-        )
+        .close_frame_and_batch_with_snapshot(head, head.safe_block, &prefix, app.l2_tx_count())
         .unwrap();
     let payload = local_batch_payload(storage, nonce);
     storage
@@ -245,7 +240,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
         history.extend(notices(outputs));
         executions.push(DirectInputExecution {
             safe_input_index: input_index,
-            executed_input_offset: offset,
+            l2_tx_index: offset,
         });
     }
     storage

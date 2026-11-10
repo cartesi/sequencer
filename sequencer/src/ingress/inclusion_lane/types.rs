@@ -6,7 +6,7 @@
 
 use std::time::SystemTime;
 
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::user_op::SignedUserOp;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -27,7 +27,7 @@ pub struct PendingUserOp {
 #[derive(Debug)]
 pub(crate) struct IncludedUserOp {
     pub pending: PendingUserOp,
-    pub executed_input_offset: ExecutedInputCount,
+    pub l2_tx_index: L2TxCount,
 }
 
 /// Per-op outcome reported back to the API caller via the response channel.

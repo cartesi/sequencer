@@ -22,7 +22,7 @@ use sequencer_core::application::{
     AppOutput, AppOutputs, Application, CanonicalState, Executed, execute,
 };
 use sequencer_core::batch::{Batch, Frame, WireUserOp};
-use sequencer_core::history::{ExecutedInputCount, HistoryClaim, HistoryPolicyError};
+use sequencer_core::history::{HistoryClaim, HistoryPolicyError, L2TxCount};
 use sequencer_core::history_api::HistoricalL1InputStart;
 use sequencer_core::l2_tx::{Direct, L2Tx};
 use sequencer_core::scheduler::{
@@ -150,9 +150,9 @@ fn l1_input(index: u64, input: &IngestedSafeInput) -> L1Input {
 
 /// Execute a transaction the fixture expects to run: a direct, or a user op at
 /// its sender's next nonce.
-fn execute_done(app: &mut WalletApp, tx: &L2Tx) -> (ExecutedInputCount, AppOutputs) {
+fn execute_done(app: &mut WalletApp, tx: &L2Tx) -> (L2TxCount, AppOutputs) {
     match execute(app, tx).unwrap() {
-        Executed::Done { offset, outputs } => (offset, outputs),
+        Executed::Done { index, outputs } => (index, outputs),
         Executed::Skipped(reason) => panic!("fixture transaction skipped: {reason}"),
     }
 }
@@ -301,8 +301,8 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
         .publish_era(
             &baseline_dump,
             &crate::storage::EraRecord {
-                base_count: reference_app.executed_input_count(),
-                rebuilt_history_end: reference_app.executed_input_count(),
+                base_count: reference_app.l2_tx_count(),
+                rebuilt_history_end: reference_app.l2_tx_count(),
                 stop_block: STOP,
                 first_queued_input: reference_export.first_queued_input,
                 next_batch_nonce: reference_nonce,
@@ -320,7 +320,7 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
     assert!(matches!(
         client.subscribe(HistoryClaim {
             version: metadata.history.version,
-            next_input: ExecutedInputCount::new(6),
+            next_input: L2TxCount::new(6),
         }).await,
         Err(sequencer_rust_client::SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
             if available_from == metadata.history.available_from
@@ -456,7 +456,7 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
     let mut stream = client
         .subscribe(HistoryClaim {
             version: current.history.version,
-            next_input: reader_app.executed_input_count(),
+            next_input: reader_app.l2_tx_count(),
         })
         .await
         .unwrap();
@@ -489,7 +489,7 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
             WalletApp::scheduler_limits().max_direct_payload_bytes,
             &[DirectInputExecution {
                 safe_input_index: 8,
-                executed_input_offset: live_offset,
+                l2_tx_index: live_offset,
             }],
         )
         .unwrap();
@@ -529,7 +529,7 @@ async fn historical_bootstrap_restores_transfer_history_and_hands_off_at_baselin
         "the feed carries the direct's index and timestamp"
     );
     let (offset, outputs) = execute_done(&mut reader_app, &received);
-    assert_eq!(offset, ExecutedInputCount::new(7));
+    assert_eq!(offset, L2TxCount::new(7));
     history.extend(notices(outputs));
     assert_eq!(history, expected_history);
     assert_eq!(

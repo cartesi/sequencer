@@ -14,9 +14,7 @@ use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
-use sequencer_core::history::{
-    ExecutedInputCount, HistoryClaim, HistoryPolicyError, RecoveryGeneration,
-};
+use sequencer_core::history::{HistoryClaim, HistoryPolicyError, L2TxCount, RecoveryGeneration};
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -110,7 +108,7 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
                     respond_to,
                     received_at: SystemTime::now(),
                 },
-                executed_input_offset: ExecutedInputCount::new(u64::from(offset)),
+                l2_tx_index: L2TxCount::new(u64::from(offset)),
             }
         })
         .collect();
@@ -435,7 +433,7 @@ fn seed_ordered_txs(db_path: &str) {
             &mut head,
             &[IncludedUserOp {
                 pending,
-                executed_input_offset: ExecutedInputCount::ZERO,
+                l2_tx_index: L2TxCount::ZERO,
             }],
         )
         .expect("append user-op chunk");
@@ -464,6 +462,6 @@ fn claim(db_path: &str, next: u64) -> HistoryClaim {
     let storage = Storage::open_read_only(db_path).unwrap();
     HistoryClaim {
         version: storage.history_state().unwrap().version,
-        next_input: ExecutedInputCount::new(next),
+        next_input: L2TxCount::new(next),
     }
 }

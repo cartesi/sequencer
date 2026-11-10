@@ -1473,7 +1473,7 @@ impl ManagedSequencer {
                     u64::try_from(generation)?,
                 ),
             },
-            next_input: sequencer_rust_client::ExecutedInputCount::new(next_input),
+            next_input: sequencer_rust_client::L2TxCount::new(next_input),
         })
     }
 
@@ -1488,7 +1488,7 @@ impl ManagedSequencer {
     pub async fn ws_adopting(&self, count: u64) -> HarnessResult<WsClient> {
         let client = self.sequencer_client()?;
         let claim = client
-            .adopt_current_era(sequencer_rust_client::ExecutedInputCount::new(count))
+            .adopt_current_era(sequencer_rust_client::L2TxCount::new(count))
             .await?;
         WsClient::connect(&client, claim).await
     }

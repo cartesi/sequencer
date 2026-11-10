@@ -6,7 +6,7 @@
 use alloy_primitives::{Address, B256, Bytes};
 use serde::{Deserialize, Serialize};
 
-use crate::history::{EraId, ExecutedInputCount, HistoryBounds, HistoryClaim, RecoveryGeneration};
+use crate::history::{EraId, HistoryBounds, HistoryClaim, L2TxCount, RecoveryGeneration};
 use thiserror::Error;
 
 pub const HISTORICAL_INPUT_MAX_ITEMS: usize = 256;
@@ -33,13 +33,13 @@ pub struct HistoryBaseline {
     pub next_batch_nonce: u64,
     /// The L2 tx count at the end of the stop block: the rebuilt history ends
     /// here and the live rows start.
-    pub rebuilt_history_end: ExecutedInputCount,
+    pub rebuilt_history_end: L2TxCount,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedCheckpoint {
     pub inclusion_block: u64,
-    pub executed_input_count: ExecutedInputCount,
+    pub executed_input_count: L2TxCount,
     pub next_batch_nonce: u64,
 }
 
@@ -58,7 +58,7 @@ impl HistoryInfo {
     /// this one with. Every count from the base through the rebuilt history's
     /// end is one this era's history reaches through rows that landed on L1;
     /// past that end the client holds rows that never landed.
-    pub fn adopt_claim(&self, count: ExecutedInputCount) -> Result<HistoryClaim, AdoptError> {
+    pub fn adopt_claim(&self, count: L2TxCount) -> Result<HistoryClaim, AdoptError> {
         if count < self.history.available_from {
             return Err(AdoptError::BelowBase {
                 available_from: self.history.available_from,
@@ -81,20 +81,18 @@ impl HistoryInfo {
 pub enum AdoptError {
     /// The era starts after the client's state: recover from an older base.
     #[error("count is below the era's base count {available_from}", available_from = available_from.get())]
-    BelowBase { available_from: ExecutedInputCount },
+    BelowBase { available_from: L2TxCount },
     /// The client's state holds rows that never landed by the stop block:
     /// restore an older state.
     #[error("count is past the era's rebuilt history end {rebuilt_history_end}", rebuilt_history_end = rebuilt_history_end.get())]
-    PastRebuiltEnd {
-        rebuilt_history_end: ExecutedInputCount,
-    },
+    PastRebuiltEnd { rebuilt_history_end: L2TxCount },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryCompatibility {
     pub from_generation: RecoveryGeneration,
     /// Checkpoint counts up to and including this boundary preserve their input prefix.
-    pub preserved_input_count: ExecutedInputCount,
+    pub preserved_input_count: L2TxCount,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,14 +141,14 @@ mod tests {
                     era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
                     recovery_generation: RecoveryGeneration::new(2),
                 },
-                available_from: ExecutedInputCount::new(base),
-                head: ExecutedInputCount::new(head),
+                available_from: L2TxCount::new(base),
+                head: L2TxCount::new(head),
             },
             baseline: HistoryBaseline {
                 l1_stop_block: 50,
                 l1_end_input_index: 9,
                 next_batch_nonce: 4,
-                rebuilt_history_end: ExecutedInputCount::new(rebuilt_end),
+                rebuilt_history_end: L2TxCount::new(rebuilt_end),
             },
             accepted_checkpoint: None,
             compatibility: None,
@@ -161,17 +159,13 @@ mod tests {
     fn a_count_from_the_base_through_the_rebuilt_end_adopts_the_current_version() {
         let info = info(41, 45, 60);
         for count in [41, 43, 45] {
-            let claim = info.adopt_claim(ExecutedInputCount::new(count)).unwrap();
+            let claim = info.adopt_claim(L2TxCount::new(count)).unwrap();
             assert_eq!(claim.version, info.history.version);
-            assert_eq!(claim.next_input, ExecutedInputCount::new(count));
+            assert_eq!(claim.next_input, L2TxCount::new(count));
             assert_eq!(info.history.validate(claim), Ok(()));
         }
         let empty_rebuild = self::info(41, 41, 41);
-        assert!(
-            empty_rebuild
-                .adopt_claim(ExecutedInputCount::new(41))
-                .is_ok()
-        );
+        assert!(empty_rebuild.adopt_claim(L2TxCount::new(41)).is_ok());
     }
 
     #[test]
@@ -179,9 +173,9 @@ mod tests {
         let info = info(41, 45, 60);
         for count in [0, 40] {
             assert_eq!(
-                info.adopt_claim(ExecutedInputCount::new(count)),
+                info.adopt_claim(L2TxCount::new(count)),
                 Err(AdoptError::BelowBase {
-                    available_from: ExecutedInputCount::new(41)
+                    available_from: L2TxCount::new(41)
                 })
             );
         }
@@ -189,9 +183,9 @@ mod tests {
         // before its stop block, so an older era's state there is not canonical.
         for count in [46, 60, u64::MAX] {
             assert_eq!(
-                info.adopt_claim(ExecutedInputCount::new(count)),
+                info.adopt_claim(L2TxCount::new(count)),
                 Err(AdoptError::PastRebuiltEnd {
-                    rebuilt_history_end: ExecutedInputCount::new(45)
+                    rebuilt_history_end: L2TxCount::new(45)
                 })
             );
         }

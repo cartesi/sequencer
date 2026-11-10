@@ -156,7 +156,7 @@ pub(crate) fn execute_history<A: Application>(
         let mut counts = Vec::with_capacity(page.len());
         for row in &page {
             match execute(app, &row.tx) {
-                Ok(Executed::Done { offset, .. }) => counts.push((row.key, offset)),
+                Ok(Executed::Done { index, .. }) => counts.push((row.key, index)),
                 Ok(Executed::Skipped(_)) => {}
                 Err(source) => {
                     return Err(SetupError::HistoryExecution {
@@ -248,7 +248,7 @@ mod tests {
     use app_core::application::{WalletApp, WalletConfig};
     use sequencer_core::application::{AppError, AppOutputs, CanonicalState};
     use sequencer_core::batch::{Batch, Frame, WireUserOp};
-    use sequencer_core::history::ExecutedInputCount;
+    use sequencer_core::history::L2TxCount;
     use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
     use sequencer_core::scheduler::{CanonicalRunner, TxFate};
     use ssz::Encode;
@@ -379,7 +379,7 @@ mod tests {
     }
 
     /// Every stored row and its count, in order.
-    fn stored(storage: &mut Storage) -> Vec<(u64, Scheduled, Option<ExecutedInputCount>)> {
+    fn stored(storage: &mut Storage) -> Vec<(u64, Scheduled, Option<L2TxCount>)> {
         let rows = storage.rebuilt_history_after(None, usize::MAX).unwrap();
         let counts: Vec<Option<i64>> = storage
             .read(|tx| {
@@ -401,7 +401,7 @@ mod tests {
                         batch_nonce: row.batch_nonce,
                         tx: row.tx,
                     },
-                    count.map(|count| ExecutedInputCount::new(u64::try_from(count).unwrap())),
+                    count.map(|count| L2TxCount::new(u64::try_from(count).unwrap())),
                 )
             })
             .collect()
@@ -413,13 +413,13 @@ mod tests {
         inputs: &[IngestedSafeInput],
         from: usize,
         to: usize,
-    ) -> Vec<(u64, Scheduled, Option<ExecutedInputCount>)> {
+    ) -> Vec<(u64, Scheduled, Option<L2TxCount>)> {
         let mut rows = Vec::new();
         for (index, input) in (u64::try_from(from).unwrap()..).zip(&inputs[from..to]) {
             let advanced = runner.process_input(l1_input(index, input)).unwrap();
             for record in advanced.txs {
                 let count = match record.fate {
-                    TxFate::Done { offset } => Some(offset),
+                    TxFate::Done { index: l2_tx_index } => Some(l2_tx_index),
                     TxFate::Skipped(_) => None,
                 };
                 rows.push((index, record.scheduled, count));
@@ -454,10 +454,7 @@ mod tests {
             (6, 2),
             "the directs after the last frame stay queued"
         );
-        assert_eq!(
-            app.executed_input_count(),
-            runner.app().executed_input_count()
-        );
+        assert_eq!(app.l2_tx_count(), runner.app().l2_tx_count());
         assert_eq!(
             app.canonical_snapshot_bytes().unwrap(),
             runner.app().canonical_snapshot_bytes().unwrap()
@@ -637,7 +634,7 @@ mod tests {
 
     /// An application that fails on its second direct.
     struct FailingApp {
-        count: ExecutedInputCount,
+        count: L2TxCount,
         nonce: u32,
         directs: u32,
     }
@@ -661,7 +658,7 @@ mod tests {
             self.count.advance();
             Ok(Vec::new())
         }
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.count
         }
         fn max_method_payload_bytes() -> usize {
@@ -689,7 +686,7 @@ mod tests {
         }
         fn from_canonical_state(
             _state_file: &std::path::Path,
-            _count: ExecutedInputCount,
+            _count: L2TxCount,
         ) -> Result<Self, AppError> {
             unreachable!("built directly")
         }
@@ -705,7 +702,7 @@ mod tests {
         rebuild_history(&mut storage, config(), &export, 9, 30).unwrap();
 
         let mut app = FailingApp {
-            count: ExecutedInputCount::ZERO,
+            count: L2TxCount::ZERO,
             nonce: 0,
             directs: 0,
         };
@@ -727,7 +724,7 @@ mod tests {
         );
         let counts: Vec<(u64, Option<u64>)> = stored(&mut storage)
             .into_iter()
-            .map(|(index, _, count)| (index, count.map(ExecutedInputCount::get)))
+            .map(|(index, _, count)| (index, count.map(L2TxCount::get)))
             .collect();
         assert_eq!(
             counts,
@@ -821,8 +818,8 @@ mod tests {
         assert_eq!(
             summary.era,
             Some(crate::storage::EraRecord {
-                base_count: ExecutedInputCount::new(export.l2_tx_count),
-                rebuilt_history_end: ExecutedInputCount::new(export.l2_tx_count),
+                base_count: L2TxCount::new(export.l2_tx_count),
+                rebuilt_history_end: L2TxCount::new(export.l2_tx_count),
                 stop_block: 12,
                 first_queued_input: 2,
                 next_batch_nonce: 1,
@@ -871,8 +868,8 @@ mod tests {
         assert_eq!(
             summary.era,
             Some(crate::storage::EraRecord {
-                base_count: ExecutedInputCount::ZERO,
-                rebuilt_history_end: at_stop.app().executed_input_count(),
+                base_count: L2TxCount::ZERO,
+                rebuilt_history_end: at_stop.app().l2_tx_count(),
                 stop_block: 17,
                 first_queued_input: state.first_queued_input,
                 next_batch_nonce: state.next_batch_nonce,
@@ -1035,14 +1032,14 @@ mod tests {
         };
         for (index, input) in (5_u64..).zip(inputs[5..].iter().chain([&root_batch])) {
             for record in runner.process_input(l1_input(index, input)).unwrap().txs {
-                let TxFate::Done { offset } = record.fate else {
+                let TxFate::Done { index: l2_tx_index } = record.fate else {
                     panic!("a direct never skips");
                 };
                 let L2Tx::Direct(direct) = record.scheduled.tx else {
                     panic!("the frame holds no op");
                 };
                 handed_out.push((
-                    offset.get(),
+                    l2_tx_index.get(),
                     direct.input_index,
                     record.scheduled.batch_nonce,
                 ));

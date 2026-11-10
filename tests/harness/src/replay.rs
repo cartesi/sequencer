@@ -50,8 +50,8 @@ impl ReplayWalletApp {
         self.app.current_user_nonce(sender)
     }
 
-    pub fn executed_input_count(&self) -> u64 {
-        self.app.executed_input_count().get()
+    pub fn l2_tx_count(&self) -> u64 {
+        self.app.l2_tx_count().get()
     }
 
     /// The frame's safe block of the last applied user op, or the inclusion
@@ -66,7 +66,7 @@ impl ReplayWalletApp {
 /// user op, the inclusion block for a direct), so mirrors that need an L1
 /// clock can track it themselves.
 pub fn apply_ws_message<A: Application>(app: &mut A, message: WsTxMessage) -> HarnessResult<u64> {
-    let expected = app.executed_input_count().get();
+    let expected = app.l2_tx_count().get();
     if message.offset() != expected {
         return Err(io_other(format!(
             "WS history gap: expected input {expected}, got {}",
@@ -80,11 +80,11 @@ pub fn apply_ws_message<A: Application>(app: &mut A, message: WsTxMessage) -> Ha
         L2Tx::UserOp(op) => op.block,
     };
     match execute(app, &tx)? {
-        Executed::Done { offset, .. } => {
-            if offset.get() != expected {
+        Executed::Done { index, .. } => {
+            if index.get() != expected {
                 return Err(io_other(format!(
-                    "executor reported offset {}, expected {expected}",
-                    offset.get()
+                    "executor reported index {}, expected {expected}",
+                    index.get()
                 ))
                 .into());
             }

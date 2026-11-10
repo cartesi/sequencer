@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use crate::{
-    AdoptEraError, EraId, ExecutedInputCount, HistoricalL1InputStart, HistoricalL1InputsPage,
-    HistoryClaim, HistoryInfo, HistoryPolicyError, HistoryReadError, RecoveryGeneration,
+    AdoptEraError, EraId, HistoricalL1InputStart, HistoricalL1InputsPage, HistoryClaim,
+    HistoryInfo, HistoryPolicyError, HistoryReadError, L2TxCount, RecoveryGeneration,
     SequencerClient,
 };
 
@@ -14,10 +14,7 @@ impl SequencerClient {
     /// the client's state; past its rebuilt history's end the state holds
     /// rows that never landed. Both refusals need another starting state, and
     /// neither check sees a state that is wrong below its count.
-    pub async fn adopt_current_era(
-        &self,
-        count: ExecutedInputCount,
-    ) -> Result<HistoryClaim, AdoptEraError> {
+    pub async fn adopt_current_era(&self, count: L2TxCount) -> Result<HistoryClaim, AdoptEraError> {
         Ok(self.history(None, None).await?.adopt_claim(count)?)
     }
 
@@ -247,9 +244,7 @@ mod tests {
     async fn adoption_claims_the_current_era_only_from_the_base_through_the_rebuilt_end() {
         let adopt = |count| async move {
             let (client, server) = serve_once(200, history_body()).await;
-            let result = client
-                .adopt_current_era(ExecutedInputCount::new(count))
-                .await;
+            let result = client.adopt_current_era(L2TxCount::new(count)).await;
             let url = request_url(&server.await.unwrap());
             assert_eq!(url.path(), "/history");
             assert!(url.query().is_none(), "adoption reads the current era");
@@ -283,7 +278,7 @@ mod tests {
     async fn adoption_reports_a_failed_history_read() {
         let (client, server) = serve_once(503, "unavailable".into()).await;
         assert!(matches!(
-            client.adopt_current_era(ExecutedInputCount::new(7)).await,
+            client.adopt_current_era(L2TxCount::new(7)).await,
             Err(AdoptEraError::Read(HistoryReadError::Http {
                 status: 503,
                 ..

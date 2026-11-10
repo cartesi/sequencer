@@ -8,16 +8,14 @@
 
 use alloy_primitives::{Address, B256};
 use rusqlite::{Connection, Row, Transaction, params};
-use sequencer_core::history::{
-    ExecutedInputCount, HistoryBounds, HistoryClaim, HistoryPolicyError,
-};
+use sequencer_core::history::{HistoryBounds, HistoryClaim, HistoryPolicyError, L2TxCount};
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 
 use crate::storage::Storage;
 use crate::storage::convert::{
     i64_to_u16, i64_to_u32, i64_to_u64, saturating_query_bound, u64_to_i64,
 };
-use crate::storage::history::{HistoryState, next_executed_input_count_in, query_history_state};
+use crate::storage::history::{HistoryState, next_l2_tx_count_in, query_history_state};
 
 /// One executed history row: the record the executor ran, plus the batch
 /// coordinates the feed reports beside it.
@@ -36,7 +34,7 @@ pub(crate) enum L2TxContext {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApplicationInputRow {
-    pub(crate) offset: ExecutedInputCount,
+    pub(crate) offset: L2TxCount,
     pub(crate) context: L2TxContext,
 }
 
@@ -68,7 +66,7 @@ fn decode_application_input(row: &Row<'_>) -> rusqlite::Result<ApplicationInputR
         kind => panic!("invalid application input kind {kind}"),
     };
     Ok(ApplicationInputRow {
-        offset: ExecutedInputCount::new(i64_to_u64(row.get(0)?)),
+        offset: L2TxCount::new(i64_to_u64(row.get(0)?)),
         context,
     })
 }
@@ -77,7 +75,7 @@ fn decode_application_input(row: &Row<'_>) -> rusqlite::Result<ApplicationInputR
 pub(crate) struct CanonicalHistoryPage {
     pub(crate) bounds: HistoryBounds,
     pub(crate) rows: Vec<ApplicationInputRow>,
-    pub(crate) next_input: ExecutedInputCount,
+    pub(crate) next_input: L2TxCount,
 }
 
 impl CanonicalHistoryPage {
@@ -128,8 +126,8 @@ fn history_bounds_in(conn: &Connection) -> rusqlite::Result<HistoryBounds> {
 fn history_bounds_from(conn: &Connection, state: &HistoryState) -> rusqlite::Result<HistoryBounds> {
     Ok(HistoryBounds {
         version: state.version,
-        available_from: ExecutedInputCount::new(state.base_executed_input_count),
-        head: next_executed_input_count_in(conn)?,
+        available_from: L2TxCount::new(state.base_l2_tx_count),
+        head: next_l2_tx_count_in(conn)?,
     })
 }
 
@@ -188,12 +186,12 @@ fn canonical_page_in(
     tx: &Transaction<'_>,
     state: &HistoryState,
     bounds: HistoryBounds,
-    from: ExecutedInputCount,
+    from: L2TxCount,
     limit: usize,
 ) -> rusqlite::Result<CanonicalHistoryPage> {
     let limit = u64::try_from(limit).expect("page size fits u64");
     let expected_len = limit.min(bounds.head.get() - from.get());
-    let rebuilt_end = ExecutedInputCount::new(state.rebuilt_history_end);
+    let rebuilt_end = L2TxCount::new(state.rebuilt_history_end);
     let mut rows = Vec::new();
     let mut expected = from;
     // H can be i64::MAX + 1, the boundary after the last representable row.

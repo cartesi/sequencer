@@ -9,7 +9,7 @@ use std::path::Path;
 
 use c_app_engine::{Application, EngineApp, sys};
 use sequencer_core::application::AppError;
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 
 const REPORTED: u32 = 1;
 
@@ -73,7 +73,7 @@ fn an_engine_of_another_abi_version_is_asked_nothing_else() {
     // The constructors return the refusal; the infallible getters can only panic with it.
     for result in [
         EngineApp::from_dump(Path::new("/nonexistent/dump")),
-        EngineApp::from_canonical_state(Path::new("/nonexistent/state"), ExecutedInputCount::ZERO),
+        EngineApp::from_canonical_state(Path::new("/nonexistent/state"), L2TxCount::ZERO),
     ] {
         assert!(matches!(
             result,

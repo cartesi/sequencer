@@ -23,10 +23,6 @@ limits this work accepts and the paths it left unverified.
 - **[interfaces.md](interfaces.md)** is code, except the outline of the
   scheduler's C header, which stays until its direction is settled
   ([build](#build)).
-- **Two counts and their names**: rename the executed-input count to the L2 tx
-  count across the docs, then in code (`ExecutedInputCount`,
-  `executed_input_count()`, `Executed::Done { offset }`), in one rename-only
-  change.
 
 ## Build
 
@@ -64,6 +60,10 @@ Later, in light of this plan:
   whose count lies past the rebuilt history end, which today only the client's
   own adopt check catches;
 - `/nonce` after a recovery, which reads only the live rows;
+- the L2 tx count's older name, `executed_input_count`, which the HTTP fields,
+  the `X-Executed-Input-Count` header and the storage columns
+  `history_state.base_executed_input_count` and
+  `snapshots.executed_input_count` still carry;
 - the WS headers.
 
 ## Machine sourcing

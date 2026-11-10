@@ -22,7 +22,7 @@ use alloy_primitives::B256;
 use sequencer_core::application::{
     Admission, AppError, AppOutputs, Application, Executed, SchedulerLimits, SkipReason, execute,
 };
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
@@ -75,7 +75,7 @@ fn register_genesis_snapshot<A: Application>(app: &mut A, storage: &mut Storage,
     )
     .expect("create genesis dump");
     storage
-        .insert_baseline_snapshot(&dump_dir, ExecutedInputCount::ZERO)
+        .insert_baseline_snapshot(&dump_dir, L2TxCount::ZERO)
         .expect("insert finalized snapshot");
 }
 
@@ -138,7 +138,7 @@ fn make_included_user_op(seed: u8, offset: u64) -> IncludedUserOp {
     let (pending, _response) = make_pending_user_op(seed);
     IncludedUserOp {
         pending,
-        executed_input_offset: ExecutedInputCount::new(offset),
+        l2_tx_index: L2TxCount::new(offset),
     }
 }
 
@@ -218,8 +218,7 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
         storage,
         config,
     };
-    let mut lane_handle =
-        tokio::task::spawn_blocking(move || lane.run_forever(ExecutedInputCount::ZERO));
+    let mut lane_handle = tokio::task::spawn_blocking(move || lane.run_forever(L2TxCount::ZERO));
 
     let producer_tx = tx.clone();
     let producer = tokio::spawn(async move {
@@ -556,7 +555,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::new(2),
+                l2_tx_index: L2TxCount::new(2),
             }],
         )
         .expect("close first frame with direct attribution");
@@ -585,7 +584,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: ExecutedInputCount::new(4),
+                l2_tx_index: L2TxCount::new(4),
             }],
         )
         .expect("close second frame with direct attribution");
@@ -610,7 +609,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 2,
-                executed_input_offset: ExecutedInputCount::new(5),
+                l2_tx_index: L2TxCount::new(5),
             }],
         )
         .expect("close third frame with direct attribution");
@@ -799,10 +798,10 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     assert!(history_rows(&mut storage, 16).is_empty());
     assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 0);
     let mut fresh_app = StubApp::default();
-    catch_up_application_paged(&mut fresh_app, &mut storage, ExecutedInputCount::ZERO, 16)
+    catch_up_application_paged(&mut fresh_app, &mut storage, L2TxCount::ZERO, 16)
         .expect("catch up");
     assert_eq!(
-        fresh_app.executed_input_count().get(),
+        fresh_app.l2_tx_count().get(),
         0,
         "batch-submitter safe input should be skipped by the local app"
     );
@@ -1066,13 +1065,13 @@ fn catch_up_replays_multiple_pages() {
     assert_eq!(mappings, vec![0, 1, 2, 3, 4, 5]);
     let mut app = StubApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect("catch up in pages");
 
     // The expected events carry each direct's index, block and timestamp, so
     // they also pin what replay hands the application.
     assert_eq!(app.replayed, expected);
-    assert_eq!(app.executed_input_count().get(), expected.len() as u64);
+    assert_eq!(app.l2_tx_count().get(), expected.len() as u64);
 }
 
 #[test]
@@ -1084,7 +1083,7 @@ fn catch_up_rejects_history_gap_before_execution() {
     conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE offset=1;").unwrap();
     let mut app = StubApp::default();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2);
+        let _ = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2);
     }));
     assert!(failure.is_err());
     assert!(app.replayed.is_empty());
@@ -1097,7 +1096,7 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = StubApp::with_progress(3);
 
-    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect_err("mapping from a different application boundary must stop catch-up");
 
     assert!(matches!(
@@ -1111,7 +1110,7 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
         app.replayed.is_empty(),
         "mapping is checked before execution"
     );
-    assert_eq!(app.executed_input_count(), ExecutedInputCount::new(3));
+    assert_eq!(app.l2_tx_count(), L2TxCount::new(3));
     assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
 }
 
@@ -1122,7 +1121,7 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = StubApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 4)
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 4)
         .expect("catch up across page boundary");
 
     assert_eq!(app.replayed, expected);
@@ -1157,7 +1156,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         &mut included,
     )
     .expect("execute prefix user op");
-    assert_eq!(included[0].executed_input_offset, ExecutedInputCount::ZERO);
+    assert_eq!(included[0].l2_tx_index, L2TxCount::ZERO);
     storage
         .append_executed_user_ops_chunk(&mut head, &included)
         .expect("persist prefix user op");
@@ -1198,14 +1197,14 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         )
         .expect("observe prefix landing and direct input");
     let Executed::Done {
-        offset: direct_offset,
+        index: direct_index,
         ..
     } = execute(&mut live_app, &L2Tx::Direct(direct))
         .expect("execute direct input in doomed suffix")
     else {
         panic!("the executor never skips a direct");
     };
-    assert_eq!(direct_offset, ExecutedInputCount::new(1));
+    assert_eq!(direct_index, L2TxCount::new(1));
     storage
         .close_frame_only_with_executions(
             &mut head,
@@ -1214,7 +1213,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: direct_offset,
+                l2_tx_index: direct_index,
             }],
         )
         .expect("drain direct and promote prefix snapshot");
@@ -1222,10 +1221,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .finalized_dump()
         .expect("read finalized prefix")
         .expect("prefix snapshot promoted");
-    assert_eq!(
-        finalized_before.executed_input_count,
-        ExecutedInputCount::new(1)
-    );
+    assert_eq!(finalized_before.l2_tx_count, L2TxCount::new(1));
 
     // The direct and this user op are both beyond the finalized checkpoint.
     // Closing batch 1 makes it the first non-gold recovery pivot.
@@ -1239,10 +1235,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         &mut included,
     )
     .expect("execute doomed user op");
-    assert_eq!(
-        included[0].executed_input_offset,
-        ExecutedInputCount::new(2)
-    );
+    assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
     storage
         .append_executed_user_ops_chunk(&mut head, &included)
         .expect("persist doomed user op");
@@ -1254,10 +1247,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         dumps_dir.path(),
     )
     .expect("close doomed batch with snapshot");
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(3)
-    );
+    assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(3));
 
     let before_recovery = history_rows(&mut storage, 32);
     assert_eq!(
@@ -1283,8 +1273,8 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     );
     assert_eq!(recovered_history.version.recovery_generation.get(), 1);
     assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(2),
+        storage.next_l2_tx_count().unwrap(),
+        L2TxCount::new(2),
         "H rolls back the doomed user op while the direct is re-drained"
     );
     assert_eq!(
@@ -1305,24 +1295,16 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
             ..
         }
     ));
-    assert_eq!(after_recovery[1].offset, ExecutedInputCount::new(1));
+    assert_eq!(after_recovery[1].offset, L2TxCount::new(1));
 
     let checkpoint = catch_up_snapshot(&mut storage).expect("select surviving checkpoint");
-    assert_eq!(
-        checkpoint.executed_input_count,
-        finalized_before.executed_input_count
-    );
+    assert_eq!(checkpoint.l2_tx_count, finalized_before.l2_tx_count);
     let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
         .expect("load surviving application checkpoint");
-    assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(1));
-    catch_up_application_paged(
-        &mut restarted,
-        &mut storage,
-        checkpoint.executed_input_count,
-        2,
-    )
-    .expect("catch up through recovery re-drain");
-    assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(2));
+    assert_eq!(restarted.l2_tx_count(), L2TxCount::new(1));
+    catch_up_application_paged(&mut restarted, &mut storage, checkpoint.l2_tx_count, 2)
+        .expect("catch up through recovery re-drain");
+    assert_eq!(restarted.l2_tx_count(), L2TxCount::new(2));
 
     // The replacement suffix reuses offset 2, rolling H forward without
     // retaining the invalidated op that previously occupied that coordinate.
@@ -1338,17 +1320,11 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         &mut included,
     )
     .expect("execute replacement user op");
-    assert_eq!(
-        included[0].executed_input_offset,
-        ExecutedInputCount::new(2)
-    );
+    assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
     storage
         .append_executed_user_ops_chunk(&mut recovery_head, &included)
         .expect("persist replacement suffix");
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(3)
-    );
+    assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(3));
 
     let valid = history_rows(&mut storage, 32);
     let mappings: Vec<_> = valid.iter().map(|row| row.offset.get()).collect();
@@ -1370,14 +1346,11 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     catch_up_application_paged(
         &mut restarted_again,
         &mut storage,
-        checkpoint.executed_input_count,
+        checkpoint.l2_tx_count,
         2,
     )
     .expect("catch up through replacement suffix");
-    assert_eq!(
-        restarted_again.executed_input_count(),
-        ExecutedInputCount::new(3)
-    );
+    assert_eq!(restarted_again.l2_tx_count(), L2TxCount::new(3));
     assert_eq!(
         restarted_again.replayed,
         vec![
@@ -1402,7 +1375,7 @@ fn catch_up_load_error_reports_offset() {
     let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
     let mut app = StubApp::default();
 
-    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect_err("catch up should fail without schema");
 
     assert!(matches!(err, CatchUpError::LoadReplay { offset: 0, .. }));
@@ -1449,7 +1422,7 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
 fn read_dump_counter(dump_dir: &Path) -> u64 {
     StubApp::from_dump(&super::dump_info::app_prefix(dump_dir))
         .expect("decode dump progress")
-        .executed_input_count()
+        .l2_tx_count()
         .get()
 }
 
@@ -1530,7 +1503,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
             s.finalized_dump()
                 .expect("finalized")
                 .expect("genesis finalized exists")
-                .executed_input_count
+                .l2_tx_count
                 .get(),
             0,
             "finalized must still be genesis (nothing was promoted)"
@@ -1625,7 +1598,7 @@ fn empty_batch_snapshot_preserves_application_count() {
     let expected = seed_replay_fixture(&db.path);
     let mut storage = Storage::open(&db.path).unwrap();
     let mut app = StubApp::default();
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2).unwrap();
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2).unwrap();
     assert_eq!(app.replayed, expected);
     let mut head = storage.open_state().unwrap().unwrap();
     let dumps = tempfile::tempdir().unwrap();
@@ -1634,10 +1607,10 @@ fn empty_batch_snapshot_preserves_application_count() {
     super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
-    assert_eq!(snapshot.executed_input_count.get(), 6);
+    assert_eq!(snapshot.l2_tx_count.get(), 6);
     let restored =
         StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
-    assert_eq!(restored.executed_input_count().get(), 6);
+    assert_eq!(restored.l2_tx_count().get(), 6);
 }
 
 fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::ApplicationInputRow> {
@@ -1708,7 +1681,7 @@ fn lane_stops_cleanly_when_its_queue_closes_during_shutdown() {
     let (_dir, mut lane, shutdown) =
         lane_with_closed_queue_and_due_direct("closed-queue-during-shutdown", true);
 
-    let result = lane.run_forever(ExecutedInputCount::ZERO);
+    let result = lane.run_forever(L2TxCount::ZERO);
 
     assert!(shutdown.is_shutdown_requested());
     assert!(result.is_ok(), "{result:?}");
@@ -1719,7 +1692,7 @@ fn lane_reports_a_closed_queue_without_shutdown() {
     let (_dir, mut lane, _shutdown) =
         lane_with_closed_queue_and_due_direct("closed-queue-without-shutdown", false);
 
-    let result = lane.run_forever(ExecutedInputCount::ZERO);
+    let result = lane.run_forever(L2TxCount::ZERO);
 
     assert!(matches!(result, Err(InclusionLaneError::ChannelClosed)));
 }
@@ -1735,14 +1708,14 @@ fn refusal_text(app: &mut StubApp, user_op: UserOp) -> String {
         frame_fee: 10,
         ..unbounded_head()
     };
-    let count_before = app.executed_input_count();
+    let count_before = app.l2_tx_count();
     let mut included = Vec::new();
 
     dequeue_and_execute_user_op_chunk(&mut rx, app, 1, &head, &mut included)
         .expect("a refusal never stops the lane");
 
     assert!(included.is_empty(), "a refused op is never persisted");
-    assert_eq!(app.executed_input_count(), count_before);
+    assert_eq!(app.l2_tx_count(), count_before);
     assert!(
         app.replayed.is_empty(),
         "a refused op never reaches the app"
@@ -1812,8 +1785,8 @@ impl Application for NonceDriftApp {
         self.inner.apply_direct(direct)
     }
 
-    fn executed_input_count(&self) -> ExecutedInputCount {
-        self.inner.executed_input_count()
+    fn l2_tx_count(&self) -> L2TxCount {
+        self.inner.l2_tx_count()
     }
 
     fn max_method_payload_bytes() -> usize {
@@ -1840,10 +1813,7 @@ impl Application for NonceDriftApp {
         StubApp::state_file_in_dump(prefix)
     }
 
-    fn from_canonical_state(
-        _state_file: &Path,
-        _executed_input_count: ExecutedInputCount,
-    ) -> Result<Self, AppError> {
+    fn from_canonical_state(_state_file: &Path, _l2_tx_count: L2TxCount) -> Result<Self, AppError> {
         unreachable!("the drift double is never restored")
     }
 }
@@ -1873,7 +1843,7 @@ fn admitted_op_that_the_executor_skips_is_a_terminal_lane_error() {
     ));
     assert!(err.is_terminal_invariant());
     assert!(included.is_empty());
-    assert_eq!(app.executed_input_count(), ExecutedInputCount::ZERO);
+    assert_eq!(app.l2_tx_count(), L2TxCount::ZERO);
     // The client gets the fixed 500 text, never the skip reason.
     let response = response
         .blocking_recv()
@@ -1902,7 +1872,7 @@ fn catch_up_stops_on_a_stored_op_the_application_would_skip() {
     // stored op, so history and application disagree.
     app.nonces.insert(Address::from_slice(&[0x51; 20]), 1);
 
-    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect_err("a replayed skip must stop catch-up");
 
     assert!(matches!(
@@ -1916,7 +1886,7 @@ fn catch_up_stops_on_a_stored_op_the_application_would_skip() {
         }
     ));
     assert!(app.replayed.is_empty());
-    assert_eq!(app.executed_input_count(), ExecutedInputCount::ZERO);
+    assert_eq!(app.l2_tx_count(), L2TxCount::ZERO);
     assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
 }
 
@@ -2029,13 +1999,8 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
     // Replay hands a restarted application the same directs, index and
     // timestamp included.
     let mut restarted = StubApp::default();
-    catch_up_application_paged(
-        &mut restarted,
-        &mut lane.storage,
-        ExecutedInputCount::ZERO,
-        2,
-    )
-    .expect("catch up over the dropped direct");
+    catch_up_application_paged(&mut restarted, &mut lane.storage, L2TxCount::ZERO, 2)
+        .expect("catch up over the dropped direct");
     assert_eq!(restarted.replayed, vec![at_cap, after_dropped, later]);
 }
 
@@ -2109,7 +2074,7 @@ async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
         .canonical_history_page(
             sequencer_core::history::HistoryClaim {
                 version: bounds.version,
-                next_input: ExecutedInputCount::new(test_era::REBUILT_END),
+                next_input: L2TxCount::new(test_era::REBUILT_END),
             },
             16,
         )

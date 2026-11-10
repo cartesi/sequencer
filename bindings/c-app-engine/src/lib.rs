@@ -17,7 +17,7 @@ use alloy_primitives::{Address, U256};
 use sequencer_core::application::{
     Admission, AppError, AppOutput, AppOutputs, PolicyRefusal, SchedulerLimits,
 };
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -269,8 +269,8 @@ impl Application for EngineApp {
         })
     }
 
-    fn executed_input_count(&self) -> ExecutedInputCount {
-        ExecutedInputCount::new(unsafe { sys::application_engine_l2_tx_count(self.engine) })
+    fn l2_tx_count(&self) -> L2TxCount {
+        L2TxCount::new(unsafe { sys::application_engine_l2_tx_count(self.engine) })
     }
 
     fn max_method_payload_bytes() -> usize {
@@ -352,10 +352,7 @@ impl Application for EngineApp {
         ))
     }
 
-    fn from_canonical_state(
-        state_file: &Path,
-        executed_input_count: ExecutedInputCount,
-    ) -> Result<Self, AppError> {
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError> {
         check_abi_version()?;
         let state_file = path_to_cstring(state_file);
         let mut engine = std::ptr::null_mut();
@@ -363,7 +360,7 @@ impl Application for EngineApp {
             unsafe {
                 sys::application_engine_from_canonical_state(
                     state_file.as_ptr(),
-                    executed_input_count.get(),
+                    l2_tx_count.get(),
                     &mut engine,
                 )
             },

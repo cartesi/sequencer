@@ -67,7 +67,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         snapshot_count > 0,
         "the consumer must restore nonempty state"
     );
-    assert!(snapshot_count <= reference.executed_input_count());
+    assert!(snapshot_count <= reference.l2_tx_count());
 
     // Hold the response without consuming its body. This write is acknowledged
     // after snapshot selection and before archive restoration or subscription.
@@ -77,7 +77,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     assert_eq!(downloaded_claim, original_claim);
     let snapshot_reference = replay_prefix(&history, snapshot_count)?;
     assert_same_state(&mut replica, &snapshot_reference)?;
-    assert!(replica.executed_input_count().get() < reference.executed_input_count());
+    assert!(replica.l2_tx_count().get() < reference.l2_tx_count());
 
     let backlog_deposit = alice_l1
         .mint_and_deposit_supported_token(U256::from(70_000))
@@ -88,7 +88,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     record(&mut reference_ws, &mut reference, &mut history).await?;
 
     let mut replica_ws = WsClient::connect(&client, downloaded_claim).await?;
-    let backlog_head = reference.executed_input_count();
+    let backlog_head = reference.l2_tx_count();
     let catch_up_target = backlog_head + 2;
     let (first_replayed, replay_started) = tokio::sync::oneshot::channel();
     let (writes_committed, resume_replay) = tokio::sync::oneshot::channel();
@@ -105,7 +105,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     };
     let consumer = async {
         apply_ws_message(&mut replica, replica_ws.next_message().await?)?;
-        assert!(replica.executed_input_count().get() < backlog_head);
+        assert!(replica.l2_tx_count().get() < backlog_head);
         first_replayed
             .send(())
             .map_err(|_| "producer dropped the replay barrier")?;
@@ -131,12 +131,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     record(&mut reference_ws, &mut reference, &mut history).await?;
     alice_l2.transfer(bob_address, U256::from(5_000)).await?;
     record(&mut reference_ws, &mut reference, &mut history).await?;
-    let live_block = consume_until(
-        &mut replica_ws,
-        &mut replica,
-        reference.executed_input_count(),
-    )
-    .await?;
+    let live_block = consume_until(&mut replica_ws, &mut replica, reference.l2_tx_count()).await?;
     assert_same_state(&mut replica, &reference)?;
     assert_eq!(live_block, reference.last_applied_block());
     assert!(live_block.is_some_and(|block| block > block_before_live));
@@ -148,7 +143,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     // Preserve the replica's claim across a clean restart, then make the
     // restarted host execute against its restored nonempty snapshot and suffix.
     let restart_claim = HistoryClaim {
-        next_input: replica.executed_input_count(),
+        next_input: replica.l2_tx_count(),
         ..downloaded_claim
     };
     drop(replica_ws);
@@ -169,12 +164,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     alice_l2.set_next_nonce(reference.current_user_nonce(alice_address));
     alice_l2.transfer(bob_address, U256::from(6_000)).await?;
     record(&mut reference_ws, &mut reference, &mut history).await?;
-    consume_until(
-        &mut replica_ws,
-        &mut replica,
-        reference.executed_input_count(),
-    )
-    .await?;
+    consume_until(&mut replica_ws, &mut replica, reference.l2_tx_count()).await?;
     assert_same_state(&mut replica, &reference)?;
     assert_eq!(
         reference.current_user_balance(bob_address),
@@ -182,7 +172,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     );
 
     let stale_claim = HistoryClaim {
-        next_input: replica.executed_input_count(),
+        next_input: replica.l2_tx_count(),
         ..downloaded_claim
     };
     drop(replica_ws);
@@ -220,7 +210,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         if let WsTxMessage::DirectInput { .. } = message {
             let mut direct = message.clone();
             if let WsTxMessage::DirectInput { offset, .. } = &mut direct {
-                *offset = recovered_reference.executed_input_count();
+                *offset = recovered_reference.l2_tx_count();
             }
             recovered_reference.apply(direct)?;
         }
@@ -229,7 +219,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     consume_until(
         &mut recovered_ws,
         &mut recovered,
-        recovered_reference.executed_input_count(),
+        recovered_reference.l2_tx_count(),
     )
     .await?;
     assert_same_state(&mut recovered, &recovered_reference)?;
@@ -237,7 +227,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         recovered_reference.current_user_balance(bob_address),
         U256::ZERO
     );
-    assert!(recovered.executed_input_count().get() < replica.executed_input_count().get());
+    assert!(recovered.l2_tx_count().get() < replica.l2_tx_count().get());
 
     let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
     let expected_nonce = recovered_reference.current_user_nonce(alice_address);
@@ -288,7 +278,7 @@ pub(crate) async fn restore<A: Application>(
     tar::Archive::new(archive.as_ref()).unpack(directory.path())?;
     assert!(directory.path().join("info.toml").is_file());
     let app = A::from_dump(&directory.path().join("state"))?;
-    assert_eq!(app.executed_input_count(), claim.next_input);
+    assert_eq!(app.l2_tx_count(), claim.next_input);
     // Subsequent replay also checks that restoring does not retain a dependency
     // on the downloaded source directory.
     directory.close()?;
@@ -314,10 +304,10 @@ async fn consume_until<A: Application>(
     target: u64,
 ) -> ScenarioResult<Option<u64>> {
     let mut last_block = None;
-    while app.executed_input_count().get() < target {
+    while app.l2_tx_count().get() < target {
         last_block = Some(apply_ws_message(app, ws.next_message().await?)?);
     }
-    assert_eq!(app.executed_input_count().get(), target);
+    assert_eq!(app.l2_tx_count().get(), target);
     Ok(last_block)
 }
 
@@ -333,13 +323,13 @@ pub(crate) fn assert_same_state<A: Application>(
     actual: &mut A,
     expected: &ReplayWalletApp,
 ) -> ScenarioResult<()> {
-    let count = actual.executed_input_count();
-    assert_eq!(count.get(), expected.executed_input_count());
+    let count = actual.l2_tx_count();
+    assert_eq!(count.get(), expected.l2_tx_count());
     let directory = tempfile::tempdir()?;
     let checkpoint = directory.path().join("checkpoint");
     actual.create_dump(&checkpoint)?;
     assert_eq!(
-        actual.executed_input_count(),
+        actual.l2_tx_count(),
         count,
         "checkpoint creation preserves state"
     );

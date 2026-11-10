@@ -5,7 +5,7 @@
 
 use crate::storage::{HistoryReadError, L2TxContext, Snapshot, Storage};
 use sequencer_core::application::{Application, Executed, execute};
-use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
+use sequencer_core::history::{HistoryClaim, L2TxCount};
 use sequencer_core::l2_tx::L2Tx;
 
 use super::error::CatchUpError;
@@ -22,7 +22,7 @@ pub(super) fn catch_up_snapshot(storage: &mut Storage) -> Result<Snapshot, Catch
 pub(super) fn catch_up_application(
     app: &mut impl Application,
     storage: &mut Storage,
-    start: ExecutedInputCount,
+    start: L2TxCount,
 ) -> Result<(), CatchUpError> {
     catch_up_application_paged(app, storage, start, DEFAULT_CATCH_UP_PAGE_SIZE)
 }
@@ -30,17 +30,17 @@ pub(super) fn catch_up_application(
 pub(super) fn catch_up_application_paged(
     app: &mut impl Application,
     storage: &mut Storage,
-    start: ExecutedInputCount,
+    start: L2TxCount,
     page_size: usize,
 ) -> Result<(), CatchUpError> {
-    if app.executed_input_count() != start {
+    if app.l2_tx_count() != start {
         return Err(CatchUpError::SnapshotExecutionCountMismatch {
-            application: app.executed_input_count().get(),
+            application: app.l2_tx_count().get(),
             storage: start.get(),
         });
     }
     tracing::debug!(
-        executed_input_count = start.get(),
+        l2_tx_count = start.get(),
         "inclusion lane resuming from snapshot"
     );
     let bounds = storage
@@ -69,7 +69,7 @@ pub(super) fn catch_up_application_paged(
         claim = page.next_claim();
         for row in page.rows {
             assert_eq!(
-                app.executed_input_count(),
+                app.l2_tx_count(),
                 row.offset,
                 "application replay offset differs from stored history"
             );

@@ -59,8 +59,7 @@ sequence one L1 input at a time:
 
 A state's **L2 tx count** is how many L2 transactions it has executed. It
 names the state, and it names the transaction that state executes next, so
-the feed numbers its rows with it. The code calls it `executed_input_count`,
-though it counts transactions, not L1 inputs.
+the feed numbers its rows with it. It counts transactions, not L1 inputs.
 
 A user op has three outcomes, and only one of them leaves no trace:
 

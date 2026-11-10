@@ -122,7 +122,7 @@ pub enum CatchUpError {
     /// application disagrees with the history it once executed.
     #[error("replay skipped the stored user op at offset {offset}: {reason}")]
     ReplaySkipped { offset: u64, reason: SkipReason },
-    #[error("snapshot executed-input count mismatch: application={application}, storage={storage}")]
+    #[error("snapshot L2 tx count mismatch: application={application}, storage={storage}")]
     SnapshotExecutionCountMismatch { application: u64, storage: u64 },
     #[error(
         "no snapshot registered before lane catch-up; \

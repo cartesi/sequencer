@@ -13,7 +13,7 @@ use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::protocol::ProtocolTiming;
 
 use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, u64_to_i64};
-use super::history::next_executed_input_count_in;
+use super::history::next_l2_tx_count_in;
 use super::ingress::{
     insert_tip_rows, open_fresh_tip_in_tx, open_successor_frame_in, seal_and_open_next_batch,
 };
@@ -22,7 +22,7 @@ use super::queries::{load_current_write_head, query_batch_policy};
 use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
 use super::snapshot_dumps::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
-    BatchPolicy, ExecutedInputCount, FrontierMode, IngestedSafeInput, SafeInputRange, Storage,
+    BatchPolicy, FrontierMode, IngestedSafeInput, L2TxCount, SafeInputRange, Storage,
     StorageOpenError, StoredSafeInput, WriteHead,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
@@ -39,8 +39,8 @@ pub(crate) const TEST_MAX_DIRECT_PAYLOAD_BYTES: u64 =
 /// An era record with nothing queued and anchor 0; fixtures override fields.
 pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::EraRecord {
     super::EraRecord {
-        base_count: ExecutedInputCount::new(base),
-        rebuilt_history_end: ExecutedInputCount::new(rebuilt_end),
+        base_count: L2TxCount::new(base),
+        rebuilt_history_end: L2TxCount::new(rebuilt_end),
         stop_block,
         first_queued_input: 0,
         next_batch_nonce: 0,
@@ -143,8 +143,8 @@ impl Storage {
         self.write(|tx| super::mutations::set_batch_tree_anchor_in(tx, nonce))
     }
 
-    pub(crate) fn next_executed_input_count(&mut self) -> rusqlite::Result<ExecutedInputCount> {
-        self.read(|tx| next_executed_input_count_in(tx))
+    pub(crate) fn next_l2_tx_count(&mut self) -> rusqlite::Result<L2TxCount> {
+        self.read(|tx| next_l2_tx_count_in(tx))
     }
 
     pub(crate) fn has_rollback_safe_snapshot(&mut self) -> rusqlite::Result<bool> {
@@ -297,15 +297,13 @@ impl Storage {
         prefix: &Path,
         batch_index: u64,
     ) -> rusqlite::Result<i64> {
-        self.write(|tx| {
-            insert_batch_snapshot_in(tx, prefix, batch_index, next_executed_input_count_in(tx)?)
-        })
+        self.write(|tx| insert_batch_snapshot_in(tx, prefix, batch_index, next_l2_tx_count_in(tx)?))
     }
 
     pub(crate) fn insert_baseline_snapshot(
         &mut self,
         prefix: &Path,
-        count: ExecutedInputCount,
+        count: L2TxCount,
     ) -> rusqlite::Result<i64> {
         self.write(|tx| insert_baseline_snapshot_in(tx, prefix, count))
     }

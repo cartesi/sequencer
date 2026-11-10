@@ -23,7 +23,7 @@ pub use driver::{
 
 use crate::application::Application;
 use crate::batch::{Batch, Frame, WireUserOp};
-use crate::history::ExecutedInputCount;
+use crate::history::L2TxCount;
 use crate::l2_tx::{Direct, L2Tx, UserOpTx};
 use crate::protocol::age_exceeds;
 use alloy_primitives::{Address, Signature};
@@ -185,7 +185,7 @@ pub struct SchedulerExportLengthError {
 impl SchedulerExport {
     pub const ENCODED_LEN: usize = 48;
 
-    pub fn new(state: SchedulerState, l2_tx_count: ExecutedInputCount) -> Self {
+    pub fn new(state: SchedulerState, l2_tx_count: L2TxCount) -> Self {
         Self {
             l1_input_count: state.l1_input_count,
             l2_tx_count: l2_tx_count.get(),
@@ -2204,10 +2204,7 @@ mod tests {
             );
         }
         let state = export.scheduler_state();
-        assert_eq!(
-            SchedulerExport::new(state, ExecutedInputCount::new(2)),
-            export
-        );
+        assert_eq!(SchedulerExport::new(state, L2TxCount::new(2)), export);
     }
 
     // ── Signatures and the off-chain predicate ────────────────────────────

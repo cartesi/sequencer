@@ -18,9 +18,7 @@ use crate::egress::l2_tx_feed::Subscription;
 use crate::egress::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
 use crate::http::ApiError;
 use axum::{Json, http::StatusCode};
-use sequencer_core::history::{
-    EraId, ExecutedInputCount, HistoryClaim, HistoryVersion, RecoveryGeneration,
-};
+use sequencer_core::history::{EraId, HistoryClaim, HistoryVersion, L2TxCount, RecoveryGeneration};
 
 use super::SubscribeState;
 
@@ -31,7 +29,7 @@ const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
 pub(crate) struct SubscribeQuery {
     era_id: EraId,
     recovery_generation: RecoveryGeneration,
-    next_input: ExecutedInputCount,
+    next_input: L2TxCount,
 }
 
 pub(crate) async fn subscribe_l2_txs(

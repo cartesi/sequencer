@@ -19,7 +19,7 @@ use c_app_engine::sys;
 use sequencer_core::application::{
     Admission, AppError, AppOutput, AppOutputs, Application, PolicyRefusal,
 };
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn application_engine_from_canonical_state(
 ) -> sys::ApplicationEngineStatus {
     clear_error();
     let state_file = unsafe { path_from(state_file) };
-    let opened = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(l2_tx_count));
+    let opened = WalletApp::from_canonical_state(&state_file, L2TxCount::new(l2_tx_count));
     unsafe { open(opened, out_engine, "from_canonical_state") }
 }
 
@@ -457,10 +457,7 @@ fn span_of(payload: &[u8]) -> sys::ApplicationEngineByteSpan {
 /// `engine` is a live handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn application_engine_l2_tx_count(engine: *const ApplicationEngine) -> u64 {
-    unsafe { engine_ref(engine) }
-        .app
-        .executed_input_count()
-        .get()
+    unsafe { engine_ref(engine) }.app.l2_tx_count().get()
 }
 
 /// # Safety

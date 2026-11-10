@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use sequencer_core::application::{AppError, Application};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::scheduler::{Scheduler, SchedulerConfig, SchedulerExport};
 
 use crate::commands::error::{CommandError, SetupError};
@@ -48,17 +48,17 @@ where
 {
     let Some(machine) = machine else {
         let app = genesis_app()?;
-        if app.executed_input_count() != ExecutedInputCount::ZERO {
+        if app.l2_tx_count() != L2TxCount::ZERO {
             return Err(CommandError::AppBootstrap(AppError::Internal {
                 reason: format!(
-                    "a genesis application must start at executed_input_count = 0, got {}",
-                    app.executed_input_count().get()
+                    "a genesis application must start at l2_tx_count = 0, got {}",
+                    app.l2_tx_count().get()
                 ),
             }));
         }
         let export = SchedulerExport::new(
             Scheduler::genesis(scheduler_config).state(),
-            ExecutedInputCount::ZERO,
+            L2TxCount::ZERO,
         );
         return Ok(Base { export, app });
     };
@@ -94,18 +94,18 @@ fn application_from_state<A: Application>(
     state_file: &Path,
     export: &SchedulerExport,
 ) -> Result<A, SetupError> {
-    let count = ExecutedInputCount::new(export.l2_tx_count);
+    let count = L2TxCount::new(export.l2_tx_count);
     let base_application = |source| SetupError::BaseApplication {
         path: PathBuf::from(machine_dir),
         source,
     };
     let app = A::from_canonical_state(state_file, count).map_err(base_application)?;
-    if app.executed_input_count() != count {
+    if app.l2_tx_count() != count {
         return Err(base_application(AppError::Internal {
             reason: format!(
                 "the application built from the machine's state is at L2 tx count {}, \
                  but the machine reports {}",
-                app.executed_input_count().get(),
+                app.l2_tx_count().get(),
                 export.l2_tx_count
             ),
         }));
@@ -124,7 +124,7 @@ mod tests {
 
     /// Builds itself from the count its state bytes hold, ignoring the one it
     /// is handed: setup must hold it to the export's count itself.
-    struct IgnoresCount(ExecutedInputCount);
+    struct IgnoresCount(L2TxCount);
 
     impl Application for IgnoresCount {
         fn user_nonce(&self, _sender: Address) -> Result<u32, AppError> {
@@ -136,7 +136,7 @@ mod tests {
         fn apply_direct(&mut self, _direct: &Direct) -> Result<AppOutputs, AppError> {
             unreachable!("setup's base never executes")
         }
-        fn executed_input_count(&self) -> ExecutedInputCount {
+        fn l2_tx_count(&self) -> L2TxCount {
             self.0
         }
         fn max_method_payload_bytes() -> usize {
@@ -162,17 +162,14 @@ mod tests {
         fn state_file_in_dump(prefix: &Path) -> PathBuf {
             prefix.to_path_buf()
         }
-        fn from_canonical_state(
-            state_file: &Path,
-            _count: ExecutedInputCount,
-        ) -> Result<Self, AppError> {
+        fn from_canonical_state(state_file: &Path, _count: L2TxCount) -> Result<Self, AppError> {
             let bytes: [u8; 8] =
                 std::fs::read(state_file)?
                     .try_into()
                     .map_err(|_| AppError::Internal {
                         reason: "eight bytes".to_owned(),
                     })?;
-            Ok(Self(ExecutedInputCount::new(u64::from_le_bytes(bytes))))
+            Ok(Self(L2TxCount::new(u64::from_le_bytes(bytes))))
         }
     }
 
@@ -182,7 +179,7 @@ mod tests {
             ..SchedulerExport::new(
                 Scheduler::genesis(SchedulerConfig::for_application::<WalletApp>(Address::ZERO))
                     .state(),
-                ExecutedInputCount::ZERO,
+                L2TxCount::ZERO,
             )
         }
     }

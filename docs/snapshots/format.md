@@ -44,8 +44,8 @@ metadata come from the sequencer; see [application history](../protocol/applicat
 - `nonces` (`Vec<SnapshotNonce>`)
   - `address` (`[u8; 20]`)
   - `nonce` (`u32`)
-- `executed_input_count` (`u64`) — the L2 tx count, reported by
-  `Application::executed_input_count`. `WalletApp::from_canonical_state`
+- `l2_tx_count` (`u64`) — the L2 tx count, reported by
+  `Application::l2_tx_count`. `WalletApp::from_canonical_state`
   refuses bytes whose count differs from the machine's.
 
 The wallet holds no clock. The safe-block clock belongs to the scheduler and

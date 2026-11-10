@@ -4,7 +4,7 @@
 //! Immutable era baseline and the preserved prefix at each recovery generation.
 
 use rusqlite::{Connection, Result, Transaction, params, types::Type};
-use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
+use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};
 
 use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
@@ -19,7 +19,7 @@ pub struct HistoryState {
     pub version: HistoryVersion,
     pub era_created_at_ms: u64,
     /// The base's L2 tx count, where the era's history starts.
-    pub base_executed_input_count: u64,
+    pub base_l2_tx_count: u64,
     /// The stop block: the L1 prefix the era's baseline accounts for.
     pub base_safe_block: u64,
     /// The L2 tx count at the end of the stop block, where live rows start.
@@ -33,9 +33,9 @@ pub struct HistoryState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EraRecord {
     /// The base's L2 tx count.
-    pub base_count: ExecutedInputCount,
+    pub base_count: L2TxCount,
     /// The L2 tx count after the rebuilt history: the baseline's count.
-    pub rebuilt_history_end: ExecutedInputCount,
+    pub rebuilt_history_end: L2TxCount,
     pub stop_block: u64,
     pub first_queued_input: u64,
     /// The scheduler's next batch nonce at the stop block: the anchor.
@@ -46,8 +46,8 @@ impl EraRecord {
     /// An era at genesis that rebuilt nothing, with stop block 0: what the
     /// command-less fixture open path and seeded harnesses publish.
     pub const EMPTY_GENESIS: Self = Self {
-        base_count: ExecutedInputCount::ZERO,
-        rebuilt_history_end: ExecutedInputCount::ZERO,
+        base_count: L2TxCount::ZERO,
+        rebuilt_history_end: L2TxCount::ZERO,
         stop_block: 0,
         first_queued_input: 0,
         next_batch_nonce: 0,
@@ -60,7 +60,7 @@ impl EraRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectInputExecution {
     pub safe_input_index: u64,
-    pub executed_input_offset: ExecutedInputCount,
+    pub l2_tx_index: L2TxCount,
 }
 
 impl Storage {
@@ -87,7 +87,7 @@ pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
                     recovery_generation: RecoveryGeneration::new(i64_to_u64(row.get(2)?)),
                 },
                 era_created_at_ms: i64_to_u64(row.get(1)?),
-                base_executed_input_count: i64_to_u64(row.get(3)?),
+                base_l2_tx_count: i64_to_u64(row.get(3)?),
                 base_safe_block: i64_to_u64(row.get(4)?),
                 rebuilt_history_end: i64_to_u64(row.get(5)?),
                 first_queued_input: i64_to_u64(row.get(6)?),
@@ -123,20 +123,17 @@ pub(super) fn initialize_history_in(tx: &Transaction<'_>, era: &EraRecord) -> Re
 
 /// The next history offset: one past the last live row, or the rebuilt
 /// history's end before the era has any.
-pub(super) fn next_executed_input_count_in(conn: &Connection) -> Result<ExecutedInputCount> {
+pub(super) fn next_l2_tx_count_in(conn: &Connection) -> Result<L2TxCount> {
     let rebuilt_end = query_history_state(conn)?.rebuilt_history_end;
     let greatest: Option<i64> =
         conn.query_row("SELECT MAX(offset) FROM application_inputs", [], |row| {
             row.get(0)
         })?;
-    Ok(ExecutedInputCount::new(greatest.map_or(
-        rebuilt_end,
-        |offset| {
-            i64_to_u64(offset)
-                .checked_add(1)
-                .expect("application input count overflow")
-        },
-    )))
+    Ok(L2TxCount::new(greatest.map_or(rebuilt_end, |offset| {
+        i64_to_u64(offset)
+            .checked_add(1)
+            .expect("application input count overflow")
+    })))
 }
 
 /// Called after suffix deletion and before the replacement Tip attributes directs.
@@ -145,7 +142,7 @@ pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<Rec
     let next = current
         .checked_add(1)
         .expect("recovery generation exhausted");
-    let preserved = next_executed_input_count_in(tx)?;
+    let preserved = next_l2_tx_count_in(tx)?;
     tx.execute(
         "INSERT INTO history_generation_cuts (recovery_generation, preserved_input_count) \
          VALUES (?1, ?2)",
@@ -165,8 +162,8 @@ pub(super) fn preserved_input_count_in(
     conn: &Connection,
     from: RecoveryGeneration,
     current: RecoveryGeneration,
-    head: ExecutedInputCount,
-) -> Result<ExecutedInputCount> {
+    head: L2TxCount,
+) -> Result<L2TxCount> {
     assert!(
         from <= current,
         "compatibility starts after the current generation"
@@ -188,7 +185,7 @@ pub(super) fn preserved_input_count_in(
         "history generation lineage is incomplete"
     );
     let minimum = minimum.expect("a nonempty complete generation interval has a minimum");
-    Ok(head.min(ExecutedInputCount::new(i64_to_u64(minimum))))
+    Ok(head.min(L2TxCount::new(i64_to_u64(minimum))))
 }
 
 #[cfg(test)]
@@ -285,7 +282,7 @@ mod tests {
         drop(storage);
         let mut reopened = Storage::open(&db.path).unwrap();
         assert_eq!(reopened.history_state().unwrap(), state);
-        assert_eq!(reopened.next_executed_input_count().unwrap().get(), 41);
+        assert_eq!(reopened.next_l2_tx_count().unwrap().get(), 41);
     }
 
     #[test]

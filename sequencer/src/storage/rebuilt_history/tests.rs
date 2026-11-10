@@ -15,8 +15,8 @@ fn key(l1_input_index: u64, position: u64) -> RebuiltKey {
     }
 }
 
-fn count(value: u64) -> ExecutedInputCount {
-    ExecutedInputCount::new(value)
+fn count(value: u64) -> L2TxCount {
+    L2TxCount::new(value)
 }
 
 fn direct(input_index: u64, batch_nonce: u64) -> Scheduled {

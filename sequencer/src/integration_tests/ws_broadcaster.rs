@@ -13,7 +13,7 @@ use sequencer::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, Sequence
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage, StoredSafeInput};
 use sequencer_core::api::WsTxMessage;
-use sequencer_core::history::{EraId, ExecutedInputCount, HistoryClaim, HistoryPolicyError};
+use sequencer_core::history::{EraId, HistoryClaim, HistoryPolicyError, L2TxCount};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 use sequencer_rust_client::SequencerClient;
 use tokio::sync::{mpsc, oneshot};
@@ -208,7 +208,7 @@ async fn ws_subscribe_requires_a_valid_history_claim_before_upgrade() {
     let mut start = history_claim(&db.path, 3);
     assert!(matches!(client.subscribe(start).await,
         Err(sequencer_rust_client::SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
-    start.next_input = ExecutedInputCount::ZERO;
+    start.next_input = L2TxCount::ZERO;
     start.version.era_id =
         EraId::from_bytes([0x11, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]).unwrap();
     assert!(matches!(
@@ -245,7 +245,7 @@ async fn a_client_of_an_older_era_adopts_the_rebuilt_era_at_its_count_and_follow
     assert_eq!(info.history.head.get(), test_era::REBUILT_END + 2);
 
     // The client's state sits at count 43 of the era the recovery replaced.
-    let count = ExecutedInputCount::new(43);
+    let count = L2TxCount::new(43);
     let old_era = HistoryClaim {
         version: sequencer_core::history::HistoryVersion {
             era_id: EraId::from_bytes([0x22, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2])
@@ -287,13 +287,13 @@ async fn a_client_of_an_older_era_adopts_the_rebuilt_era_at_its_count_and_follow
     // the head.
     assert!(matches!(
         client
-            .adopt_current_era(ExecutedInputCount::new(test_era::BASE - 1))
+            .adopt_current_era(L2TxCount::new(test_era::BASE - 1))
             .await,
         Err(AdoptEraError::Adopt(AdoptError::BelowBase { .. }))
     ));
     assert!(matches!(
         client
-            .adopt_current_era(ExecutedInputCount::new(test_era::REBUILT_END + 1))
+            .adopt_current_era(L2TxCount::new(test_era::REBUILT_END + 1))
             .await,
         Err(AdoptEraError::Adopt(AdoptError::PastRebuiltEnd { .. }))
     ));
@@ -355,13 +355,13 @@ fn seed_ordered_txs(db_path: &str) {
         received_at: SystemTime::now(),
     };
 
-    let executed_input_offset = storage.next_executed_input_count().expect("next offset");
+    let l2_tx_index = storage.next_l2_tx_count().expect("next offset");
     storage
         .append_executed_user_ops_chunk(
             &mut head,
             &[IncludedUserOp {
                 pending,
-                executed_input_offset,
+                l2_tx_index,
             }],
         )
         .expect("append user-op chunk");
@@ -542,7 +542,7 @@ fn ws_subscribe_url(db_path: &str, addr: std::net::SocketAddr, from_offset: u64)
 fn ordered_l2_tx_count(db_path: &str) -> u64 {
     let mut storage = Storage::open_read_only(db_path).expect("open read-only storage");
     storage
-        .next_executed_input_count()
+        .next_l2_tx_count()
         .expect("query application head")
         .get()
 }
@@ -621,6 +621,6 @@ fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
             .history_state()
             .unwrap()
             .version,
-        next_input: ExecutedInputCount::new(next),
+        next_input: L2TxCount::new(next),
     }
 }

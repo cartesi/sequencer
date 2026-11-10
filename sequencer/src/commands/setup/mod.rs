@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::Address;
 use sequencer_core::application::{AppError, Application};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::scheduler::SchedulerConfig;
 
 pub(crate) mod base;
@@ -313,7 +313,7 @@ pub(crate) fn rebuild_and_publish<A: Application>(
         &mut app,
         storage,
         dumps_dir,
-        ExecutedInputCount::new(export.l2_tx_count),
+        L2TxCount::new(export.l2_tx_count),
         stop_block,
         scheduler,
     )?;
@@ -992,7 +992,7 @@ mod tests {
         assert!(summary.to_string().contains("re-judges"));
         summary.era = Some(EraRecord {
             stop_block: 130,
-            rebuilt_history_end: ExecutedInputCount::new(9),
+            rebuilt_history_end: L2TxCount::new(9),
             ..EraRecord::EMPTY_GENESIS
         });
         let text = summary.to_string();

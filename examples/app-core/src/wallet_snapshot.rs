@@ -34,7 +34,7 @@ struct WalletSnapshot {
     pub sequencer_address: [u8; 20],
     pub balances: Vec<SnapshotBalance>,
     pub nonces: Vec<SnapshotNonce>,
-    pub executed_input_count: u64,
+    pub l2_tx_count: u64,
 }
 
 /// Deterministic SSZ bytes for `app`'s logical state; entries come out in
@@ -62,7 +62,7 @@ pub fn encode(app: &WalletApp) -> Vec<u8> {
         sequencer_address: app.config().sequencer_address.into_array(),
         balances,
         nonces,
-        executed_input_count: app.executed_input_count().get(),
+        l2_tx_count: app.l2_tx_count().get(),
     }
     .as_ssz_bytes()
 }
@@ -102,7 +102,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         },
         balances,
         nonces,
-        decoded.executed_input_count,
+        decoded.l2_tx_count,
     ))
 }
 
@@ -143,7 +143,7 @@ mod tests {
         );
         app.nonces_mut()
             .insert(address!("0x1111111111111111111111111111111111111111"), 1);
-        app.set_executed_input_count(3);
+        app.set_l2_tx_count(3);
 
         let bytes = encode(&app);
         let restored = decode(&bytes).expect("decode snapshot");
@@ -162,7 +162,7 @@ mod tests {
             sequencer_address: [u8; 20],
             balances: Vec<SnapshotBalance>,
             nonces: Vec<SnapshotNonce>,
-            executed_input_count: u64,
+            l2_tx_count: u64,
             last_executed_safe_block: u64,
         }
 
@@ -197,7 +197,7 @@ mod tests {
                 address: account.into_array(),
                 nonce: 1,
             }],
-            executed_input_count: 3,
+            l2_tx_count: 3,
             last_executed_safe_block: 1_000,
         };
         assert!(refused(&clocked.as_ssz_bytes()));
@@ -243,7 +243,7 @@ mod tests {
                 balance(first_byte, 1),
             ],
             nonces: vec![nonce(last_byte, 8), nonce(first_byte, 7)],
-            executed_input_count: 0,
+            l2_tx_count: 0,
         };
         assert_eq!(encode(&app), expected.as_ssz_bytes());
     }

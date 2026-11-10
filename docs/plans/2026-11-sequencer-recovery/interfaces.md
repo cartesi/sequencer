@@ -284,8 +284,8 @@ user-op check that needs the application:
 
 ```rust
 pub enum Executed {
-    /// It executed; `offset` is the count before it, its history offset.
-    Done { offset: ExecutedInputCount, outputs: AppOutputs },
+    /// It executed; `index` is the L2 tx count before it, its index in the history.
+    Done { index: L2TxCount, outputs: AppOutputs },
     /// A user op whose nonce is not its sender's next. Nothing changed.
     Skipped(SkipReason),
 }
@@ -362,8 +362,8 @@ pub trait Application: Send + Sized {
     /// Execute a direct. The L2 tx count advances by one; no nonce moves.
     fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError>;
 
-    /// The L2 tx count, under its older name until the rename.
-    fn executed_input_count(&self) -> ExecutedInputCount;
+    /// The L2 tx count.
+    fn l2_tx_count(&self) -> L2TxCount;
 
     // Admission: the sequencer's lane only. Policy, never consensus.
 
@@ -392,7 +392,7 @@ pub trait Application: Send + Sized {
     /// machine's L2 tx count. A dump of the result holds the same bytes.
     fn from_canonical_state(
         state_file: &Path,
-        executed_input_count: ExecutedInputCount,
+        l2_tx_count: L2TxCount,
     ) -> Result<Self, AppError>;
 }
 

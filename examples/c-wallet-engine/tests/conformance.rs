@@ -12,7 +12,7 @@ use sequencer_core::application::{
     check_live_user_op, execute,
 };
 use sequencer_core::fee::fee_to_linear;
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::UserOp;
 use ssz::Encode;
@@ -62,7 +62,7 @@ fn user_op(nonce: u32, max_fee: u16, data: Vec<u8>) -> UserOp {
 fn execute_both(bridge: &mut EngineApp, native: &mut WalletApp, tx: &L2Tx) -> Executed {
     let actual = execute(bridge, tx).unwrap();
     assert_eq!(actual, execute(native, tx).unwrap());
-    assert_eq!(bridge.executed_input_count(), native.executed_input_count());
+    assert_eq!(bridge.l2_tx_count(), native.l2_tx_count());
     actual
 }
 
@@ -83,7 +83,7 @@ fn abi_version_and_handle_free_getters_match_the_header_and_native() {
 #[test]
 fn abi_mixed_history_matches_native_outputs_count_and_dump() {
     let (dir, mut bridge, mut native, config) = fixture();
-    assert_eq!(bridge.executed_input_count(), ExecutedInputCount::new(0));
+    assert_eq!(bridge.l2_tx_count(), L2TxCount::new(0));
     let sender = Address::repeat_byte(0x11);
     let recipient = Address::repeat_byte(0x22);
     for direct in [
@@ -105,7 +105,7 @@ fn abi_mixed_history_matches_native_outputs_count_and_dump() {
     ] {
         execute_both(&mut bridge, &mut native, &direct);
     }
-    assert_eq!(bridge.executed_input_count().get(), 3);
+    assert_eq!(bridge.l2_tx_count().get(), 3);
 
     for (nonce, data, block) in [
         (
@@ -153,7 +153,7 @@ fn abi_mixed_history_matches_native_outputs_count_and_dump() {
             _ => unreachable!(),
         }
     }
-    assert_eq!(bridge.executed_input_count().get(), 6);
+    assert_eq!(bridge.l2_tx_count().get(), 6);
     assert_eq!(bridge.user_nonce(sender).unwrap(), 3);
     assert_eq!(bridge.user_nonce(recipient).unwrap(), 0);
     let checkpoint = dir.path().join("checkpoint");
@@ -162,10 +162,7 @@ fn abi_mixed_history_matches_native_outputs_count_and_dump() {
         native.canonical_snapshot_bytes().unwrap()
     );
     let restored = EngineApp::from_dump(&checkpoint).unwrap();
-    assert_eq!(
-        restored.executed_input_count(),
-        bridge.executed_input_count()
-    );
+    assert_eq!(restored.l2_tx_count(), bridge.l2_tx_count());
     assert_eq!(restored.user_nonce(sender).unwrap(), 3);
 }
 
@@ -185,7 +182,7 @@ fn abi_wrong_nonce_is_skipped_leaving_state_and_count_unchanged() {
             got: 9
         })
     );
-    assert_eq!(bridge.executed_input_count().get(), 1);
+    assert_eq!(bridge.l2_tx_count().get(), 1);
     assert_eq!(bridge.user_nonce(sender).unwrap(), 0);
     let after = state_bytes(&mut bridge, &dir.path().join("after"));
     assert_eq!(after, before);
@@ -221,14 +218,14 @@ fn abi_unfunded_op_is_refused_by_admission_yet_executes_and_counts() {
         assert_eq!(
             execute_both(&mut bridge, &mut native, &tx),
             Executed::Done {
-                offset: ExecutedInputCount::new(1 + offset as u64),
+                index: L2TxCount::new(1 + offset as u64),
                 outputs: vec![],
             }
         );
         assert_eq!(bridge.user_nonce(who).unwrap(), 1);
         assert_eq!(native.current_user_balance(who), U256::ZERO);
     }
-    assert_eq!(bridge.executed_input_count().get(), 3);
+    assert_eq!(bridge.l2_tx_count().get(), 3);
     assert_eq!(native.current_user_balance(sequencer), U256::from(20));
     assert_eq!(
         state_bytes(&mut bridge, &dir.path().join("charged")),
@@ -245,7 +242,7 @@ fn abi_restored_instances_and_checkpoints_are_independent() {
     let input = deposit(config, Address::repeat_byte(0x11), 10, 0);
     let next = deposit(config, Address::repeat_byte(0x11), 10, 1);
     execute(&mut first, &input).unwrap();
-    assert_eq!(second.executed_input_count().get(), 0);
+    assert_eq!(second.l2_tx_count().get(), 0);
     assert_eq!(
         std::fs::read(EngineApp::state_file_in_dump(&source)).unwrap(),
         original
@@ -265,7 +262,7 @@ fn abi_restored_instances_and_checkpoints_are_independent() {
     );
     drop(first);
     let loaded = EngineApp::from_dump(&frozen).unwrap();
-    assert_eq!(loaded.executed_input_count().get(), 1);
+    assert_eq!(loaded.l2_tx_count().get(), 1);
 }
 
 #[test]
@@ -286,13 +283,13 @@ fn abi_from_canonical_state_matches_native_and_classifies_bad_files() {
         &L2Tx::UserOp(UserOpTx::new(sender, &op, 10, 8)),
     )
     .unwrap();
-    let count = native.executed_input_count();
+    let count = native.l2_tx_count();
     let machine = dir.path().join("machine");
     native.create_dump(&machine).unwrap();
     let state_file = WalletApp::state_file_in_dump(&machine);
 
     let mut bridge = EngineApp::from_canonical_state(&state_file, count).unwrap();
-    assert_eq!(bridge.executed_input_count(), count);
+    assert_eq!(bridge.l2_tx_count(), count);
     assert_eq!(bridge.user_nonce(sender).unwrap(), 1);
     assert_eq!(
         state_bytes(&mut bridge, &dir.path().join("projected")),
@@ -313,7 +310,7 @@ fn abi_from_canonical_state_matches_native_and_classifies_bad_files() {
     let rewritten = dir.path().join("rewritten");
     native.create_dump(&rewritten).unwrap();
     let state_file = WalletApp::state_file_in_dump(&rewritten);
-    let wrong_count = ExecutedInputCount::new(native.executed_input_count().get() + 1);
+    let wrong_count = L2TxCount::new(native.l2_tx_count().get() + 1);
     let garbage = dir.path().join("garbage");
     std::fs::write(&garbage, [0xff]).unwrap();
     for (file, count) in [(state_file.as_path(), wrong_count), (&garbage, count)] {

@@ -385,7 +385,7 @@ mod tests {
         let state = storage.history_state().unwrap();
         assert_eq!(
             (
-                state.base_executed_input_count,
+                state.base_l2_tx_count,
                 state.rebuilt_history_end,
                 state.base_safe_block,
                 state.first_queued_input
@@ -394,12 +394,8 @@ mod tests {
         );
         assert_eq!(storage.batch_tree_anchor().unwrap(), 5);
         assert_eq!(
-            storage
-                .latest_snapshot()
-                .unwrap()
-                .unwrap()
-                .executed_input_count,
-            sequencer_core::history::ExecutedInputCount::new(3)
+            storage.latest_snapshot().unwrap().unwrap().l2_tx_count,
+            sequencer_core::history::L2TxCount::new(3)
         );
         assert!(
             storage.open_state().unwrap().is_none(),

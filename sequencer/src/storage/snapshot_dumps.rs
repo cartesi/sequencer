@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
-use sequencer_core::history::{ExecutedInputCount, HistoryVersion};
+use sequencer_core::history::{HistoryVersion, L2TxCount};
 
 use super::convert::{i64_to_u64, u64_to_i64};
-use super::history::{next_executed_input_count_in, query_history_state};
+use super::history::{next_l2_tx_count_in, query_history_state};
 use super::{Storage, is_persistent_storage_error, is_persistent_storage_open_error};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub struct DumpRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub dump: DumpRow,
-    pub executed_input_count: ExecutedInputCount,
+    pub l2_tx_count: L2TxCount,
 }
 
 /// A batch-close snapshot whose complete predicted prefix was accepted on L1.
@@ -32,7 +32,7 @@ pub struct FinalizedDump {
     pub dump: DumpRow,
     pub inclusion_block: u64,
     pub next_batch_nonce: u64,
-    pub executed_input_count: ExecutedInputCount,
+    pub l2_tx_count: L2TxCount,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +99,7 @@ impl Drop for LeaseGuard {
 /// Artifact and history metadata selected atomically with the lease increment.
 pub struct LeasedDump {
     pub prefix: PathBuf,
-    pub executed_input_count: ExecutedInputCount,
+    pub l2_tx_count: L2TxCount,
     pub history_version: HistoryVersion,
     pub next_batch_nonce: u64,
     pub guard: LeaseGuard,
@@ -183,7 +183,7 @@ impl Storage {
             inclusion_block: snapshot.inclusion_block,
             dump: LeasedDump {
                 prefix: snapshot.dump.prefix,
-                executed_input_count: snapshot.executed_input_count,
+                l2_tx_count: snapshot.l2_tx_count,
                 next_batch_nonce: snapshot.next_batch_nonce,
                 history_version,
                 // Only a committed increment arms a release. A failed COMMIT
@@ -215,7 +215,7 @@ impl Storage {
         Ok(
             acquired.map(|(snapshot, history_version, next_batch_nonce)| LeasedDump {
                 prefix: snapshot.dump.prefix,
-                executed_input_count: snapshot.executed_input_count,
+                l2_tx_count: snapshot.l2_tx_count,
                 history_version,
                 next_batch_nonce,
                 guard: LeaseGuard {
@@ -243,7 +243,7 @@ impl Storage {
 pub(super) fn insert_baseline_snapshot_in(
     tx: &Transaction<'_>,
     prefix: &Path,
-    count: ExecutedInputCount,
+    count: L2TxCount,
 ) -> Result<i64> {
     insert_snapshot_in(tx, prefix, None, count)
 }
@@ -252,7 +252,7 @@ pub(super) fn insert_batch_snapshot_in(
     tx: &Transaction<'_>,
     prefix: &Path,
     batch_index: u64,
-    count: ExecutedInputCount,
+    count: L2TxCount,
 ) -> Result<i64> {
     // Registration is composed with sealing, so the batch must already be closed.
     tx.query_row(
@@ -267,11 +267,11 @@ fn insert_snapshot_in(
     tx: &Transaction<'_>,
     prefix: &Path,
     batch_index: Option<u64>,
-    count: ExecutedInputCount,
+    count: L2TxCount,
 ) -> Result<i64> {
     assert_eq!(
         count,
-        next_executed_input_count_in(tx)?,
+        next_l2_tx_count_in(tx)?,
         "snapshot count differs from canonical storage history"
     );
     tx.execute(
@@ -346,7 +346,7 @@ pub(super) fn finalized_dump_in(
         let snapshot = snapshot_for_batch_in(conn, batch_index)?;
         return Ok(Some(FinalizedDump {
             dump: snapshot.dump,
-            executed_input_count: snapshot.executed_input_count,
+            l2_tx_count: snapshot.l2_tx_count,
             inclusion_block,
             next_batch_nonce: nonce.checked_add(1).expect("accepted nonce overflow"),
         }));
@@ -359,13 +359,13 @@ pub(super) fn finalized_dump_in(
     };
     let history = query_history_state(conn)?;
     assert_eq!(
-        snapshot.executed_input_count.get(),
+        snapshot.l2_tx_count.get(),
         history.rebuilt_history_end,
         "the era baseline sits at the rebuilt history's end"
     );
     Ok(Some(FinalizedDump {
         dump: snapshot.dump,
-        executed_input_count: snapshot.executed_input_count,
+        l2_tx_count: snapshot.l2_tx_count,
         inclusion_block: history.base_safe_block,
         next_batch_nonce: super::mutations::batch_tree_anchor_in(conn)?,
     }))
@@ -439,7 +439,7 @@ fn row_to_dump_row(row: &rusqlite::Row<'_>) -> Result<DumpRow> {
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<Snapshot> {
     Ok(Snapshot {
         dump: row_to_dump_row(row)?,
-        executed_input_count: ExecutedInputCount::new(i64_to_u64(row.get(2)?)),
+        l2_tx_count: L2TxCount::new(i64_to_u64(row.get(2)?)),
     })
 }
 
@@ -469,7 +469,7 @@ mod tests {
     fn close(storage: &mut Storage, head: &mut WriteHead) -> i64 {
         let index = head.batch_index;
         let safe_block = head.safe_block;
-        let count = storage.next_executed_input_count().unwrap();
+        let count = storage.next_l2_tx_count().unwrap();
         storage
             .close_frame_and_batch_with_snapshot(head, safe_block, &prefix(index + 1), count)
             .unwrap();
@@ -482,7 +482,7 @@ mod tests {
         let mut storage = Storage::open(&db.path).unwrap();
         pin_test_deployment_identity(&mut storage, SENDER_A);
         let baseline = storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -523,7 +523,7 @@ mod tests {
         let mut storage = Storage::open(&db.path).unwrap();
         pin_test_deployment_identity(&mut storage, SENDER_A);
         storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -570,7 +570,7 @@ mod tests {
                 .latest_snapshot()
                 .unwrap()
                 .unwrap()
-                .executed_input_count
+                .l2_tx_count
                 .get(),
             41
         );
@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(
             (
                 checkpoint.inclusion_block,
-                checkpoint.executed_input_count.get(),
+                checkpoint.l2_tx_count.get(),
                 checkpoint.next_batch_nonce
             ),
             (100, 41, 7)
@@ -594,7 +594,7 @@ mod tests {
         let mut storage = Storage::open(&db.path).unwrap();
         pin_test_deployment_identity(&mut storage, SENDER_A);
         let baseline = storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -622,7 +622,7 @@ mod tests {
                         respond_to,
                         received_at: SystemTime::now(),
                     },
-                    executed_input_offset: ExecutedInputCount::ZERO,
+                    l2_tx_index: L2TxCount::ZERO,
                 }],
             )
             .unwrap();
@@ -634,9 +634,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(old.prefix, prefix(0));
-        assert_eq!(old.executed_input_count, ExecutedInputCount::ZERO);
+        assert_eq!(old.l2_tx_count, L2TxCount::ZERO);
         assert_eq!(old.history_version, old_version);
-        assert_eq!(new.dump.executed_input_count.get(), 1);
+        assert_eq!(new.dump.l2_tx_count.get(), 1);
         assert_eq!(new.dump.next_batch_nonce, 1);
         assert_ne!(new.dump.history_version, old_version);
         assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
@@ -649,7 +649,7 @@ mod tests {
         let db = temp_db("invalidated-snapshot");
         let mut storage = Storage::open(&db.path).unwrap();
         storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -680,7 +680,7 @@ mod tests {
         let db = temp_db("failed-lease-commit");
         let mut storage = Storage::open(&db.path).unwrap();
         let id = storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         storage.conn.execute_batch(
             "CREATE TABLE lease_parent(id INTEGER PRIMARY KEY);
@@ -712,7 +712,7 @@ mod tests {
         let db = temp_db("failed-lease-query");
         let mut storage = Storage::open(&db.path).unwrap();
         let id = storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         storage
             .conn
@@ -742,7 +742,7 @@ mod tests {
         let db = temp_db("lease-underflow");
         let mut storage = Storage::open(&db.path).unwrap();
         let id = storage
-            .insert_baseline_snapshot(&prefix(0), ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
         let error = storage.release_dump_lease(id).unwrap_err();
         assert_eq!(

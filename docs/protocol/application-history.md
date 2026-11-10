@@ -17,7 +17,7 @@ These facts answer different questions:
 
 | Fact | Meaning |
 |---|---|
-| `ExecutedInputCount` | Number of L2 transactions already executed; at count `N`, entry `N` executes next. |
+| `L2TxCount` | Number of L2 transactions already executed; at count `N`, entry `N` executes next. |
 | Latest surviving frame's `safe_block` | Complete L1 interval accounted for by local ordering, bounded below by the era baseline. |
 | `safe_accepted_batches` | Safe L1 landings accepted by the scheduler rules and matched to local sealed bytes. |
 
@@ -57,7 +57,7 @@ A `HistoryClaim` combines:
 - **Era**: a UUIDv4 created by setup, identifying one local history.
 - **Recovery generation**: a revision within that era, advanced atomically
   whenever automatic recovery invalidates at least one valid batch.
-- **Next input**: the application's actual executed-input count.
+- **Next input**: the application's actual L2 tx count.
 
 If the era's base count is `K` and the current head is `H`, available entries
 occupy `[K, H)`. A claim at `H` waits for future entries; a claim below `K` or

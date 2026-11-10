@@ -47,7 +47,7 @@ and [admission](application-contract.md#3-admission--policy-never-consensus):
   engine executes, a fee its sender cannot cover included, and every execution
   advances the count by one. A direct arrives with its input index and
   timestamp.
-- `application_engine_l2_tx_count` reports the engine's executed-input count,
+- `application_engine_l2_tx_count` reports the engine's L2 tx count,
   which the executor checks against each successful transition.
 - `application_engine_admit_user_op` is lane-only policy. It answers `INVALID`
   with `INSUFFICIENT_FEE_BALANCE`, or with `REFUSED_BY_POLICY` and its text in

@@ -2,7 +2,7 @@
 
 An app plugs into the sequencer by implementing
 [`Application`](../../sequencer-core/src/application/mod.rs). It owns its state,
-including each sender's nonce and its executed-input count; the protocol
+including each sender's nonce and its L2 tx count; the protocol
 defines how they advance, and the shared executor decides which transactions
 run and verifies each successful transition. Application
 code remains self-trusted: Rust capabilities cannot establish the correctness
@@ -23,7 +23,7 @@ a reference wallet integration.
 | `user_nonce(sender) -> Result<u32, AppError>` | Report the sender's next nonce, zero for an address that has sent nothing, without changing state. |
 | `apply_user_op(op) -> Result<AppOutputs, AppError>` | Execute a user op found at its sender's next nonce, advancing that nonce and the count by exactly one each. |
 | `apply_direct(direct) -> Result<AppOutputs, AppError>` | Execute a direct, advancing the count by exactly one and moving no nonce. |
-| `executed_input_count() -> ExecutedInputCount` | Report the count ([§4](#4-canonical-history-cursor-executed_input_count)). |
+| `l2_tx_count() -> L2TxCount` | Report the count ([§4](#4-the-l2-tx-count-l2_tx_count)). |
 
 A transaction reaches the application only through the shared executor,
 [`execute`](../../sequencer-core/src/application/mod.rs), in the canonical
@@ -47,8 +47,8 @@ and the balance and credits the sequencer with exactly that amount.
 Before an apply hook, the executor computes the checked successor of the
 count. After `Ok`, it asserts that the engine reports exactly that successor
 and, for a user op, that the sender's nonce advanced by exactly one, and it
-returns the pre-execution count as the transaction's history offset. An engine
-may use `ExecutedInputCount::advance` or implement the same transition
+returns the pre-execution count as the transaction's index in the history. An
+engine may use `L2TxCount::advance` or implement the same transition
 natively. Adapters report the engine-owned count rather than maintaining a
 separate mirror. Overflow fails before the hook runs. An error defines no
 successor: callers terminate the execution path and discard the instance,
@@ -162,11 +162,11 @@ metadata to compute batch capacity. It is not a canonical scheduler rule. The
 scheduler limits are canonical: the [fridge](scheduler-semantics.md#the-fridge)
 admits by them, and the lane drops the same oversized directs.
 
-### 4. Canonical history cursor: `executed_input_count`
+### 4. The L2 tx count: `l2_tx_count`
 
 The count is the next application-history offset, never a SQLite cursor. It
 counts executed L2 transactions, not L1 inputs. A transaction executed at
-count `X` returns offset `X` and advances it to `X + 1`. Included no-ops count;
+count `X` returns index `X` and advances it to `X + 1`. Included no-ops count;
 skipped ops, refusals, queued or dropped directs, envelopes, and empty batches
 do not ([what counts](scheduler-semantics.md#what-counts)). Arithmetic is
 checked, never wrapping or saturating.
@@ -272,7 +272,7 @@ also stays on the concrete application.
 Every supported production application must rebuild its native instance from
 a trusted canonical machine. `from_canonical_state(state_file, count)` builds
 an instance from the machine's comparison bytes, which setup reads from the
-machine's `state` inspect report, at the machine's executed-input count, which
+machine's `state` inspect report, at the machine's L2 tx count, which
 the machine's
 `scheduler` report carries with the rest of the scheduler's state
 ([state export](scheduler-semantics.md#state-export)). A dump of the result

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use alloy_primitives::{Address, B256, Signature};
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::scheduler::Scheduled;
 use sequencer_core::user_op::{SignedUserOp, UserOp};
@@ -114,18 +114,18 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
     };
     storage
         .record_rebuilt_counts(&[
-            (key(0, 0), ExecutedInputCount::new(41)),
-            (key(1, 0), ExecutedInputCount::new(42)),
-            (key(1, 2), ExecutedInputCount::new(43)),
-            (key(2, 0), ExecutedInputCount::new(44)),
+            (key(0, 0), L2TxCount::new(41)),
+            (key(1, 0), L2TxCount::new(42)),
+            (key(1, 2), L2TxCount::new(43)),
+            (key(2, 0), L2TxCount::new(44)),
         ])
         .expect("record the executed rows' counts");
     storage
         .publish_era(
             baseline_prefix,
             &EraRecord {
-                base_count: ExecutedInputCount::new(BASE),
-                rebuilt_history_end: ExecutedInputCount::new(REBUILT_END),
+                base_count: L2TxCount::new(BASE),
+                rebuilt_history_end: L2TxCount::new(REBUILT_END),
                 stop_block: STOP_BLOCK,
                 first_queued_input: FIRST_QUEUED_INPUT,
                 next_batch_nonce: NEXT_BATCH_NONCE,
@@ -174,9 +174,7 @@ pub(crate) fn append_live_user_op(storage: &mut Storage, nonce: u32) -> serde_js
         .open_state()
         .expect("read the open frame")
         .expect("the root frame is open");
-    let offset = storage
-        .next_executed_input_count()
-        .expect("read the history head");
+    let offset = storage.next_l2_tx_count().expect("read the history head");
     let data = vec![0xe0, u8::try_from(nonce).expect("fixture nonce")];
     let (respond_to, _response) = oneshot::channel();
     let included = IncludedUserOp {
@@ -193,7 +191,7 @@ pub(crate) fn append_live_user_op(storage: &mut Storage, nonce: u32) -> serde_js
             respond_to,
             received_at: SystemTime::now(),
         },
-        executed_input_offset: offset,
+        l2_tx_index: offset,
     };
     storage
         .append_executed_user_ops_chunk(&mut head, &[included])

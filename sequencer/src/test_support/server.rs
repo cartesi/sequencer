@@ -11,7 +11,7 @@ use alloy_primitives::{Address, Signature};
 use alloy_sol_types::Eip712Domain;
 use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, WalletApp, WalletConfig};
 use sequencer_core::application::Application;
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 use tokio::sync::mpsc;
 
@@ -185,14 +185,14 @@ fn start_wallet_lane(
         )
         .expect("genesis dump");
         storage
-            .insert_baseline_snapshot(&genesis_dir, ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&genesis_dir, L2TxCount::ZERO)
             .expect("register genesis");
     }
 
     // Tip-existence invariant: open the genesis Tip only after the genesis
     // snapshot exists. Opening the Tip may attribute already-ingested direct
     // inputs, so doing this first would give the fresh application dump the
-    // wrong executed-input count.
+    // wrong L2 tx count.
     storage.ensure_open_tip().expect("establish open tip");
     let head = storage
         .open_state()

@@ -10,7 +10,7 @@ pub use errors::{
 };
 
 pub use sequencer_core::history::{
-    EraId, ExecutedInputCount, HistoryBounds, HistoryClaim, HistoryPolicyError, HistoryVersion,
+    EraId, HistoryBounds, HistoryClaim, HistoryPolicyError, HistoryVersion, L2TxCount,
     RecoveryGeneration,
 };
 pub use sequencer_core::history_api::{
@@ -217,7 +217,7 @@ impl SequencerClient {
                         generation,
                     ),
                 },
-                next_input: ExecutedInputCount::new(count),
+                next_input: L2TxCount::new(count),
             },
             response,
         })
@@ -413,7 +413,7 @@ mod tests {
                     .unwrap(),
                 recovery_generation: RecoveryGeneration::new(0),
             },
-            next_input: ExecutedInputCount::new(0),
+            next_input: L2TxCount::new(0),
         };
         let stalled_server = async {
             let (_stream, _) = listener.accept().await.unwrap();
@@ -496,7 +496,7 @@ mod tests {
                     .unwrap(),
                 recovery_generation: RecoveryGeneration::new(9),
             },
-            next_input: ExecutedInputCount::new(50_001),
+            next_input: L2TxCount::new(50_001),
         };
         let client = SequencerClient::new("http://localhost:8080").unwrap();
         assert_eq!(
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn typed_refusal_survives_an_http_body_in_a_later_packet() {
         let policy = HistoryPolicyError::AheadOfHead {
-            head: ExecutedInputCount::new(12),
+            head: L2TxCount::new(12),
         };
         let response = tokio_tungstenite::tungstenite::http::Response::builder()
             .status(409)
@@ -547,12 +547,12 @@ mod tests {
                     era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
                     recovery_generation: RecoveryGeneration::new(0),
                 },
-                next_input: ExecutedInputCount::new(40),
+                next_input: L2TxCount::new(40),
             })
             .await;
         assert!(matches!(result,
             Err(SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
-                if available_from == ExecutedInputCount::new(41)));
+                if available_from == L2TxCount::new(41)));
         server.await.unwrap();
     }
 }

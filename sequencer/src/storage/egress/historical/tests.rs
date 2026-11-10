@@ -27,10 +27,7 @@ fn fixture(name: &str, stop: u64, count: u64, nonce: u64) -> (TestDb, Storage) {
         .write(|tx| initialize_history_in(tx, &record))
         .unwrap();
     storage
-        .insert_baseline_snapshot(
-            Path::new("/snapshot/baseline"),
-            ExecutedInputCount::new(count),
-        )
+        .insert_baseline_snapshot(Path::new("/snapshot/baseline"), L2TxCount::new(count))
         .unwrap();
     (db, storage)
 }
@@ -77,8 +74,8 @@ fn genesis_history_has_an_empty_raw_prefix_even_after_live_inputs_arrive() {
     let (_db, mut storage) = fixture("historical-genesis", 0, 0, 0);
     append(&mut storage, 20, &[input(10, SENDER_B, vec![1])]);
     let info = storage.history_info(None, None).unwrap();
-    assert_eq!(info.history.available_from, ExecutedInputCount::ZERO);
-    assert_eq!(info.history.head, ExecutedInputCount::ZERO);
+    assert_eq!(info.history.available_from, L2TxCount::ZERO);
+    assert_eq!(info.history.head, L2TxCount::ZERO);
     assert_eq!(info.compatibility, None);
     assert_eq!(
         info.baseline,
@@ -86,14 +83,14 @@ fn genesis_history_has_an_empty_raw_prefix_even_after_live_inputs_arrive() {
             l1_stop_block: 0,
             l1_end_input_index: 0,
             next_batch_nonce: 0,
-            rebuilt_history_end: ExecutedInputCount::ZERO,
+            rebuilt_history_end: L2TxCount::ZERO,
         }
     );
     assert_eq!(
         info.accepted_checkpoint,
         Some(AcceptedCheckpoint {
             inclusion_block: 0,
-            executed_input_count: ExecutedInputCount::ZERO,
+            executed_input_count: L2TxCount::ZERO,
             next_batch_nonce: 0,
         })
     );
@@ -121,21 +118,18 @@ fn rebuilt_history_preserves_raw_payloads_metadata_and_its_fixed_prefix() {
     ];
     append(&mut storage, 25, &inputs);
     let info = storage.history_info(None, None).unwrap();
-    assert_eq!(info.history.available_from, ExecutedInputCount::new(41));
-    assert_eq!(info.history.head, ExecutedInputCount::new(41));
+    assert_eq!(info.history.available_from, L2TxCount::new(41));
+    assert_eq!(info.history.head, L2TxCount::new(41));
     assert_eq!(info.baseline.l1_stop_block, 20);
     assert_eq!(info.baseline.l1_end_input_index, 3);
     assert_eq!(info.baseline.next_batch_nonce, 7);
-    assert_eq!(
-        info.baseline.rebuilt_history_end,
-        ExecutedInputCount::new(41)
-    );
+    assert_eq!(info.baseline.rebuilt_history_end, L2TxCount::new(41));
     // The baseline is canonical at the stop block: the first comparison checkpoint.
     assert_eq!(
         info.accepted_checkpoint,
         Some(AcceptedCheckpoint {
             inclusion_block: 20,
-            executed_input_count: ExecutedInputCount::new(41),
+            executed_input_count: L2TxCount::new(41),
             next_batch_nonce: 7,
         })
     );
@@ -346,7 +340,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
                 &mut head,
                 20,
                 Path::new(&format!("/snapshot/{index}")),
-                ExecutedInputCount::new(41),
+                L2TxCount::new(41),
             )
             .unwrap();
     }
@@ -376,7 +370,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
         info.accepted_checkpoint,
         Some(AcceptedCheckpoint {
             inclusion_block: 30,
-            executed_input_count: ExecutedInputCount::new(41),
+            executed_input_count: L2TxCount::new(41),
             next_batch_nonce: 9,
         })
     );
@@ -447,7 +441,7 @@ fn compatibility_requires_an_era_and_rejects_future_generations_after_era_valida
         info.compatibility,
         Some(HistoryCompatibility {
             from_generation: RecoveryGeneration::new(0),
-            preserved_input_count: ExecutedInputCount::ZERO,
+            preserved_input_count: L2TxCount::ZERO,
         })
     );
 }
@@ -478,7 +472,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::new(41),
+                l2_tx_index: L2TxCount::new(41),
             }],
         )
         .unwrap();
@@ -486,7 +480,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
     let before = storage
         .history_info(Some(current), Some(RecoveryGeneration::new(0)))
         .unwrap();
-    assert_eq!(before.history.head, ExecutedInputCount::new(42));
+    assert_eq!(before.history.head, L2TxCount::new(42));
     assert_eq!(
         before.compatibility.unwrap().preserved_input_count,
         before.history.head
@@ -506,12 +500,12 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
     let after = storage
         .history_info(Some(current), Some(RecoveryGeneration::new(0)))
         .unwrap();
-    assert_eq!(after.history.available_from, ExecutedInputCount::new(41));
-    assert_eq!(after.history.head, ExecutedInputCount::new(42));
+    assert_eq!(after.history.available_from, L2TxCount::new(41));
+    assert_eq!(after.history.head, L2TxCount::new(42));
     assert_eq!(after.history.version.recovery_generation.get(), 1);
     assert_eq!(
         after.compatibility.unwrap().preserved_input_count,
-        ExecutedInputCount::new(41)
+        L2TxCount::new(41)
     );
     let latest = storage
         .history_info(Some(current), Some(RecoveryGeneration::new(1)))

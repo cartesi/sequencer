@@ -75,7 +75,7 @@ engines and gets the same changes.
 | `admit_user_op` | Say, without changing state, whether the operator wants an op; **New:** it no longer checks the nonce, and only the lane calls it |
 | `apply_user_op` | Advance the sender's nonce and the L2 tx count by exactly one, business failures included; **New:** never fail, even on a fee the sender cannot pay |
 | `apply_direct` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
-| `executed_input_count`, to be renamed `l2_tx_count` | Report the L2 tx count; **New:** the count alone, without the clock |
+| `l2_tx_count` | Report the L2 tx count; **New:** the count alone, without the clock |
 | `create_dump`, `from_dump`, `state_file_in_dump` | Write a durable dump, load it back to the same state, and name the file that holds the comparison bytes |
 | `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns whole |
 | **New:** `from_canonical_state` | Build a native instance from a machine's comparison bytes, at the machine's L2 tx count |

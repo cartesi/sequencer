@@ -110,10 +110,10 @@ fn compatibility_uses_every_intervening_cut_and_the_current_head() {
                 &storage.conn,
                 RecoveryGeneration::new(from),
                 RecoveryGeneration::new(current),
-                ExecutedInputCount::new(head)
+                L2TxCount::new(head)
             )
             .unwrap(),
-            ExecutedInputCount::new(expected),
+            L2TxCount::new(expected),
             "from={from}, current={current}, head={head}",
         );
     }
@@ -136,7 +136,7 @@ fn missing_intermediate_cut_fails_instead_of_certifying_a_partial_minimum() {
         &storage.conn,
         RecoveryGeneration::new(0),
         RecoveryGeneration::new(3),
-        ExecutedInputCount::new(9),
+        L2TxCount::new(9),
     );
 }
 
@@ -146,7 +146,7 @@ fn current_head_may_be_the_boundary_after_the_maximum_sqlite_offset() {
     let mut storage = Storage::open(&db.path).unwrap();
     let max = i64::MAX as u64;
     seed_cuts(&mut storage, &[max]);
-    let head = ExecutedInputCount::new(max + 1);
+    let head = L2TxCount::new(max + 1);
     assert_eq!(
         preserved_input_count_in(
             &storage.conn,
@@ -165,6 +165,6 @@ fn current_head_may_be_the_boundary_after_the_maximum_sqlite_offset() {
             head
         )
         .unwrap(),
-        ExecutedInputCount::new(max),
+        L2TxCount::new(max),
     );
 }

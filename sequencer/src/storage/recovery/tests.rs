@@ -7,7 +7,7 @@ use super::super::test_helpers::{
     seed_closed_batches, seed_safe_inputs_with_batch_nonces,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
-use crate::storage::{DirectInputExecution, ExecutedInputCount, SafeInputRange, Storage};
+use crate::storage::{DirectInputExecution, L2TxCount, SafeInputRange, Storage};
 use alloy_primitives::Address;
 use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::protocol::ProtocolTiming;
@@ -67,7 +67,7 @@ mod guarded_phases {
         if with_recovery_checkpoint {
             let prefix = db._dir.path().join("finalized");
             storage
-                .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
+                .insert_baseline_snapshot(&prefix, L2TxCount::ZERO)
                 .expect("seed finalized snapshot");
         }
         (db, storage, protocol)
@@ -215,7 +215,7 @@ mod guarded_phases {
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix, L2TxCount::ZERO)
             .expect("seed finalized snapshot");
         (db, storage)
     }
@@ -307,7 +307,7 @@ mod guarded_phases {
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
-            .insert_baseline_snapshot(&prefix, ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&prefix, L2TxCount::ZERO)
             .expect("seed finalized snapshot");
 
         let error = storage
@@ -1003,7 +1003,7 @@ mod tip_staleness {
                 TEST_MAX_DIRECT_PAYLOAD_BYTES,
                 &[DirectInputExecution {
                     safe_input_index: 0,
-                    executed_input_offset: ExecutedInputCount::ZERO,
+                    l2_tx_index: L2TxCount::ZERO,
                 }],
             )
             .expect("attribute mapped direct");
@@ -1012,9 +1012,9 @@ mod tip_staleness {
             .expect("close batch 0");
         assert_eq!(
             storage
-                .next_executed_input_count()
+                .next_l2_tx_count()
                 .expect("pre-recovery history head"),
-            ExecutedInputCount::new(1)
+            L2TxCount::new(1)
         );
         storage.advance_safe_head(1500); // advance safe head past staleness
 
@@ -1077,9 +1077,9 @@ mod tip_staleness {
         );
         assert_eq!(
             storage
-                .next_executed_input_count()
+                .next_l2_tx_count()
                 .expect("history head after rollback"),
-            ExecutedInputCount::new(1),
+            L2TxCount::new(1),
             "the canonical history head must roll back with its mapping"
         );
         let open_batch_index: i64 = storage
@@ -1123,10 +1123,7 @@ mod tip_staleness {
             [(1, 0)],
             "replacement directs must not enlarge the preserved prefix"
         );
-        assert_eq!(
-            storage.next_executed_input_count().unwrap(),
-            ExecutedInputCount::new(2)
-        );
+        assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
 
         let after = all_ordered_l2_txs(&mut storage);
         let direct_payloads: Vec<&[u8]> = after
@@ -1849,10 +1846,7 @@ mod recovery_snapshot_selection {
 
     fn baseline(storage: &mut Storage) -> i64 {
         storage
-            .insert_baseline_snapshot(
-                Path::new("/tmp/recovery-baseline"),
-                ExecutedInputCount::ZERO,
-            )
+            .insert_baseline_snapshot(Path::new("/tmp/recovery-baseline"), L2TxCount::ZERO)
             .expect("baseline")
     }
 
@@ -1987,12 +1981,8 @@ mod recovery_snapshot_selection {
             crate::storage::RecoveryMutationError::MissingRecoveryCheckpoint
         ));
         assert_eq!(
-            storage
-                .latest_snapshot()
-                .unwrap()
-                .unwrap()
-                .executed_input_count,
-            ExecutedInputCount::ZERO
+            storage.latest_snapshot().unwrap().unwrap().l2_tx_count,
+            L2TxCount::ZERO
         );
         assert_eq!(
             storage

@@ -1032,7 +1032,7 @@ async fn run_unsupported_token_deposit_noop_test(
 
     assert_eq!(replay.current_user_balance(alice_address), U256::ZERO);
     assert_eq!(replay.current_user_nonce(alice_address), 0);
-    assert_eq!(replay.executed_input_count(), 1);
+    assert_eq!(replay.l2_tx_count(), 1);
     Ok(())
 }
 
@@ -1297,7 +1297,7 @@ async fn run_multi_deposit_reconciliation_test(
 
     assert_eq!(replay.current_user_balance(alice_address), alice_deposit);
     assert_eq!(replay.current_user_balance(bob_address), bob_deposit);
-    assert_eq!(replay.executed_input_count(), 2);
+    assert_eq!(replay.l2_tx_count(), 2);
     Ok(())
 }
 
@@ -3536,7 +3536,7 @@ async fn run_replay_matches_live_for_mixed_workload_test(
     bob_l2.withdraw(U256::from(50_000_u64)).await?;
     replay_live.apply(ws.expect_user_op_from(bob_address).await?)?;
 
-    let expected_input_count = replay_live.executed_input_count();
+    let expected_input_count = replay_live.l2_tx_count();
 
     // Restart + catch-up replay. Each WS catch-up event feeds the fresh
     // replay identically to how the live stream fed the original; if the
@@ -3565,10 +3565,7 @@ async fn run_replay_matches_live_for_mixed_workload_test(
             "nonce divergence for {addr:?}: live vs. replay must match",
         );
     }
-    assert_eq!(
-        replay_post.executed_input_count(),
-        replay_live.executed_input_count(),
-    );
+    assert_eq!(replay_post.l2_tx_count(), replay_live.l2_tx_count(),);
     assert_eq!(
         replay_post.canonical_snapshot_bytes()?,
         replay_live.canonical_snapshot_bytes()?,
@@ -3940,11 +3937,11 @@ fn assert_wallet_state(
     replay: &ReplayWalletApp,
     first: ExpectedWalletState,
     second: ExpectedWalletState,
-    executed_input_count: u64,
+    l2_tx_count: u64,
 ) {
     assert_eq!(replay.current_user_balance(first.address), first.balance);
     assert_eq!(replay.current_user_nonce(first.address), first.nonce);
     assert_eq!(replay.current_user_balance(second.address), second.balance);
     assert_eq!(replay.current_user_nonce(second.address), second.nonce);
-    assert_eq!(replay.executed_input_count(), executed_input_count);
+    assert_eq!(replay.l2_tx_count(), l2_tx_count);
 }

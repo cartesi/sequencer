@@ -292,7 +292,7 @@ mod tests {
             eras.push(setup.history_state().unwrap());
         }
         assert_ne!(eras[0].version.era_id, eras[1].version.era_id);
-        assert_eq!(eras[1].base_executed_input_count, 8);
+        assert_eq!(eras[1].base_l2_tx_count, 8);
         assert_eq!(eras[1].base_safe_block, 100);
         assert_eq!(eras[1].rebuilt_history_end, 8);
     }

@@ -48,7 +48,7 @@ accepted, so only a watchdog comparison reveals it.
 
 ### What counts
 
-The application's **executed-input count** is how many L2 transactions it has
+The application's **L2 tx count** is how many L2 transactions it has
 executed. It names a state and the transaction that state executes next, so
 the feed numbers its rows with it. It counts transactions, not L1 inputs.
 
@@ -87,8 +87,8 @@ admitted directs from one input index, the *first queued input*, up to the L1
 input count.
 
 The two counts differ, because a batch envelope or a queued direct is an L1
-input but not an L2 transaction. The application knows its executed-input
-count, and a client knows only that one; the machine knows both
+input but not an L2 transaction. The application knows its L2 tx count, and a
+client knows only that one; the machine knows both
 ([state export](#state-export)).
 
 ### The invariant
@@ -209,7 +209,7 @@ For each frame of an accepted batch, in order:
 
    Otherwise the op executes with fee `frame.fee_price` and block
    `frame.safe_block`: the application advances the sender's nonce and the
-   executed-input count by one each, and the executor checks both.
+   L2 tx count by one each, and the executor checks both.
 
 The application stores each sender's next nonce and reports it; shared code
 compares it with the op's, so no application code decides which ops execute
@@ -242,7 +242,7 @@ Two parties decide, and they ask different questions:
 | is none of the above | | Executed | Admitted |
 
 - **Skipped** means nothing changes: no nonce, no count, no fee.
-- **Executed** means the sender's nonce and the executed-input count each
+- **Executed** means the sender's nonce and the L2 tx count each
   advance by one. What the op pays and whether its effect applies are the
   application's choice ([application contract](application-contract.md#the-execution-methods)).
   The application must not fail, since an application error halts the machine.
@@ -355,7 +355,7 @@ column and a feed field, and the block proposer can bias it, so it comes only
 on a stated need. A user op never sees its batch's context; it sees its frame's
 safe block and fee.
 
-## Outputs and the executed-input count
+## Outputs and the L2 tx count
 
 An input's outputs are the application's notices and vouchers in execution
 order: the backstop's directs first, then, for a direct, any overflow drain,
@@ -363,9 +363,9 @@ or, for a batch, each frame's drained directs and executed ops. Reports are
 diagnostics outside the outputs tree: the reference reports a rejected batch
 with one fixed string and a stale skip not at all.
 
-The executed-input count advances by one for each executed direct and each
+The L2 tx count advances by one for each executed direct and each
 executed user op, and for nothing else ([what counts](#what-counts)). The
-[application contract](application-contract.md#4-canonical-history-cursor-executed_input_count)
+[application contract](application-contract.md#4-the-l2-tx-count-l2_tx_count)
 owns the count; the [history contract](application-history.md) owns how
 catch-up, recovery and the API use it.
 
@@ -378,7 +378,7 @@ state would depend on the application. It would also drop the backstop's
 executions, which the reference keeps.
 
 The reference halts the machine when the application returns an error; when
-the batch nonce, the executed-input count or the L1 input count has no `u64`
+the batch nonce, the L2 tx count or the L1 input count has no `u64`
 successor; and when an input's `index`, `blockNumber`, `timestamp` or `chainId`
 does not fit `u64`. A halt is a permanent fixed point, not a reject
 ([rollup host semantics](../cartesi-machine.md#rollup-host-semantics)), so a
@@ -391,14 +391,14 @@ The machine answers two inspect queries, so a reader can take its whole state:
 | Query | Report |
 |---|---|
 | `state`, or an empty payload | The application's comparison bytes, whole ([application contract](application-contract.md#6-checkpoint-lifecycle)). |
-| `scheduler` | The scheduler's state and the executed-input count, 48 bytes. |
+| `scheduler` | The scheduler's state and the L2 tx count, 48 bytes. |
 
 The `scheduler` report is
 [`SchedulerExport`](../../sequencer-core/src/scheduler/mod.rs): six
 little-endian `u64`s, in this order:
 
 1. `l1_input_count`, the machine's position;
-2. `l2_tx_count`, the application's executed-input count;
+2. `l2_tx_count`, the application's L2 tx count;
 3. `next_batch_nonce`;
 4. `clock`;
 5. `first_queued_input`, the oldest queued direct's index, or the L1 input

@@ -18,7 +18,7 @@ use sequencer_core::application::{
     Admission, AppError, AppOutput, AppOutputs, Application, CanonicalState, PolicyRefusal,
     SchedulerLimits,
 };
-use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -69,7 +69,7 @@ pub struct WalletApp {
     // canonical entry order.
     balances: BTreeMap<Address, U256>,
     nonces: BTreeMap<Address, u32>,
-    executed_input_count: ExecutedInputCount,
+    l2_tx_count: L2TxCount,
 }
 
 /// Rollups-contracts v3.0.0-alpha.10 Erc20Portal. The contracts deploy at
@@ -100,7 +100,7 @@ impl WalletApp {
             config,
             balances: BTreeMap::new(),
             nonces: BTreeMap::new(),
-            executed_input_count: ExecutedInputCount::ZERO,
+            l2_tx_count: L2TxCount::ZERO,
         }
     }
 
@@ -109,13 +109,13 @@ impl WalletApp {
         config: WalletConfig,
         balances: BTreeMap<Address, U256>,
         nonces: BTreeMap<Address, u32>,
-        executed_input_count: u64,
+        l2_tx_count: u64,
     ) -> Self {
         Self {
             config,
             balances,
             nonces,
-            executed_input_count: ExecutedInputCount::new(executed_input_count),
+            l2_tx_count: L2TxCount::new(l2_tx_count),
         }
     }
 
@@ -143,8 +143,8 @@ impl WalletApp {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_executed_input_count(&mut self, count: u64) {
-        self.executed_input_count = ExecutedInputCount::new(count);
+    pub(crate) fn set_l2_tx_count(&mut self, count: u64) {
+        self.l2_tx_count = L2TxCount::new(count);
     }
 
     fn balance_of(&self, addr: &Address) -> U256 {
@@ -244,7 +244,7 @@ impl Application for WalletApp {
             _ => {}
         }
 
-        self.executed_input_count.advance();
+        self.l2_tx_count.advance();
         Ok(outputs)
     }
 
@@ -288,12 +288,12 @@ impl Application for WalletApp {
             }
         }
 
-        self.executed_input_count.advance();
+        self.l2_tx_count.advance();
         Ok(outputs)
     }
 
-    fn executed_input_count(&self) -> ExecutedInputCount {
-        self.executed_input_count
+    fn l2_tx_count(&self) -> L2TxCount {
+        self.l2_tx_count
     }
 
     fn max_method_payload_bytes() -> usize {
@@ -362,18 +362,15 @@ impl Application for WalletApp {
 
     /// The wallet's bytes hold its count, so a count that disagrees with the
     /// machine's means a corrupt or misread export, never a state to install.
-    fn from_canonical_state(
-        state_file: &Path,
-        executed_input_count: ExecutedInputCount,
-    ) -> Result<Self, AppError> {
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError> {
         let bytes = std::fs::read(state_file)?;
         let app = crate::wallet_snapshot::decode(&bytes)?;
-        if app.executed_input_count != executed_input_count {
+        if app.l2_tx_count != l2_tx_count {
             return Err(AppError::Internal {
                 reason: format!(
                     "canonical state holds L2 tx count {}, but the machine reports {}",
-                    app.executed_input_count.get(),
-                    executed_input_count.get()
+                    app.l2_tx_count.get(),
+                    l2_tx_count.get()
                 ),
             });
         }
@@ -396,7 +393,7 @@ mod tests {
     use rollups_types::alloy_sol_types::SolCall;
     use rollups_types::{Erc20Deposit, Erc20Transfer};
 
-    use super::{ExecutedInputCount, WalletApp, WalletConfig};
+    use super::{L2TxCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
     use sequencer_core::application::{
         Admission, AppError, AppOutput, AppOutputs, Application, CanonicalState, Executed,
@@ -594,7 +591,7 @@ mod tests {
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -627,7 +624,7 @@ mod tests {
         );
         assert_eq!(app.current_user_balance(recipient), U256::ZERO);
         assert_eq!(app.current_user_nonce(sender), 1);
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
     }
 
     #[test]
@@ -655,7 +652,7 @@ mod tests {
         assert_eq!(app.current_user_balance(sender), U256::ZERO);
         assert_eq!(app.current_user_balance(bystander), U256::from(11_u64));
         assert_eq!(app.current_user_balance(sequencer), U256::from(20_u64));
-        assert_eq!(app.executed_input_count().get(), 3);
+        assert_eq!(app.l2_tx_count().get(), 3);
     }
 
     #[test]
@@ -673,7 +670,7 @@ mod tests {
         assert_eq!(app.current_user_balance(sender), U256::ZERO);
         assert_eq!(app.current_user_balance(sequencer), U256::ZERO);
         assert_eq!(app.current_user_nonce(sender), 1);
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
     }
 
     fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
@@ -708,7 +705,7 @@ mod tests {
             app.current_user_balance(nested_sender),
             before + U256::from(250_u64)
         );
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
         assert_eq!(outputs.len(), 1);
         match &outputs[0] {
             AppOutput::Notice(payload) => {
@@ -740,7 +737,7 @@ mod tests {
         );
 
         assert_eq!(app.current_user_balance(nested_sender), before);
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -760,7 +757,7 @@ mod tests {
         );
 
         assert_eq!(app.current_user_balance(nested_sender), before);
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -773,7 +770,7 @@ mod tests {
             &direct_tx(super::SEPOLIA_ERC20_PORTAL_ADDRESS, vec![0xaa; 10]),
         );
 
-        assert_eq!(app.executed_input_count().get(), 1);
+        assert_eq!(app.l2_tx_count().get(), 1);
         assert!(outputs.is_empty());
     }
 
@@ -905,7 +902,7 @@ mod tests {
             assert_eq!(app.current_user_balance(sender), funded - charged);
             assert_eq!(app.current_user_balance(sequencer), charged);
             assert_eq!(app.current_user_balance(recipient), U256::ZERO);
-            assert_eq!(app.executed_input_count().get(), u64::from(nonce) + 1);
+            assert_eq!(app.l2_tx_count().get(), u64::from(nonce) + 1);
         }
         assert_eq!(
             replay.canonical_snapshot_bytes().unwrap(),
@@ -952,7 +949,7 @@ mod tests {
         app.balances.insert(bob, U256::from(5678_u64));
         app.nonces.insert(alice, 4);
         app.nonces.insert(bob, 9);
-        app.executed_input_count = ExecutedInputCount::new(42);
+        app.l2_tx_count = L2TxCount::new(42);
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
@@ -976,7 +973,7 @@ mod tests {
         );
         assert_eq!(restored.balances, app.balances);
         assert_eq!(restored.nonces, app.nonces);
-        assert_eq!(restored.executed_input_count, app.executed_input_count);
+        assert_eq!(restored.l2_tx_count, app.l2_tx_count);
     }
 
     #[test]
@@ -985,20 +982,20 @@ mod tests {
         let sender = address!("0x1111111111111111111111111111111111111111");
         app.balances.insert(sender, U256::from(1234_u64));
         app.nonces.insert(sender, 4);
-        app.executed_input_count = ExecutedInputCount::new(42);
+        app.l2_tx_count = L2TxCount::new(42);
         let bytes = app.canonical_snapshot_bytes().unwrap();
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
         let state_file = WalletApp::state_file_in_dump(&prefix);
 
-        let restored = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(42))
+        let restored = WalletApp::from_canonical_state(&state_file, L2TxCount::new(42))
             .expect("matching count");
-        let mismatch = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(41));
+        let mismatch = WalletApp::from_canonical_state(&state_file, L2TxCount::new(41));
         std::fs::remove_dir_all(&prefix).expect("cleanup dump");
 
         assert_eq!(restored.canonical_snapshot_bytes().unwrap(), bytes);
-        assert_eq!(restored.executed_input_count().get(), 42);
+        assert_eq!(restored.l2_tx_count().get(), 42);
         match mismatch {
             Err(AppError::Internal { reason }) => assert_eq!(
                 reason,
@@ -1036,7 +1033,7 @@ mod tests {
         );
         std::fs::remove_dir_all(&prefix).unwrap();
         executed(&mut first, &user_tx(sender, 1, 0, Vec::new()));
-        assert_eq!(first.executed_input_count().get(), 2);
+        assert_eq!(first.l2_tx_count().get(), 2);
     }
 
     #[test]

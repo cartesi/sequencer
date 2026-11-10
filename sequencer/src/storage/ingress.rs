@@ -16,7 +16,7 @@ use super::convert::{
     from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
     u64_to_i64,
 };
-use super::history::{next_executed_input_count_in, query_history_state};
+use super::history::{next_l2_tx_count_in, query_history_state};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence,
     persist_frame_direct_sequence_derived, seal_batch,
@@ -28,7 +28,7 @@ use super::queries::{
 use super::safe_accepted_batches::canonical_divergence_in;
 use super::snapshot_dumps::insert_batch_snapshot_in;
 use super::{
-    BatchPolicy, DirectInputExecution, ExecutedInputCount, SafeFrontierState, SafeInputFrontier,
+    BatchPolicy, DirectInputExecution, L2TxCount, SafeFrontierState, SafeInputFrontier,
     SafeInputRange, Storage, WriteHead,
 };
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
@@ -220,16 +220,16 @@ impl Storage {
         head: &mut WriteHead,
         next_safe_block: u64,
         dump_dir: &Path,
-        executed_input_count: ExecutedInputCount,
+        l2_tx_count: L2TxCount,
     ) -> Result<()> {
         let (next_batch_index, now_ms, policy) = self.write(|tx| {
             assert_eq!(
-                next_executed_input_count_in(tx)?,
-                executed_input_count,
+                next_l2_tx_count_in(tx)?,
+                l2_tx_count,
                 "application count changed between dump creation and batch close"
             );
             let result = seal_and_open_next_batch(tx, head.batch_index, next_safe_block)?;
-            insert_batch_snapshot_in(tx, dump_dir, head.batch_index, executed_input_count)?;
+            insert_batch_snapshot_in(tx, dump_dir, head.batch_index, l2_tx_count)?;
             Ok(result)
         })?;
         head.move_to_next_batch(
@@ -513,7 +513,7 @@ fn insert_executed_user_ops_batch(
             .checked_add(u32::try_from(position).expect("chunk fits u32"))
             .expect("user-op position overflow");
         stmt.execute(params![
-            u64_to_i64(item.executed_input_offset.get()),
+            u64_to_i64(item.l2_tx_index.get()),
             u64_to_i64(batch_index),
             i64::from(frame_in_batch),
             i64::from(position)
@@ -526,9 +526,8 @@ fn insert_executed_user_ops_batch(
 mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
-        DirectInputExecution, ExecutedInputCount, FrontierMode, IngestedSafeInput,
-        LifecycleCommand, SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage,
-        StoredSafeInput,
+        DirectInputExecution, FrontierMode, IngestedSafeInput, L2TxCount, LifecycleCommand,
+        SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
         test_helpers::{
             SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
             record_canonical_divergence,
@@ -562,7 +561,7 @@ mod tests {
     fn included_user_op(nonce: u32, offset: u64) -> IncludedUserOp {
         IncludedUserOp {
             pending: pending_user_op(nonce),
-            executed_input_offset: ExecutedInputCount::new(offset),
+            l2_tx_index: L2TxCount::new(offset),
         }
     }
 
@@ -575,11 +574,11 @@ mod tests {
             .unwrap();
         let prefix = std::path::Path::new("existing-baseline");
         storage
-            .insert_baseline_snapshot(prefix, ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(prefix, L2TxCount::ZERO)
             .unwrap();
         let batch = head.batch_index;
         let error = storage
-            .close_frame_and_batch_with_snapshot(&mut head, 10, prefix, ExecutedInputCount::ZERO)
+            .close_frame_and_batch_with_snapshot(&mut head, 10, prefix, L2TxCount::ZERO)
             .expect_err("colliding artifact name must roll back the whole close");
         assert!(error.to_string().contains("UNIQUE"));
         assert_eq!(head.batch_index, batch);
@@ -757,8 +756,8 @@ mod tests {
             assert_eq!(persisted, 0, "{table} must roll back atomically");
         }
         assert_eq!(
-            storage.next_executed_input_count().expect("next count"),
-            ExecutedInputCount::ZERO
+            storage.next_l2_tx_count().expect("next count"),
+            L2TxCount::ZERO
         );
     }
 
@@ -788,7 +787,7 @@ mod tests {
 
         let incomplete = [DirectInputExecution {
             safe_input_index: 0,
-            executed_input_offset: ExecutedInputCount::ZERO,
+            l2_tx_index: L2TxCount::ZERO,
         }];
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = storage.close_frame_only_with_executions(
@@ -810,11 +809,11 @@ mod tests {
         let complete = [
             DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::ZERO,
+                l2_tx_index: L2TxCount::ZERO,
             },
             DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: ExecutedInputCount::new(1),
+                l2_tx_index: L2TxCount::new(1),
             },
         ];
         storage
@@ -826,10 +825,7 @@ mod tests {
                 &complete,
             )
             .expect("commit complete direct attribution");
-        assert_eq!(
-            storage.next_executed_input_count().unwrap(),
-            ExecutedInputCount::new(2)
-        );
+        assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
     }
 
     #[test]
@@ -850,10 +846,8 @@ mod tests {
             .append_executed_user_ops_chunk(&mut head, &[included_user_op(1, 1)])
             .expect("append doomed input");
         assert_eq!(
-            storage
-                .next_executed_input_count()
-                .expect("pre-recovery count"),
-            ExecutedInputCount::new(2)
+            storage.next_l2_tx_count().expect("pre-recovery count"),
+            L2TxCount::new(2)
         );
 
         storage
@@ -866,8 +860,8 @@ mod tests {
             vec![1]
         );
         assert_eq!(
-            storage.next_executed_input_count().expect("rewound count"),
-            ExecutedInputCount::new(1)
+            storage.next_l2_tx_count().expect("rewound count"),
+            L2TxCount::new(1)
         );
 
         let mut replacement = storage.open_state().unwrap().unwrap();
@@ -1129,7 +1123,7 @@ mod tests {
         let root = storage.open_state().unwrap().unwrap();
         assert_eq!(root.safe_block, 12);
         assert_eq!(drained_directs(&mut storage), vec![1, 4, 5]);
-        assert_eq!(storage.next_executed_input_count().unwrap().get(), 4);
+        assert_eq!(storage.next_l2_tx_count().unwrap().get(), 4);
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
 
         storage.advance_safe_head(40);
@@ -1285,8 +1279,8 @@ mod tests {
             2,
             "leading directs are in the replay stream for catch-up"
         );
-        assert_eq!(replay[0].offset, ExecutedInputCount::ZERO);
-        assert_eq!(replay[1].offset, ExecutedInputCount::new(1));
+        assert_eq!(replay[0].offset, L2TxCount::ZERO);
+        assert_eq!(replay[1].offset, L2TxCount::new(1));
     }
 
     #[test]
@@ -1386,10 +1380,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
-        assert_eq!(
-            storage.next_executed_input_count().unwrap(),
-            ExecutedInputCount::ZERO
-        );
+        assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::ZERO);
         assert!(crate::storage::test_helpers::all_ordered_l2_txs(&mut storage).is_empty());
         storage.close_frame_and_batch(&mut head, 10).unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
@@ -1447,7 +1438,7 @@ mod tests {
             .unwrap();
         storage.ensure_open_tip().unwrap();
         let mut head = storage.open_state().unwrap().unwrap();
-        let offset = storage.next_executed_input_count().unwrap().get();
+        let offset = storage.next_l2_tx_count().unwrap().get();
         storage
             .append_executed_user_ops_chunk(&mut head, &[included_user_op_from(alice, 2, offset)])
             .unwrap();
@@ -1559,15 +1550,15 @@ mod tests {
         let with_over_cap = [
             DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::ZERO,
+                l2_tx_index: L2TxCount::ZERO,
             },
             DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: ExecutedInputCount::new(1),
+                l2_tx_index: L2TxCount::new(1),
             },
             DirectInputExecution {
                 safe_input_index: 3,
-                executed_input_offset: ExecutedInputCount::new(2),
+                l2_tx_index: L2TxCount::new(2),
             },
         ];
         let panic = catch_unwind(AssertUnwindSafe(|| {
@@ -1586,11 +1577,11 @@ mod tests {
         let executions = [
             DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::ZERO,
+                l2_tx_index: L2TxCount::ZERO,
             },
             DirectInputExecution {
                 safe_input_index: 3,
-                executed_input_offset: ExecutedInputCount::new(1),
+                l2_tx_index: L2TxCount::new(1),
             },
         ];
         storage
@@ -1608,10 +1599,7 @@ mod tests {
             4,
             "the whole range drains, the over-cap direct included"
         );
-        assert_eq!(
-            storage.next_executed_input_count().unwrap(),
-            ExecutedInputCount::new(2)
-        );
+        assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
         let rows: Vec<(i64, i64)> = storage
             .conn
             .prepare("SELECT offset, safe_input_index FROM application_inputs ORDER BY offset")
@@ -1651,9 +1639,6 @@ mod tests {
             })
             .collect();
         assert_eq!(indexes, vec![0, 3]);
-        assert_eq!(
-            storage.next_executed_input_count().unwrap(),
-            ExecutedInputCount::new(2)
-        );
+        assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
     }
 }
