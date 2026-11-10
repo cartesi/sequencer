@@ -265,33 +265,10 @@ impl Storage {
         query_deployment_identity(&self.conn)
     }
 
-    /// Whether this DB already contains deployment-bound state. Used to avoid
-    /// silently pinning an old, non-empty DB that predates `deployment_identity`
-    /// to whatever config happens to start it next.
-    pub fn has_persisted_deployment_state(&self) -> Result<bool> {
-        let present: i64 = self.conn.query_row(
-            "SELECT \
-                EXISTS(SELECT 1 FROM batches) OR \
-                EXISTS(SELECT 1 FROM safe_inputs) OR \
-                EXISTS(SELECT 1 FROM l1_safe_head)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(present != 0)
-    }
-
-    /// Insert `identity` on first startup, or return the already-persisted
-    /// identity on later startups. The caller compares the returned value with
-    /// its configured/discovered identity and refuses on mismatch.
-    pub fn load_or_insert_deployment_identity(
-        &mut self,
-        identity: DeploymentIdentity,
-    ) -> Result<DeploymentIdentity> {
+    /// Pin the deployment identity. Setup calls it once, on the database it
+    /// just created; the row's key refuses a second identity.
+    pub fn pin_deployment_identity(&mut self, identity: DeploymentIdentity) -> Result<()> {
         self.write(|tx| {
-            if let Some(existing) = query_deployment_identity(tx)? {
-                return Ok(existing);
-            }
-
             let (mode, fixed, weth, fee_token, pool, window): FeeOracleIdentitySql =
                 match identity.fee_oracle {
                     FeeOracleIdentity::Fixed { log_gas_price } => (
@@ -343,7 +320,7 @@ impl Storage {
             if changed != 1 {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
-            Ok(identity)
+            Ok(())
         })
     }
 
@@ -804,7 +781,7 @@ mod tests {
         );
 
         let identity_err = storage
-            .load_or_insert_deployment_identity(DeploymentIdentity {
+            .pin_deployment_identity(DeploymentIdentity {
                 chain_id: u64::MAX,
                 ..identity()
             })
@@ -814,7 +791,7 @@ mod tests {
             rusqlite::Error::ToSqlConversionFailure(_)
         ));
         let deployment_block_err = storage
-            .load_or_insert_deployment_identity(DeploymentIdentity {
+            .pin_deployment_identity(DeploymentIdentity {
                 app_deployment_block: u64::MAX,
                 ..identity()
             })
@@ -836,12 +813,9 @@ mod tests {
             storage.deployment_identity().expect("read empty identity"),
             None
         );
-        assert_eq!(
-            storage
-                .load_or_insert_deployment_identity(first)
-                .expect("insert identity"),
-            first
-        );
+        storage
+            .pin_deployment_identity(first)
+            .expect("insert identity");
         assert_eq!(
             storage
                 .deployment_identity()
@@ -853,12 +827,12 @@ mod tests {
             batch_submitter_address: SENDER_B,
             ..first
         };
-        assert_eq!(
-            storage
-                .load_or_insert_deployment_identity(changed)
-                .expect("load existing identity"),
-            first,
-            "identity must be pinned after the first insert"
+        let second = storage
+            .pin_deployment_identity(changed)
+            .expect_err("a second identity must be refused");
+        assert!(
+            crate::storage::is_persistent_storage_error(&second),
+            "a second identity is a constraint violation, got {second:?}"
         );
         assert_eq!(
             storage

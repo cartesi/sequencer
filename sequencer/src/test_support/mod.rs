@@ -42,7 +42,7 @@ pub(crate) fn pin_test_deployment_identity(
     batch_submitter_address: Address,
 ) {
     storage
-        .load_or_insert_deployment_identity(DeploymentIdentity {
+        .pin_deployment_identity(DeploymentIdentity {
             chain_id: 1,
             app_address: Address::repeat_byte(0x11),
             input_box_address: Address::repeat_byte(0x22),

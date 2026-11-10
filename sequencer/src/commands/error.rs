@@ -281,7 +281,7 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::SignerMisconfig { .. }
         | BootstrapError::SetupNotComplete { .. }
         | BootstrapError::Setup(_)
-        | BootstrapError::Identity(IdentityError::Mismatch { .. } | IdentityError::OrphanedState) => {
+        | BootstrapError::Identity(IdentityError::Mismatch { .. }) => {
             CommandFailureVerdict::Terminal
         }
 
@@ -540,11 +540,6 @@ pub enum IdentityError {
         app_deployment_block: u64,
         safe_block: u64,
     },
-    /// The DB has persisted state but no pinned identity. Binding the current
-    /// config now would silently inherit an unknown deployment's data.
-    /// Operator: confirm provenance or wipe the DB.
-    #[error("orphaned state: DB has persisted state but no deployment identity to claim it")]
-    OrphanedState,
     /// The pinned identity doesn't match the current config.
     ///
     /// `stored` and `expected` are boxed to keep `CommandError` under clippy's
@@ -1163,10 +1158,6 @@ mod tests {
                     margin_blocks: 100,
                 }),
                 "a batch-open window past the danger budget",
-            ),
-            (
-                CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState)),
-                "orphaned state",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {

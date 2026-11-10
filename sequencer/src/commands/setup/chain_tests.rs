@@ -479,18 +479,16 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
         .unwrap();
         let mut storage =
             Storage::initialize_for_command(&scratch.path, LifecycleCommand::Setup).unwrap();
-        crate::commands::ensure_deployment_identity(
-            &scratch.path,
-            DeploymentIdentity {
+        storage
+            .pin_deployment_identity(DeploymentIdentity {
                 chain_id: CHAIN_ID,
                 app_address: chain.app,
                 input_box_address: chain.input_box,
                 app_deployment_block: chain.app_deployment_block,
                 batch_submitter_address: chain.submitter,
                 fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
         reader.sync_to_current_safe_head().await.unwrap();
         chain.reference(&mut storage, 5).0
@@ -733,18 +731,16 @@ async fn the_escape_check_refuses_activity_past_the_stop_block() {
     .unwrap();
     let mut storage =
         Storage::initialize_for_command(&scratch.path, LifecycleCommand::Setup).unwrap();
-    crate::commands::ensure_deployment_identity(
-        &scratch.path,
-        DeploymentIdentity {
+    storage
+        .pin_deployment_identity(DeploymentIdentity {
             chain_id: CHAIN_ID,
             app_address: chain.app,
             input_box_address: chain.input_box,
             app_deployment_block: chain.app_deployment_block,
             batch_submitter_address: chain.submitter,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
     reader.sync_to_current_safe_head().await.unwrap();
     let safe_block = storage.current_safe_block().unwrap().unwrap();

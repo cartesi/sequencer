@@ -231,21 +231,6 @@ pub(crate) async fn validate_rpc_chain_id(
     }
 }
 
-pub(crate) fn ensure_deployment_identity(
-    db_path: &str,
-    expected: DeploymentIdentity,
-) -> Result<(), CommandError> {
-    let mut storage = storage::Storage::open(db_path)?;
-    if let Some(stored) = storage.deployment_identity()? {
-        return require_deployment_identity_match(stored, expected);
-    }
-    if storage.has_persisted_deployment_state()? {
-        return Err(IdentityError::OrphanedState.into());
-    }
-    let stored = storage.load_or_insert_deployment_identity(expected)?;
-    require_deployment_identity_match(stored, expected)
-}
-
 fn require_deployment_identity_match(
     stored: DeploymentIdentity,
     expected: DeploymentIdentity,
@@ -312,11 +297,10 @@ fn deployment_identity_mismatch_fields(
 mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
-        deployment_identity_mismatch_fields, ensure_deployment_identity,
-        preflight_lifecycle_command, require_data_dir, require_deployment_identity_match,
+        deployment_identity_mismatch_fields, preflight_lifecycle_command, require_data_dir,
+        require_deployment_identity_match,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
     use crate::test_support::temp_db;
     use alloy_primitives::Address;
@@ -447,24 +431,6 @@ mod tests {
             err,
             CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
                 if fields == "chain_id, app_address, batch_submitter_address"
-        ));
-    }
-
-    #[test]
-    fn deployment_identity_refuses_non_empty_unpinned_db() {
-        let db = temp_db("runtime-unpinned-deployment-state");
-        {
-            let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-            storage
-                .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
-                .expect("seed deployment-bound state");
-        }
-
-        let err = ensure_deployment_identity(db.path.as_str(), identity())
-            .expect_err("non-empty unpinned DB must refuse");
-        assert!(matches!(
-            err,
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState))
         ));
     }
 

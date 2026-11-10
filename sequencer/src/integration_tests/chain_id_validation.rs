@@ -72,7 +72,7 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
     let mut storage = Storage::initialize_for_command(db_path, LifecycleCommand::Setup)
         .expect("initialize setup lifecycle");
     storage
-        .load_or_insert_deployment_identity(DeploymentIdentity {
+        .pin_deployment_identity(DeploymentIdentity {
             chain_id,
             app_address: TEST_APP_ADDR,
             input_box_address: TEST_INPUT_BOX,

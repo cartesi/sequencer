@@ -44,7 +44,10 @@ fn register_accepted(
 ) -> i64 {
     let mut storage = Storage::open(db_path).unwrap();
     let sender = alloy_primitives::Address::repeat_byte(0x7f);
-    crate::test_support::pin_test_deployment_identity(&mut storage, sender);
+    // A test registers several accepted batches on one database.
+    if storage.deployment_identity().unwrap().is_none() {
+        crate::test_support::pin_test_deployment_identity(&mut storage, sender);
+    }
     let mut head = storage.open_state().unwrap().unwrap_or_else(|| {
         storage
             .initialize_open_state(inclusion_block, crate::storage::SafeInputRange::empty_at(0))

@@ -22,7 +22,7 @@ mod chain_tests;
 pub(crate) mod fill;
 pub(crate) mod rebuild;
 
-use super::{ensure_deployment_identity, validate_rpc_chain_id};
+use super::validate_rpc_chain_id;
 use crate::commands::config::{FeeOracleMode, SetupConfig};
 use crate::commands::error::{
     BootstrapError, CommandError, IdentityError, SetupError, SetupRefuse,
@@ -148,7 +148,7 @@ where
 
     // ── Writes begin: from here a failure leaves a directory to discard.
     let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)?;
-    ensure_deployment_identity(&db_path, identity)?;
+    storage.pin_deployment_identity(identity)?;
     match fee_oracle {
         PreparedFeeOracle::Fixed { log_gas_price } => storage.set_log_gas_price(log_gas_price)?,
         PreparedFeeOracle::Uniswap {
@@ -368,7 +368,7 @@ where
     .await?;
 
     let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)?;
-    ensure_deployment_identity(&db_path, identity)?;
+    storage.pin_deployment_identity(identity)?;
     input_reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
     input_reader
         .sync_to_current_safe_head()
