@@ -242,7 +242,7 @@ impl Iterator for InputPages<'_> {
 mod tests {
     use super::*;
     use crate::storage::test_helpers::default_protocol_timing;
-    use crate::storage::{FrontierMode, IngestedSafeInput, LifecycleCommand};
+    use crate::storage::{IngestedSafeInput, LifecycleCommand};
     use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
     use alloy_primitives::B256;
     use app_core::application::{WalletApp, WalletConfig};
@@ -344,9 +344,7 @@ mod tests {
                 safe_block,
                 1_700_000_000 + safe_block,
                 inputs,
-                SUBMITTER,
                 &default_protocol_timing(),
-                FrontierMode::DeferUntilAnchorSet,
             )
             .unwrap();
         (db, storage)
@@ -1055,9 +1053,7 @@ mod tests {
                 30,
                 now_ms / 1000,
                 &inputs,
-                SUBMITTER,
                 &default_protocol_timing(),
-                FrontierMode::DeferUntilAnchorSet,
             )
             .unwrap();
         let data_dir = tempfile::tempdir().unwrap();

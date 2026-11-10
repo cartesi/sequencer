@@ -67,24 +67,6 @@ pub(crate) struct IngestedSafeInput {
     pub transaction_hash: alloy_primitives::B256,
 }
 
-/// Whether a sync also maintains the scheduler-accepted gold frontier
-/// (`safe_accepted_batches`).
-///
-/// Every normal sync uses [`FrontierMode::Populate`]. Setup's syncs, genesis
-/// included, use [`FrontierMode::DeferUntilAnchorSet`]: before the era exists
-/// there is no anchor or stop block, and populating the frontier against the
-/// empty tree would mark the old instance's batches `Foreign` and falsely
-/// freeze it. `run`'s first sync populates it once the era is published. See
-/// the anchor-aware-frontier note on I15.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrontierMode {
-    /// Maintain `safe_accepted_batches` as part of the sync (the default).
-    Populate,
-    /// Skip frontier maintenance: setup's syncs run before the era, its stop
-    /// block and anchor, exists; `run`'s first sync populates it.
-    DeferUntilAnchorSet,
-}
-
 /// Half-open range `[start, end)` over `safe_input_index` values. Used to
 /// describe which safe inputs a frame drained.
 ///

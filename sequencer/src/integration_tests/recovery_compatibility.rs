@@ -33,8 +33,7 @@ use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, dump_info};
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
 use crate::storage::{
-    DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
-    Storage, WriteHead,
+    DirectInputExecution, IngestedSafeInput, LifecycleCommand, SafeInputRange, Storage, WriteHead,
 };
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 
@@ -352,9 +351,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
             10,
             crate::clock::unix_now_ms() / 1000,
             &directs,
-            SUBMITTER,
             &default_protocol_timing(),
-            FrontierMode::Populate,
         )
         .unwrap();
     let mut executions = Vec::new();

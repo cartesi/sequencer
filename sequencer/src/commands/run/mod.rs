@@ -113,7 +113,6 @@ where
         l1_config.identity.input_box_address,
         l1_config.identity.app_deployment_block,
         db_path.clone(),
-        l1_config.identity.batch_submitter_address,
         timing,
         // Bootstrap syncs use nested blocking SQLite jobs. The reader takes
         // its retained lock clone at construction—not only after worker

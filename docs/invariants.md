@@ -346,10 +346,13 @@ by writer and are write-once (`0001_schema.sql`).
   the era's stop block `C`, seeded with anchor nonce `N'`; the prefix through
   `C` is opaque
   ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
-  Later scans resume after the last acceptance. Every setup sync, genesis
-  included, runs with `FrontierMode::DeferUntilAnchorSet`: before the era
-  exists the old instance's batches would read as `Foreign` and falsely
-  freeze the frontier. `run`'s first sync populates it.
+  Later scans resume after the last acceptance. Storage maintains the
+  accepted frontier exactly when the era record exists, reading the batch
+  submitter from the pinned deployment identity: before the era (every setup
+  sync, genesis included) there is no stop block or anchor, and the old
+  instance's batches would read as `Foreign` and falsely freeze the frontier.
+  The first append after `publish_era`, `run`'s first sync, judges every
+  submitter input past `C`, whichever sync ingested it.
 
 ### I16. The batch tree has exactly one valid parentless root, carrying the deployment's anchor nonce
 

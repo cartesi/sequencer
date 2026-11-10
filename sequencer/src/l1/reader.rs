@@ -21,7 +21,7 @@ use crate::l1::partition::{
 use crate::l1::provider::error_chain;
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
 use crate::runtime::shutdown::ShutdownSignal;
-use crate::storage::{FrontierMode, IngestedSafeInput, Storage, StorageOpenError};
+use crate::storage::{IngestedSafeInput, Storage, StorageOpenError};
 use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Clone)]
@@ -163,17 +163,10 @@ pub struct InputReader {
     /// 0 and the InputBox count at the scanned safe head.
     app_deployment_block: u64,
     db_path: String,
-    /// Scheduler-acceptance identity — passed into
-    /// `Storage::append_ingested_safe_inputs_with_timestamp` so the persisted
-    /// scheduler-accepted frontier filters by the right sender.
-    batch_submitter: Address,
     /// Protocol timing used to keep `safe_accepted_batches` consistent with
-    /// every safe-input write.
+    /// every safe-input write; storage reads the batch submitter from the
+    /// pinned deployment identity.
     timing: ProtocolTiming,
-    /// Whether each sync also populates the scheduler-accepted frontier
-    /// ([`FrontierMode::Populate`] normally; setup's syncs defer it, see
-    /// [`Self::set_frontier_mode`]).
-    frontier_mode: FrontierMode,
     /// Set once the provider's chain id has been verified against
     /// [`InputReaderConfig::expected_chain_id`] on a successful RPC contact.
     /// Until then every `advance_once` re-attempts the check, so an unreachable
@@ -189,7 +182,6 @@ impl InputReader {
     pub(crate) async fn new(
         db_path: impl Into<String>,
         config: InputReaderConfig,
-        batch_submitter: Address,
         timing: ProtocolTiming,
         process_lock: ProcessLock,
     ) -> Result<Self, InputReaderError> {
@@ -231,7 +223,6 @@ impl InputReader {
             input_box_address,
             app_deployment_block,
             db_path.into(),
-            batch_submitter,
             timing,
             process_lock,
         ))
@@ -242,7 +233,6 @@ impl InputReader {
         input_box_address: Address,
         app_deployment_block: u64,
         db_path: String,
-        batch_submitter: Address,
         timing: ProtocolTiming,
         process_lock: ProcessLock,
     ) -> Self {
@@ -251,22 +241,10 @@ impl InputReader {
             input_box_address,
             app_deployment_block,
             db_path,
-            batch_submitter,
             timing,
-            frontier_mode: FrontierMode::Populate,
             chain_id_verified: false,
             process_lock,
         }
-    }
-
-    /// Set whether subsequent syncs populate the scheduler-accepted frontier.
-    /// Every setup sets [`FrontierMode::DeferUntilAnchorSet`]: until setup
-    /// publishes the era there is no stop block or anchor to judge batches by,
-    /// so a populating sync would see every L1 batch as foreign and freeze the
-    /// frontier. `run`'s startup sync populates it, scanning past the stop
-    /// block from the anchor, before the root opens.
-    pub fn set_frontier_mode(&mut self, mode: FrontierMode) {
-        self.frontier_mode = mode;
     }
 
     pub fn input_box_address(&self) -> Address {
@@ -610,9 +588,7 @@ impl InputReader {
         batch: Vec<IngestedSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
-        let batch_submitter = self.batch_submitter;
         let timing = self.timing;
-        let frontier_mode = self.frontier_mode;
         let process_lock = self.process_lock.clone();
         spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open(&db_path)?;
@@ -621,9 +597,7 @@ impl InputReader {
                     current_safe_head.block_number,
                     current_safe_head.block_timestamp,
                     &batch,
-                    batch_submitter,
                     &timing,
-                    frontier_mode,
                 )
                 .map_err(InputReaderError::from)
         })
@@ -941,12 +915,24 @@ mod tests {
         crate::storage::test_helpers::default_protocol_timing()
     }
 
+    /// A reader over `db_path` with a deployment identity pinned (submitter
+    /// `Address::ZERO`) unless a seeding append already pinned it, as setup
+    /// pins it before any sync.
     fn test_reader(
         db_path: String,
         rpc_url: String,
         app_deployment_block: u64,
         poll_interval: Duration,
     ) -> InputReader {
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        if storage
+            .deployment_identity()
+            .expect("read identity")
+            .is_none()
+        {
+            crate::test_support::pin_test_deployment_identity(&mut storage, Address::ZERO);
+        }
+        drop(storage);
         InputReader::from_parts(
             InputReaderConfig {
                 rpc_url,
@@ -960,7 +946,6 @@ mod tests {
             Address::ZERO,
             app_deployment_block,
             db_path,
-            Address::ZERO,
             test_timing(),
             ProcessLock::test(),
         )
@@ -1083,7 +1068,6 @@ mod tests {
             Address::ZERO,
             0,
             db_file.path().to_string_lossy().into_owned(),
-            Address::ZERO,
             test_timing(),
             ProcessLock::test(),
         );
@@ -1171,7 +1155,6 @@ mod tests {
                 poll_interval: Duration::from_secs(1),
                 expected_chain_id: 31337,
             },
-            Address::ZERO,
             test_timing(),
             ProcessLock::test(),
         )

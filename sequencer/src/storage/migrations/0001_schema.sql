@@ -294,7 +294,9 @@ CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
 -- prefix: batches whose nonce matched the expected sequence and were not stale.
 -- Maintained atomically by Storage::append_ingested_safe_inputs_with_timestamp
 -- (via populate_safe_accepted_batches), which simulates the scheduler's
--- acceptance logic over new safe_inputs rows.
+-- acceptance logic over new safe_inputs rows from the pinned batch submitter.
+-- Empty until the era exists: setup's syncs leave it unwritten, and the first
+-- append after the era judges every submitter input past the stop block.
 CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
     -- CHECK aligns this column with its siblings (batches.nonce, anchor nonce);

@@ -71,7 +71,7 @@ mod tests {
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
     use crate::storage::test_helpers::{TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing};
-    use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
+    use crate::storage::{LifecycleCommand, StoredSafeInput};
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use crate::test_support::{shutdown_lane, wait_until};
     use alloy_primitives::{Address, U256};
@@ -184,7 +184,6 @@ mod tests {
                 ],
                 SUBMITTER,
                 &default_protocol_timing(),
-                FrontierMode::DeferUntilAnchorSet,
             )
             .unwrap();
         (db, storage)

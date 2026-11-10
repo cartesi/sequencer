@@ -16,8 +16,7 @@ use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, EraRecord, FrontierMode, IngestedSafeInput, LifecycleCommand,
-    SafeInputRange,
+    DirectInputExecution, EraRecord, IngestedSafeInput, LifecycleCommand, SafeInputRange,
 };
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::l2_tx::L2Tx;
@@ -102,9 +101,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
                     transaction_hash: B256::repeat_byte(0x43),
                 },
             ],
-            SENDER_A,
             &default_protocol_timing(),
-            FrontierMode::Populate,
         )
         .unwrap();
     storage
@@ -278,9 +275,7 @@ fn seed_two_table_era(storage: &mut Storage) {
             10,
             1_010,
             &[input(5, 0xa0), input(6, 0xa1), input(10, 0xa2)],
-            SENDER_A,
             &default_protocol_timing(),
-            FrontierMode::DeferUntilAnchorSet,
         )
         .unwrap();
     storage

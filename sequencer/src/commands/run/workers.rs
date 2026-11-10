@@ -867,7 +867,6 @@ mod tests {
             identity.input_box_address,
             identity.app_deployment_block,
             db_path.clone(),
-            identity.batch_submitter_address,
             timing,
             ProcessLock::test(),
         );

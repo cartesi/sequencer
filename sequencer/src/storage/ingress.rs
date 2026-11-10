@@ -526,8 +526,8 @@ fn insert_executed_user_ops_batch(
 mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
-        DirectInputExecution, FrontierMode, IngestedSafeInput, L2TxCount, LifecycleCommand,
-        SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
+        DirectInputExecution, IngestedSafeInput, L2TxCount, LifecycleCommand, SafeFrontierState,
+        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
         test_helpers::{
             SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
             record_canonical_divergence,
@@ -1095,7 +1095,6 @@ mod tests {
                 ],
                 SENDER_A,
                 &default_protocol_timing(),
-                FrontierMode::DeferUntilAnchorSet,
             )
             .unwrap();
         storage
@@ -1504,9 +1503,7 @@ mod tests {
                     row(SENDER_A, vec![0xff], 3),
                     row(Address::repeat_byte(0x44), vec![0xcc], 4),
                 ],
-                SENDER_A,
                 &default_protocol_timing(),
-                FrontierMode::Populate,
             )
             .expect("persist direct inputs");
     }

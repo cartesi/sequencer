@@ -17,7 +17,7 @@ use super::queries::{
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput};
+use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput};
 use sequencer_core::protocol::ProtocolTiming;
 
 /// What a base's export is checked against: the admitted directs above its
@@ -194,13 +194,16 @@ impl Storage {
     /// `safe_accepted_batches` via `timing` so the scheduler-accepted
     /// frontier view stays consistent with the safe head.
     ///
-    /// The materialized `safe_accepted_batches` view is an invariant of this
-    /// operation while no divergence exists: every safe input up to
-    /// `safe_block` has been evaluated against the scheduler's acceptance
-    /// rules. A foreign/mismatched accepted landing instead commits the
-    /// `canonical_divergence` fact with this head and freezes the projection;
-    /// later head advances remain paired with that terminal fact. Readers
-    /// (submitter, recovery, danger checks) never populate separately.
+    /// Once the era exists, the materialized `safe_accepted_batches` view is
+    /// an invariant of this operation while no divergence exists: every safe
+    /// input up to `safe_block` has been evaluated against the scheduler's
+    /// acceptance rules for the pinned batch submitter. Before the era
+    /// (setup's syncs) the view stays empty; the first append after it judges
+    /// every input past the stop block. A foreign/mismatched accepted landing
+    /// instead commits the `canonical_divergence` fact with this head and
+    /// freezes the projection; later head advances remain paired with that
+    /// terminal fact. Readers (submitter, recovery, danger checks) never
+    /// populate separately.
     ///
     /// Asserts `safe_block` is monotonic and that it strictly advances when
     /// `inputs` is non-empty.
@@ -209,9 +212,7 @@ impl Storage {
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[IngestedSafeInput],
-        batch_submitter: Address,
         timing: &ProtocolTiming,
-        frontier: FrontierMode,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -246,10 +247,7 @@ impl Storage {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
 
-            if matches!(frontier, FrontierMode::Populate) {
-                populate_safe_accepted_batches(tx, batch_submitter, timing)?;
-            }
-            Ok(())
+            populate_safe_accepted_batches(tx, timing)
         })
     }
 
@@ -410,8 +408,7 @@ fn insert_safe_inputs_batch(
 mod tests {
     use super::AdmittedDirects;
     use crate::storage::{
-        DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, Storage,
-        StoredSafeInput,
+        DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, Storage, StoredSafeInput,
         test_helpers::{
             SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
         },
@@ -705,29 +702,37 @@ mod tests {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         let protocol = default_protocol_timing();
 
+        let identity_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                chain_id: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured chain ID must be refused");
+        assert!(matches!(
+            identity_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let deployment_block_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                app_deployment_block: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured application deployment block must be refused");
+        assert!(matches!(
+            deployment_block_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        assert_eq!(storage.deployment_identity().expect("read identity"), None);
+
         let safe_head_err = storage
-            .append_safe_inputs_with_timestamp(
-                u64::MAX,
-                1,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(u64::MAX, 1, &[], SENDER_A, &protocol)
             .expect_err("unrepresentable provider safe block must be refused");
         assert!(matches!(
             safe_head_err,
             rusqlite::Error::ToSqlConversionFailure(_)
         ));
         let safe_timestamp_err = storage
-            .append_safe_inputs_with_timestamp(
-                10,
-                u64::MAX,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(10, u64::MAX, &[], SENDER_A, &protocol)
             .expect_err("unrepresentable provider safe timestamp must be refused");
         assert!(matches!(
             safe_timestamp_err,
@@ -761,9 +766,7 @@ mod tests {
                     block_timestamp: u64::MAX,
                     transaction_hash: B256::ZERO,
                 }],
-                SENDER_A,
                 &protocol,
-                FrontierMode::Populate,
             )
             .expect_err("unrepresentable provider input timestamp must be refused");
         assert!(matches!(
@@ -779,28 +782,6 @@ mod tests {
             storage.safe_input_end_exclusive().expect("read input head"),
             0
         );
-
-        let identity_err = storage
-            .pin_deployment_identity(DeploymentIdentity {
-                chain_id: u64::MAX,
-                ..identity()
-            })
-            .expect_err("unrepresentable configured chain ID must be refused");
-        assert!(matches!(
-            identity_err,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
-        let deployment_block_err = storage
-            .pin_deployment_identity(DeploymentIdentity {
-                app_deployment_block: u64::MAX,
-                ..identity()
-            })
-            .expect_err("unrepresentable configured application deployment block must be refused");
-        assert!(matches!(
-            deployment_block_err,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
-        assert_eq!(storage.deployment_identity().expect("read identity"), None);
     }
 
     #[test]
@@ -849,14 +830,7 @@ mod tests {
         let protocol = default_protocol_timing();
 
         storage
-            .append_safe_inputs_with_timestamp(
-                7,
-                1234,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A, &protocol)
             .expect("record first real safe-head observation");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -876,14 +850,7 @@ mod tests {
         );
 
         storage
-            .append_safe_inputs_with_timestamp(
-                9,
-                5678,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A, &protocol)
             .expect("advance safe head");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),

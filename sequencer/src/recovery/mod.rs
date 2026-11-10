@@ -666,14 +666,7 @@ mod tests {
                 .expect("initialize setup");
         crate::test_support::pin_test_deployment_identity(&mut storage, SENDER_A);
         storage
-            .append_safe_inputs_with_timestamp(
-                0,
-                now_ms / 1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(0, now_ms / 1_000, &[], SENDER_A, &protocol)
             .expect("seed fresh safe head");
         let prefix = db._dir.path().join("finalized");
         storage
@@ -739,7 +732,6 @@ mod tests {
                         &inputs,
                         crate::storage::test_helpers::SENDER_A,
                         self.protocol,
-                        storage::FrontierMode::Populate,
                     )
                     .map_err(InputReaderError::Storage),
             }
@@ -765,7 +757,6 @@ mod tests {
                 &[],
                 crate::storage::test_helpers::SENDER_A,
                 &protocol,
-                storage::FrontierMode::Populate,
             )
             .expect("advance into observed danger");
         (db, protocol)
@@ -869,7 +860,6 @@ mod tests {
                 &[direct(cap + 1), direct(cap)],
                 SENDER_A,
                 &protocol,
-                storage::FrontierMode::Populate,
             )
             .unwrap();
         let mut l1 = TestL1::new(&db.path, &protocol, vec![SyncStep::Keep]);
@@ -917,7 +907,6 @@ mod tests {
                 &[],
                 SENDER_A,
                 &protocol,
-                storage::FrontierMode::Populate,
             )
             .unwrap();
         let landed = storage::StoredSafeInput {

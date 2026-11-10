@@ -489,7 +489,6 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
                 fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
             })
             .unwrap();
-        reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
         reader.sync_to_current_safe_head().await.unwrap();
         chain.reference(&mut storage, 5).0
     };
@@ -535,7 +534,6 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
             poll_interval: std::time::Duration::from_secs(1),
             expected_chain_id: CHAIN_ID,
         },
-        chain.submitter,
         timing,
         lock,
     )
@@ -741,7 +739,6 @@ async fn the_escape_check_refuses_activity_past_the_stop_block() {
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .unwrap();
-    reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
     reader.sync_to_current_safe_head().await.unwrap();
     let safe_block = storage.current_safe_block().unwrap().unwrap();
     let settled = read_submitter_wallet_nonces(&chain.url, chain.submitter, safe_block, false)

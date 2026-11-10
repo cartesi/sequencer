@@ -55,14 +55,7 @@ mod guarded_phases {
         let protocol = default_protocol_timing();
         let now_ms = crate::clock::unix_now_ms();
         storage
-            .append_safe_inputs_with_timestamp(
-                0,
-                now_ms / 1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(0, now_ms / 1_000, &[], SENDER_A, &protocol)
             .expect("seed fresh safe head");
         if with_recovery_checkpoint {
             let prefix = db._dir.path().join("finalized");
@@ -204,14 +197,7 @@ mod guarded_phases {
             .close_batch_at(&mut head, 10)
             .expect("close cascade candidate");
         storage
-            .append_safe_inputs_with_timestamp(
-                1_200,
-                1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1_200, 1_000, &[], SENDER_A, &protocol)
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
@@ -296,14 +282,7 @@ mod guarded_phases {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize Tip");
         storage
-            .append_safe_inputs_with_timestamp(
-                1_200,
-                1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1_200, 1_000, &[], SENDER_A, &protocol)
             .expect("advance safe head");
         let prefix = db._dir.path().join("finalized");
         storage
@@ -331,14 +310,7 @@ mod guarded_phases {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize Tip");
         storage
-            .append_safe_inputs_with_timestamp(
-                1_200,
-                1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1_200, 1_000, &[], SENDER_A, &protocol)
             .expect("advance safe head");
 
         let error = storage
@@ -1953,14 +1925,7 @@ mod recovery_snapshot_selection {
         let protocol = default_protocol_timing();
         let now = crate::clock::unix_now_ms();
         storage
-            .append_safe_inputs_with_timestamp(
-                1500,
-                now / 1000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1500, now / 1000, &[], SENDER_A, &protocol)
             .expect("fresh observation");
         assert!(
             storage
@@ -2200,14 +2165,7 @@ mod check_danger {
         let protocol = default_protocol_timing();
         let old_safe_timestamp = 1_000_u64;
         storage
-            .append_safe_inputs_with_timestamp(
-                1200,
-                old_safe_timestamp,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1200, old_safe_timestamp, &[], SENDER_A, &protocol)
             .expect("advance safe head with stale L1 timestamp");
 
         let now_ms =
@@ -2232,14 +2190,7 @@ mod check_danger {
         // A full block-time (12 s) ahead of the local clock: unusable. Sub-block
         // ahead-ness is NTP-scale skew and tolerated (see the companion assert).
         storage
-            .append_safe_inputs_with_timestamp(
-                10,
-                1_012,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(10, 1_012, &[], SENDER_A, &protocol)
             .expect("record future L1 timestamp");
         storage
             .conn
@@ -2280,14 +2231,7 @@ mod check_danger {
         let now_ms = 1_000_000_u64;
 
         storage
-            .append_safe_inputs_with_timestamp(
-                10,
-                1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(10, 1_000, &[], SENDER_A, &protocol)
             .expect("record safe head");
         // One full block-time (12 s) of regression: the wall-clock
         // extrapolation is genuinely invalid — refuse. A sub-block step is
@@ -2337,14 +2281,7 @@ mod check_danger {
         let now_ms = 1_000_000_u64;
 
         storage
-            .append_safe_inputs_with_timestamp(
-                1200,
-                1_000,
-                &[],
-                SENDER_A,
-                &protocol,
-                crate::storage::FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(1200, 1_000, &[], SENDER_A, &protocol)
             .expect("advance observed safe block past danger");
         // Even a full-block clock regression (a real fault, not noise) must
         // not suppress the observed arm: batch age here is pure block

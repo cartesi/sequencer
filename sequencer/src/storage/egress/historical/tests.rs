@@ -12,8 +12,7 @@ use crate::storage::test_helpers::{
     local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, EraRecord, FrontierMode, IngestedSafeInput, LifecycleCommand,
-    SafeInputRange,
+    DirectInputExecution, EraRecord, IngestedSafeInput, LifecycleCommand, SafeInputRange,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
@@ -50,9 +49,7 @@ fn append(storage: &mut Storage, safe_block: u64, inputs: &[IngestedSafeInput]) 
             safe_block,
             safe_block * 12,
             inputs,
-            SENDER_A,
             &default_protocol_timing(),
-            FrontierMode::DeferUntilAnchorSet,
         )
         .unwrap();
 }
@@ -173,9 +170,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
                 input(29, SENDER_A, payloads[0].clone()),
                 input(30, SENDER_A, payloads[1].clone()),
             ],
-            SENDER_A,
             &default_protocol_timing(),
-            FrontierMode::Populate,
         )
         .unwrap();
     storage.gc_unreferenced_dumps().unwrap();
@@ -276,9 +271,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             1400,
             now / 1000,
             &[input(110, SENDER_B, vec![1])],
-            SENDER_A,
             &protocol,
-            FrontierMode::Populate,
         )
         .unwrap();
     storage

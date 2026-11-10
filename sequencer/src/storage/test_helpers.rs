@@ -22,8 +22,8 @@ use super::queries::{load_current_write_head, query_batch_policy};
 use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
 use super::snapshot_dumps::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
-    BatchPolicy, FrontierMode, IngestedSafeInput, L2TxCount, SafeInputRange, Storage,
-    StorageOpenError, StoredSafeInput, WriteHead,
+    BatchPolicy, IngestedSafeInput, L2TxCount, SafeInputRange, Storage, StorageOpenError,
+    StoredSafeInput, WriteHead,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
@@ -172,6 +172,7 @@ impl Storage {
     }
 
     /// Append safe inputs at the current wall clock, with zero provenance.
+    /// See [`Storage::append_safe_inputs_with_timestamp`] for `batch_submitter`.
     pub(crate) fn append_safe_inputs(
         &mut self,
         safe_block: u64,
@@ -185,12 +186,14 @@ impl Storage {
             inputs,
             batch_submitter,
             timing,
-            FrontierMode::Populate,
         )
     }
 
     /// [`Storage::append_safe_inputs`] at an explicit L1 timestamp of
-    /// `safe_block`. `frontier` gates the `safe_accepted_batches` update.
+    /// `safe_block`. Stands in for setup's identity pin: on an unpinned
+    /// database it pins a test identity whose submitter is `batch_submitter`;
+    /// on a pinned one it asserts the pinned submitter is `batch_submitter`.
+    /// Storage reads the submitter from the pin, never from this argument.
     pub(crate) fn append_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
@@ -198,16 +201,20 @@ impl Storage {
         inputs: &[StoredSafeInput],
         batch_submitter: Address,
         timing: &ProtocolTiming,
-        frontier: FrontierMode,
     ) -> rusqlite::Result<()> {
+        match self.deployment_identity()? {
+            Some(identity) => assert_eq!(
+                identity.batch_submitter_address, batch_submitter,
+                "the fixture's submitter differs from the pinned identity's"
+            ),
+            None => pin_test_deployment_identity(self, batch_submitter),
+        }
         let rows: Vec<IngestedSafeInput> = inputs.iter().map(synthetic_row).collect();
         self.append_ingested_safe_inputs_with_timestamp(
             safe_block,
             safe_block_timestamp,
             rows.as_slice(),
-            batch_submitter,
             timing,
-            frontier,
         )
     }
 

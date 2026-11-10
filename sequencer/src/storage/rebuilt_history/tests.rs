@@ -5,7 +5,7 @@ use alloy_primitives::B256;
 
 use super::*;
 use crate::storage::test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, era};
-use crate::storage::{EraRecord, FrontierMode, IngestedSafeInput, LifecycleCommand};
+use crate::storage::{EraRecord, IngestedSafeInput, LifecycleCommand};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 fn key(l1_input_index: u64, position: u64) -> RebuiltKey {
@@ -63,9 +63,7 @@ fn setup_storage(name: &str) -> (TestDb, Storage) {
             9,
             109,
             &[input(SENDER_B, 5), input(SENDER_A, 6), input(SENDER_B, 9)],
-            SENDER_A,
             &default_protocol_timing(),
-            FrontierMode::DeferUntilAnchorSet,
         )
         .unwrap();
     (db, storage)

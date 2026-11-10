@@ -30,9 +30,7 @@ use crate::commands::error::{
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError, sample_safe_block};
 use crate::recovery::MempoolFlusher;
 use crate::runtime::process_lock::ProcessLock;
-use crate::storage::{
-    DeploymentIdentity, EraRecord, FeeOracleIdentity, FrontierMode, LifecycleCommand, Storage,
-};
+use crate::storage::{DeploymentIdentity, EraRecord, FeeOracleIdentity, LifecycleCommand, Storage};
 use base::{Base, ReadMachineExport};
 
 /// The process lock's anchor file. It survives every command, so a directory
@@ -177,9 +175,8 @@ where
     tracing::info!(stop_block, "setup flushed the submitter's wallet");
 
     // ── Step 3: sync through the stop block. Before the era exists there
-    // is no stop block or anchor to judge batches by, so no setup sync
-    // populates the acceptance frontier; `run`'s first sync does.
-    input_reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
+    // is no stop block or anchor to judge batches by, so storage leaves the
+    // acceptance frontier empty; `run`'s first sync populates it.
     input_reader
         .sync_to_current_safe_head()
         .await
@@ -369,7 +366,6 @@ where
 
     let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)?;
     storage.pin_deployment_identity(identity)?;
-    input_reader.set_frontier_mode(FrontierMode::DeferUntilAnchorSet);
     input_reader
         .sync_to_current_safe_head()
         .await
@@ -519,7 +515,6 @@ async fn discover(
         let reader = InputReader::new(
             db_path.to_owned(),
             input_reader_config,
-            config.batch_submitter_address,
             timing,
             process_lock,
         )

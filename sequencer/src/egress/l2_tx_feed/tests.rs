@@ -12,7 +12,7 @@ use crate::egress::test_era;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage};
+use crate::storage::{IngestedSafeInput, SafeInputRange, Storage};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::history::{HistoryClaim, HistoryPolicyError, L2TxCount, RecoveryGeneration};
 use sequencer_core::l2_tx::{Direct, UserOpTx};
@@ -448,9 +448,7 @@ fn seed_ordered_txs(db_path: &str) {
                 block_timestamp: 1_700_000_000,
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
-            NO_OWN_BATCHES,
             &crate::storage::test_helpers::default_protocol_timing(),
-            FrontierMode::Populate,
         )
         .expect("append direct input");
     storage

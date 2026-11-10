@@ -6,10 +6,10 @@
 //! writer is [`populate_safe_accepted_batches`], inside the input reader's append
 //! transaction; a divergence marker freezes it (I15).
 
-use alloy_primitives::Address;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::l1_inputs::query_deployment_identity;
 use super::mutations::batch_tree_anchor_in;
 use sequencer_core::protocol::{AcceptedBatch, ProtocolTiming, SafeInputView};
 
@@ -77,10 +77,10 @@ fn next_expected_nonce(nonce: u64) -> u64 {
 /// persistent cursor is the latest accepted row: recovery can reuse a nonce
 /// after rejected rows, so those are rescanned until a later acceptance. The
 /// expected-nonce advance stays inline because it interleaves with the
-/// content-identity check and the divergence freeze.
+/// content-identity check and the divergence freeze. Runs exactly when the
+/// era exists; the submitter is the pinned deployment identity's.
 pub(super) fn populate_safe_accepted_batches(
     conn: &Connection,
-    batch_submitter: Address,
     timing: &ProtocolTiming,
 ) -> Result<()> {
     const PAGE_SIZE: i64 = 256;
@@ -101,25 +101,27 @@ pub(super) fn populate_safe_accepted_batches(
     // The prefix through the stop block is the baseline's. Replaying it from
     // the anchor could accept an old future-nonce submission the scheduler
     // rejected at its original position. Only inputs after it belong here.
-    let base_safe_block: Option<i64> = conn
+    let Some(base_safe_block) = conn
         .query_row(
             "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
-        .optional()?;
-    let base_safe_block = match base_safe_block {
-        Some(block) => block,
-        None => {
-            let setup_complete: bool =
-                conn.query_row("SELECT EXISTS(SELECT 1 FROM setup_complete)", [], |row| {
-                    row.get(0)
-                })?;
-            assert!(!setup_complete, "completed setup has no history baseline");
-            // Setup's syncs defer this projection until the era exists.
-            0
-        }
+        .optional()?
+    else {
+        // Setup's sync, before the era exists: its stop block and anchor are
+        // not known yet, and judging the old instance's landings against an
+        // empty tree would record a false divergence (I15).
+        let complete: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM setup_complete)", [], |row| {
+                row.get(0)
+            })?;
+        assert!(!complete, "completed setup has no history baseline");
+        return Ok(());
     };
+    let batch_submitter = query_deployment_identity(conn)?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+        .batch_submitter_address;
     let anchor = batch_tree_anchor_in(conn)?;
     let latest_accepted = query_latest_safe_accepted_batch(conn)?;
     let mut cursor = latest_accepted
@@ -331,11 +333,12 @@ mod tests {
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
+    use alloy_primitives::Address;
 
     #[test]
     fn recovered_prefix_does_not_reinterpret_a_rejected_future_nonce() {
         use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
-        use crate::storage::{FrontierMode, LifecycleCommand, StoredSafeInput};
+        use crate::storage::{LifecycleCommand, StoredSafeInput};
         use crate::test_support::pin_test_deployment_identity;
         use sequencer_core::{batch::Batch, history::L2TxCount};
         use ssz::Encode;
@@ -405,7 +408,6 @@ mod tests {
                     ],
                     submitter,
                     &timing,
-                    FrontierMode::DeferUntilAnchorSet,
                 )
                 .expect("ingest opaque prefix");
             storage
@@ -1041,5 +1043,156 @@ mod tests {
             frontier2.accepted_next_nonce, 1,
             "frontier must remain stalled"
         );
+    }
+
+    fn accepted_count(storage: &Storage) -> i64 {
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| {
+                row.get(0)
+            })
+            .expect("count accepted rows")
+    }
+
+    /// A submitter batch at nonce `nonce` with no frames: the simulated
+    /// scheduler accepts it at the expected nonce, and no local batch matches.
+    fn empty_batch(nonce: u64) -> Vec<u8> {
+        ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
+            nonce,
+            frames: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn an_append_before_the_era_leaves_the_frontier_empty() {
+        use crate::storage::LifecycleCommand;
+
+        let db = temp_db("accepted-before-era");
+        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
+            .expect("initialize setup");
+        let timing = default_protocol_timing();
+        // Judged against the empty tree, this landing would read as Foreign.
+        assert!(
+            timing
+                .scheduler_accepts(
+                    SENDER_A,
+                    SafeInputView {
+                        safe_input_index: 0,
+                        sender: SENDER_A,
+                        payload: &empty_batch(0),
+                        inclusion_block: 10,
+                    },
+                    0
+                )
+                .is_some()
+        );
+        storage
+            .append_safe_inputs(
+                20,
+                &[
+                    StoredSafeInput {
+                        sender: SENDER_A,
+                        payload: empty_batch(0),
+                        block_number: 10,
+                    },
+                    StoredSafeInput {
+                        sender: SENDER_B,
+                        payload: vec![0xaa],
+                        block_number: 15,
+                    },
+                ],
+                SENDER_A,
+                &timing,
+            )
+            .expect("setup's sync appends");
+
+        assert_eq!(storage.safe_input_end_exclusive().expect("inputs"), 2);
+        assert_eq!(storage.current_safe_block().expect("head"), Some(20));
+        assert_eq!(accepted_count(&storage), 0);
+        assert_eq!(storage.canonical_divergence().expect("marker"), None);
+    }
+
+    #[test]
+    fn an_append_with_an_era_and_no_pinned_identity_fails_and_rolls_back() {
+        use crate::storage::IngestedSafeInput;
+
+        let db = temp_db("accepted-era-without-identity");
+        // The crate-test open creates the genesis era and pins nothing.
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let err = storage
+            .append_ingested_safe_inputs_with_timestamp(
+                20,
+                240,
+                &[IngestedSafeInput {
+                    sender: SENDER_B,
+                    payload: vec![0xaa],
+                    block_number: 15,
+                    block_timestamp: 180,
+                    transaction_hash: alloy_primitives::B256::repeat_byte(0x01),
+                }],
+                &default_protocol_timing(),
+            )
+            .expect_err("the era's frontier needs the pinned submitter");
+        assert!(
+            crate::storage::is_persistent_storage_error(&err),
+            "a missing identity is persistent, got {err:?}"
+        );
+        assert_eq!(storage.safe_input_end_exclusive().expect("inputs"), 0);
+        assert_eq!(storage.current_safe_block().expect("head"), None);
+    }
+
+    #[test]
+    fn the_first_append_after_the_era_judges_every_input_past_the_stop_block() {
+        use crate::storage::{EraRecord, LifecycleCommand};
+
+        let db = temp_db("accepted-first-after-era");
+        let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
+            .expect("initialize setup");
+        let timing = default_protocol_timing();
+        // Setup's sync ingests past the stop block 30: a submitter landing at
+        // the anchor nonce 1 inside the baseline (opaque) and one after it.
+        storage
+            .append_safe_inputs(
+                40,
+                &[
+                    StoredSafeInput {
+                        sender: SENDER_A,
+                        payload: empty_batch(1),
+                        block_number: 25,
+                    },
+                    StoredSafeInput {
+                        sender: SENDER_A,
+                        payload: empty_batch(1),
+                        block_number: 35,
+                    },
+                ],
+                SENDER_A,
+                &timing,
+            )
+            .expect("setup's sync appends");
+        assert_eq!(accepted_count(&storage), 0);
+        assert_eq!(storage.canonical_divergence().expect("marker"), None);
+
+        storage
+            .publish_era(
+                &db._dir.path().join("baseline"),
+                &EraRecord {
+                    next_batch_nonce: 1,
+                    ..crate::storage::test_helpers::era(0, 0, 30)
+                },
+            )
+            .expect("publish the era");
+        // `run`'s first sync lands nothing new, yet judges the landing past
+        // the stop block that setup's sync ingested: no local batch carries
+        // nonce 1, so it is Foreign.
+        storage
+            .append_safe_inputs(41, &[], SENDER_A, &timing)
+            .expect("run's first sync");
+        assert_eq!(
+            storage.canonical_divergence().expect("marker"),
+            Some((1, 1)),
+            "the post-stop landing is judged; the baseline one is not"
+        );
+        assert_eq!(accepted_count(&storage), 0);
     }
 }
