@@ -180,27 +180,6 @@ impl Storage {
             })?,
         }))
     }
-
-    /// When setup completed, or `None` before it has.
-    pub fn setup_completed_at_ms(&self) -> Result<Option<u64>, LifecycleError> {
-        let completed: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT completed_at_ms FROM setup_complete WHERE singleton_id = 0",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        completed
-            .map(|ms| {
-                u64::try_from(ms).map_err(|_| {
-                    LifecycleError::Malformed(format!(
-                        "setup_complete completed_at_ms {ms} is negative"
-                    ))
-                })
-            })
-            .transpose()
-    }
 }
 
 /// The two-sided completion rule — the one command-ordering fact: setup
@@ -290,19 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_completed_at_ms_reads_the_completion_fact() {
-        let (_db, mut storage) = seeded(LifecycleCommand::Setup);
-        assert_eq!(storage.setup_completed_at_ms().expect("read"), None);
-        complete_seeded_setup(&mut storage);
-        assert!(
-            storage
-                .setup_completed_at_ms()
-                .expect("read")
-                .is_some_and(|ms| ms > 0)
-        );
-    }
-
-    #[test]
     fn completion_rule_is_two_sided() {
         let (_db, mut storage) = seeded(LifecycleCommand::Setup);
         // Before completion: run and maintenance refuse; setup may proceed.
@@ -375,7 +341,7 @@ mod tests {
         assert!(storage.history_state().is_err());
         assert_eq!(storage.batch_tree_anchor().unwrap(), 0);
         assert!(storage.list_dump_rows().unwrap().is_empty());
-        assert_eq!(storage.setup_completed_at_ms().unwrap(), None);
+        assert!(!storage.is_setup_complete().unwrap());
 
         let published = EraRecord {
             next_batch_nonce: 5,
@@ -429,7 +395,7 @@ mod tests {
             ),
             Err(LifecycleError::Malformed(_))
         ));
-        assert_eq!(storage.setup_completed_at_ms().unwrap(), None);
+        assert!(!storage.is_setup_complete().unwrap());
     }
 
     #[test]
