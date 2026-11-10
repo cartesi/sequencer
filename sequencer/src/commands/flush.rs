@@ -42,7 +42,7 @@ async fn flush_mempool_admitted(
     // The durable flush anchor: every slot we ever broadcast
     // must resolve at safe depth, regardless of the local pool's memory.
     let watermark = {
-        let mut storage = storage::Storage::open_writer(&db_path)?;
+        let mut storage = storage::Storage::open_read_only(&db_path)?;
         storage.wallet_nonce_watermark()?
     };
 

@@ -162,7 +162,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         // panic unwind, or cancellation of the owning `run` future.
         let shutdown = RuntimeScope::new(process_lock);
         let shutdown_on_drop = ShutdownOnDrop(shutdown.clone());
-        let mut storage = crate::storage::Storage::open(&db_path)?;
+        let mut storage = crate::storage::Storage::open_writer(&db_path)?;
         let dumps_dir = std::path::Path::new(&run_config.data_dir).join("dumps");
         std::fs::create_dir_all(&dumps_dir)
             .map_err(|err| crate::commands::io_error_at("dumps dir", &dumps_dir, err))?;

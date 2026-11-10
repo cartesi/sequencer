@@ -42,6 +42,8 @@ pub struct Storage {
 
 impl Storage {
     /// Production open: runs migrations, uses the canonical synchronous pragma.
+    /// `run` calls it once, before startup recovery; every later open of the
+    /// run is [`Storage::open_writer`] or [`Storage::open_read_only`].
     ///
     /// Refuses a path with no database file (production builds): every
     /// database is created by an owning command through
@@ -98,11 +100,9 @@ impl Storage {
     }
 
     /// Read-write handle that does NOT run migrations — for components that
-    /// open the DB *after* startup has already migrated it (e.g. the
-    /// submitter and recovery, and tests that pre-seed the schema). Same
-    /// pragmas as [`Storage::open`] (WAL, `foreign_keys`, 5s `busy_timeout`);
-    /// running migrations is the caller's responsibility
-    /// (the runtime does it once via [`Storage::open`] at startup).
+    /// open the DB *after* `run` has migrated it (recovery, the lane, the
+    /// input reader, and tests that pre-seed the schema). Same pragmas as
+    /// [`Storage::open`] (WAL, `foreign_keys`, 5s `busy_timeout`).
     pub fn open_writer(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_writer_connection(path)?;
         Ok(Self { conn })

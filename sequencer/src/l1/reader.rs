@@ -272,9 +272,10 @@ impl InputReader {
     }
 
     /// Validate the storage dependency without starting a task. Runtime
-    /// startup calls this for every worker before launching any of them.
+    /// startup calls this for every worker before launching any of them, so
+    /// no writer runs beside this read-only open.
     pub(crate) fn preflight_storage(&self) -> Result<(), StorageOpenError> {
-        let _ = Storage::open(self.db_path.as_str())?;
+        let _ = Storage::open_read_only(self.db_path.as_str())?;
         Ok(())
     }
 
@@ -567,12 +568,13 @@ impl InputReader {
     /// safe inputs (= the next local `safe_input_index`, the expected on-chain
     /// index of the next ingested input). Reading them together is safe:
     /// this reader is the sole writer of both, and `advance_once` holds
-    /// `&mut self` on a single-task loop.
+    /// `&mut self` on a single-task loop. A writer handle, for its 5 s busy
+    /// timeout: the lane commits beside this read.
     async fn scan_cursor(&self) -> Result<(Option<u64>, u64), InputReaderError> {
         let db_path = self.db_path.clone();
         let process_lock = self.process_lock.clone();
         spawn_blocking_with_lock(process_lock, move || {
-            let mut storage = Storage::open(&db_path)?;
+            let mut storage = Storage::open_writer(&db_path)?;
             Ok((
                 storage.current_safe_block()?,
                 storage.safe_input_end_exclusive()?,
@@ -591,7 +593,7 @@ impl InputReader {
         let timing = self.timing;
         let process_lock = self.process_lock.clone();
         spawn_blocking_with_lock(process_lock, move || {
-            let mut storage = Storage::open(&db_path)?;
+            let mut storage = Storage::open_writer(&db_path)?;
             storage
                 .append_ingested_safe_inputs_with_timestamp(
                     current_safe_head.block_number,

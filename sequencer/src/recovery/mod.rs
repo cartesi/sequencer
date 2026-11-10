@@ -179,7 +179,7 @@ fn inspect_recovery(
     db_path: &str,
     protocol: &ProtocolTiming,
 ) -> Result<RecoveryInspection, RecoveryError> {
-    let mut storage = storage::Storage::open_writer(db_path).map_err(classify_open)?;
+    let mut storage = storage::Storage::open_read_only(db_path).map_err(classify_open)?;
     storage
         .inspect_recovery(protocol, crate::clock::unix_now_ms())
         .map_err(classify_storage)
@@ -215,7 +215,8 @@ impl RecoveryL1 for StartupL1<'_> {
         .map_err(classify_signer_provider)?;
 
         let watermark = {
-            let mut storage = storage::Storage::open_writer(self.db_path).map_err(classify_open)?;
+            let mut storage =
+                storage::Storage::open_read_only(self.db_path).map_err(classify_open)?;
             storage.wallet_nonce_watermark().map_err(classify_storage)?
         };
         MempoolFlusher::flush_to_safe(

@@ -143,6 +143,13 @@ where
         "sequencer startup"
     );
 
+    // ── Schema ───────────────────────────────────────────────
+    // The run's one migrating open. Only the black-box warning, the lifecycle
+    // preflight and the identity load, which read setup's own facts, open the
+    // database before it; recovery, the lane's handle and the workers open
+    // without migrating.
+    drop(storage::Storage::open(&db_path)?);
+
     // ── Recovery ─────────────────────────────────────────────
     // Local terminal facts are inspected before the first provider call.
     // The cap is the lane's, so the reopened Tip executes the same directs.
