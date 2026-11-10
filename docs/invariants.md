@@ -300,10 +300,14 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   durably (`synchronous=FULL`) before any broadcast at a new nonce,
   uniformly for batch txs and flush no-ops. A crash between commit and send
   only over-covers (the flush later no-ops a never-used slot — harmless).
-- **Enforced by:** write-before-broadcast — `EthereumBatchPoster::submit_batches`
-  raises through `WalletNonceWatermarkSink` before its first send;
-  `MempoolFlusher::flush_and_wait` likewise before its no-ops, and refuses to
-  complete until `safe >= watermark + 1`.
+- **Enforced by:** the `Covered` witness (`l1/watermark.rs`): only `cover`
+  mints it, after `WalletNonceWatermarkSink::raise_to` succeeds, and the
+  poster's `send_batch_at_wallet_nonce` and the flusher's `submit_noops`
+  require it and assert each wallet nonce they send is at or below it.
+  `EthereumBatchPoster::submit_batches` covers its whole consecutive range;
+  `MempoolFlusher::flush_and_wait` covers every no-op range it sends, and
+  refuses to complete until `safe >= watermark + 1`. Pinned by a
+  raise-before-send test on each side.
 - **Depended on by:** [flush completeness](recovery/README.md#closed-batches-flush-sync-cascade)
   and cascade soundness (I9).
 - **Breaks:** zombie txs evade the flush — a dropped-locally but

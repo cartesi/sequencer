@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::l1::eip1559::{estimate_fees, pad_gas_estimate};
 use crate::l1::provider::{KeyedProviders, SendError, error_chain};
 use crate::l1::watermark::{
-    StorageWatermarkSink, WalletNonceWatermarkError, WalletNonceWatermarkSink,
+    Covered, StorageWatermarkSink, WalletNonceWatermarkError, WalletNonceWatermarkSink, cover,
 };
 
 #[derive(Debug, Error)]
@@ -164,10 +164,11 @@ impl MempoolFlusher {
     /// 1. Submit 0-ETH self-transfers for wallet nonces in
     ///    `[Latest, max(Pending, watermark + 1))` — every slot not yet
     ///    mined that we might ever have used. The sink raises the persisted
-    ///    watermark before the broadcast (uniform write-before-broadcast,
-    ///    though no-ops never exceed the existing watermark under the
-    ///    invariant). These compete with any of our txs still in the
-    ///    network; whichever wins, the slot advances.
+    ///    watermark to the top of that range before the broadcast, and each
+    ///    send requires the resulting witness (uniform write-before-broadcast,
+    ///    though no-ops above the given watermark only appear if another
+    ///    process used our key). These compete with any of our txs still in
+    ///    the network; whichever wins, the slot advances.
     /// 2. Wait until every slot below the flush end is mined, by an original
     ///    or a no-op: the slot, not a particular tx, is what must be consumed.
     /// 3. Sleep to let the safe head advance, then re-check the loop condition.
@@ -246,13 +247,14 @@ impl MempoolFlusher {
                 // Uniform write-before-broadcast; covers the no-ops we are
                 // about to send (a no-op above the current watermark can only
                 // happen if someone else used our key — over-covering then is
-                // exactly right).
+                // exactly right). An empty range sends nothing and raises nothing.
                 let highest_wallet_nonce = flush_end
                     .checked_sub(1)
                     .expect("a non-empty flush range must have a highest nonce");
-                sink.raise_to(highest_wallet_nonce)?;
+                let covered = cover(sink, highest_wallet_nonce)?;
+                self.submit_noops(latest_wallet_nonce, flush_end, &covered)
+                    .await?;
             }
-            self.submit_noops(latest_wallet_nonce, flush_end).await?;
 
             if !self.wait_for_slots_mined(flush_end).await? {
                 continue;
@@ -276,11 +278,13 @@ impl MempoolFlusher {
     }
 
     /// Submit 0-ETH self-transfers for wallet nonces
-    /// `from_wallet_nonce..to_wallet_nonce`.
+    /// `from_wallet_nonce..to_wallet_nonce`; each send asserts `covered`
+    /// reaches its nonce.
     async fn submit_noops(
         &self,
         from_wallet_nonce: u64,
         to_wallet_nonce: u64,
+        covered: &Covered,
     ) -> Result<(), FlushError> {
         if from_wallet_nonce >= to_wallet_nonce {
             return Ok(());
@@ -337,6 +341,7 @@ impl MempoolFlusher {
                 .with_max_fee_per_gas(max_fee)
                 .with_max_priority_fee_per_gas(priority_fee);
 
+            covered.assert_covers(wallet_nonce);
             match self.providers.submit.send(tx).await {
                 Ok(tx_hash) => {
                     debug!(wallet_nonce, %tx_hash, gas, "flush no-op submitted");
@@ -772,6 +777,89 @@ mod tests {
             observed_safe_block > 0,
             "flush must report the safe block it observed resolution at"
         );
+    }
+
+    /// Records every `raise_to` and fails it, so a test sees the raise happen
+    /// and can check that nothing was broadcast before it.
+    struct FailingRecordingSink {
+        calls: std::sync::Mutex<Vec<u64>>,
+    }
+    impl WalletNonceWatermarkSink for FailingRecordingSink {
+        fn raise_to(&self, highest: u64) -> Result<(), WalletNonceWatermarkError> {
+            self.calls.lock().expect("lock").push(highest);
+            Err(WalletNonceWatermarkError::Storage(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                        extended_code: 5,
+                    },
+                    None,
+                ),
+            ))
+        }
+    }
+
+    /// Write-before-broadcast for the flusher: the raise comes before the
+    /// first no-op. A failing sink aborts the pass; had a no-op gone out
+    /// first, the pending wallet nonce would have moved past 0.
+    #[tokio::test]
+    async fn flush_raises_watermark_before_the_first_noop() {
+        require_anvil();
+
+        let anvil = spawn_anvil();
+        let providers = keyed_providers(&anvil);
+        let provider = providers.read.clone();
+        let addr = anvil.addresses()[0];
+        let sink = FailingRecordingSink {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        // Watermark 0 with an empty pool: slot 0 needs a no-op.
+        let flusher = MempoolFlusher::new(providers.clone(), addr, 12)
+            .with_timeouts(Duration::from_secs(2), Duration::from_millis(100));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            flusher.flush_and_wait(Some(0), &sink),
+        )
+        .await
+        .expect("a failing raise must end the flush promptly");
+
+        assert!(
+            matches!(
+                result,
+                Err(FlushError::Watermark(WalletNonceWatermarkError::Storage(_)))
+            ),
+            "a failing watermark sink must abort the flush, got {result:?}"
+        );
+        assert_eq!(
+            *sink.calls.lock().expect("lock"),
+            vec![0],
+            "raise_to must run once, to the top of the no-op range"
+        );
+        let pending = provider
+            .get_transaction_count(addr)
+            .block_id(BlockNumberOrTag::Pending.into())
+            .await
+            .expect("pending nonce");
+        assert_eq!(
+            pending, 0,
+            "raise_to must run before any no-op; a broadcast would have bumped the pending nonce"
+        );
+    }
+
+    /// A no-op above its witness trips the assert before it is sent.
+    #[tokio::test]
+    #[should_panic(expected = "above the durably covered watermark")]
+    async fn noop_above_the_covered_watermark_panics() {
+        require_anvil();
+
+        let anvil = spawn_anvil();
+        let providers = keyed_providers(&anvil);
+        let addr = anvil.addresses()[0];
+        let flusher = MempoolFlusher::new(providers, addr, 12);
+        let covered = cover(&NoopWatermarkSink, 0).expect("noop sink covers");
+
+        let _ = flusher.submit_noops(0, 2, &covered).await;
     }
 
     #[tokio::test]
