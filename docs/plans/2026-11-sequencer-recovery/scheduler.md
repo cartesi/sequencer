@@ -19,9 +19,10 @@ the contract, and the reference can have bugs, so report any disagreement.
 | Change | Why | Does recovery need it? |
 |---|---|---|
 | [State export](#state-export) | Setup starts a sequencer from a machine's whole state | Yes, and nothing else on this list |
-| [The fridge bound](#the-fridge) | An unbounded fridge can exhaust the machine's memory, which halts the application for good | No; a recovery is only the remedy after an overflow |
+| [The fridge's bound and payload cap](#the-fridge) | An unbounded fridge can exhaust the machine's memory, which halts the application for good | No; a recovery is only the remedy after an overflow |
 | [Monotone blocks](#the-scheduler-clock) | A transaction's block never goes backwards, so applications may read blocks as time | No |
-| [An underfunded op counts](#frame-execution) | An op's fate depends only on what its signer controls | No |
+| [An underfunded op executes](#a-user-ops-fate) | Whether a sender can pay protects only the operator, so the lane checks it and consensus does not | No |
+| [Shared code compares the nonce](#frame-execution) | No application code decides which ops execute | No |
 | [Direct context](#direct-context) | The application learns a direct's input index and timestamp | No |
 | [Progress is the L2 tx count alone](#outputs-and-progress) | The scheduler keeps the clock now, so the application need not | No |
 
@@ -41,13 +42,14 @@ sequence one L1 input at a time:
    `MAX_WAIT_BLOCKS` execute, oldest first, even when the input is a batch the
    gates then reject.
 2. **A direct input**, from any sender but the sequencer, joins the fridge,
-   the queue of directs not yet executed. **New:** only a well-formed one
-   joins, and a full fridge drains its oldest blocks to make room.
+   the queue of directs not yet executed. **New:** one whose payload is over
+   the cap never joins, and a full fridge drains its oldest blocks to make
+   room.
 3. **A batch**, the sequencer's input, is accepted or changes nothing
    ([batch validity](#batch-validity)).
 4. **Each frame of an accepted batch** first executes every queued direct up
    to its safe block, oldest first, then offers its user ops in order.
-5. **A user op is executed or skipped** ([frame execution](#frame-execution)).
+5. **A user op is executed or skipped** ([a user op's fate](#a-user-ops-fate)).
 
 ### What counts
 
@@ -65,7 +67,8 @@ A user op has three outcomes, and only one of them leaves no trace:
 | **Executed, failed** | The sender's nonce advances and the fee is charged, but the effect fails, such as a transfer larger than the balance | Yes |
 
 An op whose sender cannot pay the whole fee executes too (**New**,
-[frame execution](#frame-execution)). Every executed direct counts, whatever the application does with it.
+[a user op's fate](#a-user-ops-fate)). Every executed direct counts, whatever
+the application does with it.
 Nothing else counts: not a queued or dropped direct, not a skipped op, not a
 batch envelope, not anything in a rejected or stale batch. This page avoids
 "no-op": today's docs use it both for an op that counts and for an empty batch.
@@ -81,9 +84,15 @@ batch envelope, not anything in a rejected or stale batch. This page avoids
 Nothing else carries over between inputs. **The scheduler's state never reads
 the application's.** The nonce, the clock and the fridge depend only on the
 inputs; the application affects them only by halting the machine. Whether the
-application executes a user op changes none of them. A port must keep this
-property: it is what lets the sequencer run the scheduler without the
-application during a recovery.
+application executes a user op changes none of them. The scheduler runs no
+application code either: the fridge admits by sender and payload length. A
+port must keep this property: it is what lets the sequencer run the scheduler
+without the application during a recovery.
+
+**The fridge is a queue.** Directs join at the back in input order and leave
+only from the front, whichever rule drains them. So the fridge always holds
+exactly the admitted directs from one input index, the *first queued input*,
+up to the L1 input count.
 
 ### Two counts
 
@@ -98,10 +107,24 @@ not an L2 transaction. The machine exports both
 
 ### The invariant
 
-**New.** With the four rules of the [scheduler clock](#the-scheduler-clock),
-whole-block drains among them, one invariant holds after every input:
-every admitted direct at or below the clock has executed, and every one above
-it is still queued. Along the L2 sequence, blocks never go backwards.
+**New.** The [scheduler clock](#the-scheduler-clock) gives two properties
+after every input:
+
+- **Blocks never go backwards** along the L2 sequence. Gate f gives this.
+- **The clock splits the directs.** Every admitted direct at or below the
+  clock has executed, and every one above it is still queued. Three more rules
+  give this: strict frames, the backstop's raise and whole-block drains.
+
+The split gives the clock a meaning an application can use: at clock `c`, it
+has applied every direct up to block `c` and none after. Recovery does not
+depend on it, since setup takes the first queued input from the machine
+([state export](#state-export)). Two readers keep it true:
+
+- **Setup checks it.** Among the inputs a base machine consumed, the admitted
+  directs above its clock must be exactly the queued ones its export names
+  ([operations](operations.md#what-setup-does)).
+- **The conformance vectors assert it** after every input, through the
+  `scheduler` report ([conformance](#conformance)).
 
 ## Inputs
 
@@ -168,8 +191,9 @@ This acceptance set is alloy's. Narrowing it to `v ∈ {27, 28}` and low `s` is
    raising the clock to each one's block (**New**). This bounds how long a
    sequencer that stops submitting, or freezes `safe_block`, can hold a direct
    back.
-2. **A direct** joins the fridge, if it is well formed and once there is room
-   ([the fridge](#the-fridge)).
+2. **A direct** joins the fridge, unless its payload is over the cap, and once
+   there is room ([the fridge](#the-fridge)). The cap comes first: a direct
+   that never joins drains nothing.
 3. **A batch** runs the gates below.
 
 ### Batch validity
@@ -211,52 +235,114 @@ For each frame of an accepted batch, in order:
 2. **Offer the user ops** in order. Skip an op, checked in this order, when:
    - its sender cannot be recovered ([signatures](#user-op-signatures));
    - its `max_fee` is below `frame.fee_price`;
-   - the application reports that its nonce is not the sender's next;
-   - its `nonce` is `u32::MAX`, which has no successor.
+   - its nonce is not its sender's next;
+   - its sender's next nonce is `u32::MAX`, which has no successor.
 
    Otherwise the op executes with fee `frame.fee_price` and block
-   `frame.safe_block`, through the shared execution boundary
-   ([`validate_and_execute_user_op`](../../../sequencer-core/src/application/mod.rs)):
-   the application advances the sender's nonce by one, charges the fee and
+   `frame.safe_block`: the application advances the sender's nonce by one and
    applies the op, and the L2 tx count advances by one.
 
+**New: shared code compares the nonce.** The application stores each sender's
+next nonce and reports it; the shared executor compares it with the op's
+([interfaces](interfaces.md#the-executor)). Today the application's own
+validation decides
+([`validate_and_execute_user_op`](../../../sequencer-core/src/application/mod.rs)).
+The first two checks need no application, so the scheduler makes them alone.
+
+### A user op's fate
+
+Two parties decide, and they ask different questions:
+
+- **The canonical scheduler asks whether the sender authorized the op.** A
+  check that protects the user is consensus: the signature, the nonce and the
+  fee cap. An op that fails one is **skipped**, with no trace.
+- **The sequencer's lane asks whether the operator wants the op.** A check that
+  protects the operator is admission: can the sender pay, does the payload fit
+  the batch, does the operator's policy allow it. An op that fails one is
+  **refused** at `POST /tx`. The canonical scheduler never asks: the fee is
+  owed to the sequencer, and only the sequencer includes ops.
+
+| An op that… | Checked by | Canonical scheduler | Sequencer's lane |
+|---|---|---|---|
+| has no recoverable sender | The scheduler | Skipped | Refused |
+| caps its fee below the frame's price | The scheduler | Skipped | Refused |
+| carries a nonce that is not its sender's next | The executor, from the application's stored nonce | Skipped | Refused |
+| comes from a sender whose next nonce is `u32::MAX` | The executor | Skipped | Refused |
+| comes from a sender who cannot pay the fee (**New**) | The application's admission | Executed | Refused |
+| exceeds the application's declared payload bound | The lane | Executed | Refused |
+| breaks an operator policy | The application's admission, or the lane | Executed | Refused |
+| fails in the application, such as a transfer above the balance | The application's execution | Executed | Admitted |
+| is sponsored: the application charges it nothing | The application's execution | Executed | Admitted |
+| is none of the above | | Executed | Admitted |
+
+- **Skipped** means nothing changes: no nonce, no count, no fee.
+- **Executed** means the sender's nonce and the L2 tx count each advance by
+  one. What the op pays and whether its effect applies are the application's
+  choice ([application](application.md#the-application-trait)). The
+  application must not fail, since an application error halts the machine.
+- **The lane refuses everything the scheduler skips**, by running the same
+  checks first. No op is admitted and then skipped.
+
 **New: an underfunded op executes.** Today the scheduler also skips an op whose
-sender cannot pay the frame fee. With the next template it executes: its nonce
-advances and it counts. How much fee it pays and whether its effect runs are
-the application's choice; charging what the sender has, a saturating
-subtraction, is the recommendation. The application must not fail on it,
-since an application error halts the machine. Two reasons:
+sender cannot pay the frame fee. That check protects only the sequencer from
+its own inclusion, so it moves to the lane. With it gone, which transactions
+execute depends on signatures, fee caps and nonces alone, never on a balance.
+A fault in the application's logic can then change what a transaction does,
+but not which transactions execute or what their counts are.
 
-- An op's fate depends only on what its signer controls: the signature, the
-  nonce and the fee cap.
-- An op on L1 always uses up its nonce. A skipped op stays valid, in public,
-  and any later batch can include it once its sender has funds.
+**A fee cap below the price skips the op.** The cap is part of what the sender
+signed: execute this op only at a price up to the cap. Charging the price would
+take more than the sender authorized. Executing at the cap instead would make
+a frame's price mean something else for one op. The sequencer loses nothing by
+the skip: it sets each frame's price, so it can put the op in a frame it fits.
+A skipped op stays valid until its sender's nonce moves past it, as a pending
+transaction does anywhere.
 
-Ingress is policy, not consensus: the sequencer still refuses an underfunded op
-at `POST /tx`, since it would pay less than the L1 data it costs
-([application](application.md#the-application-trait)).
+**A sponsored op needs no rule of its own.** Whether an executed op pays is
+the application's choice, and whether an unpaid op is wanted is admission's.
+An operator can run its own price feed for nothing in three ways, none of
+which the scheduler sees:
+
+- fund the feed's account: where the application credits fees to the operator,
+  as the wallet does, the operator pays itself;
+- exempt the role in the application: admission accepts its ops and execution
+  charges them nothing;
+- put its ops in a frame priced at exponent 0, one smallest unit.
+
+A sponsored sender still signs a cap at or above the frame's price, such as
+`MAX_EXPONENT`. An exemption must hang on something the signature proves, the
+sender's role, or anyone can use it.
 
 ## The scheduler clock
 
 **New.** The clock is the latest block the scheduler has executed at: an
 accepted frame's safe block, or an executed direct's inclusion block. Every
 frame of an accepted batch raises it, and so does every executed direct,
-whether a frame, the backstop or an overflow drained it. Gate f rejects a
-batch whose first frame lies below it, and gate d orders the rest. Four rules
-work together:
+whether a frame, the backstop or an overflow drained it. It only rises: a
+raise takes the later of the clock and the new block. Gate f rejects a batch
+whose first frame lies below it, and gate d orders the rest.
 
-- **Gate f** keeps every frame at or above the clock, so the blocks the
-  application sees never go backwards: a frame's directs come from above the
-  clock and at or below its safe block, and its user ops see the safe block.
+**Gate f alone keeps blocks from going backwards.** Every frame lies at or
+above the clock, so a frame's directs come from the clock or above and at or
+below its safe block, and its user ops see the safe block. The backstop needs
+no help: a batch whose first frame lies below a block the backstop drained is
+already stale by gate e.
+
+Three more rules keep the clock's split of the directs
+([the invariant](#the-invariant)):
+
 - **Strict frames** (gate d) let a frame drain every direct of its own safe
   block, because all of them landed before its batch. With equality allowed, a
   direct from that block landing after the batch would stay queued at the
-  clock, breaking the [invariant](#the-invariant).
-- **The backstop raises the clock** without changing any outcome: a batch whose
-  first frame lies below a block the backstop drained is already stale by
-  gate e. The raise only keeps the invariant.
+  clock. Equality is also a claim no sequencer can make honestly: the block
+  was not finished when the batch was sealed.
+- **The backstop raises the clock**, as every drain does, so no direct it
+  executed sits above the clock. The raise changes no outcome: gate e already
+  skips any batch it would reject.
 - **Overflow drains whole blocks**, so no direct at or below the clock stays
-  queued ([the fridge](#the-fridge)).
+  queued ([the fridge](#the-fridge)). Draining only as many entries as needed
+  would hand out the same L2 sequence under a hard bound, but it would leave
+  part of a block queued at the clock.
 
 Unless an overflow overtakes it, a correct sequencer never trips gate f or the
 strict rule: it never opens a frame below an earlier one, and it opens frames
@@ -266,31 +352,44 @@ becomes consensus-critical, though: a bug there now gets batches rejected.
 
 ## The fridge
 
-- **Admission (New).** Only a direct the application's *direct filter* accepts
-  joins. The rest are dropped: they never execute and never count. The filter
-  reads only the direct and the application's fixed configuration, such as a
-  portal's address, never state that transactions change. The sequencer drops
-  the same directs with the same filter, or the two diverge
-  ([application](application.md#the-application-trait)).
+- **Admission (New).** A direct whose payload is longer than
+  `MAX_DIRECT_PAYLOAD_BYTES` never joins: it never executes and never counts.
+  Every other direct joins, whatever it holds, and executes as today, where
+  the application ignores what it cannot read. The cap is a constant of the
+  template, set from the longest payload the application accepts. The
+  sequencer's lane drops the same directs by the same constant, or the two
+  diverge.
+- **Why a constant.** A count bounds memory only if each entry's size is
+  bounded too: portals accept zero-value deposits with extra data up to the
+  InputBox's 64 KiB cap. A constant bounds the size without the scheduler
+  running application code. A filter written by the application would also
+  drop small garbage, but a zero-value portal deposit takes a slot for about
+  the same L1 gas, so it would buy little.
 - **Entries.** Each entry keeps the direct as delivered (sender, block,
   payload) with its input index (**New**), and the [direct context](#direct-context)
   the application receives.
-- **The bound (New).** The fridge holds at most `FRIDGE_BOUND` entries. When a
-  direct arrives at a full fridge, the scheduler executes whole blocks from the
-  front, oldest first, until there is room, raising the clock to the last
-  drained block. It never drains the arriving direct's own block: if only that
-  block's directs remain, the direct joins over the bound. The bound is then
-  soft by at most one block's directs, and memory stays bounded by what one L1
-  block can carry.
-- **An overflow diverges.** The sequencer cannot predict an overflow, so the
-  batches it sealed before one diverge, and a manual recovery answers that. The
-  watchdog's divergence latch reports it.
+- **The bound (New).** The fridge is full when it holds `FRIDGE_BOUND` entries
+  or more. When a direct arrives at a full fridge, the scheduler executes whole
+  blocks from the front, oldest first, until there is room, raising the clock
+  to the last drained block. It never drains the arriving direct's own block:
+  if only that block's directs remain, the direct joins over the bound. The
+  bound is then soft by at most one block's directs, and memory stays bounded
+  by what one L1 block can carry.
+- **An overflow can reject sealed batches.** The sequencer cannot predict an
+  overflow, and a batch it sealed earlier then lands in one of two ways. If
+  its first frame is at or above the last drained block, it is accepted, and
+  the L2 sequence is the one the sequencer predicted: the drained directs are
+  the first ones that frame would have drained. If it is below, gate f rejects
+  the batch, and every later one fails the nonce gate. The sequencer's
+  acceptance check does not see the clock, so it counts those batches as
+  accepted and diverges. A manual recovery answers that, and the watchdog's
+  divergence latch reports it. An overflow also moves which input executes the
+  drained directs, which the watchdog's comparison at that block can see
+  ([register](../../review/register.md#bound-the-canonical-direct-input-fridge)).
 
-The bound's value, an entry's largest size, and the largest drain the guest
-can afford are **Open**
+The bound's value, the cap's value, and the largest drain the guest can afford
+are **Open**
 ([register](../../review/register.md#bound-the-canonical-direct-input-fridge)).
-A count bounds memory only if each entry's size is bounded too: portals accept
-zero-value deposits with extra data up to the InputBox's 64 KiB cap.
 
 ## Direct context
 
@@ -333,12 +432,15 @@ so a port must halt on the same inputs. No canonical successor state exists.
 so the sequencer's setup can start from it:
 
 - its L1 input count and its L2 tx count;
-- the scheduler's state: the next batch nonce, the clock and the fridge, with
-  each entry's input index;
+- the scheduler's state: the next batch nonce, the clock, and the first queued
+  input, where the fridge starts;
 - the application's state.
 
-It answers through inspect queries, which [application](application.md#the-state-export)
-specifies. The harness answers the scheduler's part for every application; the
+The queued directs themselves are not exported.
+[The fridge is a queue](#the-schedulers-state), so the first queued input and
+the L1 input count name them, and L1 holds their bytes.
+[Application](application.md#the-state-export) specifies how the machine
+answers. The harness answers the scheduler's part for every application; the
 application supplies only its own state.
 
 ## The scheduler's interface
@@ -346,9 +448,10 @@ application supplies only its own state.
 During a recovery the sequencer runs the scheduler without the application:
 first it schedules the whole rebuilt range, then the application executes it.
 That needs a free-standing scheduler with an interface of its own, as the
-application has its trait and its C binding. That interface is pending, to
-design with Bart ([todo](todo.md#build)). This page fixes the scheduler's
-behavior whatever the interface.
+application has its trait and its C binding.
+[Interfaces](interfaces.md#the-scheduler) proposes it, in Rust and in C, to
+settle with Bart. This page fixes the scheduler's behavior whatever the
+interface.
 
 ## Constants
 
@@ -357,6 +460,7 @@ behavior whatever the interface.
 | `MAX_WAIT_BLOCKS` | 1200 L1 blocks, about 4 h | [`lib.rs`](../../../sequencer-core/src/lib.rs) |
 | `MAX_EXPONENT` | 17101 | [`fee.rs`](../../../sequencer-core/src/fee.rs) (`build.rs` generates it) |
 | `FRIDGE_BOUND` | **New**, value **Open** | the template |
+| `MAX_DIRECT_PAYLOAD_BYTES` | **New**, value **Open** | the template |
 | `sequencer_address` | per deployment | compiled into the canonical machine |
 
 A fee exponent `n` stands for `(129/128)^n` smallest token units. The
@@ -373,7 +477,9 @@ outputs. It is never regenerated, since a mismatch is a consensus change. The
 next template ships a new vector set:
 
 - the guest scenarios rewritten for strict frames, which change 18 of the 19;
-- scenarios for gate f, an overflow, the direct filter, an underfunded op, and
-  the export queries;
+- scenarios for gate f, an overflow, the payload cap, an underfunded op, and
+  the export query;
+- the `scheduler` report after every input of every scenario, so each one
+  asserts the clock's [split of the directs](#the-invariant);
 - the cases v1 leaves out: `s ≥ n`, `v` from 29 to 34, the fee-range reject,
   and the gate edge cases the reference's unit tests pin today.

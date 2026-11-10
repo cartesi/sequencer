@@ -37,10 +37,15 @@ scheduler clock has executed, and every one above it is queued. The
 [sequencer recovery plan](../plans/2026-11-sequencer-recovery/scheduler.md#the-fridge)
 reads the fridge from the machine, so recovery no longer needs the invariant;
 on 2026-11-05 the owner kept whole blocks for its own sake, and a direct that
-arrives when only its own block is left joins over the bound. The bound is
-protocol: canonical
-execution, recovery and the C++ port apply it alike, and live prediction
-applies the well-formedness rule. Live prediction cannot mirror an overflow
+arrives when only its own block is left joins over the bound. On 2026-11-09
+the owner replaced the application-defined rule with a payload cap, a constant
+of the template: a direct with a longer payload never joins, and every other
+direct does. A cap bounds each entry's size without the scheduler running
+application code, and a rule that also dropped small garbage would buy
+little, since a zero-value portal deposit takes a slot for about the same L1
+gas. The bound and the cap are protocol: canonical
+execution, recovery and the C++ port apply them alike, and live prediction
+applies the cap. Live prediction cannot mirror an overflow
 drain, which can run ahead of batches the lane has already sealed, so an
 overflow is a deliberate divergence. An overflow is answered by a manual
 cockroach recovery, and the watchdog's divergence latch is what reports it;
@@ -54,10 +59,10 @@ To settle with Bart:
   know when it seals a batch, so one `addInput` would force a divergence.
   Every direct counts as an executed input today, so dropping one changes the
   history.
-- How large an entry can be. A count bounds memory only if each entry's size
+- The payload cap's value. A count bounds memory only if each entry's size
   is bounded too, and portals accept zero-value deposits with arbitrary extra
-  data, up to the 64 KiB input cap; a fixed-size record of each deposit the
-  application credits would do.
+  data, up to the 64 KiB input cap; the cap is the longest payload the
+  application accepts.
 - The count. Above what L1 can include within the backstop window, roughly
   2 million zero-value deposits at mainnet's 60M gas limit today (30-40k gas
   each when a contract batches them; measure it on the pinned contracts),
@@ -316,8 +321,13 @@ need.
   pending Bart: a gate on the scheduler clock, the latest of every accepted
   frame's `safe_block` and every drained direct's block. Raising it on a
   backstop drain changes no gate outcome, since gate e already skips any batch
-  that raise would reject, but recovery needs it: a direct the backstop
-  executed must not sit above the clock.
+  that raise would reject; it only keeps a direct the backstop executed from
+  sitting above the clock. Gate f alone keeps blocks from going backwards.
+  Strict frame clocks, the backstop's raise and whole-block overflow drains
+  serve only the clock's split of the directs, which recovery no longer
+  reads. On 2026-11-09 the owner kept them for the meaning they give the
+  clock, with setup and the conformance vectors checking the split
+  ([the invariant](../plans/2026-11-sequencer-recovery/scheduler.md#the-invariant)).
 - **Strict frame clocks** (checked 2026-11-02 at `3e92563`). Gate d accepts a
   frame whose `safe_block` equals its batch's inclusion block, which lets the
   frame drain only part of its own block. Settled by the owner for the next
@@ -331,7 +341,10 @@ need.
   authorized it (signature, nonce, fee cap); an included op advances the
   nonce and pays the fee capped at the balance, whatever else happens. On
   2026-11-05 the owner left the charge to the application, recommending the
-  capped fee.
+  capped fee. On 2026-11-09 the owner moved the nonce comparison into shared
+  code, with the application only storing the nonce, and made the fee-balance
+  check a separate admission call that only the lane makes
+  ([a user op's fate](../plans/2026-11-sequencer-recovery/scheduler.md#a-user-ops-fate)).
 - **Direct input context** (checked 2026-10-29 at `3e92563`). The guest drops
   a direct's input index, timestamp and prevRandao, and the application never
   sees them. Settled by the owner for the next template, pending Bart: they

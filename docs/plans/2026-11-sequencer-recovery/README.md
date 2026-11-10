@@ -23,9 +23,10 @@ instance kept down.
 
 ## The ideas
 
-- **The machine exports its whole state.** Setup reads the application's state
-  and the scheduler's state, the fridge of queued directs included, through
-  inspect queries. Nothing below the machine is rebuilt.
+- **The machine exports its state.** Setup reads the application's state and
+  the scheduler's: its counts, its batch nonce, its clock and where its queue
+  of directs starts. L1 holds the queued directs themselves. Nothing below the
+  machine is rebuilt.
 - **The scheduler alone rebuilds the history.** From the machine's scheduler
   state and the L1 inputs after it, the scheduler decides which transactions
   run, in order, without the application. The application then executes them.
@@ -43,7 +44,7 @@ Three layers, each readable on its own:
 
 | Layer | For | Files |
 |---|---|---|
-| 1. The shared software | Whoever writes the guest or ports the scheduler | [scheduler.md](scheduler.md), every check and gate; [application.md](application.md), the state export and the `Application` trait |
+| 1. The shared software | Whoever writes the guest or ports the scheduler | [scheduler.md](scheduler.md), every check and gate; [application.md](application.md), the state export and the `Application` trait; [interfaces.md](interfaces.md), both components' signatures in Rust and C |
 | 2. Operations | Whoever runs the sequencer or a client | [operations.md](operations.md), the interface and the playbooks; [client-backups.md](client-backups.md) |
 | 3. The design | Whoever builds or reviews the sequencer's side | [sequencer.md](sequencer.md), the rebuild, the history table and the feed; [todo.md](todo.md) |
 
@@ -66,4 +67,4 @@ Each file becomes a real doc when the plan lands:
 | scheduler state | The next batch nonce, the scheduler clock and the fridge |
 | scheduled transaction | A transaction the scheduler hands the application; a user op may still be skipped |
 | executed transaction | A scheduled transaction the application executed; it has an L2 tx count |
-| first queued input | The InputBox index of the oldest direct still queued at the end of the stop block |
+| first queued input | The InputBox index of the oldest direct still queued, at the base and again at the end of the stop block |

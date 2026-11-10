@@ -70,9 +70,9 @@ Setup needs an empty data directory. It refuses one that holds anything, a
 completed setup or a failed one, loudly and without touching it: nothing there
 can be trusted to fit this run.
 
-1. **Reads the base.** For a machine, setup loads it, runs its
-   [export queries](application.md#the-state-export), and builds the
-   sequencer's application from the export. For genesis, it starts empty.
+1. **Reads the base.** For a machine, setup loads it, reads its
+   [export](application.md#the-state-export), and builds the sequencer's
+   application from the export. For genesis, it starts empty.
 2. **Flushes and pins the stop block.** It replaces what the provider's pool
    holds for the submitter account and waits until that is safe
    ([flush](../../recovery/cockroach.md#flush-and-stopping-block)). The flush is
@@ -84,20 +84,26 @@ can be trusted to fit this run.
    wallet is still unsettled. Either means a transaction escaped the flush or
    the old instance still runs; stop it and run setup again. This is setup's
    one check on the old instance.
-4. **Rebuilds the history, with the scheduler alone.** It resumes the
-   scheduler from the base's scheduler state and feeds it every input the base
-   has not consumed, through the stop block. It stores each transaction the
-   scheduler hands out, in order, in a new table. No application runs here.
-5. **Executes the history.** The application advances through the stored
+4. **Checks the base's export against L1.** Among the inputs the base
+   consumed, the admitted directs above its clock must be exactly the ones its
+   export names: as many as it reports queued, starting at its first queued
+   input ([the invariant](scheduler.md#the-invariant)). A mismatch stops
+   setup: the machine is not canonical, or its scheduler drained wrongly.
+5. **Rebuilds the history, with the scheduler alone.** It resumes the
+   scheduler from the base's scheduler state, with the directs the base still
+   had queued, and feeds it every input the base has not consumed, through the
+   stop block. It stores each transaction the scheduler hands out, in order,
+   in a new table. No application runs here.
+6. **Executes the history.** The application advances through the stored
    transactions, through the shared execution boundary. A direct always
    executes; a user op executes or is skipped
    ([what counts](scheduler.md#what-counts)). An application error stops setup
    there. If the canonical machine halts on the same transaction, the
    application is dead on chain; otherwise the fault is in the native engine or
    the projection ([what can go wrong](#what-can-go-wrong)).
-6. **Publishes the new era**, in one transaction. It opens no root frame.
+7. **Publishes the new era**, in one transaction. It opens no root frame.
 
-Nothing is published until step 6. A failed setup leaves a directory to
+Nothing is published until step 7. A failed setup leaves a directory to
 discard; run setup again in an empty one.
 
 ### After setup
@@ -167,6 +173,7 @@ discard; run setup again in an empty one.
 | A client's state holds rows that never landed | The client's range check | The client restores an older state |
 | A client's state is wrong below its count | Only the client's own checks, such as the row comparison | The client restores an older state |
 | A transaction escaped the flush, or the old instance runs | Setup's escape check | Stop the old instance and run setup again |
+| The base's export disagrees with L1 | Setup's export check | Recover from a trusted machine; if this one is canonical, its scheduler drained wrongly |
 | The base machine is not canonical | The new era's first watchdog comparison | Recover from a trusted machine |
 | An I/O error while executing the history | Setup stops | Fix the host and run setup again |
 | The application fails on a transaction of the history | Setup stops | Replay a trusted machine to that input: if it halts there too, the application is dead; if not, fix the native engine or the projection |

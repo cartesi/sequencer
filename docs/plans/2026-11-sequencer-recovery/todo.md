@@ -21,22 +21,47 @@ is easy to miss. An item leaves this list when it lands.
   canonical shows only at the watchdog's first comparison. A client state that
   is wrong below its count shows only in the client's own row comparison
   ([what can go wrong](operations.md#what-can-go-wrong)).
-- **Each queued direct keeps its input index**, in the guest and in the
-  `fridge` export. The feed takes a direct's transaction hash and timestamp
-  from the input table by that index, and the lane starts draining at the first
-  queued input ([export](application.md#the-state-export)).
+- **Each queued direct keeps its input index** in the guest, and the export
+  reports the first one's. The feed takes a direct's transaction hash and
+  timestamp from the input table by that index, the scheduler resumes from the
+  base's first queued input, and the lane starts draining at the stop block's
+  ([export](application.md#the-state-export)).
+- **A direct over the payload cap never executes.** Today every direct in a
+  drained range executes and gets a row, so the lane's range drain and its
+  execution rows must allow an input that has none
+  ([the fridge](scheduler.md#the-fridge)).
+- **A direct's index and timestamp reach the application.** Storage and the
+  feed already carry them. The lane's query, the replay, the scheduler's input
+  and the engine's record drop them today
+  ([direct context](scheduler.md#direct-context)).
 - **The rebuilt history table keeps every scheduled transaction, and the feed
   serves only the executed ones.** A skipped user op stays in the table without
   a count ([table](sequencer.md#the-rebuilt-history-table)).
-- **Setup links the emulator**, to load the machine and run its export
-  queries. Today only `sdk/guest/testsi` links it, so the sequencer's build and
-  image grow ([loading a machine](sequencer.md#loading-a-machine)).
-- **An underfunded op executes and counts.** Today it is skipped. Validation
-  reports it apart from a wrong nonce, `apply_valid_user_op` must never fail on
-  it (the wallet treats an unpayable fee as fatal today), and the lane refuses
-  it at `POST /tx`. The application contract's
+- **Setup links the emulator**, to load the machine and read its export.
+  Today only `sdk/guest/testsi` links it, so the sequencer's build and image
+  grow ([loading a machine](sequencer.md#loading-a-machine)).
+- **An underfunded op executes and counts.** Today it is skipped. Applying an
+  op must never fail on it: the wallet treats an unpayable fee as fatal today,
+  and the engine's conformance test uses that failure as its example of an
+  execution error. The scheduler's own test of the skip changes with it. The
+  application contract's
   [§2](../../protocol/application-contract.md#2-replay-safety--rejection-inclusion-and-failure)
-  changes with it ([frame execution](scheduler.md#frame-execution)).
+  changes too ([a user op's fate](scheduler.md#a-user-ops-fate)).
+- **Shared code compares the nonce, and admission is its own call.** The
+  application's validation splits into a nonce getter, which the executor
+  reads, and an admission call, which only the lane makes
+  ([interfaces](interfaces.md#the-executor)). `POST /tx` keeps its 422 texts:
+  the README teaches clients to read the expected nonce from the bad-nonce
+  text, and the tests and the Sepolia demo script match them.
+- **The clock leaves the application's state.** The wallet's state bytes lose
+  it, which changes the golden fixture, the template hash and every stored
+  dump. The replica bootstrap test reads it as the block to start after
+  (`historical_bootstrap.rs`), so that recipe needs another source
+  ([outputs and progress](scheduler.md#outputs-and-progress)).
+- **The engine's header gets a version.** A changed meaning, such as applying
+  an op the sender cannot pay for, does not fail at link time, and an engine
+  built for the old meaning would halt the canonical machine
+  ([interfaces](interfaces.md#the-application)).
 - **Setup becomes one procedure.** `--recovery` and its dump directory go;
   plain setup's refusal on submitter activity goes, and its post-flush escape
   check stays; setup takes the submitter key; genesis is a base like any other.
@@ -57,6 +82,8 @@ is easy to miss. An item leaves this list when it lands.
   [application contract's §4](../../protocol/application-contract.md#4-canonical-history-cursor-executed_input_count).
 - **[application.md](application.md)** goes into the application contract and
   the [C binding](../../protocol/c-application-binding.md).
+- **[interfaces.md](interfaces.md)** becomes code: the two traits and the
+  executor in `sequencer-core`, and the two C headers.
 - **[operations.md](operations.md)** replaces the procedure in
   [cockroach recovery](../../recovery/cockroach.md) and the
   [incident runbook](../../watchdog/incident-runbook.md); then this directory
@@ -68,20 +95,23 @@ is easy to miss. An item leaves this list when it lands.
 
 The changes above are part of this work; each item here names only the rest.
 
-- **The scheduler's interface**: design with Bart a free-standing scheduler's
-  C interface and its Rust wrapper, with examples, as the `Application` trait
-  and the C binding were ([scheduler](scheduler.md#the-schedulers-interface)).
+- **The scheduler's interface**: settle with Bart the free-standing
+  scheduler's Rust trait and C header, with examples, as the `Application`
+  trait and the C binding were ([interfaces](interfaces.md#the-scheduler)).
   Then split today's `Scheduler<A>` into the scheduler and the executor
   ([rebuild](sequencer.md#the-rebuild)).
-- **Guest**: the template rules and the export queries.
-- **Setup**: `--base` and `--dry-run`. It loads the machine, runs its export
-  queries, builds the application from the export, rebuilds and stores the
-  history, executes it, and publishes the era.
+- **Guest**: the template rules and the `scheduler` export query.
+- **Setup**: `--base` and `--dry-run`. It loads the machine, reads its export
+  and checks it against L1, builds the application from the export, rebuilds
+  and stores the history, executes it, and publishes the era.
+- **Vectors**: the new set carries the `scheduler` report after every input,
+  so every scenario asserts the clock's split of the directs
+  ([conformance](scheduler.md#conformance)).
 - **Sequencer storage**: the rebuilt history table; the era's base count,
   rebuilt history end and first queued input; the new baseline served as the
   era's first comparison checkpoint.
-- **The lane and the predicate**: the direct filter, the underfunded refusal,
-  and gate f in `scheduler_accepts` ([sequencer](sequencer.md#the-lane-and-the-predicate)).
+- **The lane and the predicate**: the payload cap, admission, and gate f in
+  `scheduler_accepts` ([sequencer](sequencer.md#the-lane-and-the-predicate)).
 - **Feed**: serve the rebuilt history, then the live rows, switching tables
   internally.
 - **Tests of setup against a chain with history**, from genesis and from a
@@ -121,22 +151,27 @@ operator's job.
 
 ## Questions for Bart
 
-- Can your guest answer the export queries and keep each queued direct's input
-  index? Which encoding will libdex's `state` export use?
-- Does libdex's drive hold the L2 tx count, so that a projected state starts at
-  the machine's count? Does it hold only the flat buffer, or a padding tail
-  too?
+- Can your guest answer the `scheduler` query and keep each queued direct's
+  input index? Which encoding will libdex's `state` export use?
+- Does libdex's drive hold the L2 tx count? The projection is given the
+  machine's either way. Does the drive hold only the flat buffer, or a padding
+  tail too?
 - Which of a direct's index, timestamp and prevRandao does libdex read? Does it
   read a transaction's block as time?
-- Which directs are well formed for libdex, and how large can one be? What
-  bound and largest drain can the guest afford?
+- What is the longest direct payload libdex accepts? It sets the payload cap.
+  What bound and largest drain can the guest afford?
 - How should libdex's apply handle an underfunded op? We recommend charging
   what the sender has.
+- Can libdex report a nonce for an address it has never seen, and store one
+  after that address's first op? A bounded account table cannot, and the nonce
+  getter would then need a "no such sender" answer that skips the op.
+- Would your guest link the reference scheduler through `scheduler.h`, or
+  would your port implement `scheduler.h`, so that the sequencer links it for
+  the rebuild?
 - Is your guest's compiled sequencer address the pinned submitter? Can its
   harness answer an input with `RX_REJECTED`?
 - Does your scheduler reproduce the conformance vectors, and reject an
   out-of-range `fee_price` at gate d, as ours does since PR #56?
-- How should the free-standing scheduler's interface look from your side?
 - Can your client restore a state at a count it trusts, by the two backup
   rules or its own? Which SQLite version does it link? Will it compare its rows
   from the base count before it continues?
@@ -147,8 +182,8 @@ operator's job.
 
 - Setup's rebuild from the base machine to the stop block, at the age a base
   machine will typically have, and from genesis.
-- Exporting a full fridge, and a large application state, through paged
-  inspect queries.
+- Reading a large application state from a stopped machine through its state
+  source.
 - The guest's cost to drain a full fridge in one input, which the first frame
   after an outage and the root frame after a recovery both do.
 - The time to recover, end to end, in a drill.

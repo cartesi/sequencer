@@ -6,8 +6,8 @@ Rust show roles, and their names are proposals.
 
 ## Loading a machine
 
-Setup links the emulator to load a base machine and run its
-[export queries](application.md#the-state-export). Today only
+Setup links the emulator to load a base machine and read its
+[export](application.md#the-state-export). Today only
 `sdk/guest/testsi` links it, through the `cartesi-machine` crate, so the
 sequencer's build and image grow.
 
@@ -17,9 +17,12 @@ Setup runs the same two pieces the canonical guest runs, the scheduler and then
 the application, but one after the other over the whole rebuilt range instead
 of input by input. The scheduler needs no application: what it hands out
 depends only on its state and the inputs
-([scheduler](scheduler.md#the-schedulers-state)). Its interface is pending
-([scheduler](scheduler.md#the-schedulers-interface)). What it hands out, in
-order, is one of:
+([scheduler](scheduler.md#the-schedulers-state)).
+[Interfaces](interfaces.md#the-scheduler) outlines it. Setup first checks the
+machine's export against its input table
+([operations](operations.md#what-setup-does)). Then it resumes the scheduler
+from the export, re-supplying the inputs from the first queued input up to the
+machine's position. What it hands out, in order, is one of:
 
 - **a direct**, with a batch nonce: the batch whose frame drained it, or, when
   the backstop or an overflow drained it, the scheduler's next batch nonce at
@@ -68,8 +71,10 @@ nonce from the rebuild ([above](#the-rebuild)).
 
 The next template's rules reach the sequencer's live side too:
 
-- **The lane** drops the directs the direct filter refuses, drains from the
-  first queued input, and refuses an underfunded op at `POST /tx`.
+- **The lane** drops the directs over the payload cap and drains from the
+  first queued input. Before it includes an op it asks the application's
+  admission, which refuses an underfunded one at `POST /tx`
+  ([a user op's fate](scheduler.md#a-user-ops-fate)).
 - **Frame ordering** ([I3](../../invariants.md#i3-frame-safe_blocks-are-non-decreasing-along-the-spine))
   becomes consensus-critical: a frame below the scheduler clock gets its batch
   rejected.

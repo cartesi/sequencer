@@ -7,35 +7,24 @@ An application lives in two places: natively, inside the sequencer and its
 clients, and in the canonical machine, the template every validator runs. A
 recovery reads a machine's state and builds the native side from it, so both
 sides carry obligations. The [scheduler](scheduler.md) owns the rules the
-machine runs; this page owns the interfaces around them: the machine's state
-export, the `Application` trait, and the guest's duties.
+machine runs; this page owns what surrounds them: the machine's state export,
+the `Application` trait's obligations, and the guest's duties.
+[Interfaces](interfaces.md) outlines the signatures, in Rust and in C.
 
 ## The state export
 
-**New.** Setup reads a stopped machine's whole state through inspect queries.
-The interface is generic. The canonical harness answers the scheduler's part
-for every application, since it owns that state, and the application answers
-only for its own state, in an encoding it chooses.
+**New.** Setup reads two things from a stopped machine. The canonical harness
+answers the scheduler's part for every application, since it owns that state,
+and the application answers only for its own state, in an encoding it chooses.
 
-| Query | Answered by | Returns |
+| What | How setup reads it | Answered by |
 |---|---|---|
-| `state`, the literal bytes or an empty payload | The application | The whole comparison bytes in one report, unchanged from today |
-| `scheduler` | The harness | The counts, the next batch nonce, the clock and the fridge's length |
-| `fridge`, with a start and a count | The harness | A page of fridge entries, oldest first |
-| `state_page`, with a page | The application | A page of the comparison bytes |
+| The application's state | Through the deployment's state source, as the watchdog does: the `state` inspect report, or the labeled range | The application |
+| The scheduler's state and the counts | The `scheduler` inspect query | The harness |
 
-An outline in Rust; the names and the encoding are proposals. SSZ, as batches
-use, would do:
+The `scheduler` report is six little-endian `u64`s, in this order:
 
 ```rust
-/// An export request's payload. Neither the literal `state` nor an empty
-/// payload decodes as one, so today's query keeps its meaning.
-pub enum ExportQuery {
-    Scheduler,
-    Fridge { start: u64, count: u32 },
-    StatePage { page: u32 },
-}
-
 pub struct SchedulerExport {
     /// InputBox inputs the machine has consumed: its position.
     pub l1_input_count: u64,
@@ -44,75 +33,75 @@ pub struct SchedulerExport {
     pub next_batch_nonce: u64,
     /// The latest block the scheduler has executed at.
     pub clock: u64,
+    /// Index of the oldest queued direct; the L1 input count when none is.
+    pub first_queued_input: u64,
+    /// How many directs are queued.
     pub fridge_len: u64,
-}
-
-/// A queued direct. The first entry's index is the first queued input.
-pub struct FridgeEntry {
-    pub input_index: u64,
-    pub sender: Address,
-    pub block: u64,
-    pub timestamp: u64,
-    pub payload: Vec<u8>,
-}
-
-pub struct StatePage {
-    pub page_count: u32,
-    pub bytes: Vec<u8>,
 }
 ```
 
-- **Each query returns one report**, and a report holds at most 2 MiB, so the
-  fridge and the state come in pages. A `fridge` reply holds as many of the
-  asked entries as fit, and the reader continues after the last one. An entry
-  can carry nearly 64 KiB, the InputBox's cap on an encoded input.
-- **The export is the comparison bytes.** The literal `state` query returns
-  them whole, as today
-  ([`inspect_state`](../../../sequencer-core/src/scheduler/mod.rs)), and the
-  watchdog's inspect source keeps hashing that report. `state_page` returns the
-  same bytes in pages, for setup, so one method serves both. A state larger
-  than one report uses the watchdog's range source, as today.
+- **The application's state is the comparison bytes**, read the way the
+  watchdog reads them ([state sources](../../watchdog/README.md#state-sources)).
+  It needs no new query: a state too large for one report already uses the
+  range source.
+- **The fridge is named, not exported.** It holds the admitted directs from the
+  first queued input up to the L1 input count
+  ([scheduler](scheduler.md#the-schedulers-state)). Setup reads them from its
+  own input table and checks the export against it
+  ([operations](operations.md#what-setup-does)).
 - **The application chooses its encoding.** The wallet exports its SSZ
   snapshot; libdex could export the flat buffer its drive holds, as it is.
+- **The `state` query keeps its meaning.** The literal bytes or an empty
+  payload return the comparison bytes whole, as today
+  ([`inspect_state`](../../../sequencer-core/src/scheduler/mod.rs)). The
+  literal `scheduler` is the one query added.
 - **An unknown query gets a report saying so**, never a halt, as today.
 
 ## The `Application` trait
 
 What the sequencer calls, in
 [`sequencer-core/src/application/mod.rs`](../../../sequencer-core/src/application/mod.rs).
+[Interfaces](interfaces.md#the-application) outlines the trait as proposed.
 The [C binding](../../protocol/c-application-binding.md) maps it to native
-engines and gets the same additions.
+engines and gets the same changes.
 
 | Method | Obligation |
 |---|---|
-| `max_method_payload_bytes` | A fixed cap on a user op's payload |
-| `validate_user_op` | Decide, without changing state, whether an op executes; **New:** only a wrong nonce rejects it, and an underfunded op is reported as such |
-| `apply_valid_user_op` | Advance the sender's nonce and the L2 tx count by exactly one, and charge the fee, business failures included; **New:** never fail on a fee the sender cannot pay |
-| `apply_direct_input` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
-| `progress` | Report the L2 tx count; **New:** the count alone, without today's clock |
+| `max_method_payload_bytes` | A fixed cap on a user op's payload, which only the lane enforces |
+| **New:** `user_nonce` | Report a sender's next nonce, which the shared executor compares with the op's |
+| `admit_user_op`, today's `validate_user_op` | Say, without changing state, whether the operator wants an op; **New:** it no longer checks the nonce, and only the lane calls it |
+| `apply_user_op`, today's `apply_valid_user_op` | Advance the sender's nonce and the L2 tx count by exactly one, business failures included; **New:** never fail, even on a fee the sender cannot pay |
+| `apply_direct`, today's `apply_direct_input` | Apply a direct, advancing the L2 tx count and never a nonce; **New:** it receives the input index and timestamp |
+| `l2_tx_count`, today's `progress` | Report the L2 tx count; **New:** the count alone, without today's clock |
 | `create_dump`, `from_dump`, `state_file_in_dump` | Write a durable dump, load it back to the same state, and name the file that holds the comparison bytes |
-| `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns whole; **New:** `state_page` returns them in pages |
-| **New:** the direct filter | Say whether a direct is well formed, from the direct and the application's fixed configuration alone |
-| **New:** the projection | Build a native instance from a machine's export |
+| `CanonicalState::canonical_snapshot_bytes` | The comparison bytes, which the `state` query returns whole |
+| **New:** `from_canonical_state` | Build a native instance from a machine's comparison bytes, at the machine's L2 tx count |
 
-- **Underfunded ops.** The scheduler executes an op whose sender cannot pay
-  the fee ([scheduler](scheduler.md#frame-execution)), so validation reports it
-  apart from a wrong nonce. The sequencer's ingress refuses it, since it would
-  pay less than the L1 data it costs; the canonical boundary executes it. How
-  much `apply_valid_user_op` charges and whether the effect runs are the
-  application's choice. Charging what the sender has is the recommendation.
-- **The direct filter.** A stateless predicate: it reads only the direct and
-  fixed configuration, such as the wallet's portal and token addresses, never
-  state that transactions change. The guest drops what it refuses, and so must
-  the sequencer's lane, or the two diverge.
+- **Nonces.** The application stores each sender's next nonce and reports it.
+  It no longer decides whether an op's nonce is right: the shared executor
+  compares before an op and checks the one-step advance after it, so the
+  [nonce rule](../../protocol/application-contract.md#user-nonces) is checked
+  the same way for every application. The same getter is what
+  [Track 6](../2026-07-coordination-tracks.md#track-6--dump--application-api-redesign)
+  proposes for an exact `GET /nonce`.
+- **What an op pays.** The scheduler executes every op its sender authorized,
+  funded or not ([scheduler](scheduler.md#a-user-ops-fate)). How much
+  `apply_user_op` charges and whether the effect runs are the application's
+  choice. Charging what the sender has, a saturating subtraction, is the
+  recommendation.
+- **Admission.** The lane asks before it includes an op, and refuses an
+  underfunded one, since it would pay less than the L1 data it costs. It is
+  policy: the canonical machine never calls it, a guest build need not link
+  it, and its answer never changes what an included op does. An operator's
+  exemptions, such as a sponsored role, are answered here.
 - **The projection.** The instance it builds must equal the machine's: the
-  same comparison bytes and the same L2 tx count. For the wallet that means
-  decoding its SSZ snapshot; for libdex, loading the flat buffer.
+  same comparison bytes, at the L2 tx count it is given. For the wallet that
+  means decoding its SSZ snapshot; for libdex, loading the flat buffer.
 
 The rules behind the trait still hold. Execution is deterministic and reads
 nothing but the state and the transaction
 ([§1](../../protocol/application-contract.md#1-determinism--purity)); a
-rejected op changes nothing, and every executed op follows the nonce rule
+skipped op changes nothing, and every executed op follows the nonce rule
 ([§2](../../protocol/application-contract.md#2-replay-safety--rejection-inclusion-and-failure));
 an `AppError` is fatal and defines no successor state.
 
@@ -126,12 +115,14 @@ What the guest must do, for every validator and for recovery:
   [fatal conditions](scheduler.md#no-reverts-and-when-to-halt).
 - **Keep each input's index.** The guest records how many inputs it has
   consumed, and each queued direct keeps its own index.
-- **Answer the [export queries](#the-state-export).**
-- **Compile in the pinned submitter** as `sequencer_address`.
+- **Answer the [export](#the-state-export)**: its state through the state
+  source, and the `scheduler` query.
+- **Compile in the deployment's constants**: the pinned submitter as
+  `sequencer_address`, the fridge's bound and the directs' payload cap.
 
 ## Where this gets written down
 
 The trait's rows live in the
 [application contract](../../protocol/application-contract.md). The export,
-the direct filter, the projection and the changed rows go into it and into the
-C binding when the template lands ([todo](todo.md#promote-to-real-docs)).
+the projection and the changed rows go into it and into the C binding when the
+template lands ([todo](todo.md#promote-to-real-docs)).
