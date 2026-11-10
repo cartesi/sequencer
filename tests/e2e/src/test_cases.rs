@@ -7,15 +7,13 @@ use crate::{Host, Scenario, ScenarioFn, ScenarioResult};
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
     DEVNET_PREEMPTIVE_MARGIN_BLOCKS, DEVNET_SECONDS_PER_BLOCK, ManagedSequencer,
-    ManagedSequencerConfig, RecoveryCheckpoint, RecoverySetupParams, ReplayWalletApp,
-    RespawnAttemptOutcome, RespawnPolicy, TcpProxy, TestSigner, WalletL1Client, WalletL2Client,
-    WsClient, sign_user_op_hex,
+    ManagedSequencerConfig, ReplayWalletApp, RespawnAttemptOutcome, RespawnPolicy, TcpProxy,
+    TestSigner, WalletL1Client, WalletL2Client, WsClient, sign_user_op_hex,
 };
 use sequencer_core::api::{TxRequest, WsTxMessage};
-use sequencer_core::application::Application;
 use sequencer_core::fee::fee_to_linear;
 use sequencer_core::user_op::UserOp;
-use sequencer_rust_client::{HistoryPolicyError, SequencerClient, SubscribeError};
+use sequencer_rust_client::SequencerClient;
 
 const NO_WS_MESSAGE_WAIT: Duration = Duration::from_secs(1);
 
@@ -182,9 +180,6 @@ pub fn test_cases() -> Vec<Scenario> {
             "c_host_cold_replica_snapshot_backlog_live_recovery_test",
             |runtime| Box::pin(crate::cold_replica::run_c(runtime)),
         ),
-        c_host("c_host_setup_recovery_round_trip_test", |runtime| {
-            Box::pin(run_setup_recovery_round_trip_test::<c_app_engine::EngineApp>(runtime))
-        }),
         c_host("c_host_deposit_transfer_withdrawal_test", |runtime| {
             Box::pin(run_deposit_transfer_withdrawal_test(runtime))
         })
@@ -240,11 +235,6 @@ pub fn test_cases() -> Vec<Scenario> {
         ),
         rust("recovery_after_stale_batches_test", |runtime| {
             Box::pin(run_recovery_after_stale_batches_test(runtime))
-        }),
-        rust("setup_recovery_round_trip_test", |runtime| {
-            Box::pin(run_setup_recovery_round_trip_test::<
-                app_core::application::WalletApp,
-            >(runtime))
         }),
         rust("sequencer_outage_pre_danger_no_recovery_test", |runtime| {
             Box::pin(run_sequencer_outage_pre_danger_no_recovery_test(runtime))
@@ -924,9 +914,14 @@ async fn run_restart_and_replay_test(runtime: &mut ManagedSequencer) -> Scenario
         3,
     );
     assert_eq!(
-        replay_after_restart.last_executed_safe_block(),
-        replay_before_restart.last_executed_safe_block(),
-        "mirror safe-block clock must match the pre-restart live replay clock",
+        replay_after_restart.canonical_snapshot_bytes()?,
+        replay_before_restart.canonical_snapshot_bytes()?,
+        "the replayed mirror's whole state must match the pre-restart live mirror",
+    );
+    assert_eq!(
+        replay_after_restart.last_applied_block(),
+        replay_before_restart.last_applied_block(),
+        "the replayed feed must carry the same L1 blocks as the live feed",
     );
 
     // Reading the persisted feed alone does not prove the restarted engine
@@ -1423,184 +1418,6 @@ async fn run_recovery_after_stale_batches_test(
         alice_address,
     )
     .await?;
-    crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
-
-    Ok(())
-}
-
-// ── Cockroach recovery: setup --recovery round-trip ────────
-//
-// The affirmative end-to-end test of cockroach recovery: build state, promote a
-// real finalized snapshot (the checkpoint), wipe the DB, rebuild it from the
-// checkpoint via `setup --recovery` (flush → fold → fill), boot `run`, and
-// prove the recovered state is correct — the resumed sequencer accepts a new
-// user-op at the *continuing* nonce (so the fold preserved the sender's nonce +
-// balance), and the rebuilt tree is anchored at the resume nonce N' (validated
-// structurally by the post-scenario `assert_schema_invariants`).
-//
-// `max_batch_open` is set to 5s (not the 2h default) so a batch seals + gets
-// promoted via plain L1 mining — no 2h clock jump, so the L1 view stays fresh
-// and no staleness/cascade fires.
-
-/// Mine + wait until a finalized snapshot is promoted past genesis (B > 0),
-/// then capture it as a checkpoint. Times out loudly if no promotion lands.
-async fn drive_promotion_and_capture(
-    runtime: &ManagedSequencer,
-) -> ScenarioResult<RecoveryCheckpoint> {
-    mine_until_finalized_advances(runtime, 0).await?;
-    runtime.capture_finalized_checkpoint().await
-}
-
-async fn run_setup_recovery_round_trip_test<A: Application>(
-    runtime: &mut ManagedSequencer,
-) -> ScenarioResult<()> {
-    runtime.set_max_batch_open_seconds(Some(5));
-    runtime.restart().await?;
-
-    let alice = TestSigner::from_default(1)?;
-    let bob = TestSigner::from_default(2)?;
-    let alice_address = alice.address();
-    let bob_address = bob.address();
-    let gas = fee_to_linear(DEFAULT_FRAME_FEE);
-
-    let mut ws = runtime.ws(0).await?;
-    let alice_l1 = runtime.wallet_l1(alice.clone()).await?;
-    let mut alice_l2 = runtime.wallet_l2(alice.clone())?;
-    let mut replay = ReplayWalletApp::devnet();
-
-    // Build state: a deposit (direct) + a transfer (user-op). These land in the
-    // batch that will seal + promote into the checkpoint. Size the deposit for
-    // the post-recovery gold-batch pump (~150 self-transfers × ~38k fee).
-    let deposit = U256::from(10_000_000_u64);
-    let transfer1 = U256::from(100_000_u64);
-    apply_reconciled_supported_deposit(runtime, &mut ws, &mut replay, &alice_l1, deposit).await?;
-    alice_l2.transfer(bob_address, transfer1).await?;
-    replay.apply(ws.expect_user_op_from(alice_address).await?)?;
-    let expected_alice = deposit - transfer1 - gas;
-    assert_eq!(replay.current_user_balance(alice_address), expected_alice);
-    assert_eq!(replay.current_user_balance(bob_address), transfer1);
-    assert_eq!(replay.current_user_nonce(alice_address), 1);
-
-    // Drive the batch to seal + be accepted + promoted, and capture the
-    // resulting finalized snapshot as the recovery checkpoint.
-    let checkpoint = drive_promotion_and_capture(runtime).await?;
-    let old_claim = SequencerClient::new(runtime.internal_endpoint())?
-        .latest_snapshot()
-        .await?
-        .claim;
-    eprintln!(
-        "recovery checkpoint: B={} N={}",
-        checkpoint.checkpoint_block, checkpoint.resume_nonce
-    );
-
-    // Wipe the DB and rebuild it from the checkpoint via `setup --recovery`.
-    drop(ws);
-    runtime.stop().await?;
-    runtime.set_recovery_setup(Some(RecoverySetupParams {
-        checkpoint_block: checkpoint.checkpoint_block,
-        checkpoint_dump_dir: checkpoint.dir,
-    }));
-    runtime.reset_database()?;
-    // The recovery setup's flush + the post-recovery run boot both need L1 to
-    // keep advancing.
-    runtime.set_mine_l1_during_boot(true);
-    runtime.respawn().await?;
-
-    // A rebuilt database cannot authorize the old replica, even when its
-    // numerical generation/count match. Restore and subscribe in the new era.
-    let client = SequencerClient::new(runtime.internal_endpoint())?;
-    assert!(matches!(
-        client.subscribe(old_claim).await,
-        Err(SubscribeError::History(
-            HistoryPolicyError::EraChanged { .. }
-        ))
-    ));
-    let (mut restored, fresh_claim) =
-        crate::cold_replica::restore::<A>(client.latest_snapshot().await?).await?;
-    assert_ne!(fresh_claim.version.era_id, old_claim.version.era_id);
-    assert_eq!(fresh_claim.version.recovery_generation.get(), 0);
-    assert!(fresh_claim.next_input.get() > 0);
-    crate::cold_replica::assert_same_state(&mut restored, &replay)?;
-    let mut resumed_ws = WsClient::connect(&client, fresh_claim).await?;
-
-    // A continuing nonce exercises the recovered host's state as well as the
-    // independently restored replica and the retained reference history.
-    let mut alice_l2_after = runtime.wallet_l2(alice)?;
-    // Known gap: the rebuilt database has no ops for the folded prefix, so a
-    // sender idle since the rebuild reads 0 (application contract, "User
-    // nonces"). Flip this when setup seeds baseline nonces.
-    assert_eq!(alice_l2_after.served_next_nonce().await?, 0);
-    alice_l2_after.set_next_nonce(1);
-    let post_transfer = U256::from(70_000_u64);
-    alice_l2_after.transfer(bob_address, post_transfer).await?;
-    assert_eq!(
-        alice_l2_after.served_next_nonce().await?,
-        2,
-        "stored nonces are absolute, so one op in the new era makes it exact"
-    );
-    let message = resumed_ws.expect_user_op_from(alice_address).await?;
-    rollups_harness::replay::apply_ws_message(&mut restored, message.clone())?;
-    replay.apply(message)?;
-    crate::cold_replica::assert_same_state(&mut restored, &replay)?;
-
-    // Explicit recovery-correctness assertions, beyond the structural
-    // `assert_schema_invariants` (which checks `0..`-from-anchor contiguity):
-    //   1. the rebuilt tree is anchored at N' (I16): the checkpoint's N plus the
-    //      batches accepted in (B, C], counted from L1;
-    //   2. recovery's resync did NOT spuriously freeze the frontier — the I15
-    //      content-identity false-positive against below-anchor collapsed history
-    //      is otherwise a silent failure, invisible at the e2e level (the same
-    //      silence the (C, H1] bug shipped behind).
-    // The 5 s timer keeps closing batches until the stop, so whether one lands
-    // after B varies run to run. Counting consecutive nonces from N mirrors the
-    // scheduler's acceptance; batches this fresh cannot be stale.
-    let stop_block = runtime.baseline_safe_block()?;
-    let mut resume_nonce = checkpoint.resume_nonce;
-    for nonce in runtime
-        .l1_batch_nonces(checkpoint.checkpoint_block, stop_block)
-        .await?
-    {
-        if nonce == resume_nonce {
-            resume_nonce += 1;
-        }
-    }
-    eprintln!("recovery fold: C={stop_block} N'={resume_nonce}");
-    assert_eq!(
-        runtime.batch_tree_anchor()?,
-        resume_nonce,
-        "the rebuilt tree must be anchored at N', the checkpoint nonce plus the \
-         batches accepted after the checkpoint block"
-    );
-    assert_eq!(
-        runtime.canonical_divergence()?,
-        None,
-        "recovery must not falsely freeze the frontier (no canonical divergence)"
-    );
-
-    // ── Watchdog agreement on the rebuilt + resumed state ────────────────
-    //
-    // The strongest end-to-end proof that `setup --recovery` reconstructed
-    // canonical state: drive a finalized gold batch on the *resumed* sequencer,
-    // then assert the watchdog's from-genesis CM replay is byte-identical to the
-    // finalized snapshot the sequencer now serves. The CM replays every L1 input
-    // from genesis — the pre-wipe batches (nonce < N') plus the post-recovery
-    // batches at the resume nonce N' — so agreement proves the fold-rebuilt state
-    // S' and the resumed submission both land exactly on the canonical chain
-    // state. This checks native execution against the independent CM target.
-    let floor_inclusion_block = runtime.finalized_inclusion_block().await?.unwrap_or(0);
-    let batches_before = runtime.count_batches()?;
-    for _ in 0..TRANSFERS_TO_FORCE_BATCH_CLOSE {
-        alice_l2_after
-            .transfer(alice_address, U256::from(1_u64))
-            .await?;
-    }
-    let batches_after = runtime.count_batches()?;
-    assert!(
-        batches_after.sealed > batches_before.sealed,
-        "expected a sealed batch before the recovery watchdog compare: \
-         before={batches_before:?} after={batches_after:?}"
-    );
-    mine_until_finalized_advances(runtime, floor_inclusion_block).await?;
     crate::watchdog_compare::run_watchdog_non_genesis_compare_test(runtime).await?;
 
     Ok(())
@@ -3696,9 +3513,14 @@ async fn run_replay_matches_live_for_mixed_workload_test(
         replay_live.executed_input_count(),
     );
     assert_eq!(
-        replay_post.last_executed_safe_block(),
-        replay_live.last_executed_safe_block(),
-        "mirror safe-block clock must match the live replay clock",
+        replay_post.canonical_snapshot_bytes()?,
+        replay_live.canonical_snapshot_bytes()?,
+        "the replayed mirror's whole state must match the live mirror",
+    );
+    assert_eq!(
+        replay_post.last_applied_block(),
+        replay_live.last_applied_block(),
+        "the replayed feed must carry the same L1 blocks as the live feed",
     );
 
     Ok(())

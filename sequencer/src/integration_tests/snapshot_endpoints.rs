@@ -12,7 +12,7 @@ use app_core::application::WalletApp;
 use futures_util::StreamExt;
 use sequencer::ingress::inclusion_lane::dump_info;
 use sequencer::storage::Storage;
-use sequencer_core::application::Application;
+use sequencer_core::application::{Application, CanonicalState};
 
 use crate::test_support::server::{PUBLIC_ROUTES, TestServer};
 use crate::test_support::temp_db;
@@ -109,7 +109,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
     use crate::storage::{ExecutedInputCount, SafeInputRange, StoredSafeInput};
     use crate::test_support::pin_test_deployment_identity;
     use sequencer_core::batch::{Batch, Frame};
-    use sequencer_core::scheduler::{Scheduler, SchedulerConfig, SchedulerInput};
+    use sequencer_core::scheduler::{CanonicalRunner, L1Input, SchedulerConfig};
     use ssz::Encode;
 
     let db = temp_db("same-block-divergence-http");
@@ -157,20 +157,27 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
 
     // The foreign batch consumes the next nonce and drains a direct that the
     // matching local batch did not: its snapshot is not the end of block 10.
-    let mut canonical = Scheduler::new(WalletApp::default(), SchedulerConfig::new(submitter));
-    for input in inputs {
+    let mut canonical = CanonicalRunner::genesis(
+        WalletApp::default(),
+        SchedulerConfig::for_application::<WalletApp>(submitter),
+    );
+    for (index, input) in (0_u64..).zip(inputs) {
         canonical
-            .process_input(SchedulerInput {
+            .process_input(L1Input {
+                index,
                 sender: input.sender,
+                block: input.block_number,
+                timestamp: 0,
+                chain_id: 1,
+                app_contract: alloy_primitives::Address::ZERO,
                 payload: input.payload,
-                inclusion_block: input.block_number,
-                domain: sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO),
             })
             .unwrap();
     }
-    let (app, nonce) = canonical.finish();
-    assert_eq!(nonce, 2);
-    assert_eq!(app.executed_input_count().get(), 1);
+    let export = canonical.export();
+    assert_eq!(export.next_batch_nonce, 2);
+    assert_eq!(export.l2_tx_count, 1);
+    assert_eq!(export.fridge_len, 0);
     assert_eq!(snapshot.executed_input_count, ExecutedInputCount::ZERO);
 
     let server = TestServer::start(&db.path).await;
@@ -845,11 +852,11 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
             .next_batch_nonce,
         receipt.next_batch_nonce
     );
+    let exported = WalletApp::from_dump(&dump_info::app_prefix(export_dir.path())).unwrap();
+    assert_eq!(exported.executed_input_count(), app.executed_input_count());
     assert_eq!(
-        WalletApp::from_dump(&dump_info::app_prefix(export_dir.path()))
-            .unwrap()
-            .progress(),
-        app.progress()
+        exported.canonical_snapshot_bytes().unwrap(),
+        app.canonical_snapshot_bytes().unwrap()
     );
     assert!(
         !dir.path().join("accepted/checkpoint.toml").exists(),

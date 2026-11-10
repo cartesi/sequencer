@@ -107,10 +107,12 @@ paths:
               example: { ok: false, code: PAYLOAD_TOO_LARGE, message: request body too large }
         "422":
           description: |
-            The application rejected the op; no state changed and nothing was
-            persisted. Reasons: bad nonce, exhausted nonce, `max_fee` below
-            the open-frame fee, or insufficient balance for the fee. After a
-            bad-nonce rejection, query `GET /nonce` again.
+            The sequencer refused the op; no state changed and nothing was
+            persisted. Checked in order: `max_fee` below the open-frame fee,
+            bad nonce, exhausted nonce, then the application's admission
+            policy (insufficient balance for the fee, or another policy
+            reason, whose text is the message). After a bad-nonce rejection,
+            query `GET /nonce` again.
           content:
             application/json:
               schema:
@@ -170,8 +172,7 @@ paths:
       description: |
         `next_nonce` is one past the sender's latest included op, or 0 if it
         has none. It counts soft-confirmed ops. The value is a hint, not a
-        reservation: it can go down after automatic recovery, and after an
-        operator rebuild a sender with no surviving op reads 0.
+        reservation: it can go down after automatic recovery.
         `4294967295` means the account is exhausted.
 
         Keep one op in flight per sender: sign `next_nonce`, submit, and
@@ -262,9 +263,10 @@ paths:
         are not modelled as parameters.
 
         After the upgrade, the server sends JSON text frames shaped as
-        `BroadcastTxMessage`. The subscriber cap is 64. Shutdown or a feed
-        failure may disconnect without a Close frame; resume from the saved
-        claim.
+        `BroadcastTxMessage`. A direct input whose payload is over the
+        application's cap never executes and has no offset or message. The
+        subscriber cap is 64. Shutdown or a feed failure may disconnect
+        without a Close frame; resume from the saved claim.
       parameters:
         - name: era_id
           in: query

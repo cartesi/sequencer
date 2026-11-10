@@ -32,7 +32,9 @@ pub(crate) struct IncludedUserOp {
 
 /// Per-op outcome reported back to the API caller via the response channel.
 ///
-/// - `Invalid` — application rejected the op (nonce mismatch, fee too low, etc.); maps to HTTP 4xx.
+/// - `Invalid` — the lane refused the op: its fee cap is below the frame's price,
+///   the executor would skip it (wrong or exhausted nonce), or the application's
+///   admission refused it; the text is the refusal's own; maps to HTTP 422.
 /// - `Unavailable` — sequencer can't currently accept (shutting down, queue full); maps to HTTP 503/429.
 /// - `Internal` — bug or unrecoverable failure; maps to HTTP 500.
 #[derive(Debug, Error, Clone)]

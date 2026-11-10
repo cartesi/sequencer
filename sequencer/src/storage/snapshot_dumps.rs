@@ -351,8 +351,8 @@ pub(super) fn finalized_dump_in(
             next_batch_nonce: nonce.checked_add(1).expect("accepted nonce overflow"),
         }));
     }
-    // Genesis is independently known canonical. A rebuilt baseline may contain
-    // the recovery fold's speculative final drain and is never comparable at C.
+    // Genesis is independently known canonical. A rebuilt baseline is not
+    // known to match the canonical machine at C, so it is never comparable.
     let Some(snapshot) = baseline_snapshot_in(conn)? else {
         return Ok(None);
     };

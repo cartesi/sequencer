@@ -17,14 +17,35 @@ use alloy_primitives::Address;
 use app_core::application::{WalletApp, WalletConfig};
 use c_app_engine::sys;
 use sequencer_core::application::{
-    AppError, AppOutput, AppOutputs, Application, InvalidReason, ValidationOutcome,
+    Admission, AppError, AppOutput, AppOutputs, Application, PolicyRefusal,
 };
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn application_engine_abi_version() -> u32 {
+    sys::APPLICATION_ENGINE_ABI_VERSION
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn application_engine_max_method_payload_bytes() -> u64 {
     u64::try_from(WalletApp::max_method_payload_bytes()).expect("wallet payload bound exceeds u64")
+}
+
+/// # Safety
+/// `out_limits` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn application_engine_scheduler_limits(
+    out_limits: *mut sys::ApplicationEngineSchedulerLimits,
+) {
+    let limits = WalletApp::scheduler_limits();
+    unsafe {
+        *out_limits = sys::ApplicationEngineSchedulerLimits {
+            fridge_bound: limits.fridge_bound,
+            max_direct_payload_bytes: limits.max_direct_payload_bytes,
+        }
+    };
 }
 
 thread_local! {
@@ -48,7 +69,7 @@ fn set_error(message: impl AsRef<str>) {
     });
 }
 
-/// Validation and execution: NOT_FOUND and INVALID_DUMP are lifecycle-only statuses.
+/// Admission, nonce reads and execution: NOT_FOUND and INVALID_DUMP are lifecycle-only statuses.
 fn report(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     match error {
         AppError::Io(err) => {
@@ -62,10 +83,10 @@ fn report(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     }
 }
 
-/// Dump loading and creation: preserve the missing/corrupt classification across the ABI. These
-/// are the kinds `referenced_artifact_io_is_terminal` and the host's AppBootstrap arm treat as
-/// terminal; other I/O, PermissionDenied included, stays IO_ERROR, which the host classifies
-/// operational. Diagnostics are not parsed.
+/// Opening a dump or a canonical state file, and creating a dump: preserve the missing/corrupt
+/// classification across the ABI. These are the kinds `referenced_artifact_io_is_terminal` and
+/// the host's AppBootstrap arm treat as terminal; other I/O, PermissionDenied included, stays
+/// IO_ERROR, which the host classifies operational. Diagnostics are not parsed.
 fn report_lifecycle(error: &AppError, what: &str) -> sys::ApplicationEngineStatus {
     let AppError::Io(err) = error else {
         return report(error, what);
@@ -122,7 +143,8 @@ pub struct ApplicationEngine {
 /// Take a handle the C API was given.
 ///
 /// # Safety
-/// `engine` must be a live handle from `application_engine_from_dump`, not yet destroyed.
+/// `engine` must be a live handle from `application_engine_from_dump` or
+/// `application_engine_from_canonical_state`, not yet destroyed.
 unsafe fn engine_ref<'a>(engine: *const ApplicationEngine) -> &'a ApplicationEngine {
     assert!(!engine.is_null(), "the C API forbids a null engine handle");
     unsafe { &*engine }
@@ -140,16 +162,16 @@ pub extern "C" fn application_engine_get_last_error_message() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ptr())
 }
 
+/// Hand out a freshly opened wallet, or classify why it could not be opened.
+///
 /// # Safety
-/// `prefix` is a NUL terminated path and `out_engine` is writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_from_dump(
-    prefix: *const c_char,
+/// `out_engine` is writable.
+unsafe fn open(
+    opened: Result<WalletApp, AppError>,
     out_engine: *mut *mut ApplicationEngine,
+    what: &str,
 ) -> sys::ApplicationEngineStatus {
-    clear_error();
-    let prefix = unsafe { path_from(prefix) };
-    match WalletApp::from_dump(&prefix) {
+    match opened {
         Ok(app) => {
             let engine = Box::new(ApplicationEngine {
                 app,
@@ -159,13 +181,40 @@ pub unsafe extern "C" fn application_engine_from_dump(
             unsafe { *out_engine = Box::into_raw(engine) };
             sys::APPLICATION_ENGINE_STATUS_OK
         }
-        // WalletApp::from_dump only reads and decodes; its Internal errors identify malformed bytes.
+        // The wallet's constructors only read and decode, and a count that disagrees with the
+        // bytes is a decode failure too, so their Internal errors identify malformed bytes.
         Err(AppError::Internal { reason }) => {
-            set_error(format!("from_dump failed: {reason}"));
+            set_error(format!("{what} failed: {reason}"));
             sys::APPLICATION_ENGINE_STATUS_INVALID_DUMP
         }
-        Err(err) => report_lifecycle(&err, "from_dump"),
+        Err(err) => report_lifecycle(&err, what),
     }
+}
+
+/// # Safety
+/// `prefix` is a NUL terminated path and `out_engine` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn application_engine_from_dump(
+    prefix: *const c_char,
+    out_engine: *mut *mut ApplicationEngine,
+) -> sys::ApplicationEngineStatus {
+    clear_error();
+    let prefix = unsafe { path_from(prefix) };
+    unsafe { open(WalletApp::from_dump(&prefix), out_engine, "from_dump") }
+}
+
+/// # Safety
+/// `state_file` is a NUL terminated path and `out_engine` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn application_engine_from_canonical_state(
+    state_file: *const c_char,
+    l2_tx_count: u64,
+    out_engine: *mut *mut ApplicationEngine,
+) -> sys::ApplicationEngineStatus {
+    clear_error();
+    let state_file = unsafe { path_from(state_file) };
+    let opened = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(l2_tx_count));
+    unsafe { open(opened, out_engine, "from_canonical_state") }
 }
 
 /// # Safety
@@ -181,11 +230,31 @@ pub unsafe extern "C" fn application_engine_destroy(engine: *mut ApplicationEngi
 /// # Safety
 /// Every pointer is non-null and its pointee outlives the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_validate_user_op(
+pub unsafe extern "C" fn application_engine_user_nonce(
+    engine: *const ApplicationEngine,
+    sender: *const sys::ApplicationEngineEthereumAddress,
+    out_nonce: *mut u32,
+) -> sys::ApplicationEngineStatus {
+    clear_error();
+    let engine = unsafe { engine_ref(engine) };
+    let sender = Address::from(unsafe { (*sender).bytes });
+    match engine.app.user_nonce(sender) {
+        Ok(nonce) => {
+            unsafe { *out_nonce = nonce };
+            sys::APPLICATION_ENGINE_STATUS_OK
+        }
+        Err(err) => report(&err, "user_nonce"),
+    }
+}
+
+/// # Safety
+/// Every pointer is non-null and its pointee outlives the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn application_engine_admit_user_op(
     engine: *const ApplicationEngine,
     sender: *const sys::ApplicationEngineEthereumAddress,
     user_op: *const sys::ApplicationEngineUserOp,
-    current_fee: u16,
+    fee: u16,
     out_invalid: *mut sys::ApplicationEngineInvalid,
 ) -> sys::ApplicationEngineStatus {
     clear_error();
@@ -198,45 +267,45 @@ pub unsafe extern "C" fn application_engine_validate_user_op(
         data: unsafe { slice_from(&user_op.data) }.to_vec().into(),
     };
 
-    match engine.app.validate_user_op(sender, &op, current_fee) {
-        Ok(ValidationOutcome::Accept) => sys::APPLICATION_ENGINE_STATUS_OK,
-        Err(err) => report(&err, "validate_user_op"),
-        Ok(ValidationOutcome::Reject(reason)) => {
-            let invalid = match reason {
-                InvalidReason::InvalidNonce { expected, got } => sys::ApplicationEngineInvalid {
-                    reason: sys::APPLICATION_ENGINE_INVALID_NONCE,
-                    values: sys::ApplicationEngineInvalidValues {
-                        nonce: sys::ApplicationEngineInvalidNonce { expected, got },
+    let refusal = match engine.app.admit_user_op(sender, &op, fee) {
+        Ok(Admission::Admit) => return sys::APPLICATION_ENGINE_STATUS_OK,
+        Ok(Admission::Refuse(refusal)) => refusal,
+        Err(err) => return report(&err, "admit_user_op"),
+    };
+    let invalid = match refusal {
+        PolicyRefusal::Underfunded {
+            required,
+            available,
+        } => sys::ApplicationEngineInvalid {
+            reason: sys::APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE,
+            values: sys::ApplicationEngineInvalidValues {
+                fee_balance: sys::ApplicationEngineInsufficientFeeBalance {
+                    required: sys::ApplicationEngineUint256 {
+                        bytes: required.to_be_bytes(),
+                    },
+                    available: sys::ApplicationEngineUint256 {
+                        bytes: available.to_be_bytes(),
                     },
                 },
-                InvalidReason::InsufficientFeeBalance {
-                    required,
-                    available,
-                } => sys::ApplicationEngineInvalid {
-                    reason: sys::APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE,
-                    values: sys::ApplicationEngineInvalidValues {
-                        fee_balance: sys::ApplicationEngineInsufficientFeeBalance {
-                            required: sys::ApplicationEngineUint256 {
-                                bytes: required.to_be_bytes(),
-                            },
-                            available: sys::ApplicationEngineUint256 {
-                                bytes: available.to_be_bytes(),
-                            },
-                        },
+            },
+        },
+        // The header gives this reason no union member: its text travels in the last error
+        // message, and the record carries the reason alone.
+        PolicyRefusal::Other(reason) => {
+            set_error(reason);
+            sys::ApplicationEngineInvalid {
+                reason: sys::APPLICATION_ENGINE_REFUSED_BY_POLICY,
+                values: sys::ApplicationEngineInvalidValues {
+                    fee_balance: sys::ApplicationEngineInsufficientFeeBalance {
+                        required: sys::ApplicationEngineUint256 { bytes: [0; 32] },
+                        available: sys::ApplicationEngineUint256 { bytes: [0; 32] },
                     },
                 },
-                // The caller owns these guards and this entry point never checks them, so the app
-                // cannot produce these reasons. Reporting one would be a lie about which union
-                // member carries the diagnostics.
-                InvalidReason::InvalidMaxFee { .. } | InvalidReason::NonceExhausted => {
-                    set_error("the app reported a caller-owned rejection");
-                    return sys::APPLICATION_ENGINE_STATUS_INTERNAL_ERROR;
-                }
-            };
-            unsafe { *out_invalid = invalid };
-            sys::APPLICATION_ENGINE_STATUS_INVALID
+            }
         }
-    }
+    };
+    unsafe { *out_invalid = invalid };
+    sys::APPLICATION_ENGINE_STATUS_INVALID
 }
 
 /// Take an execution's outputs, refusing to run over ones still queued.
@@ -266,29 +335,47 @@ unsafe fn execute(
     }
 }
 
+/// The user op a record describes, its data copied. The wallet reads neither the nonce nor the
+/// safe block, so only this crate's tests would see them dropped or swapped.
+/// # Safety
+/// The record's data span is readable.
+unsafe fn user_op_from(user_op: &sys::ApplicationEngineUserOpTx) -> UserOpTx {
+    UserOpTx {
+        sender: Address::from(user_op.sender.bytes),
+        nonce: user_op.nonce,
+        fee: user_op.fee,
+        block: user_op.safe_block,
+        data: unsafe { slice_from(&user_op.data) }.to_vec(),
+    }
+}
+
+/// The direct a record describes, its payload copied. The wallet reads neither the index, the
+/// block nor the timestamp, so only this crate's tests would see them dropped or swapped.
+/// # Safety
+/// The record's payload span is readable.
+unsafe fn direct_from(input: &sys::ApplicationEngineDirectInput) -> Direct {
+    Direct {
+        input_index: input.input_index,
+        sender: Address::from(input.sender.bytes),
+        block: input.block_number,
+        timestamp: input.timestamp,
+        payload: unsafe { slice_from(&input.payload) }.to_vec(),
+    }
+}
+
 /// # Safety
 /// Every pointer is non-null and its pointee outlives the call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_execute_valid_user_op(
+pub unsafe extern "C" fn application_engine_execute_user_op(
     engine: *mut ApplicationEngine,
-    user_op: *const sys::ApplicationEngineValidUserOp,
-    safe_block: u64,
+    user_op: *const sys::ApplicationEngineUserOpTx,
     out_output_count: *mut u64,
 ) -> sys::ApplicationEngineStatus {
     clear_error();
     let engine = unsafe { engine_mut(engine) };
-    let user_op = unsafe { &*user_op };
-    let op = ValidUserOp {
-        sender: Address::from(user_op.sender.bytes),
-        fee: user_op.fee,
-        data: unsafe { slice_from(&user_op.data) }.to_vec(),
-    };
+    let op = unsafe { user_op_from(&*user_op) };
     // SAFETY: the caller guarantees `out_output_count` is writable.
-    unsafe {
-        execute(engine, out_output_count, |app| {
-            app.apply_valid_user_op(&op, safe_block)
-        })
-    }
+    unsafe { execute(engine, out_output_count, |app| app.apply_user_op(&op)) }
 }
 
 /// # Safety
@@ -301,18 +388,9 @@ pub unsafe extern "C" fn application_engine_execute_direct_input(
 ) -> sys::ApplicationEngineStatus {
     clear_error();
     let engine = unsafe { engine_mut(engine) };
-    let input = unsafe { &*input };
-    let direct = DirectInput {
-        sender: Address::from(input.sender.bytes),
-        block_number: input.block_number,
-        payload: unsafe { slice_from(&input.payload) }.to_vec(),
-    };
+    let direct = unsafe { direct_from(&*input) };
     // SAFETY: the caller guarantees `out_output_count` is writable.
-    unsafe {
-        execute(engine, out_output_count, |app| {
-            app.apply_direct_input(&direct)
-        })
-    }
+    unsafe { execute(engine, out_output_count, |app| app.apply_direct(&direct)) }
 }
 
 /// # Safety
@@ -376,19 +454,13 @@ fn span_of(payload: &[u8]) -> sys::ApplicationEngineByteSpan {
 }
 
 /// # Safety
-/// `engine` is a live handle and `out_progress` is writable.
+/// `engine` is a live handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn application_engine_progress(
-    engine: *const ApplicationEngine,
-    out_progress: *mut sys::ApplicationEngineProgress,
-) {
-    let progress = unsafe { engine_ref(engine) }.app.progress();
-    unsafe {
-        *out_progress = sys::ApplicationEngineProgress {
-            executed_input_count: progress.executed_input_count().get(),
-            last_executed_safe_block: progress.last_executed_safe_block(),
-        }
-    };
+pub unsafe extern "C" fn application_engine_l2_tx_count(engine: *const ApplicationEngine) -> u64 {
+    unsafe { engine_ref(engine) }
+        .app
+        .executed_input_count()
+        .get()
 }
 
 /// # Safety
@@ -434,4 +506,57 @@ pub unsafe extern "C" fn application_engine_state_file_in_dump(
 /// The seam has no create path, so every application ships a genesis tool. This is the wallet's.
 pub fn write_genesis(prefix: &Path, config: WalletConfig) -> Result<(), AppError> {
     WalletApp::new(config).create_dump(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(bytes: &[u8]) -> sys::ApplicationEngineByteSpan {
+        sys::ApplicationEngineByteSpan {
+            data: bytes.as_ptr(),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn records_unpack_every_field() {
+        let payload = [1_u8, 2, 3];
+        let direct = sys::ApplicationEngineDirectInput {
+            sender: sys::ApplicationEngineEthereumAddress { bytes: [0x41; 20] },
+            input_index: 3,
+            block_number: 7,
+            timestamp: 1_700_000_011,
+            payload: span(&payload),
+        };
+        assert_eq!(
+            unsafe { direct_from(&direct) },
+            Direct {
+                input_index: 3,
+                sender: Address::repeat_byte(0x41),
+                block: 7,
+                timestamp: 1_700_000_011,
+                payload: payload.to_vec(),
+            }
+        );
+
+        let data = [4_u8, 5];
+        let user_op = sys::ApplicationEngineUserOpTx {
+            sender: sys::ApplicationEngineEthereumAddress { bytes: [0x42; 20] },
+            nonce: 5,
+            fee: 300,
+            safe_block: 9,
+            data: span(&data),
+        };
+        assert_eq!(
+            unsafe { user_op_from(&user_op) },
+            UserOpTx {
+                sender: Address::repeat_byte(0x42),
+                nonce: 5,
+                fee: 300,
+                block: 9,
+                data: data.to_vec(),
+            }
+        );
+    }
 }

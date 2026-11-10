@@ -6,10 +6,12 @@ when necessary, and replaces the affected suffix before resuming. It uses the
 existing SQLite database and assumes the sequencer's own code and accepted
 local history are correct.
 
-For lost or unusable local state, including after a sequencer bug, use
-[cockroach recovery](cockroach.md): fix the bug, choose a trusted canonical
-application checkpoint, and rebuild from L1 in a fresh data directory. Automatic
-recovery does not establish trust in a corrupted application state.
+For lost or unusable local state, including after a sequencer bug, the remedy
+is [cockroach recovery](cockroach.md): fix the bug, then rebuild in a fresh
+data directory from a trusted canonical machine and L1. This build has no
+rebuild command; it arrives with `setup --base`
+([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)).
+Automatic recovery does not establish trust in a corrupted application state.
 
 This page owns the automatic procedure and its rationale. Start with the
 lifecycle and dispatch below; read the safety arguments and model boundaries
@@ -38,8 +40,8 @@ Keep three identities separate:
 | Scheduler batch nonce | Ordering identity; derived when storage creates the batch. A replacement branch reuses the invalidated suffix's nonces. |
 | L1 wallet nonce | Transaction slot; a batch transaction and a flush no-op may compete for it. Covered slots must be consumed at safe depth before post-flush repair. |
 
-A parentless root uses the deployment's immutable anchor nonce: zero at genesis,
-or the scheduler's next nonce after cockroach recovery. Production needs no
+A parentless root uses the deployment's immutable anchor nonce: zero, the only
+anchor setup writes in this build. Production needs no
 accepted ancestor or submitted sentinel to repair a fully invalidated branch
 ([I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce)).
 

@@ -1,5 +1,14 @@
 # Cockroach recovery: rebuild from L1
 
+> **This build cannot run this procedure.** It has no `setup --recovery`, and
+> the application no longer carries the safe-block clock the fold below relies
+> on. Until recovery from a canonical machine arrives with `setup --base`, an
+> operator facing lost or untrusted state has no in-tree rebuild. The
+> replacement procedure is designed in
+> [Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)
+> and will replace this page; the text below records the retired rebuild that
+> other pages still link to.
+
 Cockroach recovery (`setup --recovery`) creates a fresh sequencer starting state
 from a trusted application checkpoint and historical L1 inputs. Use it when the
 local database is lost or cannot be trusted, including after a sequencer bug has
@@ -337,13 +346,3 @@ attempt, but the lock and setup admission prevent serving a partial baseline.
 the root. The [history contract](../protocol/application-history.md#era-baseline)
 owns these immutable coordinates; [snapshot lifecycle](../snapshots/lifecycle.md)
 owns restore selection, rollback-safe retention, and eventual baseline disposal.
-
-## Code map
-
-| Responsibility | Code |
-|---|---|
-| Load, flush, sync, fold | [`commands/setup/mod.rs`](../../sequencer/src/commands/setup/mod.rs) |
-| Durable baseline artifact | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs) |
-| Atomic baseline completion | [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs) |
-| Scheduler fold | [`scheduler/fold.rs`](../../sequencer-core/src/scheduler/fold.rs) |
-| Accepted-prefix boundary | [`storage/safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) |

@@ -517,10 +517,10 @@ CREATE TABLE IF NOT EXISTS setup_complete (
 );
 
 -- The batch-tree anchor is frozen once setup completes. `setup` writes it (0
--- by default, N' on recovery) before inserting the `setup_complete` marker;
+-- by default, N' on a rebuild) before inserting the `setup_complete` marker;
 -- after the marker exists, re-anchoring a live deployment would strand the
 -- existing batch spine, so any further UPDATE aborts. Defense-in-depth: the
--- `setup --recovery` path is already a strict one-shot on a fresh DB.
+-- lifecycle check already makes setup's publish a one-shot on a fresh DB.
 CREATE TRIGGER IF NOT EXISTS trg_batch_tree_anchor_write_once
 BEFORE UPDATE OF nonce ON batch_tree_anchor
 FOR EACH ROW

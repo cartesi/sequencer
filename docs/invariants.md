@@ -70,17 +70,18 @@ by writer and are write-once (`0001_schema.sql`).
 ### I1. Scheduler-acceptance semantics agree across all implementations
 
 - **Authoritative prose:** [`docs/protocol/scheduler-semantics.md`](protocol/scheduler-semantics.md).
-- **Holds:** the canonical fold (`Scheduler<A>`,
-  `sequencer-core/src/scheduler/mod.rs`), the off-chain predicate
+- **Holds:** the canonical scheduler (`Scheduler`,
+  `sequencer-core/src/scheduler/mod.rs`, which `CanonicalRunner` in
+  `scheduler/driver.rs` drives with the executor), the off-chain predicate
   (`ProtocolTiming::scheduler_accepts`, `sequencer-core/src/protocol.rs`), and
   the inclusion lane's live prediction produce the same
-  accept/reject/ordering decisions for every input. The recovery fold
-  (`fold_replay`) drives `Scheduler<A>` itself, not a copy. (Known, documented
-  exception: the predicate omits the three structural rejections — self-trust,
-  since the simulator only runs over the sequencer's own well-formed batches;
-  the reason is recorded at `scheduler_accepts`, and it is test-pinned by
-  the I1 duality test in `sequencer-core/src/scheduler/mod.rs`, which asserts
-  the canonical fold and the predicate diverge exactly and only there.)
+  accept/reject/ordering decisions for every input. (Known, documented
+  exception: the predicate omits gate d's three structural rejections and
+  gate f — self-trust, since the simulator only runs over the sequencer's own
+  well-formed batches, opened in order at safe heads it has seen; the reason
+  is recorded at `scheduler_accepts`, and it is test-pinned by the I1 duality
+  test in `sequencer-core/src/scheduler/mod.rs`, which asserts the scheduler
+  and the predicate diverge exactly and only there.)
 - **Enforced by:** review + the duality test. No structural mechanism.
 - **Depended on by:** everything — the gold frontier, recovery's cascade pivot,
   checkpoint selection, soft-confirmation honesty.
@@ -93,13 +94,13 @@ by writer and are write-once (`0001_schema.sql`).
   **new** frame, which is stamped with the observed safe head
   (`close_frame_in`, `storage/ingress.rs`). Directs may have accumulated across
   several below-threshold observations. Frame K's wire content is therefore
-  "directs ≤ S_K, then ops validated on top"; a clock tick with no directs is
+  "directs ≤ S_K, then the frame's ops"; a clock tick with no directs is
   an empty-prefix instance of the same rule. That leading direct prefix is
   recoverable from `application_inputs` plus `frames.safe_block` alone.
 - **Enforced by:** `close_frame_in` ordering; lane convention.
 - **Depended on by:** the duality (scheduler's drain-before-ops equals the
   flattened replay order); catch-up; the feed.
-- **Breaks:** ops validated against a state the scheduler won't reproduce —
+- **Breaks:** ops executed against a state the scheduler won't reproduce —
   divergence.
 
 ### I3. Frame `safe_block`s are non-decreasing along the spine
@@ -138,8 +139,8 @@ by writer and are write-once (`0001_schema.sql`).
 
 - **Holds:** the surviving latest frame clock, floored by baseline block `C`,
   identifies the completely accounted L1 prefix. Reconciliation executes all
-  external directs in the newly safe interval before committing its next frame
-  and application rows. Envelopes-only intervals advance the clock with no rows.
+  external directs within the payload cap in the newly safe interval before
+  committing its next frame and application rows. Envelopes-only intervals advance the clock with no rows.
 - **Enforced by:** complete-block ingestion: every committed `safe_inputs` /
   `l1_safe_head` pair holds every input through its head, witnessed by index
   contiguity plus the InputBox count at that head (`l1/reader.rs`), above a
@@ -200,8 +201,7 @@ by writer and are write-once (`0001_schema.sql`).
   checkpoint state and continuation nonce instead of reinterpreting that prefix.
   It shares `scheduler_accepts` (including its documented self-trust omissions),
   and does not independently detect bugs in
-  direct-input/user-op execution. A wrong-high cockroach checkpoint nonce is a
-  known example that can escape it. Absence of the marker therefore does not
+  direct-input/user-op execution. Absence of the marker therefore does not
   prove global agreement. Conversely, a structurally malformed foreign landing
   may conservatively record divergence even when the on-chain algorithm would
   reject it — an accepted false positive under self-trust. Detection is
@@ -223,14 +223,15 @@ by writer and are write-once (`0001_schema.sql`).
 ### I11. Batch envelopes remain outside application history
 
 - **Holds:** `safe_inputs` retains every InputBox observation. The storage/lane
-  boundary selects external directs by the setup-pinned submitter address;
+  boundary selects external directs by the setup-pinned submitter address and
+  the payload cap ([I20](#i20-application-history-is-committed-with-its-execution-receipts));
   only those inputs and included user ops enter `application_inputs`.
 - **Enforced by:** append-only `safe_inputs` triggers; classified direct reads
   and complete receipt validation at append. Standard startup recovery
   attributes undrained directs to the new Tip; lane catch-up executes them
-  before processing queued user operations. Manual
-  rebuild represents the folded prefix through `C` in its baseline snapshot,
-  with no application-history rows for that prefix. Replay and WS need no
+  before processing queued user operations. A baseline holds the prefix
+  through `C` in its snapshot, with no application-history rows for that
+  prefix. Replay and WS need no
   envelope filter because every row executes.
 - **Depended on by:** application replay and replicated state correctness.
 
@@ -336,11 +337,10 @@ by writer and are write-once (`0001_schema.sql`).
 
 - **Holds:** every batch's nonce is
   `parent.nonce + 1`, except the single parentless root, which carries the
-  `batch_tree_anchor` nonce — `0` for a genesis deployment, `N'` for a
-  cockroach-recovered one (`setup --recovery` writes the anchor before the
-  `setup_complete` marker). The first Tip is that root (there is no separate sentinel batch): plain
-  setup leaves its creation to startup recovery; rebuild creates it at `C` in
-  the baseline transaction. A fully-torn cascade re-roots parentless at the
+  `batch_tree_anchor` nonce — `0`, the only anchor setup writes in this build
+  (recovery from a canonical machine arrives with `setup --base`). The first
+  Tip is that root (there is no separate sentinel batch): setup leaves its
+  creation to startup recovery. A fully-torn cascade re-roots parentless at the
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
   invalidating the old root — so only one *valid* parentless root ever exists,
   invalidated ones coexisting.
@@ -354,12 +354,8 @@ by writer and are write-once (`0001_schema.sql`).
   `setup_complete` exists.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
-  defaults to the anchor (`= N'`) while `safe_accepted_batches` is still empty
-  after recovery, so the submitter starts at `N'` rather than 0; the recovery
-  fill roots the rebuilt tree at `N'` without replaying history. (`N'` is fold-derived from trusted
-  checkpoint nonce `N`; wrong-low and wrong-high `N` are outside the supported
-  checkpoint model — see
-  [`docs/recovery/cockroach.md`](recovery/cockroach.md#data-dictionary).)
+  defaults to the anchor while `safe_accepted_batches` is still empty, so the
+  submitter starts at the anchor.
 - **Breaks:** a tree mis-anchored at the wrong nonce ⇒ `run`'s first batch
   carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
   submits), or — worse, if defenses were absent — a recovered tree silently
@@ -411,29 +407,28 @@ by writer and are write-once (`0001_schema.sql`).
   before the requested count, including for empty history. Cuts remain available
   for the era's lifetime; their absence must never authorize a partial minimum.
 - **Breaks:** a client silently resumes a replaced suffix or inaccessible prefix.
-- **Operational boundary:** rebuilding uses a fresh/wiped data directory.
-  Checkpoint state, inclusion block, and next nonce are trusted operator inputs;
-  neither clone detection nor distributed fencing is implied.
+- **Operational boundary:** setup uses a fresh data directory, and the
+  baseline it publishes is trusted; neither clone detection nor distributed
+  fencing is implied.
 
 ### I19. Application progress follows the shared execution contract
 
-- **Holds:** `ApplicationProgress` is the pair
-  `(ExecutedInputCount, last_executed_safe_block)`. Count zero implies clock
-  zero. A successful canonical application input returns its pre-execution
-  count as the offset and commits exactly `(count + 1, max(clock,
-  input_clock))`; rejection changes neither field. `AppError` is fatal and
-  defines no canonical successor.
-- **Enforced by:** the application owns and persists the progress pair and
-  returns it by value. All execution consumers use the shared boundary, which
-  preflights count overflow and asserts the exact expected successor after a
-  successful hook. Validation purity and native-engine mutation remain
-  self-trusted; progress ownership does not require a Rust-side mirror.
-- **Depended on by:** the canonical scheduler, inclusion lane, catch-up,
-  recovery fold, cockroach base `K`, durable execution attribution, and the
-  versioned replica protocol.
-- **Breaks:** an input can be applied without advancing history, an offset can
-  advance twice, or recovery can derive the wrong checkpoint clock — silent
-  application-history divergence.
+- **Holds:** the application's progress is its `ExecutedInputCount` alone.
+  An executed transaction returns its pre-execution count as the offset
+  (`Executed::Done { offset, .. }`) and leaves the count at exactly
+  `count + 1`; an executed user op also leaves its sender's nonce at exactly
+  `nonce + 1`. A skipped op (wrong nonce) changes nothing. `AppError` is fatal
+  and defines no canonical successor.
+- **Enforced by:** the application owns and persists the count and nonces.
+  Every execution consumer calls `sequencer_core::application::execute`, which
+  compares the op's nonce, preflights count overflow, and asserts both
+  successors after a successful hook. Admission purity and native-engine
+  mutation remain self-trusted; the count does not need a Rust-side mirror.
+- **Depended on by:** the canonical runner, inclusion lane, catch-up, durable
+  execution attribution, and the versioned replica protocol.
+- **Breaks:** a transaction can be applied without advancing history, an
+  offset can advance twice, or an op can run at a nonce the canonical machine
+  skips — silent application-history divergence.
 - **Scope:** application-specific mutation and determinism remain self-trusted.
   A failing hook is not rolled back; every production caller terminates that
   path and discards the instance.
@@ -441,8 +436,11 @@ by writer and are write-once (`0001_schema.sql`).
 ### I20. Application history is committed with its execution receipts
 
 - **Holds:** `application_inputs` contains every current included user op and
-  external direct exactly once, keyed by mandatory pre-execution count. Its
-  source reference, owning batch/frame, and payload tables reconstruct replay.
+  every external direct within the application's payload cap
+  (`scheduler_limits().max_direct_payload_bytes`) exactly once, keyed by
+  mandatory pre-execution count. A direct over the cap never executes and has
+  no row; one SQL predicate (`DIRECT_EXECUTES_SQL`, `storage/queries.rs`)
+  selects the directs to execute in every query. Its source reference, owning batch/frame, and payload tables reconstruct replay.
   There are no entries for batch envelopes or the opaque baseline prefix.
 - **Creation atomicity:** user-op source rows and application rows commit in the
   same FULL chunk transaction that authorizes acknowledgements. Direct inputs
@@ -453,9 +451,9 @@ by writer and are write-once (`0001_schema.sql`).
   suffix. Replacement rows reuse counts under the incremented generation.
 - **Snapshot/replay agreement:** a batch-close snapshot records storage-derived
   `H`; the restored engine must report the same count. Each replay row must
-  match the engine's next count and executes with its persisted frame fee/clock
-  (or the direct input's source block). Missing rows or count mismatches fail
-  loud; they are never repaired or backfilled.
+  match the engine's next count and executes with its persisted frame fee and
+  safe block (or the direct input's index, block and timestamp). Missing rows
+  or count mismatches fail loud; they are never repaired or backfilled.
 - **Enforced by:** shared execution receipts, storage append APIs, PK/FK/XOR/
   uniqueness and contiguous-offset triggers, coherent canonical pages, and
   catch-up checks.

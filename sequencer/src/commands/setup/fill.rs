@@ -1,10 +1,10 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! File-first baseline creation for setup. The complete baseline, optional
-//! recovery root, and setup-complete fact become visible in one transaction.
+//! File-first baseline creation for setup. The complete baseline and the
+//! setup-complete fact become visible in one transaction.
 
-use crate::commands::error::{CommandError, SetupRecoveryError};
+use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{
     self, CreateDumpDirError, create_dump_dir_with_info,
 };
@@ -28,24 +28,6 @@ pub(crate) fn register_genesis_baseline<A: Application + 'static>(
     }
     let prefix = write_baseline_dump(&mut initial_app, 0, dumps_dir)?;
     storage.complete_baseline_setup(&prefix, count, 0, 0, false)?;
-    Ok(())
-}
-
-/// The terminal fold has already applied every direct through C. Its dump
-/// is a local resume baseline; it is not a canonical comparison checkpoint.
-pub(crate) fn fill_recovery_state<A: Application + 'static>(
-    mut recovered_app: A,
-    resume_nonce: u64,
-    stop_block: u64,
-    storage: &mut crate::storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<(), CommandError> {
-    if storage.is_setup_complete()? {
-        return Err(SetupRecoveryError::AlreadySetUp.into());
-    }
-    let count = recovered_app.executed_input_count();
-    let prefix = write_baseline_dump(&mut recovered_app, resume_nonce, dumps_dir)?;
-    storage.complete_baseline_setup(&prefix, count, stop_block, resume_nonce, true)?;
     Ok(())
 }
 
@@ -84,84 +66,99 @@ mod tests {
     use crate::test_support::{shutdown_lane, wait_until};
     use alloy_primitives::{Address, U256};
     use app_core::application::{WalletApp, WalletConfig};
-    use sequencer_core::application::{
-        AppError, AppOutputs, ApplicationProgress, ValidationOutcome,
-    };
+    use sequencer_core::application::{Admission, AppError, AppOutputs, SchedulerLimits};
     use sequencer_core::history::ExecutedInputCount;
-    use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+    use sequencer_core::l2_tx::{Direct, UserOpTx};
     use sequencer_core::user_op::UserOp;
     use std::path::Path;
     use std::time::Duration;
 
+    /// Counts the directs it executes and persists only that count.
     #[derive(Clone)]
-    struct CountedSweepTestApp(ApplicationProgress);
+    struct CountedSweepTestApp(ExecutedInputCount);
 
     impl CountedSweepTestApp {
         fn new(executed_input_count: u64) -> Self {
-            Self(
-                ApplicationProgress::try_new(ExecutedInputCount::new(executed_input_count), 0)
-                    .expect("coherent progress"),
-            )
+            Self(ExecutedInputCount::new(executed_input_count))
         }
     }
 
     impl Application for CountedSweepTestApp {
+        fn user_nonce(&self, _sender: Address) -> Result<u32, AppError> {
+            unreachable!("not used by setup-fill tests")
+        }
+
+        fn apply_user_op(&mut self, _op: &UserOpTx) -> Result<AppOutputs, AppError> {
+            unreachable!("not used by setup-fill tests")
+        }
+
+        fn apply_direct(&mut self, _direct: &Direct) -> Result<AppOutputs, AppError> {
+            self.0.advance();
+            Ok(Vec::new())
+        }
+
+        fn executed_input_count(&self) -> ExecutedInputCount {
+            self.0
+        }
+
         fn max_method_payload_bytes() -> usize {
             0
         }
 
-        fn validate_user_op(
+        fn scheduler_limits() -> SchedulerLimits {
+            app_core::application::WALLET_SCHEDULER_LIMITS
+        }
+
+        fn admit_user_op(
             &self,
             _sender: Address,
-            _user_op: &UserOp,
-            _current_fee: u16,
-        ) -> Result<ValidationOutcome, AppError> {
-            Ok(ValidationOutcome::Accept)
-        }
-
-        fn apply_valid_user_op(
-            &mut self,
-            _user_op: &ValidUserOp,
-            _safe_block: u64,
-        ) -> Result<AppOutputs, AppError> {
+            _op: &UserOp,
+            _fee: u16,
+        ) -> Result<Admission, AppError> {
             unreachable!("not used by setup-fill tests")
-        }
-
-        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-            self.0.advance(input.block_number);
-            Ok(Vec::new())
-        }
-
-        fn progress(&self) -> ApplicationProgress {
-            self.0
         }
 
         fn from_dump(prefix: &Path) -> Result<Self, AppError> {
             let bytes = std::fs::read(prefix.join("state"))?;
-            let bytes: [u8; 16] = bytes.try_into().map_err(|_| AppError::Internal {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| AppError::Internal {
                 reason: "invalid counted test dump".to_string(),
             })?;
-            let count = u64::from_le_bytes(bytes[..8].try_into().expect("eight-byte count"));
-            let safe_block =
-                u64::from_le_bytes(bytes[8..].try_into().expect("eight-byte safe block"));
-            Ok(Self(
-                ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
-                    .expect("coherent progress"),
-            ))
+            Ok(Self::new(u64::from_le_bytes(bytes)))
         }
 
         fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
             std::fs::create_dir(prefix)?;
-            let mut bytes = Vec::with_capacity(16);
-            bytes.extend_from_slice(&self.0.executed_input_count().get().to_le_bytes());
-            bytes.extend_from_slice(&self.0.last_executed_safe_block().to_le_bytes());
-            std::fs::write(prefix.join("state"), bytes)?;
+            std::fs::write(prefix.join("state"), self.0.get().to_le_bytes())?;
             Ok(())
         }
 
         fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
             prefix.join("state")
         }
+
+        fn from_canonical_state(
+            _state_file: &Path,
+            _executed_input_count: ExecutedInputCount,
+        ) -> Result<Self, AppError> {
+            unreachable!("not used by setup-fill tests")
+        }
+    }
+
+    /// Publishes a rebuilt baseline through the storage half `setup --base`
+    /// will reuse: the dump first, then the baseline, the root tip at the
+    /// stop block and setup completion in one transaction. Storage's lifecycle
+    /// check, not this helper, makes a second publish refuse.
+    fn fill_recovery_root<A: Application>(
+        mut recovered_app: A,
+        resume_nonce: u64,
+        stop_block: u64,
+        storage: &mut Storage,
+        dumps_dir: &Path,
+    ) -> Result<(), CommandError> {
+        let count = recovered_app.executed_input_count();
+        let prefix = write_baseline_dump(&mut recovered_app, resume_nonce, dumps_dir)?;
+        storage.complete_baseline_setup(&prefix, count, stop_block, resume_nonce, true)?;
+        Ok(())
     }
 
     #[test]
@@ -195,7 +192,7 @@ mod tests {
                 FrontierMode::DeferUntilAnchorSet,
             )
             .expect("ingest prefix and later direct");
-        fill_recovery_state(
+        fill_recovery_root(
             CountedSweepTestApp::new(41),
             3,
             100,
@@ -240,7 +237,7 @@ mod tests {
                 .expect("application rows"),
             0
         );
-        let err = fill_recovery_state(
+        let err = fill_recovery_root(
             CountedSweepTestApp::new(42),
             4,
             150,
@@ -250,9 +247,7 @@ mod tests {
         .expect_err("completed rebuild is one-shot");
         assert!(matches!(
             err,
-            CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupRecovery(
-                SetupRecoveryError::AlreadySetUp
-            ))
+            CommandError::Lifecycle(crate::storage::LifecycleError::NotAdmissible { .. })
         ));
         assert_eq!(
             storage.history_state().expect("unchanged baseline"),
@@ -274,7 +269,7 @@ mod tests {
                 )
             })
             .expect("inject failure");
-        let err = fill_recovery_state(
+        let err = fill_recovery_root(
             CountedSweepTestApp::new(41),
             3,
             100,
@@ -304,7 +299,7 @@ mod tests {
         storage
             .write(|tx| tx.execute_batch("DROP TRIGGER fail_baseline"))
             .expect("remove failure");
-        fill_recovery_state(
+        fill_recovery_root(
             CountedSweepTestApp::new(42),
             4,
             150,
@@ -383,7 +378,7 @@ mod tests {
                 FrontierMode::DeferUntilAnchorSet,
             )
             .expect("ingest inputs");
-        fill_recovery_state(
+        fill_recovery_root(
             CountedSweepTestApp::new(41),
             3,
             100,
@@ -421,10 +416,14 @@ mod tests {
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].offset, ExecutedInputCount::new(41));
         match &page.rows[0].context {
-            crate::storage::L2TxContext::DirectInput { tx, .. } => {
-                assert_eq!(tx.block_number, 1400);
-                sequencer_core::application::execute_direct_input(&mut app, tx)
-                    .expect("replay direct");
+            crate::storage::L2TxContext::Direct { tx, .. } => {
+                assert_eq!(tx.block, 1400);
+                assert_eq!(tx.input_index, 1);
+                sequencer_core::application::execute(
+                    &mut app,
+                    &sequencer_core::l2_tx::L2Tx::Direct(tx.clone()),
+                )
+                .expect("replay direct");
             }
             _ => panic!("expected post-baseline direct"),
         }
@@ -505,7 +504,7 @@ mod tests {
                 .expect("sync to H1 = 150");
             // Fill at N' = 3, C = 100: drains only the three `<= C` directs into
             // the recovery root frame; the deposit (index 3) stays undrained.
-            fill_recovery_state(recovered, 3, 100, &mut storage, dumps_dir.path())
+            fill_recovery_root(recovered, 3, 100, &mut storage, dumps_dir.path())
                 .expect("recovery fill");
 
             // Preconditions (the (C, H1] cap — covered by the cap tests; pinned

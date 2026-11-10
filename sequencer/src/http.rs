@@ -383,6 +383,24 @@ mod tests {
 
     use super::*;
 
+    /// An application's policy refusal is a client error like any other lane
+    /// refusal: 422, and its text reaches the client unchanged.
+    #[tokio::test]
+    async fn lane_refusal_is_a_422_carrying_the_refusal_text() {
+        let text = "sender is frozen by policy";
+        let response = ApiError::from(SequencerError::invalid(text)).into_response();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("decode error body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "ok": false, "code": "EXECUTION_REJECTED", "message": text })
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_release_drain_waits_for_late_release() {
         let shutdown = RuntimeScope::default();

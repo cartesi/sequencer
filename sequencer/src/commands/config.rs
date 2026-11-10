@@ -7,6 +7,7 @@
 //! cannot drift. The setup/run phase split is in README "Running".
 
 use alloy_primitives::Address;
+use clap::builder::{FalseyValueParser, TypedValueParser};
 use clap::{ArgGroup, Args};
 
 use crate::commands::error::BootstrapError;
@@ -250,35 +251,21 @@ pub struct KeyArgs {
 impl KeyArgs {
     /// Resolve the batch submitter private key from either the inline value or a key file.
     pub fn resolve(&self) -> Result<SubmitterKey, BootstrapError> {
-        resolve_key_source(
-            &self.batch_submitter_private_key,
-            &self.batch_submitter_private_key_file,
-        )
-        .map(|opt| opt.expect("batch submitter private key is required by CLI arg group"))
-    }
-}
-
-/// Resolve a batch-submitter key from an inline value or a key file (first line).
-/// Returns `Ok(None)` when neither source is set — `KeyArgs` makes that
-/// impossible via its required arg group, but `setup --recovery` validates the
-/// "exactly one source" rule in code (the group can't be conditionally required
-/// at the clap level), so it needs the `None` case.
-fn resolve_key_source(
-    inline: &Option<SubmitterKey>,
-    file: &Option<String>,
-) -> Result<Option<SubmitterKey>, BootstrapError> {
-    if let Some(file) = file {
+        let Some(file) = &self.batch_submitter_private_key_file else {
+            return Ok(self
+                .batch_submitter_private_key
+                .clone()
+                .expect("batch submitter private key is required by CLI arg group"));
+        };
         // The error carries the path, never the contents: a key file's
         // bytes must not reach a log line even when the read fails.
         let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
             path: std::path::PathBuf::from(file),
             source,
         })?;
-        Ok(Some(SubmitterKey::new(
+        Ok(SubmitterKey::new(
             contents.lines().next().unwrap_or("").trim().to_string(),
-        )))
-    } else {
-        Ok(inline.clone())
+        ))
     }
 }
 
@@ -308,53 +295,6 @@ pub(crate) fn key_file_io_is_terminal(source: &std::io::Error) -> bool {
     )
 }
 
-/// Batch-submitter signing-key source for a context where the key is
-/// *conditionally* required — `setup --recovery` needs it (to flush the wallet
-/// nonce), plain `setup` must not carry it. clap can't express a
-/// conditionally-required arg group, so unlike [`KeyArgs`] neither source is
-/// required at the clap level; the owner validates presence + exclusivity via
-/// [`is_present`](Self::is_present) / [`both_set`](Self::both_set).
-#[derive(Debug, Clone, Args)]
-pub struct OptionalKeyArgs {
-    /// Hex-encoded batch-submitter private key.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
-        hide_env_values = true,
-        value_parser = parse_submitter_key
-    )]
-    batch_submitter_private_key: Option<SubmitterKey>,
-    /// Path to a file whose first line is the batch-submitter private key.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
-        hide_env_values = true
-    )]
-    batch_submitter_private_key_file: Option<String>,
-}
-
-impl OptionalKeyArgs {
-    /// At least one source is set.
-    fn is_present(&self) -> bool {
-        self.batch_submitter_private_key.is_some()
-            || self.batch_submitter_private_key_file.is_some()
-    }
-
-    /// Both sources are set — the owner rejects this (at most one is allowed).
-    fn both_set(&self) -> bool {
-        self.batch_submitter_private_key.is_some()
-            && self.batch_submitter_private_key_file.is_some()
-    }
-
-    /// Resolve the key if either source is set; `Ok(None)` when neither is.
-    fn resolve_if_present(&self) -> Result<Option<SubmitterKey>, BootstrapError> {
-        resolve_key_source(
-            &self.batch_submitter_private_key,
-            &self.batch_submitter_private_key_file,
-        )
-    }
-}
-
 /// `setup` — establish the deployment's timeless state: pin identity, do the
 /// initial L1 sync, register the genesis finalized snapshot, and atomically
 /// complete setup. L1-read-only: takes the batch-submitter address, not the
@@ -379,85 +319,51 @@ pub struct SetupConfig {
     /// L1 inclusion block `B` of the trusted checkpoint this setup boots from;
     /// `0` is genesis. Plain `setup` uses `B` only as the lower bound of its
     /// read-only detection scan: work a previous instance left past `B`, or an
-    /// unsettled wallet nonce, refuses with exit 40. `setup --recovery` loads the
-    /// checkpoint itself (`docs/recovery/cockroach.md`).
+    /// unsettled wallet nonce, refuses with exit 40.
     #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_BLOCK", default_value_t = 0)]
     pub checkpoint_block: u64,
-    /// Recovery mode (cockroach recovery): rebuild this freshly-wiped DB from a
-    /// trusted checkpoint at `--checkpoint-block` instead of genesis bootstrap.
-    /// Requires `--checkpoint-dump-dir` and the
-    /// batch-submitter signing key (recovery flushes the wallet nonce, which
-    /// signs L1 no-ops). Plain `setup` stays L1-read-only and key-less.
-    #[arg(long, env = "CARTESI_SEQUENCER_RECOVERY", default_value_t = false)]
-    pub recovery: bool,
-    /// Directory of the trusted checkpoint dump (a finalized `dumps/<id>/` with
-    /// `state/` + `info.toml`) that `setup --recovery` boots the machine `S`
-    /// from. Required with `--recovery`; rejected without it. This is a
-    /// **sequencer** dump from `$CARTESI_SEQUENCER_DATA_DIR/dumps/`, not a
-    /// watchdog CM checkpoint under `.../checkpoints/<block>/`.
-    #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR", value_parser = parse_non_empty_string)]
-    pub checkpoint_dump_dir: Option<String>,
-    /// Batch-submitter signing key, recovery-only (for the wallet-nonce flush).
-    /// Conditionally required: present iff `--recovery`. The two sources are
-    /// mutually exclusive and rejected on a non-recovery `setup` — see
-    /// [`SetupConfig::validate`].
-    #[command(flatten)]
-    key: OptionalKeyArgs,
+    /// The removed recovery mode, kept hidden so that its flag or environment
+    /// variable refuses setup instead of letting a deployment that still sets
+    /// it run a genesis setup. A false value is what plain setup always meant.
+    #[arg(
+        long = "recovery",
+        env = "CARTESI_SEQUENCER_RECOVERY",
+        hide = true,
+        value_parser = FalseyValueParser::new().try_map(refuse_removed_recovery_mode)
+    )]
+    _removed_recovery: bool,
+    /// The removed recovery mode's checkpoint dump, refused like the mode.
+    #[arg(
+        long = "checkpoint-dump-dir",
+        env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR",
+        hide = true,
+        value_parser = refuse_removed_checkpoint_dump_dir
+    )]
+    _removed_checkpoint_dump_dir: Option<String>,
     #[command(flatten)]
     pub timing: TimingArgs,
     #[command(flatten)]
     pub fee_oracle: FeeOracleArgs,
 }
 
+const REMOVED_RECOVERY_MODE: &str = "setup --recovery was removed; recovery from a canonical \
+                                     machine arrives with `setup --base`";
+
+fn refuse_removed_recovery_mode(recovery: bool) -> Result<bool, &'static str> {
+    if recovery {
+        Err(REMOVED_RECOVERY_MODE)
+    } else {
+        Ok(false)
+    }
+}
+
+fn refuse_removed_checkpoint_dump_dir(_: &str) -> Result<String, &'static str> {
+    Err(REMOVED_RECOVERY_MODE)
+}
+
 impl SetupConfig {
     pub fn db_path(&self) -> String {
         db_path_in(&self.data_dir)
-    }
-
-    /// Validate the cross-field recovery constraints clap can't express (a
-    /// conditionally-required arg group). Returns the first violation as a
-    /// human-readable message; the caller maps it to a terminal bootstrap error.
-    ///
-    /// Recovery requires an exported checkpoint (a matching block + dump
-    /// dir) and the signing key; a plain `setup` must carry none of the
-    /// recovery-only inputs (key, dump dir).
-    pub fn validate(&self) -> Result<(), String> {
-        let key_present = self.key.is_present();
-        if self.key.both_set() {
-            return Err(
-                "--batch-submitter-private-key and --batch-submitter-private-key-file \
-                        are mutually exclusive"
-                    .to_string(),
-            );
-        }
-        if self.recovery {
-            if self.checkpoint_dump_dir.is_none() {
-                return Err("--recovery requires --checkpoint-dump-dir".to_string());
-            }
-            if !key_present {
-                return Err("--recovery requires the batch-submitter signing key \
-                            (--batch-submitter-private-key[-file]) to flush the wallet nonce"
-                    .to_string());
-            }
-        } else {
-            if self.checkpoint_dump_dir.is_some() {
-                return Err("--checkpoint-dump-dir is only valid with --recovery".to_string());
-            }
-            if key_present {
-                return Err("plain `setup` is L1-read-only and takes no signing key; \
-                            pass the batch-submitter address, or use --recovery"
-                    .to_string());
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve the recovery signing key. Precondition: [`SetupConfig::validate`]
-    /// passed with `recovery == true` (so exactly one source is set).
-    pub fn resolve_recovery_key(&self) -> Result<SubmitterKey, BootstrapError> {
-        self.key
-            .resolve_if_present()
-            .map(|opt| opt.expect("recovery key presence is validated before resolve"))
     }
 }
 
@@ -696,104 +602,91 @@ mod tests {
     }
 
     #[test]
-    fn plain_setup_passes_validation_and_is_not_recovery() {
-        let cfg = setup_config();
-        assert!(!cfg.recovery);
-        assert!(cfg.checkpoint_dump_dir.is_none());
-        cfg.validate().expect("plain setup is a valid config");
-    }
-
-    #[test]
-    fn setup_rejects_a_signing_key_without_recovery() {
-        // The key now parses (recovery needs it), but a non-recovery `setup`
-        // carrying one is rejected by cross-field validation, not at parse time.
-        let cfg = setup_config_from(&["--batch-submitter-private-key", TEST_KEY]);
-        let err = cfg.validate().expect_err("plain setup must reject a key");
+    fn setup_rejects_a_signing_key() {
+        // `setup` never signs, so it has no key argument at all.
+        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
+        args.extend_from_slice(&["--batch-submitter-private-key", TEST_KEY]);
         assert!(
-            err.contains("key-less") || err.contains("L1-read-only"),
-            "got: {err}"
+            Cli::try_parse_from(args).is_err(),
+            "setup must reject a signing key"
         );
     }
 
     #[test]
-    fn setup_rejects_dump_dir_without_recovery() {
-        let cfg = setup_config_from(&["--checkpoint-dump-dir", "/tmp/ckpt"]);
-        let err = cfg
-            .validate()
-            .expect_err("dump dir without --recovery must fail");
-        assert!(err.contains("--checkpoint-dump-dir"), "got: {err}");
+    fn setup_has_no_recovery_mode() {
+        // Recovery from a canonical machine arrives with `setup --base`; the
+        // old checkpoint flags must not parse into a plain setup.
+        for extra in [
+            &["--recovery"][..],
+            &["--checkpoint-dump-dir", "/tmp/dump"][..],
+        ] {
+            let mut args: Vec<&str> = SETUP_ARGS.to_vec();
+            args.extend_from_slice(extra);
+            let err = Cli::try_parse_from(args).expect_err("a removed option must not parse");
+            assert!(err.to_string().contains("setup --base"), "{err}");
+        }
     }
 
+    /// The environment spellings go through the same parsers as the flags,
+    /// so a deployment that still sets them is refused, not run as genesis.
     #[test]
-    fn recovery_requires_dump_dir_and_key() {
-        // --recovery alone (no dump dir / block / key) is invalid; each missing
-        // input is reported.
-        let bare = setup_config_from(&["--recovery"]);
-        assert!(
-            bare.validate()
-                .unwrap_err()
-                .contains("--checkpoint-dump-dir")
-        );
-
-        let genesis = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-        ]);
-        genesis
-            .validate()
-            .expect("genesis checkpoint is a valid recovery source");
-        assert_eq!(genesis.checkpoint_block, 0);
-
-        let no_key = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-        ]);
-        assert!(no_key.validate().unwrap_err().contains("signing key"));
-    }
-
-    #[test]
-    fn recovery_full_config_validates_and_resolves_key() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-        ]);
-        cfg.validate().expect("full recovery config is valid");
-        assert!(cfg.recovery);
-        assert_eq!(cfg.checkpoint_block, 1200);
-        assert_eq!(cfg.checkpoint_dump_dir.as_deref(), Some("/tmp/ckpt"));
-        assert_eq!(
-            cfg.resolve_recovery_key()
-                .expect("resolve key")
-                .expose_secret(),
-            TEST_KEY
-        );
+    fn setup_refuses_the_removed_recovery_environment() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let setup = cli.find_subcommand("setup").expect("setup subcommand");
+        // Clap hands an environment value to the argument's own parser; a
+        // probe command feeds it the same value through a plain option.
+        let parse = |id: &str, env: &str, value: &str| {
+            let arg = setup
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} is still declared"));
+            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
+            assert!(arg.is_hide_set());
+            let probe = arg
+                .clone()
+                .long("probe")
+                .action(clap::ArgAction::Set)
+                .num_args(1);
+            clap::Command::new("probe")
+                .arg(probe)
+                .try_get_matches_from(["probe", "--probe", value])
+                .map(|_| ())
+        };
+        for truthy in ["true", "1", "yes"] {
+            let err = parse("_removed_recovery", "CARTESI_SEQUENCER_RECOVERY", truthy)
+                .expect_err("a set recovery mode refuses");
+            assert!(err.to_string().contains("setup --base"), "{err}");
+        }
+        for falsy in ["false", "0", ""] {
+            parse("_removed_recovery", "CARTESI_SEQUENCER_RECOVERY", falsy)
+                .expect("an unset recovery mode is plain setup");
+        }
+        let err = parse(
+            "_removed_checkpoint_dump_dir",
+            "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR",
+            "/ckpt",
+        )
+        .expect_err("a checkpoint dump refuses");
+        assert!(err.to_string().contains("setup --base"), "{err}");
     }
 
     #[test]
     fn missing_key_file_is_terminal_and_names_the_path_not_the_contents() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
+        let args = [
+            "sequencer",
+            "run",
+            "--eth-rpc-url",
+            "http://127.0.0.1:8545",
             "--batch-submitter-private-key-file",
             "/nonexistent/dir/submitter.key",
-        ]);
-        cfg.validate().expect("one key source is valid");
+        ];
+        let cfg = match Cli::try_parse_from(args).expect("parse run").command {
+            crate::harness::Command::Run(c) => *c,
+            other => panic!("expected run subcommand, got {other:?}"),
+        };
         let err = cfg
-            .resolve_recovery_key()
+            .resolve_private_key()
             .expect_err("a missing key file must not resolve");
         assert!(
             matches!(&err, BootstrapError::KeyFile { path, source }
@@ -808,22 +701,6 @@ mod tests {
             crate::commands::error::CommandError::from(err).exit_code(),
             crate::commands::error::EXIT_TERMINAL
         );
-    }
-
-    #[test]
-    fn recovery_rejects_both_key_sources() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-            "--batch-submitter-private-key-file",
-            "/tmp/key",
-        ]);
-        assert!(cfg.validate().unwrap_err().contains("mutually exclusive"));
     }
 
     #[test]
@@ -1210,9 +1087,11 @@ mod tests {
                 !help.contains("SECRET_TOKEN_XYZ"),
                 "{subcmd} --help must not print the RPC URL (may contain API tokens)"
             );
-            assert!(
+            // `setup` never signs, so only the signing commands name the key.
+            assert_eq!(
                 help.contains("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY"),
-                "{subcmd} --help should still mention the env var name"
+                subcmd != "setup",
+                "{subcmd} --help names the key env var exactly when it takes a key"
             );
         }
     }

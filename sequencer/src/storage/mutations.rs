@@ -4,12 +4,12 @@
 //! Write helpers shared across writer roles. Like [`super::queries`], they take a
 //! `&Transaction` so they compose inside a larger atomic unit.
 
-use alloy_primitives::Address;
-use rusqlite::{Connection, Result, Transaction, params};
+use rusqlite::{Connection, Result, Transaction, named_params, params};
 
-use super::convert::{i64_to_u64, u64_to_i64};
+use super::convert::{i64_to_u64, saturating_query_bound, u64_to_i64};
 use super::history::next_executed_input_count_in;
 use super::l1_inputs::query_deployment_identity;
+use super::queries::DIRECT_EXECUTES_SQL;
 use super::{DirectInputExecution, SafeInputRange};
 
 /// Insert a new batch. Nonce is derived from `parent_batch_index`:
@@ -161,11 +161,12 @@ pub(super) fn persist_frame_direct_sequence(
     batch_index: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
+    max_direct_payload_bytes: u64,
     executions: &[DirectInputExecution],
 ) -> Result<()> {
     assert_eq!(
         executions,
-        derive_direct_input_executions_in(tx, range)?,
+        derive_direct_input_executions_in(tx, range, max_direct_payload_bytes)?,
         "direct executions must cover the complete external-input range at the next application count"
     );
     persist_direct_executions(tx, batch_index, frame_in_batch, executions)
@@ -178,8 +179,9 @@ pub(super) fn persist_frame_direct_sequence_derived(
     batch_index: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
+    max_direct_payload_bytes: u64,
 ) -> Result<()> {
-    let executions = derive_direct_input_executions_in(tx, range)?;
+    let executions = derive_direct_input_executions_in(tx, range, max_direct_payload_bytes)?;
     persist_direct_executions(tx, batch_index, frame_in_batch, &executions)
 }
 
@@ -204,9 +206,13 @@ fn persist_direct_executions(
     Ok(())
 }
 
+/// The executions a drained range owes: one per direct that
+/// [`DIRECT_EXECUTES_SQL`] admits, at consecutive counts. A submitter input
+/// or an over-cap direct takes no count and gets no row.
 fn derive_direct_input_executions_in(
     tx: &Transaction<'_>,
     range: SafeInputRange,
+    max_direct_payload_bytes: u64,
 ) -> Result<Vec<DirectInputExecution>> {
     if range.is_empty() {
         return Ok(Vec::new());
@@ -214,21 +220,28 @@ fn derive_direct_input_executions_in(
 
     let identity = query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     let mut next = next_executed_input_count_in(tx)?;
-    let mut stmt = tx.prepare_cached(
-        "SELECT safe_input_index, sender \
+    // Every input in the range is read, so the range's completeness is
+    // checked even where none of its inputs executes.
+    let mut stmt = tx.prepare_cached(&format!(
+        "SELECT safe_input_index, {DIRECT_EXECUTES_SQL} \
          FROM safe_inputs \
-         WHERE safe_input_index >= ?1 AND safe_input_index < ?2 \
-         ORDER BY safe_input_index ASC",
-    )?;
+         WHERE safe_input_index >= :start AND safe_input_index < :end \
+         ORDER BY safe_input_index ASC"
+    ))?;
     let rows = stmt.query_map(
-        params![u64_to_i64(range.start()), u64_to_i64(range.end())],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        named_params! {
+            ":start": u64_to_i64(range.start()),
+            ":end": u64_to_i64(range.end()),
+            ":batch_submitter": identity.batch_submitter_address.as_slice(),
+            ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
+        },
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
     )?;
 
     let mut executions = Vec::new();
     let mut fetched = 0_u64;
     for row in rows {
-        let (safe_input_index, sender) = row?;
+        let (safe_input_index, executes) = row?;
         let safe_input_index = i64_to_u64(safe_input_index);
         let expected_index = range
             .start()
@@ -238,7 +251,7 @@ fn derive_direct_input_executions_in(
             safe_input_index, expected_index,
             "non-contiguous safe-input range while assigning execution offsets"
         );
-        if Address::from_slice(sender.as_slice()) != identity.batch_submitter_address {
+        if executes {
             executions.push(DirectInputExecution {
                 safe_input_index,
                 executed_input_offset: next,

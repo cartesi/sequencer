@@ -171,8 +171,8 @@ pub struct InputReader {
     /// every safe-input write.
     timing: ProtocolTiming,
     /// Whether each sync also populates the scheduler-accepted frontier
-    /// ([`FrontierMode::Populate`] normally; `setup --recovery` defers it — see
-    /// [`Self::set_frontier_mode`]).
+    /// ([`FrontierMode::Populate`] normally; a sync into an empty batch tree
+    /// defers it — see [`Self::set_frontier_mode`]).
     frontier_mode: FrontierMode,
     /// Set once the provider's chain id has been verified against
     /// [`InputReaderConfig::expected_chain_id`] on a successful RPC contact.
@@ -260,9 +260,10 @@ impl InputReader {
     }
 
     /// Set whether subsequent syncs populate the scheduler-accepted frontier.
-    /// `setup --recovery` sets [`FrontierMode::DeferUntilAnchorSet`] for the
-    /// syncs that feed the fold (the frontier is populated by `run`'s first
-    /// sync, once the anchor = `N'`).
+    /// A setup that rebuilds the batch tree after its sync sets
+    /// [`FrontierMode::DeferUntilAnchorSet`], so the content-identity check
+    /// does not see every L1 batch as foreign before the anchor is set. The
+    /// first such setup is `setup --base`; no command calls this today.
     pub fn set_frontier_mode(&mut self, mode: FrontierMode) {
         self.frontier_mode = mode;
     }

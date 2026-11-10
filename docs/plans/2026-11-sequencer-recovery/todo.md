@@ -21,50 +21,19 @@ is easy to miss. An item leaves this list when it lands.
   canonical shows only at the watchdog's first comparison. A client state that
   is wrong below its count shows only in the client's own row comparison
   ([what can go wrong](operations.md#what-can-go-wrong)).
-- **Each queued direct keeps its input index** in the guest, and the export
-  reports the first one's. The feed takes a direct's transaction hash and
-  timestamp from the input table by that index, the scheduler resumes from the
-  base's first queued input, and the lane starts draining at the stop block's
+- **The rebuild starts from the export's first queued input.** The feed takes
+  a direct's transaction hash and timestamp from the input table by its
+  index, the scheduler resumes from the base's first queued input, and the
+  lane starts draining at the stop block's
   ([export](application.md#the-state-export)).
-- **A direct over the payload cap never executes.** Today every direct in a
-  drained range executes and gets a row, so the lane's range drain and its
-  execution rows must allow an input that has none
-  ([the fridge](scheduler.md#the-fridge)).
-- **A direct's index and timestamp reach the application.** Storage and the
-  feed already carry them. The lane's query, the replay, the scheduler's input
-  and the engine's record drop them today
-  ([direct context](scheduler.md#direct-context)).
 - **The rebuilt history table keeps every scheduled transaction, and the feed
   serves only the executed ones.** A skipped user op stays in the table without
   a count ([table](sequencer.md#the-rebuilt-history-table)).
 - **Setup links the emulator**, to load the machine and read its export.
   Today only `sdk/guest/testsi` links it, so the sequencer's build and image
   grow ([loading a machine](sequencer.md#loading-a-machine)).
-- **An underfunded op executes and counts.** Today it is skipped. Applying an
-  op must never fail on it: the wallet treats an unpayable fee as fatal today,
-  and the engine's conformance test uses that failure as its example of an
-  execution error. The scheduler's own test of the skip changes with it. The
-  application contract's
-  [§2](../../protocol/application-contract.md#2-replay-safety--rejection-inclusion-and-failure)
-  changes too ([a user op's fate](scheduler.md#a-user-ops-fate)).
-- **Shared code compares the nonce, and admission is its own call.** The
-  application's validation splits into a nonce getter, which the executor
-  reads, and an admission call, which only the lane makes
-  ([interfaces](interfaces.md#the-executor)). `POST /tx` keeps its 422 texts:
-  the README teaches clients to read the expected nonce from the bad-nonce
-  text, and the tests and the Sepolia demo script match them.
-- **The clock leaves the application's state.** The wallet's state bytes lose
-  it, which changes the golden fixture, the template hash and every stored
-  dump. The replica bootstrap test reads it as the block to start after
-  (`historical_bootstrap.rs`), so that recipe needs another source
-  ([outputs and progress](scheduler.md#outputs-and-progress)).
-- **The engine's header gets a version.** A changed meaning, such as applying
-  an op the sender cannot pay for, does not fail at link time, and an engine
-  built for the old meaning would halt the canonical machine
-  ([interfaces](interfaces.md#the-application)).
-- **Setup becomes one procedure.** `--recovery` and its dump directory go;
-  plain setup's refusal on submitter activity goes, and its post-flush escape
-  check stays; setup takes the submitter key; genesis is a base like any other.
+- **Setup becomes one procedure.** Plain setup's refusal on submitter
+  activity goes, and its post-flush escape check stays; setup takes the submitter key; genesis is a base like any other.
   Setup refuses any data directory that holds anything, so plain setup's no-op
   on a completed directory and today's retry in place both go: the root
   README's "run once; idempotent" changes, and a setup unit must not run on
@@ -82,8 +51,8 @@ is easy to miss. An item leaves this list when it lands.
   [application contract's §4](../../protocol/application-contract.md#4-canonical-history-cursor-executed_input_count).
 - **[application.md](application.md)** goes into the application contract and
   the [C binding](../../protocol/c-application-binding.md).
-- **[interfaces.md](interfaces.md)** becomes code: the two traits and the
-  executor in `sequencer-core`, and the two C headers.
+- **[interfaces.md](interfaces.md)** is code, except the scheduler's C
+  header ([build](#build)).
 - **[operations.md](operations.md)** replaces the procedure in
   [cockroach recovery](../../recovery/cockroach.md) and the
   [incident runbook](../../watchdog/incident-runbook.md); then this directory
@@ -96,11 +65,9 @@ is easy to miss. An item leaves this list when it lands.
 The changes above are part of this work; each item here names only the rest.
 
 - **The scheduler's interface**: settle with Bart the free-standing
-  scheduler's Rust trait and C header, with examples, as the `Application`
-  trait and the C binding were ([interfaces](interfaces.md#the-scheduler)).
-  Then split today's `Scheduler<A>` into the scheduler and the executor
-  ([rebuild](sequencer.md#the-rebuild)).
-- **Guest**: the template rules and the `scheduler` export query.
+  scheduler's Rust interface and a C header, with examples, as the
+  `Application` trait and the C binding were
+  ([interfaces](interfaces.md#the-scheduler)).
 - **Setup**: `--base` and `--dry-run`. It loads the machine, reads its export
   and checks it against L1, builds the application from the export, rebuilds
   and stores the history, executes it, and publishes the era.
@@ -110,8 +77,6 @@ The changes above are part of this work; each item here names only the rest.
 - **Sequencer storage**: the rebuilt history table; the era's base count,
   rebuilt history end and first queued input; the new baseline served as the
   era's first comparison checkpoint.
-- **The lane and the predicate**: the payload cap, admission, and gate f in
-  `scheduler_accepts` ([sequencer](sequencer.md#the-lane-and-the-predicate)).
 - **Feed**: serve the rebuilt history, then the live rows, switching tables
   internally.
 - **Tests of setup against a chain with history**, from genesis and from a
@@ -190,7 +155,7 @@ operator's job.
 
 ## When this plan lands
 
-Delete today's `setup --recovery` fold and what the
+Delete what the
 [tracks board](../2026-07-coordination-tracks.md#track-3--feed--replay-protocol-redesign)
 lists for deletion. The earlier plans are already
 [archived](../../recovery/history/README.md#superseded-cockroach-recovery-plans).

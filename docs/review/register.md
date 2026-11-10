@@ -18,47 +18,18 @@ are proposed work.
 
 ### Bound the canonical direct-input fridge
 
-The shared [scheduler](../../sequencer-core/src/scheduler/mod.rs) retains raw
-direct payloads without a byte budget. The age backstop does not bound memory,
-and HTTP controls cannot limit canonical L1 traffic. QA's guest/node OOM
-evidence supports investigating this independently of the toy wallet's state
-growth; its workload-specific thresholds are not deployment capacity bounds.
-
-Direction, settled by the owner on 2026-10-29: only well-formed directs enter
-the fridge, under application-defined format and sender rules that read only
-the input and fixed configuration, and the rest are dropped without
-executing; and a count of entries bounds it. Refined on 2026-11-02: an
-overflow executes whole blocks of the oldest entries, in FIFO order, until
-there is room, raising the scheduler clock to the last drained block. An
-overflow never splits a block and drains at most one block more than it
-must. Whole blocks and strict
-frame clocks keep one invariant: every admitted direct at or below the
-scheduler clock has executed, and every one above it is queued. The
-[sequencer recovery plan](../plans/2026-11-sequencer-recovery/scheduler.md#the-fridge)
-reads the fridge from the machine, so recovery no longer needs the invariant;
-on 2026-11-05 the owner kept whole blocks for its own sake, and a direct that
-arrives when only its own block is left joins over the bound. On 2026-11-09
-the owner replaced the application-defined rule with a payload cap, a constant
-of the template: a direct with a longer payload never joins, and every other
-direct does. A cap bounds each entry's size without the scheduler running
-application code, and a rule that also dropped small garbage would buy
-little, since a zero-value portal deposit takes a slot for about the same L1
-gas. The bound and the cap are protocol: canonical
-execution, recovery and the C++ port apply them alike, and live prediction
-applies the cap. Live prediction cannot mirror an overflow
-drain, which can run ahead of batches the lane has already sealed, so an
-overflow is a deliberate divergence. An overflow is answered by a manual
-cockroach recovery, and the watchdog's divergence latch is what reports it;
-making standard recovery repair one is deferred on complexity
-([shared recovery tool](../recovery/history/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
+The scheduler bounds its fridge by a count of entries, and a direct whose
+payload is over a cap never joins it. Both are template constants the
+application supplies through `Application::scheduler_limits`; the wallet's
+values, 16384 entries and 1024 bytes
+([`wallet.rs`](../../examples/app-core/src/application/wallet.rs)), are
+provisional. The [scheduler contract](../protocol/scheduler-semantics.md)
+owns the rules: an overflow drains whole blocks of the oldest entries, which
+live prediction cannot mirror, so an overflow is a deliberate divergence that
+the watchdog's divergence latch reports and cockroach recovery answers.
 
 To settle with Bart:
 
-- Live prediction drops the same directs as the guest. Executing one when it
-  arrives instead would count an input at an L1 position the sequencer cannot
-  know when it seals a batch, so one `addInput` would force a divergence.
-  Every direct counts as an executed input today, so dropping one changes the
-  history.
 - The payload cap's value. A count bounds memory only if each entry's size
   is bounded too, and portals accept zero-value deposits with arbitrary extra
   data, up to the 64 KiB input cap; the cap is the longest payload the
@@ -77,20 +48,10 @@ To settle with Bart:
   accumulated outputs included. The five-block local frame tick is not a
   canonical drain interval.
 
-An overflow rejects a still-fresh delayed batch whose first frame lies below
-the raised floor, and every later batch then fails the nonce gate, though live
-prediction counted them accepted. Silent loss of valid deposits is not a
-recovery strategy.
-
-Next: settle these with Bart and measure headroom, then exercise delayed fresh
-batches, same-block overflow, outages, and replay/rebuild agreement. Preserve
-the [checkpoint eligibility rule](../recovery/cockroach.md#checkpoint-eligibility):
-forcing one direct while leaving another from the same block queued can require
-an earlier checkpoint or genesis. The [scheduler contract](../protocol/scheduler-semantics.md)
-and [application contract](../protocol/application-contract.md) own the boundaries
-the implementation must update together. An overflow changes the application
-state after a block's last accepted batch, so the watchdog's block-boundary
-comparison does not hold for that block
+Next: settle these values and measure headroom, then exercise delayed fresh
+batches, same-block overflow and outages on devnet. An overflow changes the
+application state after a block's last accepted batch, so the watchdog's
+block-boundary comparison does not hold for that block
 ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
 
 ### Batch-size accounting omits SSZ overhead
@@ -245,8 +206,8 @@ at `6b2a233`.
   `1a9615d`). A reader tick fetches `[cursor, safe]` whole, holds every event in
   memory (decoded event plus raw log, roughly twice the input bytes;
   unmeasured) and commits once; one failed single-block `get_logs` restarts the
-  span. In `run` the span stays under `l1_read_stale_after_blocks`. Setup,
-  startup syncs after downtime and `setup --recovery` have no bound: a fresh
+  span. In `run` the span stays under `l1_read_stale_after_blocks`. Setup and
+  startup syncs after downtime have no bound: a fresh
   database scans every input since the app's deployment, our batches included
   (the InputBox caps an encoded input at 64 KiB). Current histories are
   megabytes, and rerunning on a larger host is the fallback. The known
@@ -259,8 +220,7 @@ at `6b2a233`.
   nothing; the window that reaches the sampled safe head keeps today's count
   check; reject logs outside the requested window; a later failure still
   returns an error. A window end is never committed on contiguity alone: the
-  lane would stamp frames past a dropped tail input. The recovery fold still
-  loads every input after its checkpoint. Act when `safe_inputs` payload bytes
+  lane would stamp frames past a dropped tail input. Act when `safe_inputs` payload bytes
   approach a quarter of the recovery host's memory, when a recovery sync fails
   on a transient mid-crawl, or when the reader becomes a crate shared with
   another node. Evidence: [`l1/reader.rs`](../../sequencer/src/l1/reader.rs),
@@ -277,7 +237,7 @@ at the smallest useful boundary when working on that behavior.
 |---|---|
 | Elapsed-time danger | Storage/procedure coverage exists. Add a process scenario isolating `EstimatedBatchInDanger` from stale-view refusal: retry at exit 20 without a speculative cascade. Start in [recovery](../../sequencer/src/recovery/mod.rs) and the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Canonical divergence | Storage freeze and startup refusal are covered separately. Compose accepted divergent input, runtime stop, and refusal after respawn in a process test; frontier must remain frozen. See [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen). |
-| Rebuilt anchor | Anchor unit mechanics and rebuild round-trip are covered. Exercise a later full-tear cascade after a nonzero-anchor rebuild and verify submission resumes at that anchor. See [I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce). |
+| Rebuilt anchor | Anchor unit mechanics are covered; no command writes a nonzero anchor until `setup --base`. With it, exercise a later full-tear cascade after a nonzero-anchor rebuild and verify submission resumes at that anchor. See [I16](../invariants.md#i16-the-batch-tree-has-exactly-one-valid-parentless-root-carrying-the-deployments-anchor-nonce). |
 | Same-block directs | `multi_deposit_reconciliation_test` accumulates directs in separate blocks. Queue portal sends, mine once, assert equal receipt blocks, and verify canonical/WS order and attribution in the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Boot failure exits | Exit 20 now has a process assertion; exits 40/1 still need exact assertions in applicable setup/failure scenarios, so the supervisor receives the intended recovery/retry hint. Start in the [E2E scenarios](../../tests/e2e/src/test_cases.rs) and [exit contract](../../sequencer/src/commands/error.rs). |
 | SDK HTTPS | A test pins that `https://` endpoints open with a TLS ClientHello. Certificate rejection is untested; it relies on reqwest's rustls platform verifier, with no override in the SDK. Add a rejection test if the SDK gains custom roots. See the [client](../../sdk/rust-client/src/lib.rs). |
@@ -290,20 +250,12 @@ replay; no new snapshot lifecycle is implied.
 
 ## Canonical rules open for the C++ port
 
-The [scheduler spec](../protocol/scheduler-semantics.md) marks these rules
-**pending**. Each changes the canonical machine image or its wire format, so
-they are agreed with the port's author. The wire-format bump ships first, on
-its own, after draining sealed batches and before the first production deploy;
-the rest ship in the port's image. Checked 2026-10-14 at `32bf8de`;
-evidence: the spec's links and
-[`consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json).
-
-The [sequencer recovery plan](../plans/2026-11-sequencer-recovery/scheduler.md)
-restates every rule for the next template, with these marked. It reads the
-scheduler state from the machine, so recovery needs none of them; on
-2026-11-05 the owner kept the scheduler clock, strict frame clocks and the
-authorization rule for their own sake. The plan leaves prevRandao to a stated
-need.
+Each of these changes the canonical machine image or its wire format, so it is
+agreed with the port's author. The wire-format bump ships first, on its own,
+after draining sealed batches and before the first production deploy; the
+rest ship in the port's image. The
+[scheduler contract](../protocol/scheduler-semantics.md) owns the rules in
+force.
 
 - **Signature acceptance set.** The guest and `POST /tx` accept every `v ≥ 35`
   and the high-`s` twin, as alloy does. Proposed: `v ∈ {27, 28}` and low `s`
@@ -314,50 +266,12 @@ need.
 - **Wire format.** A fixed 65-byte signature field, with the
   [SSZ overhead](#batch-size-accounting-omits-ssz-overhead) fix; drain sealed
   batches before the switch.
-- **Frame clocks across batches** (checked 2026-10-29 at `3e92563`). Gate d
-  orders frame clocks only within a batch, so after faulty sequencing a later
-  batch's user ops can run below an earlier input's clock, though applications
-  may read blocks as time. Settled by the owner for the next template,
-  pending Bart: a gate on the scheduler clock, the latest of every accepted
-  frame's `safe_block` and every drained direct's block. Raising it on a
-  backstop drain changes no gate outcome, since gate e already skips any batch
-  that raise would reject; it only keeps a direct the backstop executed from
-  sitting above the clock. Gate f alone keeps blocks from going backwards.
-  Strict frame clocks, the backstop's raise and whole-block overflow drains
-  serve only the clock's split of the directs, which recovery no longer
-  reads. On 2026-11-09 the owner kept them for the meaning they give the
-  clock, with setup and the conformance vectors checking the split
-  ([the invariant](../plans/2026-11-sequencer-recovery/scheduler.md#the-invariant)).
-- **Strict frame clocks** (checked 2026-11-02 at `3e92563`). Gate d accepts a
-  frame whose `safe_block` equals its batch's inclusion block, which lets the
-  frame drain only part of its own block. Settled by the owner for the next
-  template, pending Bart: strictly below. A correct sequencer never posts
-  equality, but the frozen conformance vectors post such a frame in 18 of their
-  19 guest scenarios, so the rule ships with v2 vectors.
-- **Authorization decides inclusion** (checked 2026-10-29 at `3e92563`). The
-  scheduler skips an op the application rejects, fee balance included, so
-  which ops execute depends on application state. Settled by the owner for
-  the next template, pending Bart: an op is included exactly when its sender
-  authorized it (signature, nonce, fee cap); an included op advances the
-  nonce and pays the fee capped at the balance, whatever else happens. On
-  2026-11-05 the owner left the charge to the application, recommending the
-  capped fee. On 2026-11-09 the owner moved the nonce comparison into shared
-  code, with the application only storing the nonce, and made the fee-balance
-  check a separate admission call that only the lane makes
-  ([a user op's fate](../plans/2026-11-sequencer-recovery/scheduler.md#a-user-ops-fate)).
-- **Direct input context** (checked 2026-10-29 at `3e92563`). The guest drops
-  a direct's input index, timestamp and prevRandao, and the application never
-  sees them. Settled by the owner for the next template, pending Bart: they
-  reach the application with the direct, and the sequencer stores prevRandao
-  and carries it on the feed's direct rows
-  ([shared recovery tool](../recovery/history/2026-10-shared-recovery-tool.md#rules-for-the-next-template)).
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
-  the [fridge bound](#bound-the-canonical-direct-input-fridge), a `scheduler`
-  inspect query, and a setup check of the guest's compiled
-  `sequencer_address`. With them come versioned gate
-  and signature vectors, adding the unpinned `s ≥ n`, `v` from 29 to 34 and the
-  fee-range reject.
+  the [fridge bound and cap values](#bound-the-canonical-direct-input-fridge),
+  and a setup check of the guest's compiled `sequencer_address`. With them
+  come versioned gate and signature vectors, adding the unpinned `s ≥ n`, `v`
+  from 29 to 34 and the fee-range reject.
 
 ## Integration work owned elsewhere
 

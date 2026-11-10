@@ -4,10 +4,10 @@ Snapshots preserve application state at a declared execution boundary. Their
 contents and boundary are immutable. L1 acceptance is a separate durable fact:
 there is no promotion operation and no mutable finalized pointer.
 
-Keep three boundaries separate: the engine embeds its executed-input count and
-safe-block clock; SQLite associates an artifact with a local batch or era
-baseline; safe L1 acceptance selects a comparison checkpoint. Counts and clocks
-alone do not establish acceptance. The [history guide](../protocol/application-history.md)
+Keep three boundaries separate: the engine embeds its executed-input count;
+SQLite associates an artifact with a local batch or era baseline; safe L1
+acceptance selects a comparison checkpoint. A count alone does not establish
+acceptance. The [history guide](../protocol/application-history.md)
 explains these coordinates.
 
 ## Artifact and boundary
@@ -77,11 +77,8 @@ This selection is independent of the lane's L1 reconciliation cursor. A crash
 between reader ingestion and lane reconciliation cannot miss a promotion or
 repeat one: acceptance is already durable, and the query derives the result.
 
-The genesis baseline is known canonical at block zero. A rebuilt baseline is
-**only a restore artifact** until a new batch is accepted. The recovery fold can
-pre-execute queued direct inputs through its stop block; that state need not
-equal the canonical machine's state at that block. It is never advertised as an
-accepted comparison checkpoint solely because recovery produced it.
+The genesis baseline is known canonical at block zero, the only baseline setup
+writes in this build.
 
 The current watchdog compares at the selected accepted batch's **L1 block
 boundary**. Every batch has a snapshot, and reader ingestion accounts for a
@@ -119,12 +116,11 @@ The metadata, selected artifact, and lease are captured in one transaction.
 Restoring `/latest_snapshot` and subscribing with its history claim gives the
 consumer a coherent snapshot-plus-suffix starting point.
 
-**Operator backup workflow:** download `/finalized_snapshot` and extract the
-archive. Supply that extracted directory to `setup --recovery`, with the
-checkpoint block recorded in its receipt. The loader checks the receipt against
-the immutable dump metadata and configured block. Copying a bare local
-`dumps/<id>/` directory is insufficient: it is a restore artifact and has no
-acceptance receipt. Export creates the receipt without modifying local files.
+**Operator backup:** `/finalized_snapshot` exports an accepted checkpoint with
+its receipt, without modifying local files. A bare local `dumps/<id>/`
+directory is only a restore artifact and has no acceptance receipt. No command
+in this build consumes the archive: recovery from a canonical machine arrives
+with `setup --base`.
 
 ## Retention, leases, and crash safety
 

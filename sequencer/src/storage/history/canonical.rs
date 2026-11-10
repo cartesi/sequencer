@@ -10,7 +10,7 @@ use rusqlite::{Connection, Row, Transaction, params};
 use sequencer_core::history::{
     ExecutedInputCount, HistoryBounds, HistoryClaim, HistoryPolicyError,
 };
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 
 use crate::storage::Storage;
 use crate::storage::convert::{
@@ -18,19 +18,17 @@ use crate::storage::convert::{
 };
 use crate::storage::history::{next_executed_input_count_in, query_history_state};
 
+/// One executed history row: the record the executor ran, plus the batch
+/// coordinates the feed reports beside it.
 #[derive(Debug, Clone)]
 pub(crate) enum L2TxContext {
     UserOp {
-        tx: ValidUserOp,
-        nonce: u32,
-        safe_block: u64,
+        tx: UserOpTx,
         batch_nonce: u64,
     },
-    DirectInput {
-        tx: DirectInput,
-        input_index: u64,
+    Direct {
+        tx: Direct,
         batch_nonce: u64,
-        block_timestamp: u64,
         transaction_hash: B256,
     },
 }
@@ -47,24 +45,24 @@ fn decode_application_input(row: &Row<'_>) -> rusqlite::Result<ApplicationInputR
     let batch_nonce = i64_to_u64(row.get(8)?);
     let context = match row.get::<_, i64>(1)? {
         0 => L2TxContext::UserOp {
-            tx: ValidUserOp {
+            tx: UserOpTx {
                 sender,
-                data: row.get(3)?,
+                nonce: i64_to_u32(row.get(10)?),
                 fee: i64_to_u16(row.get(4)?),
+                block: safe_block,
+                data: row.get(3)?,
             },
-            nonce: i64_to_u32(row.get(10)?),
-            safe_block,
             batch_nonce,
         },
-        1 => L2TxContext::DirectInput {
-            tx: DirectInput {
+        1 => L2TxContext::Direct {
+            tx: Direct {
+                input_index: i64_to_u64(row.get(9)?),
                 sender,
+                block: i64_to_u64(row.get(6)?),
+                timestamp: i64_to_u64(row.get(11)?),
                 payload: row.get(5)?,
-                block_number: i64_to_u64(row.get(6)?),
             },
-            input_index: i64_to_u64(row.get(9)?),
             batch_nonce,
-            block_timestamp: i64_to_u64(row.get(11)?),
             transaction_hash: B256::from_slice(row.get::<_, Vec<u8>>(12)?.as_slice()),
         },
         kind => panic!("invalid application input kind {kind}"),

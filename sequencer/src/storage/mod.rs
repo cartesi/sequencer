@@ -54,13 +54,6 @@ pub struct StoredSafeInput {
     pub block_number: u64,
 }
 
-/// A sender-classified L1 direct input ready for application execution.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredDirectInput {
-    pub safe_input_index: u64,
-    pub input: sequencer_core::l2_tx::DirectInput,
-}
-
 /// One InputBox event with the L1 provenance persisted for feed consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IngestedSafeInput {
@@ -74,12 +67,12 @@ pub(crate) struct IngestedSafeInput {
 /// Whether a sync also maintains the scheduler-accepted gold frontier
 /// (`safe_accepted_batches`).
 ///
-/// Every normal sync uses [`FrontierMode::Populate`]. `setup --recovery` uses
-/// [`FrontierMode::DeferUntilAnchorSet`] for its interim syncs: the local batch
-/// tree is rebuilt from the checkpoint *after* the sync, so populating the
-/// frontier against the empty tree would mark every L1 batch `Foreign` and
-/// falsely freeze it. `run`'s first sync populates it once the anchor is `N'`.
-/// See `docs/recovery/cockroach.md` and the anchor-aware-frontier note on I15.
+/// Every normal sync uses [`FrontierMode::Populate`]. A setup that rebuilds
+/// the batch tree after its sync uses [`FrontierMode::DeferUntilAnchorSet`] for
+/// its interim syncs: populating the frontier against the empty tree would mark
+/// every L1 batch `Foreign` and falsely freeze it. `run`'s first sync populates
+/// it once the anchor is set. See the anchor-aware-frontier note on I15. No
+/// command rebuilds until `setup --base`, which reuses this mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontierMode {
     /// Maintain `safe_accepted_batches` as part of the sync (the default).

@@ -38,12 +38,13 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 - **Go offline** — stop providing soft confirmations.
 - **Diverge** — if batches fail to land on L1 in time, soft confirmations that were issued become invalid.
 
-**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
+**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it. A direct whose payload is over the application's cap
+never executes, on L1 or in the sequencer.
 
 During normal operation the sequencer advances logical frame time after five
 newly-safe blocks have accumulated. That clock tick drains every covered direct
-before later user ops and may also create an empty-direct frame to improve the
-application-visible clock. Safe-head publication is best effort: if the node
+before later user ops and may also create an empty-direct frame, so that later
+user ops carry a fresher block: each op executes at its frame's safe block. Safe-head publication is best effort: if the node
 exposes a multi-block jump, the sequencer creates one frame at the observed tip
 and never fabricates intermediate frames.
 
@@ -63,12 +64,12 @@ suffix, and resume from retained state. Stale batches do not consume the
 scheduler's expected nonce, so their successors cannot be accepted until recovery
 supplies a replacement at that nonce.
 
-**[Cockroach recovery](docs/recovery/cockroach.md)** is an operator-triggered
-rebuild when the local database is lost or cannot be trusted. This includes a
-sequencer bug that corrupted state or emitted malformed batches: fix the bug,
-choose a trusted canonical application checkpoint, then rebuild in a fresh data
-directory. The command processes historical L1 inputs through the canonical
-scheduler and prepares a baseline for resuming normal operation.
+**Cockroach recovery** is an operator-triggered rebuild when the local
+database is lost or cannot be trusted, including after a sequencer bug that
+corrupted state or emitted malformed batches. This build has no rebuild
+command: recovery from a canonical machine arrives with `setup --base`, whose
+procedure is designed in
+[sequencer recovery operations](docs/plans/2026-11-sequencer-recovery/operations.md).
 
 The [threat model](docs/threat-model/README.md#self-trust) explains the boundary
 between normal operation's self-trust and manual repair after a bug.
@@ -79,7 +80,7 @@ The sequencer is designed to handle:
 
 - **L1 provider outages** — each worker retries on its next tick; the RPC client resends a rate-limited or temporarily unavailable request at most twice, a second apart or after the server's requested wait when that is 5 s or less. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
 - **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
-- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state follows the cockroach recovery procedure above.
+- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state is cockroach recovery, above.
 - **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. Recovery waits until every covered wallet-nonce slot is consumed at safe depth, whether the original transaction or a flush no-op wins, so delayed "zombie" submissions cannot land later.
 
 ## Interfaces
@@ -106,14 +107,10 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 The sequencer runs in two phases. **`setup`** pins the
 deployment identity (including the reviewed fee-oracle source), does the initial L1 sync, and registers the genesis
-snapshot — run it once. Plain `setup` is L1-read-only: it takes the batch-submitter
+snapshot — run it once. `setup` is L1-read-only: it takes the batch-submitter
 *address*, never the signing key. **`run`** boots the sequencer from the
 set-up DB, reading identity from it (so chain id / app address are not `run`
 arguments); it holds the signing key because it submits.
-
-For rebuilding from a trusted checkpoint, follow the
-[cockroach recovery procedure](docs/recovery/cockroach.md#run-a-rebuild).
-`setup --recovery` also needs the submitter key because it flushes transactions.
 
 ```bash
 # Phase A — set up the data dir (run once; idempotent).
@@ -156,7 +153,7 @@ Optional variables, by name; each subcommand's `--help` shows their defaults and
 
 - Every subcommand: `CARTESI_SEQUENCER_DATA_DIR` (the SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC` (below).
 - `setup` and `run`: `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`.
-- `setup`: the fee-oracle source it pins, either `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` or a Uniswap source (the overrides `CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`, `CARTESI_SEQUENCER_WETH_ADDRESS` and `CARTESI_SEQUENCER_UNISWAP_V3_POOL`, given together and required on other chains, and `CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`); `CARTESI_SEQUENCER_CHECKPOINT_BLOCK`; and, for a [rebuild](docs/recovery/cockroach.md), `CARTESI_SEQUENCER_RECOVERY`, `CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR` and the signing key.
+- `setup`: the fee-oracle source it pins, either `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` or a Uniswap source (the overrides `CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`, `CARTESI_SEQUENCER_WETH_ADDRESS` and `CARTESI_SEQUENCER_UNISWAP_V3_POOL`, given together and required on other chains, and `CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`); and `CARTESI_SEQUENCER_CHECKPOINT_BLOCK`. Setup refuses the removed recovery mode's `CARTESI_SEQUENCER_RECOVERY` (when true) and `CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR`: recovery from a canonical machine arrives with `setup --base`.
 - `run`: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener), `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH` and `CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`.
 
 Logs and errors show only the endpoint's scheme, host and port, since its path, query and userinfo can hold an API key or a password, unless the RPC server echoes them inside a JSON-RPC error message or a malformed result, which alloy builds above the redaction layer, or quotes in an error body only part of them or a different URL that carries them, such as a redirect target on another path. An L1 error's text stays on one line, with each cause cut at 256 bytes. The client follows no redirects: an endpoint that answers 3xx fails with that status, so configure the provider's final URL (setup exits 30 at its chain-id check, since a retry gets the same redirect). Debug-level logging for the `alloy_transport_http` target records the full URL, so keep that target at `info` where logs leave the host.
@@ -171,7 +168,7 @@ environment:
   CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
 ```
 
-Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (wipe the data directory and run `setup --recovery`), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics and an undecodable batch landed by the submitter key, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
+Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (do not restart; recovery from a canonical machine arrives with `setup --base`), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics and an undecodable batch landed by the submitter key, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
 
 The [EIP-712 domain](docs/protocol/scheduler-semantics.md#user-op-signatures) is fixed except `chainId` and `verifyingContract`, which come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`.
 
@@ -226,7 +223,7 @@ Notes:
 - `sender` is required and must match the recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
 - size is bounded at ingress, before the hot path: the raw request body is capped at 4096 bytes (`413 PAYLOAD_TOO_LARGE`), and `message.data` at the application's maximum method payload size (`400 BAD_REQUEST`).
-- the inclusion lane checks nonce, `max_fee`, and fee balance. A rejected op returns `422 EXECUTION_REJECTED` and persists nothing.
+- the inclusion lane checks, in order, `max_fee` against the open-frame fee, the nonce, then the application's admission policy (the wallet refuses a sender that cannot pay the fee). A refused op returns `422 EXECUTION_REJECTED` with the refusal's text and persists nothing.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 - Browser wallets can call `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
@@ -271,8 +268,7 @@ Notes:
 - `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
 - Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
-- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
-- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
+- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, which names the expected nonce (`bad nonce: expected N, got M`), query again rather than incrementing.
 - Successful responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
 
 ### `GET /domain`
@@ -311,7 +307,8 @@ After each successfully applied input at offset `X`, persist the claim with
 - Messages are JSON text frames; binary fields are `0x`-prefixed hex.
   Direct-input `block_timestamp` values are Unix seconds.
 - Batch envelopes are absent. Offsets count executed application inputs,
-  including business failures and malformed-direct no-ops.
+  including business failures and malformed-direct no-ops. A direct whose
+  payload is over the application's cap never executes and has no offset.
 - Recovery stops the process and disconnects subscribers. A reconnect must
   present its saved claim; offsets alone cannot distinguish a replaced suffix.
 - Shutdown or a feed read/send failure may disconnect without a WebSocket

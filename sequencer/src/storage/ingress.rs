@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use alloy_primitives::Address;
-use rusqlite::{OptionalExtension, Result, Transaction, params};
+use rusqlite::{OptionalExtension, Result, Transaction, named_params, params};
+use sequencer_core::l2_tx::Direct;
 
 use super::convert::{
     from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
@@ -21,7 +22,7 @@ use super::mutations::{
     persist_frame_direct_sequence_derived, seal_batch,
 };
 use super::queries::{
-    current_safe_block_required, load_current_write_head, query_batch_policy,
+    DIRECT_EXECUTES_SQL, current_safe_block_required, load_current_write_head, query_batch_policy,
     query_latest_safe_input_index_exclusive,
 };
 use super::safe_accepted_batches::canonical_divergence_in;
@@ -103,10 +104,15 @@ impl Storage {
         })
     }
 
+    /// The directs in `range` that execute, in input order, each with the
+    /// index and timestamp the application receives. A direct over
+    /// `max_direct_payload_bytes` is left out, as storage's derivation of the
+    /// frame's executions leaves it out.
     pub(crate) fn fill_direct_inputs(
         &mut self,
         range: SafeInputRange,
-        out: &mut Vec<super::StoredDirectInput>,
+        max_direct_payload_bytes: u64,
+        out: &mut Vec<Direct>,
     ) -> Result<()> {
         out.clear();
         if range.is_empty() {
@@ -114,26 +120,28 @@ impl Storage {
         }
         let identity = super::l1_inputs::query_deployment_identity(&self.conn)?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        let mut statement = self.conn.prepare_cached(
-            "SELECT safe_input_index, sender, payload, block_number FROM safe_inputs
-             WHERE safe_input_index >= ?1 AND safe_input_index < ?2 AND sender != ?3
-             ORDER BY safe_input_index",
-        )?;
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT safe_input_index, sender, payload, block_number, block_timestamp
+             FROM safe_inputs
+             WHERE safe_input_index >= :start AND safe_input_index < :end
+               AND {DIRECT_EXECUTES_SQL}
+             ORDER BY safe_input_index"
+        ))?;
         let rows = statement.query_map(
-            params![
-                u64_to_i64(range.start()),
-                u64_to_i64(range.end()),
-                identity.batch_submitter_address.as_slice()
-            ],
+            named_params! {
+                ":start": u64_to_i64(range.start()),
+                ":end": u64_to_i64(range.end()),
+                ":batch_submitter": identity.batch_submitter_address.as_slice(),
+                ":max_direct_payload_bytes": saturating_query_bound(max_direct_payload_bytes),
+            },
             |row| {
                 let sender: Vec<u8> = row.get(1)?;
-                Ok(super::StoredDirectInput {
-                    safe_input_index: i64_to_u64(row.get(0)?),
-                    input: sequencer_core::l2_tx::DirectInput {
-                        sender: Address::from_slice(&sender),
-                        payload: row.get(2)?,
-                        block_number: i64_to_u64(row.get(3)?),
-                    },
+                Ok(Direct {
+                    input_index: i64_to_u64(row.get(0)?),
+                    sender: Address::from_slice(&sender),
+                    block: i64_to_u64(row.get(3)?),
+                    timestamp: i64_to_u64(row.get(4)?),
+                    payload: row.get(2)?,
                 })
             },
         )?;
@@ -178,16 +186,26 @@ impl Storage {
         Ok(())
     }
 
-    /// Commit frame advancement together with its application inputs.
+    /// Commit frame advancement together with its application inputs, which
+    /// must be exactly the directs the range executes under
+    /// `max_direct_payload_bytes`.
     pub fn close_frame_only_with_executions(
         &mut self,
         head: &mut WriteHead,
         next_safe_block: u64,
         leading_direct_range: SafeInputRange,
+        max_direct_payload_bytes: u64,
         executions: &[DirectInputExecution],
     ) -> Result<()> {
         let policy = self.write(|tx| {
-            close_frame_in(tx, head, next_safe_block, leading_direct_range, executions)
+            close_frame_in(
+                tx,
+                head,
+                next_safe_block,
+                leading_direct_range,
+                max_direct_payload_bytes,
+                executions,
+            )
         })?;
         head.advance_frame(policy, next_safe_block);
         Ok(())
@@ -246,7 +264,8 @@ pub(super) fn insert_tip_rows(
 }
 
 /// Extend the valid batch path with a fresh open Tip at the current safe head,
-/// attributing every undrained safe input to its first frame (lane catch-up
+/// draining every undrained safe input into its first frame: each direct that
+/// executes under `max_direct_payload_bytes` gets its row there (lane catch-up
 /// executes them, I11).
 ///
 /// One mechanism, two callers with distinct intents (each keeps its own guard):
@@ -258,7 +277,10 @@ pub(super) fn insert_tip_rows(
 /// explicit genesis `0` only when the `batches` table is empty, otherwise the
 /// monotonic PK (so recovery batches keep climbing and indices are never
 /// reused).
-pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
+pub(super) fn open_fresh_tip_in_tx(
+    tx: &Transaction<'_>,
+    max_direct_payload_bytes: u64,
+) -> Result<()> {
     let safe_block = current_safe_block_required(tx)?;
     let table_empty = tx
         .query_row("SELECT MAX(batch_index) FROM batches", [], |row| {
@@ -277,6 +299,7 @@ pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
         parent,
         safe_block,
         query_latest_safe_input_index_exclusive(tx)?,
+        max_direct_payload_bytes,
     )
 }
 
@@ -289,16 +312,24 @@ fn insert_draining_tip_with_executions(
     parent: Option<u64>,
     safe_block: u64,
     drain_upper: u64,
+    max_direct_payload_bytes: u64,
 ) -> Result<()> {
     let leading_direct_range =
         SafeInputRange::new(next_undrained_safe_input_index_in(tx)?, drain_upper);
     let batch_index = insert_tip_rows(tx, batch_index, parent, safe_block)?;
-    persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
+    persist_frame_direct_sequence_derived(
+        tx,
+        batch_index,
+        0,
+        leading_direct_range,
+        max_direct_payload_bytes,
+    )?;
     Ok(())
 }
 
-/// The folded prefix is represented by the baseline, so the root contains no
+/// The rebuilt prefix is represented by the baseline, so the root contains no
 /// replay entries for it. Inputs beyond the stop block remain unaccounted.
+/// Reached only through a rebuild's baseline, which `setup --base` reuses.
 pub(super) fn open_recovery_tip_in_tx(tx: &Transaction<'_>, stop_block: u64) -> Result<()> {
     assert!(
         load_current_write_head(tx)?.is_none(),
@@ -391,6 +422,7 @@ fn close_frame_in(
     head: &WriteHead,
     next_safe_block: u64,
     leading_direct_range: SafeInputRange,
+    max_direct_payload_bytes: u64,
     executions: &[DirectInputExecution],
 ) -> Result<BatchPolicy> {
     assert_eq!(
@@ -407,6 +439,7 @@ fn close_frame_in(
         head.batch_index,
         next_frame_in_batch,
         leading_direct_range,
+        max_direct_payload_bytes,
         executions,
     )?;
     Ok(policy)
@@ -510,13 +543,17 @@ fn insert_executed_user_ops_batch(
 mod tests {
     use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
     use crate::storage::{
-        DirectInputExecution, ExecutedInputCount, LifecycleCommand, SafeFrontierState,
-        SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput,
-        test_helpers::{SENDER_A, default_protocol_timing, record_canonical_divergence},
+        DirectInputExecution, ExecutedInputCount, FrontierMode, IngestedSafeInput,
+        LifecycleCommand, SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage,
+        StoredSafeInput,
+        test_helpers::{
+            SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
+            record_canonical_divergence,
+        },
     };
     use crate::test_support::{pin_test_deployment_identity, temp_db};
-    use alloy_primitives::{Address, Signature};
-    use sequencer_core::l2_tx::SequencedL2Tx;
+    use alloy_primitives::{Address, B256, Signature};
+    use sequencer_core::l2_tx::{Direct, L2Tx};
     use sequencer_core::user_op::{SignedUserOp, UserOp};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::SystemTime;
@@ -603,7 +640,13 @@ mod tests {
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .unwrap();
         storage
-            .close_frame_only_with_executions(&mut head, 9, SafeInputRange::empty_at(0), &[])
+            .close_frame_only_with_executions(
+                &mut head,
+                9,
+                SafeInputRange::empty_at(0),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &[],
+            )
             .unwrap();
     }
 
@@ -769,6 +812,7 @@ mod tests {
                 &mut head,
                 10,
                 SafeInputRange::new(0, 2),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
                 &incomplete,
             );
         }));
@@ -791,7 +835,13 @@ mod tests {
             },
         ];
         storage
-            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &complete)
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                SafeInputRange::new(0, 2),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &complete,
+            )
             .expect("commit complete direct attribution");
         assert_eq!(
             storage.next_executed_input_count().unwrap(),
@@ -1085,11 +1135,17 @@ mod tests {
         let replay = crate::storage::test_helpers::all_ordered_l2_txs(&mut storage);
         assert_eq!(replay.len(), 2);
         match &replay[0] {
-            SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xaa]),
+            L2Tx::Direct(value) => {
+                assert_eq!(value.payload.as_slice(), &[0xaa]);
+                assert_eq!((value.input_index, value.block), (0, 10));
+            }
             _ => panic!("expected direct input at position 0"),
         }
         match &replay[1] {
-            SequencedL2Tx::Direct(value) => assert_eq!(value.payload.as_slice(), &[0xbb]),
+            L2Tx::Direct(value) => {
+                assert_eq!(value.payload.as_slice(), &[0xbb]);
+                assert_eq!((value.input_index, value.block), (1, 10));
+            }
             _ => panic!("expected direct input at position 1"),
         }
     }
@@ -1256,7 +1312,13 @@ mod tests {
             )
             .unwrap();
         storage
-            .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 1), &[])
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                SafeInputRange::new(0, 1),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &[],
+            )
             .unwrap();
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 1);
         assert_eq!(
@@ -1362,6 +1424,171 @@ mod tests {
         assert!(
             !plan.contains("TEMP B-TREE"),
             "index order must serve ORDER BY:\n{plan}"
+        );
+    }
+
+    /// Four directs at block 10, timestamp 120: one at the payload cap, one a
+    /// byte over it, then the submitter's own input, then one more direct.
+    fn seed_directs_around_the_payload_cap(storage: &mut Storage) {
+        let cap = usize::try_from(TEST_MAX_DIRECT_PAYLOAD_BYTES).unwrap();
+        let row = |sender: Address, payload: Vec<u8>, hash: u8| IngestedSafeInput {
+            sender,
+            payload,
+            block_number: 10,
+            block_timestamp: 120,
+            transaction_hash: B256::repeat_byte(hash),
+        };
+        storage
+            .append_ingested_safe_inputs_with_timestamp(
+                10,
+                120,
+                &[
+                    row(Address::ZERO, vec![0xaa; cap], 1),
+                    row(Address::ZERO, vec![0xbb; cap + 1], 2),
+                    row(SENDER_A, vec![0xff], 3),
+                    row(Address::repeat_byte(0x44), vec![0xcc], 4),
+                ],
+                SENDER_A,
+                &default_protocol_timing(),
+                FrontierMode::Populate,
+            )
+            .expect("persist direct inputs");
+    }
+
+    #[test]
+    fn an_over_cap_direct_never_executes_and_later_directs_keep_contiguous_offsets() {
+        let db = temp_db("direct-payload-cap");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
+            .expect("initialize open state");
+        seed_directs_around_the_payload_cap(&mut storage);
+
+        // The lane reads exactly the directs that execute, each with the
+        // index and timestamp the application receives.
+        let range = SafeInputRange::new(0, 4);
+        let mut directs = Vec::new();
+        storage
+            .fill_direct_inputs(range, TEST_MAX_DIRECT_PAYLOAD_BYTES, &mut directs)
+            .expect("read executable directs");
+        let cap = usize::try_from(TEST_MAX_DIRECT_PAYLOAD_BYTES).unwrap();
+        let at_cap = Direct {
+            input_index: 0,
+            sender: Address::ZERO,
+            block: 10,
+            timestamp: 120,
+            payload: vec![0xaa; cap],
+        };
+        let after_skip = Direct {
+            input_index: 3,
+            sender: Address::repeat_byte(0x44),
+            block: 10,
+            timestamp: 120,
+            payload: vec![0xcc],
+        };
+        assert_eq!(directs, vec![at_cap.clone(), after_skip.clone()]);
+
+        // Offering an execution for the over-cap direct breaks the frame's
+        // agreement with storage's derivation and rolls the close back.
+        let with_over_cap = [
+            DirectInputExecution {
+                safe_input_index: 0,
+                executed_input_offset: ExecutedInputCount::ZERO,
+            },
+            DirectInputExecution {
+                safe_input_index: 1,
+                executed_input_offset: ExecutedInputCount::new(1),
+            },
+            DirectInputExecution {
+                safe_input_index: 3,
+                executed_input_offset: ExecutedInputCount::new(2),
+            },
+        ];
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = storage.close_frame_only_with_executions(
+                &mut head,
+                10,
+                range,
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &with_over_cap,
+            );
+        }));
+        assert!(panic.is_err(), "an over-cap execution must fail loud");
+        assert_eq!(head.frame_in_batch, 0);
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 0);
+
+        let executions = [
+            DirectInputExecution {
+                safe_input_index: 0,
+                executed_input_offset: ExecutedInputCount::ZERO,
+            },
+            DirectInputExecution {
+                safe_input_index: 3,
+                executed_input_offset: ExecutedInputCount::new(1),
+            },
+        ];
+        storage
+            .close_frame_only_with_executions(
+                &mut head,
+                10,
+                range,
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+                &executions,
+            )
+            .expect("close the frame over the executable directs");
+
+        assert_eq!(
+            storage.next_undrained_safe_input_index().unwrap(),
+            4,
+            "the whole range drains, the over-cap direct included"
+        );
+        assert_eq!(
+            storage.next_executed_input_count().unwrap(),
+            ExecutedInputCount::new(2)
+        );
+        let rows: Vec<(i64, i64)> = storage
+            .conn
+            .prepare("SELECT offset, safe_input_index FROM application_inputs ORDER BY offset")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(0, 0), (1, 3)]);
+        assert_eq!(
+            crate::storage::test_helpers::all_ordered_l2_txs(&mut storage),
+            vec![L2Tx::Direct(at_cap), L2Tx::Direct(after_skip)]
+        );
+
+        storage
+            .close_frame_and_batch(&mut head, 10)
+            .expect("the batch closes over the drained frame");
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 4);
+    }
+
+    #[test]
+    fn a_derived_drain_skips_the_over_cap_direct_too() {
+        let db = temp_db("direct-payload-cap-derived");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        pin_test_deployment_identity(&mut storage, SENDER_A);
+        seed_directs_around_the_payload_cap(&mut storage);
+
+        storage.ensure_open_tip().expect("open genesis tip");
+
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 4);
+        let replay = crate::storage::test_helpers::all_ordered_l2_txs(&mut storage);
+        let indexes: Vec<u64> = replay
+            .iter()
+            .map(|tx| match tx {
+                L2Tx::Direct(direct) => direct.input_index,
+                L2Tx::UserOp(op) => panic!("unexpected user op {op:?}"),
+            })
+            .collect();
+        assert_eq!(indexes, vec![0, 3]);
+        assert_eq!(
+            storage.next_executed_input_count().unwrap(),
+            ExecutedInputCount::new(2)
         );
     }
 }

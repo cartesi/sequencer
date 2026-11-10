@@ -11,8 +11,10 @@ The canonical scheduler turns an application's L1 inputs, in L1 order, into
 one sequence of L2 transactions, and the application executes them. Every
 validator runs it inside the canonical machine. The sequencer predicts it
 while it sequences, and runs it on its own during a recovery. The reference is
-[`Scheduler<A>`](../../../sequencer-core/src/scheduler/mod.rs). This text is
-the contract, and the reference can have bugs, so report any disagreement.
+the concrete [`Scheduler`](../../../sequencer-core/src/scheduler/mod.rs), with
+[`application::execute`](../../../sequencer-core/src/application/mod.rs) running
+each transaction it hands out. This text is the contract, and the reference can
+have bugs, so report any disagreement.
 
 ## What changes
 
@@ -421,8 +423,9 @@ state would depend on the application. It would also drop the backstop's
 executions, which the reference keeps.
 
 The reference halts the machine when the application returns an error; when
-the batch nonce or the L2 tx count has no `u64` successor; and when
-`blockNumber` or `chainId` does not fit `u64`. A halt is a permanent fixed point,
+the batch nonce, the L2 tx count or the L1 input count has no `u64` successor;
+and when an input's `index`, `blockNumber`, `timestamp` or `chainId` does not
+fit `u64`. A halt is a permanent fixed point,
 not a reject ([rollup host semantics](../../cartesi-machine.md#rollup-host-semantics)),
 so a port must halt on the same inputs. No canonical successor state exists.
 
@@ -462,6 +465,10 @@ interface.
 | `FRIDGE_BOUND` | **New**, value **Open** | the template |
 | `MAX_DIRECT_PAYLOAD_BYTES` | **New**, value **Open** | the template |
 | `sequencer_address` | per deployment | compiled into the canonical machine |
+
+The window `MAX_WAIT_BLOCKS` is at least one block. With zero, the backstop
+could drain the arriving input's own block and leave a direct from that block
+queued at the clock.
 
 A fee exponent `n` stands for `(129/128)^n` smallest token units. The
 application converts it; [`fee_to_linear`](../../../sequencer-core/src/fee.rs)

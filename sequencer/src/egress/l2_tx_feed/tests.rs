@@ -15,20 +15,20 @@ use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::history::{
     ExecutedInputCount, HistoryClaim, HistoryPolicyError, RecoveryGeneration,
 };
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
 #[test]
 fn broadcast_user_op_serializes_with_hex_data() {
     let msg = BroadcastTxMessage::from_user_op(
         7,
-        ValidUserOp {
+        &UserOpTx {
             sender: Address::from_slice(&[0x11; 20]),
+            nonce: 11,
             fee: 3,
+            block: 1_234,
             data: vec![0xaa, 0xbb],
         },
-        11,
-        1_234,
         5,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -43,16 +43,16 @@ fn broadcast_user_op_serializes_with_hex_data() {
 
 #[test]
 fn broadcast_direct_input_serializes_with_hex_payload() {
-    let msg = BroadcastTxMessage::from_direct_input(
+    let msg = BroadcastTxMessage::from_direct(
         9,
-        DirectInput {
+        &Direct {
+            input_index: 3,
             sender: Address::ZERO,
-            block_number: 42,
+            block: 42,
+            timestamp: 1_700_000_000,
             payload: vec![0xcc, 0xdd],
         },
-        3,
         5,
-        1_700_000_000,
         B256::repeat_byte(0xab),
     );
     let json = serde_json::to_string(&msg).expect("serialize");

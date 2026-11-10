@@ -10,13 +10,20 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, default_protocol_timing, record_canonical_divergence, set_one_op_batch_target,
+    SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, record_canonical_divergence,
+    set_one_op_batch_target,
 };
-use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
+use crate::storage::{
+    DirectInputExecution, FrontierMode, IngestedSafeInput, L2TxContext, SafeInputRange, Storage,
+    StoredSafeInput, WriteHead,
+};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
-use sequencer_core::application::{AppError, Application};
+use alloy_primitives::B256;
+use sequencer_core::application::{
+    Admission, AppError, AppOutputs, Application, Executed, SchedulerLimits, SkipReason, execute,
+};
 use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx};
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
 use crate::test_support::{ReplayEvent, StubApp, shutdown_lane, wait_until};
@@ -109,7 +116,7 @@ fn make_pending_user_op(
     let user_op = UserOp {
         nonce: 0,
         // Must be >= the DB default recommended_fee (1356) to pass the
-        // protocol-level max_fee >= fee_price check in the trait default.
+        // lane's max_fee >= frame fee check.
         max_fee: u16::MAX,
         data: vec![seed; 4].into(),
     };
@@ -390,17 +397,17 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     assert_eq!(sequenced.len(), 2);
     assert!(matches!(
         &sequenced[0].context,
-        crate::storage::L2TxContext::DirectInput {
-            tx: DirectInput {
-                block_number: 4,
-                ..
-            },
+        L2TxContext::Direct {
+            tx: Direct { block: 4, .. },
             ..
         }
     ));
     assert!(matches!(
         &sequenced[1].context,
-        crate::storage::L2TxContext::UserOp { safe_block: 5, .. }
+        L2TxContext::UserOp {
+            tx: UserOpTx { block: 5, .. },
+            ..
+        }
     ));
 
     lane.storage
@@ -546,6 +553,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             10,
             SafeInputRange::new(0, 1),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(2),
@@ -574,6 +582,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             20,
             SafeInputRange::new(1, 2),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
                 executed_input_offset: ExecutedInputCount::new(4),
@@ -598,6 +607,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             &mut head,
             30,
             SafeInputRange::new(2, 3),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 2,
                 executed_input_offset: ExecutedInputCount::new(5),
@@ -615,8 +625,10 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             data: vec![0x52; 4],
         },
         ReplayEvent::DirectInput {
+            input_index: 0,
             sender: Address::ZERO,
             block_number: 10,
+            timestamp: 0,
             payload: vec![0xaa],
         },
         ReplayEvent::UserOp {
@@ -624,13 +636,17 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             data: vec![0x53; 4],
         },
         ReplayEvent::DirectInput {
+            input_index: 1,
             sender: Address::ZERO,
             block_number: 20,
+            timestamp: 0,
             payload: vec![0xbb],
         },
         ReplayEvent::DirectInput {
+            input_index: 2,
             sender: Address::ZERO,
             block_number: 30,
+            timestamp: 0,
             payload: vec![0xcc],
         },
     ]
@@ -858,7 +874,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
         .expect("wait for ack")
         .expect("ack channel open");
 
-    let replay: Vec<SequencedL2Tx> = {
+    let replay: Vec<L2Tx> = {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         history_rows(&mut storage, 1_000_000)
             .into_iter()
@@ -871,11 +887,11 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
     assert_eq!(replay.len(), 2);
     assert!(matches!(
         replay.first(),
-        Some(SequencedL2Tx::Direct(direct)) if direct.payload.as_slice() == [0xaa]
+        Some(L2Tx::Direct(direct)) if direct.payload.as_slice() == [0xaa]
     ));
     assert!(matches!(
         replay.get(1),
-        Some(SequencedL2Tx::UserOp(user_op)) if user_op.data.as_slice() == [0x31, 0x31, 0x31, 0x31]
+        Some(L2Tx::UserOp(user_op)) if user_op.data.as_slice() == [0x31, 0x31, 0x31, 0x31]
     ));
 }
 
@@ -1053,13 +1069,10 @@ fn catch_up_replays_multiple_pages() {
     catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect("catch up in pages");
 
+    // The expected events carry each direct's index, block and timestamp, so
+    // they also pin what replay hands the application.
     assert_eq!(app.replayed, expected);
     assert_eq!(app.executed_input_count().get(), expected.len() as u64);
-    assert_eq!(
-        app.last_executed_safe_block(),
-        30,
-        "catch-up must advance application-owned progress through execution"
-    );
 }
 
 #[test]
@@ -1082,7 +1095,7 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
     let db = temp_db("catch-up-wrong-mapping");
     seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut app = StubApp::with_progress(3, 0);
+    let mut app = StubApp::with_progress(3);
 
     let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
         .expect_err("mapping from a different application boundary must stop catch-up");
@@ -1158,9 +1171,11 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     .expect("close prefix batch with snapshot");
 
     let prefix_landing = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
-    let direct = DirectInput {
+    let direct = Direct {
+        input_index: 1,
         sender: direct_sender,
-        block_number: 10,
+        block: 10,
+        timestamp: 0,
         payload: vec![0xd1],
     };
     storage
@@ -1175,24 +1190,31 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
                 StoredSafeInput {
                     sender: direct.sender,
                     payload: direct.payload.clone(),
-                    block_number: direct.block_number,
+                    block_number: direct.block,
                 },
             ],
             batch_submitter,
             &protocol,
         )
         .expect("observe prefix landing and direct input");
-    let direct_receipt = sequencer_core::application::execute_direct_input(&mut live_app, &direct)
-        .expect("execute direct input in doomed suffix");
-    assert_eq!(direct_receipt.offset, ExecutedInputCount::new(1));
+    let Executed::Done {
+        offset: direct_offset,
+        ..
+    } = execute(&mut live_app, &L2Tx::Direct(direct))
+        .expect("execute direct input in doomed suffix")
+    else {
+        panic!("the executor never skips a direct");
+    };
+    assert_eq!(direct_offset, ExecutedInputCount::new(1));
     storage
         .close_frame_only_with_executions(
             &mut head,
             10,
             SafeInputRange::new(0, 2),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: direct_receipt.offset,
+                executed_input_offset: direct_offset,
             }],
         )
         .expect("drain direct and promote prefix snapshot");
@@ -1246,7 +1268,12 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         vec![0, 1, 2]
     );
     let invalidated = storage
-        .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
+        .recover_post_flush_for_recovery(
+            10,
+            &protocol,
+            crate::clock::unix_now_ms(),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
+        )
         .expect("standard recovery cascade");
     assert_eq!(invalidated, vec![1, 2]);
     let recovered_history = storage.history_state().expect("recovered history");
@@ -1273,7 +1300,10 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     assert_eq!(after_recovery.len(), 2);
     assert!(matches!(
         &after_recovery[1].context,
-        crate::storage::L2TxContext::DirectInput { input_index: 1, .. }
+        L2TxContext::Direct {
+            tx: Direct { input_index: 1, .. },
+            ..
+        }
     ));
     assert_eq!(after_recovery[1].offset, ExecutedInputCount::new(1));
 
@@ -1297,6 +1327,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     // The replacement suffix reuses offset 2, rolling H forward without
     // retaining the invalidated op that previously occupied that coordinate.
     let mut recovery_head = storage.open_state().unwrap().unwrap();
+    let replacement_safe_block = recovery_head.safe_block;
     let (replacement_op, _response) = make_pending_user_op(0x53);
     included.clear();
     super::execute_user_op(
@@ -1322,14 +1353,16 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
     let valid = history_rows(&mut storage, 32);
     let mappings: Vec<_> = valid.iter().map(|row| row.offset.get()).collect();
     assert_eq!(mappings, vec![0, 1, 2]);
-    let user_seeds: Vec<_> = valid
+    let user_ops: Vec<_> = valid
         .iter()
         .filter_map(|row| match &row.context {
-            crate::storage::L2TxContext::UserOp { tx, .. } => Some(tx.data[0]),
-            crate::storage::L2TxContext::DirectInput { .. } => None,
+            L2TxContext::UserOp { tx, .. } => Some((tx.data[0], tx.block)),
+            L2TxContext::Direct { .. } => None,
         })
         .collect();
-    assert_eq!(user_seeds, vec![0x51, 0x53]);
+    // The replacement op carries its frame's safe block, which replay hands
+    // the application in place of an application-held clock.
+    assert_eq!(user_ops, vec![(0x51, 0), (0x53, replacement_safe_block)]);
 
     let mut restarted_again =
         StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
@@ -1345,7 +1378,22 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         restarted_again.executed_input_count(),
         ExecutedInputCount::new(3)
     );
-    assert_eq!(restarted_again.last_executed_safe_block(), 10);
+    assert_eq!(
+        restarted_again.replayed,
+        vec![
+            ReplayEvent::DirectInput {
+                input_index: 1,
+                sender: direct_sender,
+                block_number: 10,
+                timestamp: 0,
+                payload: vec![0xd1],
+            },
+            ReplayEvent::UserOp {
+                sender: Address::from_slice(&[0x53; 20]),
+                data: vec![0x53; 4],
+            },
+        ]
+    );
 }
 
 #[test]
@@ -1375,7 +1423,7 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
         )
         .expect("seed observed safe head");
 
-    let mut app = StubApp::with_progress(1, 0);
+    let mut app = StubApp::with_progress(1);
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
 
@@ -1606,10 +1654,10 @@ fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::Appl
         .rows
 }
 
-fn context_tx(context: crate::storage::L2TxContext) -> SequencedL2Tx {
+fn context_tx(context: L2TxContext) -> L2Tx {
     match context {
-        crate::storage::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
-        crate::storage::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
+        L2TxContext::UserOp { tx, .. } => L2Tx::UserOp(tx),
+        L2TxContext::Direct { tx, .. } => L2Tx::Direct(tx),
     }
 }
 
@@ -1674,4 +1722,319 @@ fn lane_reports_a_closed_queue_without_shutdown() {
     let result = lane.run_forever(ExecutedInputCount::ZERO);
 
     assert!(matches!(result, Err(InclusionLaneError::ChannelClosed)));
+}
+
+/// Run one queued op through a dequeue chunk whose frame price is 10 and
+/// return the 422 text it was refused with. Nothing may execute.
+fn refusal_text(app: &mut StubApp, user_op: UserOp) -> String {
+    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
+    let (mut pending, mut response) = make_pending_user_op(0x61);
+    pending.signed.user_op = user_op;
+    tx.try_send(pending).expect("enqueue refused op");
+    let head = WriteHead {
+        frame_fee: 10,
+        ..unbounded_head()
+    };
+    let count_before = app.executed_input_count();
+    let mut included = Vec::new();
+
+    dequeue_and_execute_user_op_chunk(&mut rx, app, 1, &head, &mut included)
+        .expect("a refusal never stops the lane");
+
+    assert!(included.is_empty(), "a refused op is never persisted");
+    assert_eq!(app.executed_input_count(), count_before);
+    assert!(
+        app.replayed.is_empty(),
+        "a refused op never reaches the app"
+    );
+    match response.try_recv() {
+        Ok(Err(SequencerError::Invalid(message))) => message,
+        other => panic!("expected a 422 refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn lane_refuses_with_each_refusal_text_in_check_order() {
+    let sender = Address::from_slice(&[0x61; 20]);
+    let op = |nonce: u32, max_fee: u16| UserOp {
+        nonce,
+        max_fee,
+        data: vec![0x61; 4].into(),
+    };
+    let refusing = || StubApp {
+        refuse_user_ops: Some("sender is frozen by policy".to_owned()),
+        ..StubApp::default()
+    };
+
+    // Fee cap first: it outranks a wrong nonce and a policy refusal.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(3, 9)),
+        "max fee 9 below base fee 10"
+    );
+    // Then the executor's nonce rule, ahead of admission.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(3, 10)),
+        "bad nonce: expected 0, got 3"
+    );
+    let mut exhausted = refusing();
+    exhausted.nonces.insert(sender, u32::MAX);
+    assert_eq!(
+        refusal_text(&mut exhausted, op(u32::MAX, 10)),
+        "nonce 4294967295 has no successor"
+    );
+    // Admission last, its text verbatim.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(0, 10)),
+        "sender is frozen by policy"
+    );
+}
+
+/// Reports every sender one nonce higher after its first read, so the
+/// executor disagrees with the lane's pre-check about an op it admitted.
+#[derive(Default)]
+struct NonceDriftApp {
+    inner: StubApp,
+    reads: std::cell::Cell<u32>,
+}
+
+impl Application for NonceDriftApp {
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError> {
+        let drift = self.reads.get().min(1);
+        self.reads.set(self.reads.get().saturating_add(1));
+        Ok(self.inner.user_nonce(sender)? + drift)
+    }
+
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError> {
+        self.inner.apply_user_op(op)
+    }
+
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError> {
+        self.inner.apply_direct(direct)
+    }
+
+    fn executed_input_count(&self) -> ExecutedInputCount {
+        self.inner.executed_input_count()
+    }
+
+    fn max_method_payload_bytes() -> usize {
+        StubApp::max_method_payload_bytes()
+    }
+
+    fn scheduler_limits() -> SchedulerLimits {
+        StubApp::scheduler_limits()
+    }
+
+    fn admit_user_op(&self, sender: Address, op: &UserOp, fee: u16) -> Result<Admission, AppError> {
+        self.inner.admit_user_op(sender, op, fee)
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unreachable!("the drift double is never restored")
+    }
+
+    fn create_dump(&mut self, _prefix: &Path) -> Result<(), AppError> {
+        unreachable!("the drift double is never dumped")
+    }
+
+    fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
+        StubApp::state_file_in_dump(prefix)
+    }
+
+    fn from_canonical_state(
+        _state_file: &Path,
+        _executed_input_count: ExecutedInputCount,
+    ) -> Result<Self, AppError> {
+        unreachable!("the drift double is never restored")
+    }
+}
+
+#[test]
+fn admitted_op_that_the_executor_skips_is_a_terminal_lane_error() {
+    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(2);
+    let (pending, response) = make_pending_user_op(0x62);
+    tx.blocking_send(pending).expect("enqueue admitted op");
+    let (later, mut later_response) = make_pending_user_op(0x63);
+    tx.blocking_send(later).expect("enqueue later op");
+    let mut app = NonceDriftApp::default();
+    let mut included = Vec::new();
+
+    let err =
+        dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &unbounded_head(), &mut included)
+            .expect_err("a skip after admission must stop the lane");
+
+    assert!(matches!(
+        err,
+        InclusionLaneError::AdmittedOpSkipped {
+            reason: SkipReason::WrongNonce {
+                expected: 1,
+                got: 0
+            }
+        }
+    ));
+    assert!(err.is_terminal_invariant());
+    assert!(included.is_empty());
+    assert_eq!(app.executed_input_count(), ExecutedInputCount::ZERO);
+    // The client gets the fixed 500 text, never the skip reason.
+    let response = response
+        .blocking_recv()
+        .expect("lane answers the skipped op")
+        .expect_err("skipped op gets an internal error");
+    assert!(matches!(
+        response,
+        SequencerError::Internal(message) if message == "application internal error"
+    ));
+    assert!(
+        matches!(
+            later_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "the chunk stops at the faulting op"
+    );
+}
+
+#[test]
+fn catch_up_stops_on_a_stored_op_the_application_would_skip() {
+    let db = temp_db("catch-up-replay-skipped");
+    seed_replay_fixture(db.path.as_str());
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut app = StubApp::default();
+    // The restored application already moved the first sender past its
+    // stored op, so history and application disagree.
+    app.nonces.insert(Address::from_slice(&[0x51; 20]), 1);
+
+    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+        .expect_err("a replayed skip must stop catch-up");
+
+    assert!(matches!(
+        err,
+        CatchUpError::ReplaySkipped {
+            offset: 0,
+            reason: SkipReason::WrongNonce {
+                expected: 1,
+                got: 0
+            }
+        }
+    ));
+    assert!(app.replayed.is_empty());
+    assert_eq!(app.executed_input_count(), ExecutedInputCount::ZERO);
+    assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
+}
+
+fn ingested_direct(block: u64, timestamp: u64, payload: Vec<u8>) -> IngestedSafeInput {
+    IngestedSafeInput {
+        sender: Address::repeat_byte(0x77),
+        payload,
+        block_number: block,
+        block_timestamp: timestamp,
+        transaction_hash: B256::ZERO,
+    }
+}
+
+#[test]
+fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
+    let cap = usize::try_from(StubApp::scheduler_limits().max_direct_payload_bytes)
+        .expect("payload cap fits usize");
+    let db = temp_db("direct-payload-cap");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
+    storage
+        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .expect("seed observed safe head");
+    let head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize open state");
+    let (_tx, rx) = mpsc::channel(1);
+    let mut lane = InclusionLane {
+        rx,
+        shutdown: RuntimeScope::default(),
+        app: StubApp::default(),
+        storage,
+        config: default_test_config(),
+    };
+    let mut state = LaneState::new(0, head);
+    let mut safe_inputs = Vec::new();
+
+    lane.storage
+        .append_ingested_safe_inputs_with_timestamp(
+            5,
+            1_005,
+            &[
+                ingested_direct(3, 1_003, vec![0xa1; cap]),
+                ingested_direct(4, 1_004, vec![0xee; cap + 1]),
+                ingested_direct(5, 1_005, vec![0xa3]),
+            ],
+            SENDER_A,
+            &default_protocol_timing(),
+            FrontierMode::Populate,
+        )
+        .expect("append directs around the payload cap");
+    lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
+        .expect("drain the range and close the frame");
+
+    let at_cap = ReplayEvent::DirectInput {
+        input_index: 0,
+        sender: Address::repeat_byte(0x77),
+        block_number: 3,
+        timestamp: 1_003,
+        payload: vec![0xa1; cap],
+    };
+    let after_dropped = ReplayEvent::DirectInput {
+        input_index: 2,
+        sender: Address::repeat_byte(0x77),
+        block_number: 5,
+        timestamp: 1_005,
+        payload: vec![0xa3],
+    };
+    // Each direct reaches the application with its own L1 index and block
+    // timestamp; the over-cap one never reaches it at all.
+    assert_eq!(
+        lane.app.replayed,
+        vec![at_cap.clone(), after_dropped.clone()]
+    );
+    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5]);
+    assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 2);
+    assert_eq!(lane.storage.next_undrained_safe_input_index().unwrap(), 3);
+
+    // A later frame keeps executing directs at the next contiguous offset.
+    lane.storage
+        .append_ingested_safe_inputs_with_timestamp(
+            10,
+            1_010,
+            &[ingested_direct(10, 1_010, vec![0xb1])],
+            SENDER_A,
+            &default_protocol_timing(),
+            FrontierMode::Populate,
+        )
+        .expect("append a later direct");
+    lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
+        .expect("drain the later direct");
+    let later = ReplayEvent::DirectInput {
+        input_index: 3,
+        sender: Address::repeat_byte(0x77),
+        block_number: 10,
+        timestamp: 1_010,
+        payload: vec![0xb1],
+    };
+    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 10]);
+    let rows = history_rows(&mut lane.storage, 16);
+    let stored: Vec<_> = rows
+        .iter()
+        .map(|row| match &row.context {
+            L2TxContext::Direct { tx, .. } => (row.offset.get(), tx.input_index),
+            L2TxContext::UserOp { .. } => panic!("no user op was submitted"),
+        })
+        .collect();
+    assert_eq!(stored, vec![(0, 0), (1, 2), (2, 3)]);
+
+    // Replay hands a restarted application the same directs, index and
+    // timestamp included.
+    let mut restarted = StubApp::default();
+    catch_up_application_paged(
+        &mut restarted,
+        &mut lane.storage,
+        ExecutedInputCount::ZERO,
+        2,
+    )
+    .expect("catch up over the dropped direct");
+    assert_eq!(restarted.replayed, vec![at_cap, after_dropped, later]);
 }

@@ -10,12 +10,14 @@ The bridge is `Send`, without `Clone` or `Sync`.
 The [binding guide](../../docs/protocol/c-application-binding.md) maps the ABI
 to the Application and scheduler contracts.
 
-The native engine owns application state and its execution count/safe-block
-clock. Successful execution advances that progress, including counted no-ops;
-protocol rejection leaves it unchanged. The shared Rust execution functions
-check these transitions. Fatal validation, execution, or output-drain failures
-return `AppError`; callers must discard that instance. Exceptions must not cross
-the C ABI.
+The native engine owns application state, each sender's nonce and the L2 tx
+count, and holds no clock. Execution is total, the shared executor compares
+nonces, admission is lane-only policy, and `EngineApp` checks the engine's ABI
+version before any other call; the binding guide's
+[execution and ownership](../../docs/protocol/c-application-binding.md#execution-and-ownership)
+section maps each call. Fatal admission, nonce-read, execution, or
+output-drain failures return `AppError`; callers must discard that instance.
+Exceptions must not cross the C ABI.
 
 `NOT_FOUND` and `INVALID_DUMP` retain the distinction between missing/corrupt
 checkpoint artifacts and other operational `IO_ERROR` failures. Error strings
@@ -24,14 +26,16 @@ bindings must use the same header, including these status declarations.
 
 A dump prefix may be a file or a directory. Opening it produces independently
 mutable state without changing the source; checkpoint creation may mutate the
-engine's backing arrangement, while preserving logical state and progress.
+engine's backing arrangement, while preserving logical state and its count.
 Successful checkpoints are durable and immutable under subsequent execution.
 All checkpoint artifacts reside at or below the prefix; the sequencer disposes
 of them with ordinary recursive filesystem deletion. Restored engines remain
 usable after source deletion.
 `state_file_in_dump` names the one canonical comparison file, which can be the
-whole dump or a projection alongside richer restoration artifacts. `EngineApp`
-does not implement the optional Rust `CanonicalState` inspection trait.
+whole dump or a projection alongside richer restoration artifacts.
+`application_engine_from_canonical_state` opens an engine over such a file at a
+canonical machine's count. `EngineApp` does not implement the optional Rust
+`CanonicalState` inspection trait.
 
 ## Reference wallet
 
@@ -48,8 +52,8 @@ cargo test -p c-wallet-engine --test conformance
 
 The ordinary setup/run environment configuration is still required. The genesis
 path is required only when plain `setup` needs its first snapshot; completed
-setup, warm startup, `flush-mempool`, and `setup --recovery` use the sequencer's
-durable checkpoints.
+setup, warm startup, and `flush-mempool` use the sequencer's durable
+checkpoints.
 
 The host adds `--state-file` through its own parser and passes the parsed command
 to `sequencer::run_command`. This shares `run_main`'s command lifecycle and exit
@@ -72,10 +76,12 @@ APPLICATION_ENGINE_HEADER=/absolute/path/application-engine.h \
   cargo build -p c-app-sequencer
 ```
 
-The linked engine reports its stable payload bound through
-`application_engine_max_method_payload_bytes()`; zero permits only empty method
-payloads. Bindgen generates the Rust records from the header, so a build needs
-libclang. The engine also supplies its own genesis tool; configuration does not
+The linked engine reports its ABI version through
+`application_engine_abi_version()`, its stable payload bound through
+`application_engine_max_method_payload_bytes()`, where zero permits only empty
+method payloads, and its scheduler constants through
+`application_engine_scheduler_limits()`. Bindgen generates the Rust records
+from the header, so a build needs libclang. The engine also supplies its own genesis tool; configuration does not
 cross this ABI. With no external archive configured, the generic binary reports
 that no engine was linked, and
 `c-wallet-sequencer` supplies the reference implementation through Cargo.
@@ -103,18 +109,20 @@ and `sequencer` at the same Git revision and compose `EngineApp` with
 `sequencer::run_command` directly. No wallet crate is required in either case.
 
 The conformance suite compares native and ABI execution over mixed inputs,
-notices and vouchers, rejection/no-op progress, dump round trips, independent
-instances, and fatal/error classification.
+notices and vouchers, nonce skips, admission refusals, underfunded ops that
+still execute, no-op counting, dump round trips, the canonical-state projection,
+independent instances, and fatal/error classification.
 `cargo test -p c-app-engine --lib` also checks mixed-output ordering, copying
-reused engine buffers, and full-width voucher values with a small ABI fixture.
+reused engine buffers, full-width voucher values, the version check, and
+admission's reason mapping with a small ABI fixture.
 
 The `c_host_` scenarios in `rollups-e2e` launch the reference C host with generated
 devnet genesis, delete that source before startup, and exercise ordinary execution,
-clean restart, stale recovery, and checkpoint-based rebuild. Independent
-`EngineApp` replicas restore HTTP archives, discard the downloaded sources,
-follow backlog and live WS inputs, and check history identity across recovery.
-Ordinary execution and both recovery paths also compare the host against the
-canonical machine. Run them with:
+clean restart, and stale-batch recovery. Independent `EngineApp` replicas restore
+HTTP archives, discard the downloaded sources, follow backlog and live WS inputs,
+and check history identity across recovery. Ordinary execution and stale-batch
+recovery also compare the host against the canonical machine. Recovery from a
+canonical machine arrives with `setup --base`. Run them with:
 
 ```sh
 just setup
@@ -125,5 +133,5 @@ target/debug/rollups-e2e c_host_ --nocapture
 
 `just test-rollups-e2e` includes these scenarios in CI. This covers the reference
 wallet across the C ABI; private engines still need their own integration and
-canonical comparison. Rebuilding from a native recovery archive does not test
-the application's canonical-machine-to-native exporter.
+canonical comparison. No scenario starts a sequencer from a canonical machine;
+the conformance suite checks `application_engine_from_canonical_state` alone.

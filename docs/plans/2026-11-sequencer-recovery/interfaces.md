@@ -1,10 +1,11 @@
 # The interfaces
 
-**Status:** proposed on 2026-11-09, to settle with Bart; nothing here is
-implemented. The signatures of the two components, in Rust and in C. The
-[scheduler](scheduler.md) owns the rules they carry out, and
-[application](application.md) owns the trait's obligations and the machine's
-export. Names are proposals.
+**Status:** the Rust side and `application-engine.h` are code in this tree;
+`scheduler.h` is a proposal to settle with Bart. The signatures of the two
+components, in Rust and in C. The [scheduler](scheduler.md) owns the rules
+they carry out, and [application](application.md) owns the trait's
+obligations and the machine's export. Where this page and the code differ,
+the code is right.
 
 ## The model
 
@@ -23,8 +24,8 @@ There are four interfaces, each component in Rust and in C:
 
 | Interface | Implemented by | Called by |
 |---|---|---|
-| `Scheduler`, a Rust trait | The reference scheduler, and an adapter over `scheduler.h` | The guest harness and setup |
-| `scheduler.h` | The reference scheduler's C export, or a port | A C or C++ guest, and the Rust adapter |
+| `Scheduler`, a Rust struct in `sequencer-core` | The reference scheduler | The guest harness, through `CanonicalRunner`, and setup |
+| `scheduler.h` (proposed) | The reference scheduler's C export, or a port | A C or C++ guest, and a Rust adapter |
 | `Application`, a Rust trait | An application, and the adapter over `application-engine.h` | The executor, the lane and setup |
 | `application-engine.h` | A native engine | The Rust adapter |
 
@@ -76,20 +77,27 @@ pub struct UserOpTx {
 }
 ```
 
-These replace today's `DirectInput`, `ValidUserOp` with its separate
-`safe_block`, and `SequencedL2Tx`. The op keeps its nonce, so every caller runs
-the same nonce check, a replay included.
+The op keeps its nonce, so every caller runs the same nonce check, a replay
+included. `UserOpTx::new(sender, &op, fee, block)` builds the record from a
+signed op and its frame, the same way in every caller.
 
 ## The scheduler
 
 ```rust
-/// Deployment constants, compiled into the template.
+/// Deployment constants, compiled into the template. No default: a build
+/// that forgot one would run another deployment's rules.
 pub struct SchedulerConfig {
     pub sequencer_address: Address,
+    /// At least 1; genesis and resume assert it.
     pub max_wait_blocks: u64,
     pub fridge_bound: u64,
     /// A direct with a longer payload never joins the fridge.
     pub max_direct_payload_bytes: u64,
+}
+
+impl SchedulerConfig {
+    /// The protocol's staleness window and the application's limits.
+    pub fn for_application<A: Application>(sequencer_address: Address) -> Self;
 }
 
 /// One InputBox input, as `EvmAdvance` delivers it.
@@ -131,27 +139,53 @@ pub struct Scheduled {
     pub tx: L2Tx,
 }
 
-pub trait Scheduler: Sized {
-    fn genesis(config: SchedulerConfig) -> Self;
+pub struct Scheduler { /* private */ }
+
+impl Scheduler {
+    pub fn genesis(config: SchedulerConfig) -> Self;
 
     /// Resume from an exported state. `queued` re-supplies every input from
     /// `first_queued_input` up to `l1_input_count`, in order. The scheduler
-    /// re-admits the directs among them, and checks their number and that
-    /// each lies above the clock.
-    fn resume(
+    /// re-admits the directs among them by the same rule, and refuses a
+    /// range that does not match the state.
+    pub fn resume(
         config: SchedulerConfig,
         state: SchedulerState,
         queued: impl IntoIterator<Item = L1Input>,
     ) -> Result<Self, ResumeError>;
 
-    fn state(&self) -> SchedulerState;
+    pub fn config(&self) -> &SchedulerConfig;
+    pub fn state(&self) -> SchedulerState;
 
     /// Take the next input, whose index must be `l1_input_count`, and say
-    /// what became of it. The previous input must have no transactions left.
-    fn feed(&mut self, input: L1Input) -> InputOutcome;
+    /// what became of it. Panics on misuse: another index, or a previous
+    /// input with transactions left.
+    pub fn feed(&mut self, input: L1Input) -> InputOutcome;
 
     /// The current input's next transaction, in execution order.
-    fn next_tx(&mut self) -> Option<Scheduled>;
+    pub fn next_tx(&mut self) -> Option<Scheduled>;
+}
+
+pub enum ResumeError {
+    FirstQueuedAfterCount { first_queued_input: u64, l1_input_count: u64 },
+    OutOfSequence { expected: u64, got: u64 },
+    BeyondInputCount { index: u64, l1_input_count: u64 },
+    MissingInputs { next: u64, l1_input_count: u64 },
+    BlockDecreases { index: u64, block: u64, previous_block: u64 },
+    FirstQueuedNotADirect { index: u64 },
+    DirectNotAboveClock { index: u64, block: u64, clock: u64 },
+    FridgeLenMismatch { expected: u64, admitted: u64 },
+}
+
+/// The machine's `scheduler` inspect report: six little-endian `u64`, in
+/// field order (48 bytes).
+pub struct SchedulerExport {
+    pub l1_input_count: u64,
+    pub l2_tx_count: u64,
+    pub next_batch_nonce: u64,
+    pub clock: u64,
+    pub first_queued_input: u64,
+    pub fridge_len: u64,
 }
 ```
 
@@ -164,10 +198,15 @@ pub trait Scheduler: Sized {
 - **Resuming needs four numbers and a range of L1.** The fridge is a queue
   ([scheduler](scheduler.md#the-schedulers-state)), so `queued` is the inputs
   from `first_queued_input` up to `l1_input_count`, which setup's input table
-  already has.
-- **Its state is the machine's export.** The harness answers the `scheduler`
-  query from `state()` and the application's count
-  ([application](application.md#the-state-export)).
+  already has. Resume refuses a range out of sequence, short or long, whose
+  blocks decrease, whose first input is not an admitted direct, with a queued
+  direct at or below the clock, or that admits another number of directs.
+- **Its state is the machine's export.** `CanonicalRunner`
+  (`scheduler/driver.rs`) holds the scheduler and the application, feeds each
+  input and executes its transactions, and answers the `state` and
+  `scheduler` queries, the latter from `state()` and the application's count
+  ([application](application.md#the-state-export)). A runner whose input
+  failed with an `AppError` refuses further use.
 - **It halts where the reference halts.** A batch nonce without a successor
   panics in Rust and returns a fatal status in C.
 
@@ -222,8 +261,8 @@ user-op check that needs the application:
 
 ```rust
 pub enum Executed {
-    /// It executed; `l2_tx_count` is the count before it.
-    Done { l2_tx_count: L2TxCount, outputs: AppOutputs },
+    /// It executed; `offset` is the count before it, its history offset.
+    Done { offset: ExecutedInputCount, outputs: AppOutputs },
     /// A user op whose nonce is not its sender's next. Nothing changed.
     Skipped(SkipReason),
 }
@@ -240,7 +279,7 @@ pub fn execute<A: Application>(app: &mut A, tx: &L2Tx) -> Result<Executed, AppEr
 A direct always executes. For a user op, the executor reads
 `app.user_nonce(sender)`, skips on a mismatch, then on `u32::MAX`, and
 otherwise applies the op. The mismatch comes first, so a stale op that carries
-`u32::MAX` still reads as a wrong nonce, as today. After either kind it checks
+`u32::MAX` still reads as a wrong nonce. After either kind it checks
 that the L2 tx count advanced by exactly one, and after a user op that the
 sender's nonce did.
 
@@ -260,10 +299,19 @@ while (scheduler_next_tx(scheduler, &tx) == SCHEDULER_STATUS_OK) {
 }
 ```
 
-The lane runs the scheduler's two stateless checks and the nonce check itself,
-then asks admission, then calls `execute`:
+The lane checks a live op with `check_live_user_op`, then calls `execute`. The
+check runs the fee cap, the executor's own nonce rule, then admission, so an
+op it lets through is one `execute` runs; a skip after it is a terminal lane
+fault:
 
 ```rust
+pub fn check_live_user_op<A: Application>(
+    app: &A,
+    sender: Address,
+    op: &UserOp,
+    frame_fee: u16,
+) -> Result<Option<Refusal>, AppError>;
+
 pub enum Refusal {
     FeeCapBelowPrice { max_fee: u16, price: u16 },
     Skip(SkipReason),
@@ -271,7 +319,7 @@ pub enum Refusal {
 }
 ```
 
-A refusal reaches the client as today, a 422 with the same texts. The README
+A refusal reaches the client as a 422 whose text is the refusal's `Display`. The README
 teaches clients to read the expected nonce from `bad nonce: expected N, got M`,
 and the tests match the fee-balance text.
 
@@ -291,11 +339,15 @@ pub trait Application: Send + Sized {
     /// Execute a direct. The L2 tx count advances by one; no nonce moves.
     fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError>;
 
-    fn l2_tx_count(&self) -> L2TxCount;
+    /// The L2 tx count, under its older name until the rename.
+    fn executed_input_count(&self) -> ExecutedInputCount;
 
     // Admission: the sequencer's lane only. Policy, never consensus.
 
     fn max_method_payload_bytes() -> usize;
+
+    /// The template's fridge bound and direct payload cap.
+    fn scheduler_limits() -> SchedulerLimits;
 
     /// Does the operator want this op in a frame at this fee? The canonical
     /// machine never asks, and the answer never changes what an included
@@ -317,13 +369,18 @@ pub trait Application: Send + Sized {
     /// machine's L2 tx count. A dump of the result holds the same bytes.
     fn from_canonical_state(
         state_file: &Path,
-        l2_tx_count: L2TxCount,
+        executed_input_count: ExecutedInputCount,
     ) -> Result<Self, AppError>;
 }
 
 pub enum Admission {
     Admit,
     Refuse(PolicyRefusal),
+}
+
+pub struct SchedulerLimits {
+    pub fridge_bound: u64,
+    pub max_direct_payload_bytes: u64,
 }
 
 pub enum PolicyRefusal {
@@ -349,9 +406,9 @@ pub enum PolicyRefusal {
 [Application](application.md#the-application-trait) states each method's
 obligation and what changes from today.
 
-`application-engine.h` changes to match:
+`application-engine.h` (ABI version 2) matches it:
 
-| Today | Proposed |
+| Version 1 | Version 2 |
 |---|---|
 | `application_engine_validate_user_op` | `application_engine_admit_user_op`: the same call without the nonce check, refusing with the fee-balance reason or a new policy reason |
 | No nonce getter | `application_engine_user_nonce(engine, sender, out_nonce)` |
@@ -361,9 +418,12 @@ obligation and what changes from today.
 | `ApplicationEngineProgress`: count and clock | `application_engine_l2_tx_count` |
 | No projection | `application_engine_from_canonical_state(state_file, l2_tx_count, out_engine)` |
 | No version | `application_engine_abi_version()`, which the adapter checks before anything else |
+| No limits | `application_engine_scheduler_limits(out_limits)` |
 
 A new function fails at link time against an old archive, but a changed
 meaning does not: an engine that still fails on an unpayable fee would halt
 the canonical machine on the first underfunded op a batch carries. The version
 is the only check on that. The reason values the engine stops producing keep
-their numbers, since the header's vocabularies are append only.
+their numbers, since the header's vocabularies are append only; admission
+adds `APPLICATION_ENGINE_REFUSED_BY_POLICY` (4), whose text travels in the
+last error message.

@@ -23,6 +23,9 @@ pub struct HistoryState {
     pub base_safe_block: u64,
 }
 
+/// One direct a drained range executed, at its history offset. A drained
+/// range may hold inputs without one: the batch submitter's own inputs and
+/// directs over the application's payload cap never execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectInputExecution {
     pub safe_input_index: u64,

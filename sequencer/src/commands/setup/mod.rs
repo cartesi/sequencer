@@ -2,28 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! The `setup` command: pin the deployment identity and fee source, sync L1 to
-//! the safe head, and register the genesis baseline (or the `--recovery` rebuild),
-//! committing `setup_complete` last as its single completion point. Storage phases
-//! are re-entry safe. Plain `setup` reads L1 only and never signs.
+//! the safe head, and register the genesis baseline, committing
+//! `setup_complete` last as its single completion point. Storage phases are
+//! re-entry safe. `setup` reads L1 only and never signs.
 
 use alloy_primitives::Address;
 use sequencer_core::application::{AppError, Application};
-use sequencer_core::scheduler::{FoldInput, SchedulerConfig, fold_replay};
 
-#[cfg(test)]
-mod checkpoint_tests;
 pub(crate) mod fill;
 
 use super::{ensure_deployment_identity, validate_rpc_chain_id};
 use crate::commands::config::{FeeOracleMode, SetupConfig};
-use crate::commands::error::{
-    BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,
-};
-use crate::ingress::inclusion_lane::dump_info;
+use crate::commands::error::{BootstrapError, CommandError, IdentityError, SetupRefuse};
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError, sample_safe_block};
-use crate::recovery::{
-    MempoolFlusher, RecoveryError, RecoveryRetryReason, assert_resync_caught_up,
-};
 use crate::storage::{self, DeploymentIdentity, FeeOracleIdentity};
 
 pub async fn setup<A, F>(config: SetupConfig, genesis_app: F) -> Result<(), CommandError>
@@ -31,12 +22,6 @@ where
     A: Application + 'static,
     F: FnOnce() -> Result<A, AppError>,
 {
-    // Cross-field config validation (recovery vs the recovery-only args). A
-    // misconfig is operator error — terminal, before any filesystem touch.
-    config
-        .validate()
-        .map_err(|message| SetupRecoveryError::InvalidConfig { message })?;
-
     std::fs::create_dir_all(&config.data_dir)
         .map_err(|err| super::io_error_at("data dir", &config.data_dir, err))?;
     // Exclusive process ownership before any read or mutation: setup rewrites
@@ -46,14 +31,8 @@ where
 
     let db_path = config.db_path();
     config.timing.protocol_timing()?;
-    let command = if config.recovery {
-        storage::LifecycleCommand::Rebuild
-    } else {
-        storage::LifecycleCommand::Setup
-    };
-    if let SetupAdmission::AlreadyComplete =
-        admit_setup_lifecycle(&db_path, command, config.recovery)?
-    {
+    let command = storage::LifecycleCommand::Setup;
+    if let SetupAdmission::AlreadyComplete = admit_setup_lifecycle(&db_path, command)? {
         tracing::info!(data_dir = %config.data_dir, "setup already complete — nothing to do");
         return Ok(());
     }
@@ -219,8 +198,7 @@ where
     // A checkpoint promotion cannot predate the application's deployment
     // block (the scan genesis — no input exists before it).
     // `B = 0` is the genesis bootstrap (no checkpoint) and is always valid.
-    // (plain setup detects only; loading a non-genesis checkpoint machine and
-    // the checkpoint clock check are `setup --recovery`'s job.)
+    // Setup only detects here; it never loads a checkpoint machine.
     if config.checkpoint_block != 0 && config.checkpoint_block < input_reader.app_deployment_block()
     {
         return Err(BootstrapError::CheckpointBeforeAppDeployment {
@@ -236,80 +214,54 @@ where
     // Re-entry-safe: a retry resumes from the persisted safe head. A
     // transient sync failure leaves setup incomplete; the operator simply
     // re-runs `setup`.
-    //
-    // Recovery rebuilds the batch tree from the checkpoint *after* this sync, so
-    // the local tree is empty here. Disable frontier population for recovery's
-    // syncs (this one and the post-flush re-sync): otherwise the
-    // content-identity check would see every L1 batch as "foreign" and falsely
-    // freeze the frontier, poisoning the rebuilt DB. `run`'s first sync
-    // populates it correctly once the anchor = N' is set (I16).
-    if config.recovery {
-        input_reader.set_frontier_mode(storage::FrontierMode::DeferUntilAnchorSet);
-    }
     input_reader
         .sync_to_current_safe_head()
         .await
         .map_err(BootstrapError::SetupInputReader)?;
 
-    // ── Branch: recovery rebuild vs the genesis-style detect-and-refuse ──
     let mut storage = storage::Storage::open(&db_path)?;
 
-    if config.recovery {
-        // ── Recovery: flush → fold → fill. Replaces the
-        // detection gate + genesis snapshot; the operator is acting *on* the
-        // refusal the gate would otherwise raise.
-        recover::<A>(
-            &config,
-            &identity,
-            timing,
-            &mut input_reader,
-            &mut storage,
-            &dumps_dir,
-        )
-        .await?;
-    } else {
-        // ── Detection gate, steps 1–2: refuse if a previous instance left work ──
-        // Read-only: no key, no L1 write. Runs *after*
-        // the sync so step 2 reads a `safe_inputs` table populated to the safe
-        // head, and *before* the genesis snapshot / completion transaction so
-        // a refusing setup cannot complete. A retry while still incomplete
-        // re-detects identically. Once setup is complete,
-        // plain `setup` is a no-op; detecting a dirty chain is the job of a
-        // fresh setup/rebuild.
-        //
-        // Coherence: read the submitter's `safe` wallet nonce at the
-        // **persisted** safe block from the sync, not the live `Safe` tag. The head can advance
-        // between the sync and this read; pinning step 1 to the same block step 2
-        // scans (`safe_inputs` up to that block) closes the window where a batch
-        // landing in between would be counted as settled by a live-tag read yet
-        // be missing from the not-yet-resynced scan. `pending` stays live, so any
-        // submitter activity past the synced head still trips `pending > safe`.
-        //
-        // Step 1 reads the LOCAL provider's pool view — a zombie tx dropped
-        // from this pool but alive elsewhere evades it, bounded at runtime by the
-        // content-identity check (CanonicalDivergence → cockroach recovery).
-        let synced_safe_block = storage.current_safe_block()?;
-        let wallet_nonces = read_submitter_wallet_nonces(
-            &config.rpc.eth_rpc_url,
-            config.batch_submitter_address,
-            synced_safe_block,
-            config.rpc.allow_insecure_rpc,
-        )
-        .await?;
-        run_detection_gate(
-            &mut storage,
-            config.batch_submitter_address,
-            config.checkpoint_block,
-            wallet_nonces,
-        )?;
+    // ── Detection gate, steps 1–2: refuse if a previous instance left work ──
+    // Read-only: no key, no L1 write. Runs *after*
+    // the sync so step 2 reads a `safe_inputs` table populated to the safe
+    // head, and *before* the genesis snapshot / completion transaction so
+    // a refusing setup cannot complete. A retry while still incomplete
+    // re-detects identically. Once setup is complete,
+    // plain `setup` is a no-op; detecting a dirty chain is the job of a
+    // fresh setup.
+    //
+    // Coherence: read the submitter's `safe` wallet nonce at the
+    // **persisted** safe block from the sync, not the live `Safe` tag. The head can advance
+    // between the sync and this read; pinning step 1 to the same block step 2
+    // scans (`safe_inputs` up to that block) closes the window where a batch
+    // landing in between would be counted as settled by a live-tag read yet
+    // be missing from the not-yet-resynced scan. `pending` stays live, so any
+    // submitter activity past the synced head still trips `pending > safe`.
+    //
+    // Step 1 reads the LOCAL provider's pool view — a zombie tx dropped
+    // from this pool but alive elsewhere evades it, bounded at runtime by the
+    // content-identity check (CanonicalDivergence → cockroach recovery).
+    let synced_safe_block = storage.current_safe_block()?;
+    let wallet_nonces = read_submitter_wallet_nonces(
+        &config.rpc.eth_rpc_url,
+        config.batch_submitter_address,
+        synced_safe_block,
+        config.rpc.allow_insecure_rpc,
+    )
+    .await?;
+    run_detection_gate(
+        &mut storage,
+        config.batch_submitter_address,
+        config.checkpoint_block,
+        wallet_nonces,
+    )?;
 
-        // ── Genesis snapshot ─────────────────────────────────────
-        // Construct only after the admission facts and every
-        // detect-and-refuse gate. Factory errors follow normal setup settlement;
-        // completed no-ops and recovery never construct genesis state.
-        let genesis_app = genesis_app()?;
-        fill::register_genesis_baseline::<A>(genesis_app, &mut storage, &dumps_dir)?;
-    }
+    // ── Genesis snapshot ─────────────────────────────────────
+    // Construct only after the admission facts and every
+    // detect-and-refuse gate. Factory errors follow normal setup settlement;
+    // completed no-ops never construct genesis state.
+    let genesis_app = genesis_app()?;
+    fill::register_genesis_baseline::<A>(genesis_app, &mut storage, &dumps_dir)?;
 
     // Baseline registration committed setup_complete with the restore point.
     tracing::info!(
@@ -348,7 +300,6 @@ fn check_fixed_log_gas_price(db_path: &str, log_gas_price: i16) -> Result<(), Co
 fn admit_setup_lifecycle(
     db_path: &str,
     command: storage::LifecycleCommand,
-    recovery: bool,
 ) -> Result<SetupAdmission, CommandError> {
     let exists = std::path::Path::new(db_path)
         .try_exists()
@@ -360,17 +311,14 @@ fn admit_setup_lifecycle(
     }
 
     // Admission facts only: divergence is absorbing; a completed setup
-    // is once-per-database (already-complete plain setup is a no-op, an
-    // already-complete rebuild is an error); a crashed prior attempt left
-    // only idempotent residue behind — the retry proceeds fresh over it.
+    // is once-per-database (an already-complete setup is a no-op); a crashed
+    // prior attempt left only idempotent residue behind — the retry proceeds
+    // fresh over it.
     let mut storage = storage::Storage::open_read_only(db_path)?;
     if let Some((nonce, _)) = storage.canonical_divergence()? {
         return Err(storage::LifecycleError::CanonicalDivergence { nonce }.into());
     }
     if storage.is_setup_complete()? {
-        if recovery {
-            return Err(SetupRecoveryError::AlreadySetUp.into());
-        }
         return Ok(SetupAdmission::AlreadyComplete);
     }
     Ok(SetupAdmission::Proceed)
@@ -398,277 +346,6 @@ fn settle_setup_lifecycle(
             crate::commands::record_terminal_fault_best_effort(db_path, command, result);
             Ok(())
         }
-    }
-}
-
-/// The trusted checkpoint a `setup --recovery` folds from — the machine state
-/// `S` at block `B`, plus the two scalars the fold needs that the bare-metal app
-/// cannot recompute: `A` (`S`'s last-executed safe block — the fridge is the
-/// `(A, B]` directs) and `N` (the resume batch nonce at `B`, which rides in the
-/// dump's `info.toml`). See the data dictionary in `docs/recovery/cockroach.md`.
-struct Checkpoint<A> {
-    /// `S` — the checkpoint app state at block `B`.
-    app: A,
-    /// `A` — `S`'s last-executed safe block.
-    executed_safe_block: u64,
-    /// `N` — the resume batch nonce at `B` (checkpoint metadata). Named to
-    /// contrast with the fold's output `N'` (`resume_nonce` in `recover`).
-    checkpoint_nonce: u64,
-    /// `B` — the checkpoint's L1 inclusion block (`--checkpoint-block`).
-    checkpoint_block: u64,
-}
-
-impl<A: Application> Checkpoint<A> {
-    /// Load `S` from the dump dir, derive `A` and `N`, and enforce the load-time
-    /// precondition `A < B`, except for the known empty genesis checkpoint.
-    /// Equality otherwise hides pending directs later in the same block.
-    /// The exporter must separately verify no canonical direct at or below A
-    /// remains queued; this bundle carries no queue evidence to check here.
-    fn load(dir: &std::path::Path, checkpoint_block: u64) -> Result<Self, SetupRecoveryError> {
-        let load_err = |message: String| SetupRecoveryError::CheckpointLoad {
-            path: dir.display().to_string(),
-            message,
-        };
-        let info = dump_info::read_info(dir).map_err(|e| load_err(e.to_string()))?;
-        let checkpoint =
-            dump_info::read_checkpoint_info(dir).map_err(|e| load_err(e.to_string()))?;
-        if checkpoint.inclusion_block != checkpoint_block {
-            return Err(load_err(format!(
-                "checkpoint receipt block {} differs from configured block {checkpoint_block}",
-                checkpoint.inclusion_block,
-            )));
-        }
-        if checkpoint.next_batch_nonce != info.next_batch_nonce {
-            return Err(load_err(
-                "checkpoint receipt nonce differs from immutable dump metadata".into(),
-            ));
-        }
-        let app = A::from_dump(&dump_info::app_prefix(dir)).map_err(|e| load_err(e.to_string()))?;
-        let executed_safe_block = app.last_executed_safe_block();
-        let is_genesis = checkpoint_block == 0
-            && info.next_batch_nonce == 0
-            && app.executed_input_count() == sequencer_core::history::ExecutedInputCount::ZERO;
-        if executed_safe_block >= checkpoint_block && !is_genesis {
-            return Err(SetupRecoveryError::CheckpointNotBeforeBlock {
-                executed_safe_block,
-                checkpoint_block,
-            });
-        }
-        Ok(Self {
-            app,
-            executed_safe_block,
-            checkpoint_nonce: info.next_batch_nonce,
-            checkpoint_block,
-        })
-    }
-}
-
-/// Source the fold inputs from the synced `safe_inputs`: the
-/// `(A, B]` direct **seeds** and the full `(B, C]` **replay** stream.
-///
-/// Seeds must be directs only — the fold enqueues them straight into the fridge
-/// (`enqueue_direct`, no classification). The `sender != submitter` filter IS
-/// the scheduler's own sender-based classification: the fold's `process_input`
-/// routes `sender == sequencer_address` to the batch path and everything else to
-/// a direct, so a dropped `sender == submitter` row is never a direct-with-
-/// effect — it is a batch already folded into `S` (every valid batch with
-/// inclusion `≤ B` is in `S` by the operator's checkpoint, the same trust
-/// boundary as the resume nonce `N`) or an undecodable scheduler no-op.
-///
-/// Replay is the full stream; the fold classifies each input itself, so no
-/// pre-filter.
-fn source_fold_inputs<A>(
-    storage: &mut storage::Storage,
-    checkpoint: &Checkpoint<A>,
-    stop_block: u64,
-    submitter: Address,
-) -> Result<(Vec<FoldInput>, Vec<FoldInput>), CommandError> {
-    let seeds = storage
-        .safe_inputs_in_block_range(checkpoint.executed_safe_block, checkpoint.checkpoint_block)?
-        .into_iter()
-        .filter(|input| input.sender != submitter)
-        .map(to_fold_input)
-        .collect();
-    let replay = storage
-        .safe_inputs_in_block_range(checkpoint.checkpoint_block, stop_block)?
-        .into_iter()
-        .map(to_fold_input)
-        .collect();
-    Ok((seeds, replay))
-}
-
-/// The `setup --recovery` procedure: rebuild a freshly-wiped DB from
-/// a trusted checkpoint instead of refusing. Runs after the shared prefix
-/// (identity pinned, initial sync done); replaces the detection gate + genesis
-/// snapshot. Invalid checkpoint/configuration failures are terminal; transient
-/// L1 failures leave setup incomplete for a fresh attempt.
-///
-/// The `flush → fold → fill` steps are enumerated authoritatively in
-/// **[`docs/recovery/cockroach.md`](../../../../docs/recovery/cockroach.md)** (spec,
-/// data dictionary `A`/`B`/`C`/`N`/`N'`, and code map) and anchored inline below
-/// (`// 1.`…`// 6.`). Read the doc before editing this function.
-///
-/// `N` (and the whole checkpoint tuple `S`/`A`/`B`/`N`) is **trusted** metadata
-/// from the operator-prepared recovery bundle (a canonical export or a validated
-/// retained archive); recovery does not re-verify it. See cockroach.md
-/// "Obtaining the recovery artifact" and "Data dictionary" for the trust boundary.
-async fn recover<A>(
-    config: &SetupConfig,
-    identity: &DeploymentIdentity,
-    timing: sequencer_core::protocol::ProtocolTiming,
-    input_reader: &mut InputReader,
-    storage: &mut storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<(), CommandError>
-where
-    A: Application + 'static,
-{
-    // 1. Load the trusted checkpoint (S, A, N, B); require A < B or empty genesis.
-    let checkpoint_dir = std::path::Path::new(
-        config
-            .checkpoint_dump_dir
-            .as_deref()
-            .expect("validated: recovery requires a checkpoint dump dir"),
-    );
-    let checkpoint = Checkpoint::<A>::load(checkpoint_dir, config.checkpoint_block)?;
-
-    // 2. Flush the previous instance's batch txs → C, the post-flush safe head.
-    let stop_block =
-        flush_wallet_nonce(config, identity, timing.seconds_per_block(), storage).await?;
-
-    // 3. Re-sync through C, then verify the resynced safe block reaches the
-    //    flush observation before cascade. Frontier population stays OFF (the
-    //    caller disabled it before the initial sync): the tree is rebuilt in
-    //    step 6, so a frontier built here against an empty tree would falsely
-    //    diverge. `run`'s first sync populates it correctly once anchor = N'.
-    tracing::info!("re-syncing L1 safe head after flush");
-    input_reader
-        .sync_to_current_safe_head()
-        .await
-        .map_err(|e| {
-            CommandError::Worker(WorkerExit::InputReader(
-                crate::commands::error::WorkerStop::Source(e),
-            ))
-        })?;
-    let resynced_safe_block = require_resynced_safe_block(storage.current_safe_block()?)?;
-    assert_resync_caught_up(resynced_safe_block, stop_block)?;
-
-    rebuild_from_checkpoint(checkpoint, identity, stop_block, storage, dumps_dir)
-}
-
-fn rebuild_from_checkpoint<A: Application + 'static>(
-    checkpoint: Checkpoint<A>,
-    identity: &DeploymentIdentity,
-    stop_block: u64,
-    storage: &mut storage::Storage,
-    dumps_dir: &std::path::Path,
-) -> Result<(), CommandError> {
-    // A valid checkpoint can outpace an honestly lagging RPC node. Labelling
-    // its state with an earlier C would let run execute its directs again.
-    if stop_block < checkpoint.checkpoint_block {
-        return Err(
-            RecoveryError::retry(RecoveryRetryReason::CheckpointAheadOfStop {
-                checkpoint_block: checkpoint.checkpoint_block,
-                stop_block,
-            })
-            .into(),
-        );
-    }
-
-    // 4. Source the (A, B] direct seeds + the (B, C] replay stream.
-    let submitter = identity.batch_submitter_address;
-    let (seeds, replay) = source_fold_inputs(storage, &checkpoint, stop_block, submitter)?;
-
-    // 5. Fold (S, N) over the inputs → (S', N').
-    let Checkpoint {
-        app,
-        executed_safe_block,
-        checkpoint_nonce,
-        checkpoint_block,
-    } = checkpoint;
-    let domain = sequencer_core::build_input_domain(identity.chain_id, identity.app_address);
-    let scheduler_config = SchedulerConfig::new(submitter);
-    let (recovered_app, resume_nonce) = fold_replay(
-        app,
-        checkpoint_nonce,
-        scheduler_config,
-        domain,
-        seeds,
-        replay,
-        stop_block,
-    )?;
-
-    // 6. Publish the local resume baseline and root atomically. The first run
-    //    scans acceptance only after C, beginning with expected nonce N'.
-    fill::fill_recovery_state(recovered_app, resume_nonce, stop_block, storage, dumps_dir)?;
-
-    tracing::info!(
-        executed_safe_block,
-        checkpoint_block,
-        stop_block,
-        resume_nonce,
-        "recovery complete — DB rebuilt from checkpoint"
-    );
-    Ok(())
-}
-
-fn require_resynced_safe_block(observed: Option<u64>) -> Result<u64, SetupRecoveryError> {
-    observed.ok_or(SetupRecoveryError::MissingResyncedSafeHead)
-}
-
-/// Recovery step 2: flush the previous instance's stranded batch txs and wait
-/// for the wallet nonce to settle, returning `C` — the post-flush safe head at
-/// which every slot the provider's pool knows (and any watermark persisted in
-/// this directory) is resolved at safe depth. This is `setup`'s only
-/// L1-signing action (it otherwise takes the submitter *address*, not the key).
-///
-/// The flush-acquire core (flusher + watermark sink + `flush_and_wait`) is
-/// shared with the runtime danger path and `flush-mempool` via
-/// [`MempoolFlusher::flush_to_safe`]; this site supplies the recovery key, the
-/// pinned submitter address, and the watermark from the open `storage`.
-async fn flush_wallet_nonce(
-    config: &SetupConfig,
-    identity: &DeploymentIdentity,
-    seconds_per_block: u64,
-    storage: &mut storage::Storage,
-) -> Result<u64, CommandError> {
-    // The recovery key must match the pinned batch-submitter address — flushing
-    // under a different account's key would settle the wrong wallet's nonce (and
-    // burn its gas) while recovery never settles `identity.batch_submitter_address`.
-    // Gate before signing, exactly as `flush-mempool` does.
-    let key = super::verify_submitter_key(config.resolve_recovery_key()?, identity)?;
-    // Keyed-write chain-id gate: `setup --recovery`'s flush signs L1 no-op txs,
-    // so re-confirm the RPC serves the pinned chain right before building the
-    // signer (the earlier `validate_rpc_chain_id` may have gone stale). Same
-    // guarded constructor the runtime flush and `flush-mempool` use.
-    let providers = crate::l1::provider::create_verified_keyed_providers(
-        &config.rpc.eth_rpc_url,
-        key.expose_secret(),
-        config.chain_id,
-        config.rpc.allow_insecure_rpc,
-    )
-    .await
-    .map_err(CommandError::from)?;
-    let watermark = storage.wallet_nonce_watermark()?;
-    let stop_block = MempoolFlusher::flush_to_safe(
-        providers,
-        identity.batch_submitter_address,
-        seconds_per_block,
-        config.db_path(),
-        watermark,
-    )
-    .await?;
-    Ok(stop_block)
-}
-
-/// Map a synced `safe_inputs` row to a fold input. The EIP-712 domain is a
-/// deployment-wide constant the engine clones onto each, so it is not stored
-/// per row.
-fn to_fold_input(input: crate::storage::StoredSafeInput) -> FoldInput {
-    FoldInput {
-        sender: input.sender,
-        inclusion_block: input.block_number,
-        payload: input.payload,
     }
 }
 
@@ -827,144 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_load_requires_an_export_receipt_matching_the_artifact_and_block() {
-        use crate::test_support::StubApp;
-        let dir = tempfile::tempdir().expect("checkpoint parent");
-        let prefix = dir.path().join("checkpoint");
-        let mut app = StubApp::default();
-        dump_info::create_dump_dir_with_info(
-            &mut app,
-            &prefix,
-            &dump_info::DumpInfo::at_baseline(3),
-        )
-        .expect("create artifact");
-        assert!(matches!(
-            Checkpoint::<StubApp>::load(&prefix, 10),
-            Err(SetupRecoveryError::CheckpointLoad { .. })
-        ));
-        let write_receipt = |nonce| {
-            let receipt = dump_info::CheckpointInfo {
-                format_version: dump_info::FORMAT_VERSION,
-                next_batch_nonce: nonce,
-                inclusion_block: 10,
-            };
-            std::fs::write(
-                prefix.join("checkpoint.toml"),
-                toml::to_string(&receipt).unwrap(),
-            )
-            .expect("write receipt");
-        };
-        write_receipt(4);
-        assert!(matches!(
-            Checkpoint::<StubApp>::load(&prefix, 10),
-            Err(SetupRecoveryError::CheckpointLoad { .. })
-        ));
-        write_receipt(3);
-        assert!(matches!(
-            Checkpoint::<StubApp>::load(&prefix, 11),
-            Err(SetupRecoveryError::CheckpointLoad { .. })
-        ));
-        let checkpoint = Checkpoint::<StubApp>::load(&prefix, 10).unwrap();
-        assert_eq!(
-            (checkpoint.checkpoint_nonce, checkpoint.checkpoint_block),
-            (3, 10)
-        );
-    }
-
-    #[test]
-    fn genesis_checkpoint_loads_and_has_an_empty_seed_interval() {
-        use crate::test_support::StubApp;
-        let dir = tempfile::tempdir().expect("checkpoint parent");
-        let prefix = dir.path().join("genesis");
-        let mut app = StubApp::default();
-        dump_info::create_dump_dir_with_info(
-            &mut app,
-            &prefix,
-            &dump_info::DumpInfo::at_baseline(0),
-        )
-        .expect("genesis artifact");
-        std::fs::write(
-            prefix.join("checkpoint.toml"),
-            toml::to_string(&dump_info::CheckpointInfo {
-                format_version: dump_info::FORMAT_VERSION,
-                next_batch_nonce: 0,
-                inclusion_block: 0,
-            })
-            .unwrap(),
-        )
-        .expect("genesis receipt");
-        let checkpoint = Checkpoint::<StubApp>::load(&prefix, 0).expect("load genesis export");
-        assert_eq!(checkpoint.executed_safe_block, checkpoint.checkpoint_block);
-        let db = temp_db("genesis-checkpoint-seed");
-        let mut storage = Storage::open(&db.path).expect("storage");
-        storage
-            .append_safe_inputs(
-                10,
-                &[StoredSafeInput {
-                    sender: Address::repeat_byte(0x22),
-                    payload: vec![1],
-                    block_number: 5,
-                }],
-                SENDER_A,
-                &default_protocol_timing(),
-            )
-            .expect("post-genesis direct");
-        let (seeds, replay) = source_fold_inputs(&mut storage, &checkpoint, 10, SENDER_A)
-            .expect("source empty seed and replay");
-        assert!(seeds.is_empty());
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].inclusion_block, 5);
-    }
-
-    #[test]
-    fn non_genesis_checkpoint_rejects_equal_execution_and_inclusion_blocks() {
-        use app_core::application::{WalletApp, WalletConfig};
-        use sequencer_core::application::execute_direct_input;
-        use sequencer_core::l2_tx::DirectInput;
-
-        let dir = tempfile::tempdir().expect("checkpoint parent");
-        let prefix = dir.path().join("checkpoint");
-        let mut app = WalletApp::new(WalletConfig::devnet());
-        execute_direct_input(
-            &mut app,
-            &DirectInput {
-                sender: Address::repeat_byte(0x22),
-                payload: vec![],
-                block_number: 10,
-            },
-        )
-        .expect("execute direct at checkpoint block");
-        dump_info::create_dump_dir_with_info(
-            &mut app,
-            &prefix,
-            &dump_info::DumpInfo::at_batch_close(0),
-        )
-        .expect("checkpoint artifact");
-        std::fs::write(
-            prefix.join("checkpoint.toml"),
-            toml::to_string(&dump_info::CheckpointInfo {
-                format_version: dump_info::FORMAT_VERSION,
-                next_batch_nonce: 1,
-                inclusion_block: 10,
-            })
-            .unwrap(),
-        )
-        .expect("checkpoint receipt");
-
-        // A direct arriving after this batch in the same L1 block is still
-        // pending, but the (A, B] seed interval would omit the whole block.
-        let error = Checkpoint::<WalletApp>::load(&prefix, 10).err().unwrap();
-        assert!(matches!(
-            error,
-            SetupRecoveryError::CheckpointNotBeforeBlock {
-                executed_safe_block: 10,
-                checkpoint_block: 10,
-            }
-        ));
-        assert!(error.to_string().contains("pending same-block directs"));
-    }
-
-    #[test]
     fn completed_plain_setup_is_a_noop_and_writes_nothing() {
         let db = temp_db("setup-noop-preserves-recovery");
         let mut storage =
@@ -989,7 +528,7 @@ mod tests {
         drop(storage);
 
         assert!(matches!(
-            admit_setup_lifecycle(db.path.as_str(), storage::LifecycleCommand::Setup, false)
+            admit_setup_lifecycle(db.path.as_str(), storage::LifecycleCommand::Setup)
                 .expect("plain setup no-op"),
             SetupAdmission::AlreadyComplete
         ));
@@ -999,15 +538,6 @@ mod tests {
             .expect("read")
             .expect("still recorded");
         assert_eq!(after, before, "plain setup must write nothing");
-    }
-
-    #[test]
-    fn recovery_resync_requires_a_persisted_safe_head() {
-        assert_eq!(require_resynced_safe_block(Some(7)).unwrap(), 7);
-        assert!(matches!(
-            require_resynced_safe_block(None),
-            Err(SetupRecoveryError::MissingResyncedSafeHead)
-        ));
     }
 
     /// Seed `safe_inputs` with one batch-submitter (`SENDER_A`) input per block
@@ -1262,170 +792,5 @@ mod tests {
             "{unavailable:?}"
         );
         assert_eq!(unavailable.exit_code(), EXIT_RESTART_TRANSIENT);
-    }
-
-    /// `setup --recovery`'s flush signs L1 no-ops with the recovery key, so it
-    /// must match the pinned batch-submitter — otherwise it would settle some
-    /// other account's nonce while recovery never settles the intended wallet.
-    /// The guard is pure and runs first, so a wrong key is refused before any L1
-    /// contact (the RPC here is unreachable) or DB write.
-    #[tokio::test]
-    async fn flush_wallet_nonce_refuses_mismatched_recovery_key() {
-        use crate::harness::{Cli, Command};
-        use crate::storage::DeploymentIdentity;
-        use clap::Parser;
-
-        // A recovery key whose address is NOT the pinned submitter below.
-        const OTHER_KEY: &str =
-            "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let pinned_submitter: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-            .parse()
-            .unwrap();
-
-        let cli = Cli::try_parse_from([
-            "sequencer",
-            "setup",
-            "--eth-rpc-url",
-            "http://127.0.0.1:1", // unreachable — the verify fails before any contact
-            "--chain-id",
-            "31337",
-            "--app-address",
-            "0x1111111111111111111111111111111111111111",
-            "--batch-submitter-address",
-            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-            "--recovery",
-            "--checkpoint-block",
-            "10",
-            "--checkpoint-dump-dir",
-            "/nonexistent/checkpoint", // never read — refusal precedes the load
-            "--batch-submitter-private-key",
-            OTHER_KEY,
-        ])
-        .expect("parse setup --recovery");
-        let config = match cli.command {
-            Command::Setup(c) => *c,
-            other => panic!("expected setup subcommand, got {other:?}"),
-        };
-
-        let identity = DeploymentIdentity {
-            chain_id: 31337,
-            app_address: "0x1111111111111111111111111111111111111111"
-                .parse()
-                .unwrap(),
-            input_box_address: "0x2222222222222222222222222222222222222222"
-                .parse()
-                .unwrap(),
-            app_deployment_block: 0,
-            batch_submitter_address: pinned_submitter,
-            fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
-        };
-        let db = temp_db("recovery-wrong-key");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-
-        let result = flush_wallet_nonce(&config, &identity, 12, &mut storage).await;
-        match result {
-            Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
-                fields,
-                ..
-            }))) => assert_eq!(fields, "batch_submitter_address"),
-            other => panic!("expected batch_submitter_address mismatch, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn source_fold_inputs_splits_seeds_and_replay_dropping_submitter_batches() {
-        use crate::storage::test_helpers::SENDER_B;
-        let db = temp_db("source-fold-inputs");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let protocol = default_protocol_timing();
-        let submitter = SENDER_A;
-        let direct = SENDER_B;
-
-        // A=5, B=20, C=40. (A,B] directs are seeds (submitter batches dropped);
-        // (B,C] is the full replay stream.
-        let mk = |sender, block, marker| StoredSafeInput {
-            sender,
-            payload: vec![marker],
-            block_number: block,
-        };
-        let inputs = vec![
-            mk(direct, 10, 0x10),    // (A,B] direct  → seed
-            mk(submitter, 15, 0x11), // (A,B] batch   → dropped (already in S)
-            mk(direct, 20, 0x12),    // (A,B] direct@B → seed
-            mk(submitter, 25, 0x13), // (B,C] batch   → replay
-            mk(direct, 30, 0x14),    // (B,C] direct  → replay
-        ];
-        storage
-            .append_safe_inputs(40, &inputs, submitter, &protocol)
-            .expect("seed");
-
-        let checkpoint = Checkpoint::<()> {
-            app: (),
-            executed_safe_block: 5,
-            checkpoint_nonce: 0,
-            checkpoint_block: 20,
-        };
-        let (seeds, replay) =
-            source_fold_inputs(&mut storage, &checkpoint, 40, submitter).expect("source");
-
-        assert_eq!(
-            seeds.iter().map(|s| s.inclusion_block).collect::<Vec<_>>(),
-            vec![10, 20],
-            "seeds are the (A,B] directs; the submitter batch @15 is dropped"
-        );
-        assert_eq!(
-            replay.iter().map(|r| r.inclusion_block).collect::<Vec<_>>(),
-            vec![25, 30],
-            "replay is the full (B,C] stream (batch + direct)"
-        );
-    }
-
-    #[test]
-    fn source_fold_inputs_replay_upper_bound_stays_at_c_when_resync_overshoots() {
-        // The recovery resync runs to the live head H1 > C, so safe_inputs holds
-        // directs past C. The fold's replay range must stay (B, C]: a direct in
-        // (C, H1] must NOT leak into replay (it would be folded into S' AND then
-        // left undrained for run = double execution — the (C, H1] bug class). Unit
-        // twin of the recovery e2e, pinning the boundary the bug lived at.
-        use crate::storage::test_helpers::SENDER_B;
-        let db = temp_db("source-fold-overshoot");
-        let mut storage = Storage::open(db.path.as_str()).expect("open");
-        let protocol = default_protocol_timing();
-        let submitter = SENDER_A;
-        let direct = SENDER_B;
-
-        let mk = |block, marker| StoredSafeInput {
-            sender: direct,
-            payload: vec![marker],
-            block_number: block,
-        };
-        // A=5, B=20, C=40, H1=50: a direct at block 50 is in the (C, H1] overshoot.
-        let inputs = vec![
-            mk(10, 0x10), // (A,B]  → seed
-            mk(30, 0x14), // (B,C]  → replay
-            mk(50, 0x20), // (C,H1] → must NOT appear in replay
-        ];
-        storage
-            .append_safe_inputs(50, &inputs, submitter, &protocol)
-            .expect("seed");
-
-        let checkpoint = Checkpoint::<()> {
-            app: (),
-            executed_safe_block: 5,
-            checkpoint_nonce: 0,
-            checkpoint_block: 20,
-        };
-        let (seeds, replay) =
-            source_fold_inputs(&mut storage, &checkpoint, 40, submitter).expect("source");
-
-        assert_eq!(
-            seeds.iter().map(|s| s.inclusion_block).collect::<Vec<_>>(),
-            vec![10]
-        );
-        assert_eq!(
-            replay.iter().map(|r| r.inclusion_block).collect::<Vec<_>>(),
-            vec![30],
-            "the (C, H1] direct @50 must be excluded from replay (upper bound is C, not H1)"
-        );
     }
 }

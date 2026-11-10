@@ -1,17 +1,18 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::Address;
-use app_core::application::MAX_METHOD_PAYLOAD_BYTES;
+use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, WALLET_SCHEDULER_LIMITS};
 use sequencer_core::application::{
-    AppError, AppOutputs, Application, ApplicationProgress, InvalidReason, ValidationOutcome,
+    Admission, AppError, AppOutputs, Application, PolicyRefusal, SchedulerLimits,
 };
 use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
 use crate::ingress::inclusion_lane::dump_info::{self, create_dump_dir_with_info};
@@ -24,23 +25,32 @@ pub(crate) enum ReplayEvent {
         data: Vec<u8>,
     },
     DirectInput {
+        input_index: u64,
         sender: Address,
         block_number: u64,
+        timestamp: u64,
         payload: Vec<u8>,
     },
 }
 
-/// Accepts and executes every input. Dumps persist only progress (two LE
-/// `u64`s at `prefix/state`); `from_dump` resets every other field, so a test
-/// observes what the lane executed through the dumps it writes.
+/// Executes every transaction it is handed. Dumps persist the count and the
+/// per-sender nonces at `prefix/state`; `from_dump` resets every other field,
+/// so a test observes what the lane executed through the dumps it writes.
 #[derive(Default)]
 pub(crate) struct StubApp {
-    pub(crate) progress: ApplicationProgress,
-    /// Inputs this instance executed; not persisted.
+    pub(crate) count: ExecutedInputCount,
+    /// Each sender's next nonce; an absent sender is at zero.
+    pub(crate) nonces: BTreeMap<Address, u32>,
+    /// Transactions this instance executed; not persisted.
     pub(crate) replayed: Vec<ReplayEvent>,
-    /// Test-only scheduling seam used to keep a rejected queue saturated long
-    /// enough to distinguish one bounded turn from an unbounded drain.
+    /// Test-only scheduling seam that keeps a refused queue saturated long
+    /// enough to distinguish one bounded turn from an unbounded drain: each
+    /// nonce read sleeps, then reports one past the sender's next nonce, so
+    /// every live op refuses with a wrong nonce (and a stored op would skip).
     pub(crate) reject_user_ops_after: Option<Duration>,
+    /// `admit_user_op` refuses every op with this policy text.
+    pub(crate) refuse_user_ops: Option<String>,
+    /// `admit_user_op` fails with an internal error.
     pub(crate) fail_validation: bool,
     pub(crate) fail_apply: bool,
     pub(crate) fail_dump: bool,
@@ -53,15 +63,15 @@ pub(crate) struct StubApp {
 }
 
 impl StubApp {
-    pub(crate) fn with_progress(executed_input_count: u64, last_executed_safe_block: u64) -> Self {
+    pub(crate) fn with_progress(executed_input_count: u64) -> Self {
         Self {
-            progress: ApplicationProgress::try_new(
-                ExecutedInputCount::new(executed_input_count),
-                last_executed_safe_block,
-            )
-            .expect("coherent progress"),
+            count: ExecutedInputCount::new(executed_input_count),
             ..Self::default()
         }
+    }
+
+    fn next_nonce(&self, sender: Address) -> u32 {
+        self.nonces.get(&sender).copied().unwrap_or(0)
     }
 }
 
@@ -72,68 +82,79 @@ fn internal_failure() -> AppError {
 }
 
 impl Application for StubApp {
-    fn max_method_payload_bytes() -> usize {
-        MAX_METHOD_PAYLOAD_BYTES
-    }
-
-    fn validate_user_op(
-        &self,
-        _sender: Address,
-        user_op: &UserOp,
-        _current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        if self.fail_validation {
-            return Err(internal_failure());
-        }
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError> {
+        let next = self.next_nonce(sender);
         if let Some(delay) = self.reject_user_ops_after {
             std::thread::sleep(delay);
-            return Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
-                expected: user_op.nonce.wrapping_add(1),
-                got: user_op.nonce,
-            }));
+            return Ok(next.wrapping_add(1));
         }
-        Ok(ValidationOutcome::Accept)
+        Ok(next)
     }
 
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError> {
         if self.fail_apply {
             return Err(internal_failure());
         }
         self.replayed.push(ReplayEvent::UserOp {
-            sender: user_op.sender,
-            data: user_op.data.clone(),
+            sender: op.sender,
+            data: op.data.clone(),
         });
-        self.progress.advance(safe_block);
+        let next = self
+            .next_nonce(op.sender)
+            .checked_add(1)
+            .expect("the executor never applies an op at nonce u32::MAX");
+        self.nonces.insert(op.sender, next);
+        self.count.advance();
         Ok(Vec::new())
     }
 
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError> {
         if let Some(shutdown) = &self.shutdown_on_direct {
             shutdown.request_shutdown();
         }
         self.replayed.push(ReplayEvent::DirectInput {
-            sender: input.sender,
-            block_number: input.block_number,
-            payload: input.payload.clone(),
+            input_index: direct.input_index,
+            sender: direct.sender,
+            block_number: direct.block,
+            timestamp: direct.timestamp,
+            payload: direct.payload.clone(),
         });
-        self.progress.advance(input.block_number);
+        self.count.advance();
         Ok(Vec::new())
     }
 
-    fn progress(&self) -> ApplicationProgress {
-        self.progress
+    fn executed_input_count(&self) -> ExecutedInputCount {
+        self.count
+    }
+
+    fn max_method_payload_bytes() -> usize {
+        MAX_METHOD_PAYLOAD_BYTES
+    }
+
+    /// The wallet's limits, so storage fixtures that open frames with the
+    /// stub's cap select the same directs a `WalletApp` lane would.
+    fn scheduler_limits() -> SchedulerLimits {
+        WALLET_SCHEDULER_LIMITS
+    }
+
+    fn admit_user_op(
+        &self,
+        _sender: Address,
+        _op: &UserOp,
+        _fee: u16,
+    ) -> Result<Admission, AppError> {
+        if self.fail_validation {
+            return Err(internal_failure());
+        }
+        if let Some(reason) = &self.refuse_user_ops {
+            return Ok(Admission::Refuse(PolicyRefusal::Other(reason.clone())));
+        }
+        Ok(Admission::Admit)
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
         let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
-        Ok(Self {
-            progress: decode_progress(&bytes)?,
-            ..Self::default()
-        })
+        decode_state(&bytes)
     }
 
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
@@ -141,37 +162,68 @@ impl Application for StubApp {
             return Err(std::io::Error::other("injected application dump failure").into());
         }
         std::fs::create_dir(prefix)?;
-        std::fs::write(
-            Self::state_file_in_dump(prefix),
-            encode_progress(self.progress),
-        )?;
+        std::fs::write(Self::state_file_in_dump(prefix), encode_state(self))?;
         Ok(())
     }
 
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
     }
+
+    fn from_canonical_state(
+        state_file: &Path,
+        executed_input_count: ExecutedInputCount,
+    ) -> Result<Self, AppError> {
+        let app = decode_state(&std::fs::read(state_file)?)?;
+        if app.count != executed_input_count {
+            return Err(AppError::Internal {
+                reason: format!(
+                    "StubApp state holds count {}, but the machine reports {}",
+                    app.count.get(),
+                    executed_input_count.get()
+                ),
+            });
+        }
+        Ok(app)
+    }
 }
 
-fn encode_progress(progress: ApplicationProgress) -> [u8; 16] {
-    let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&progress.executed_input_count().get().to_le_bytes());
-    bytes[8..].copy_from_slice(&progress.last_executed_safe_block().to_le_bytes());
+const NONCE_ENTRY_BYTES: usize = 20 + 4;
+
+/// The count as a LE `u64`, then each sender with a nonce as its 20 address
+/// bytes and a LE `u32`, in address order.
+fn encode_state(app: &StubApp) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + app.nonces.len() * NONCE_ENTRY_BYTES);
+    bytes.extend_from_slice(&app.count.get().to_le_bytes());
+    for (sender, nonce) in &app.nonces {
+        bytes.extend_from_slice(sender.as_slice());
+        bytes.extend_from_slice(&nonce.to_le_bytes());
+    }
     bytes
 }
 
-fn decode_progress(bytes: &[u8]) -> Result<ApplicationProgress, AppError> {
-    if bytes.len() != 16 {
-        return Err(AppError::Internal {
-            reason: "StubApp dump must be exactly 16 bytes".to_owned(),
-        });
+fn decode_state(bytes: &[u8]) -> Result<StubApp, AppError> {
+    let malformed = || AppError::Internal {
+        reason: "StubApp dump must be a count and whole nonce entries".to_owned(),
+    };
+    let (count, entries) = bytes.split_first_chunk::<8>().ok_or_else(malformed)?;
+    let (entries, rest) = entries.as_chunks::<NONCE_ENTRY_BYTES>();
+    if !rest.is_empty() {
+        return Err(malformed());
     }
-    let count = u64::from_le_bytes(bytes[..8].try_into().expect("checked slice length"));
-    let safe_block = u64::from_le_bytes(bytes[8..].try_into().expect("checked slice length"));
-    Ok(
-        ApplicationProgress::try_new(ExecutedInputCount::new(count), safe_block)
-            .expect("coherent progress"),
-    )
+    let nonces = entries
+        .iter()
+        .map(|entry| {
+            let (sender, nonce) = entry.split_at(20);
+            let nonce: [u8; 4] = nonce.try_into().expect("checked entry length");
+            (Address::from_slice(sender), u32::from_le_bytes(nonce))
+        })
+        .collect();
+    Ok(StubApp {
+        count: ExecutedInputCount::new(u64::from_le_bytes(*count)),
+        nonces,
+        ..StubApp::default()
+    })
 }
 
 /// Mirror of the production dump layout: a structured directory with

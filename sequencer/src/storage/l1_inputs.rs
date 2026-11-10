@@ -86,13 +86,11 @@ impl Storage {
 
     /// All `safe_inputs` rows whose `block_number` is in `(after_block,
     /// through_block]`, ordered by `safe_input_index` ascending — i.e. L1
-    /// inclusion order. The recovery fold sources
-    /// its seeds from `(A, B]` and its replay stream from `(B, C]` through this:
-    /// half-open on the lower bound (directs at block `B` belong to the fridge,
-    /// batches at `B` are already in `S` — open-question 1 boundary convention).
+    /// inclusion order. Half-open on the lower bound, so consecutive ranges
+    /// sharing a boundary block never return an input twice.
     ///
-    /// Returns both senders and directs; the caller classifies (a batch iff
-    /// `sender == batch_submitter`) and drops batches from the `(A, B]` seed set.
+    /// Returns every sender's inputs; the caller classifies (a batch iff
+    /// `sender == batch_submitter`).
     /// Read-only; queries the reader-synced table rather than a fresh log scan,
     /// inheriting the reader's input-completeness witness (see
     /// [`Storage::first_batch_submitter_input_after_block`]).

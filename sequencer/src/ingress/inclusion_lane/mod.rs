@@ -28,11 +28,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{SafeFrontierState, SafeInputRange, Storage, StoredDirectInput, WriteHead};
-use sequencer_core::application::{
-    Application, ExecutionOutcome, execute_direct_input, validate_and_execute_user_op,
-};
+use crate::storage::{SafeFrontierState, SafeInputRange, Storage, WriteHead};
+use sequencer_core::application::{Application, Executed, check_live_user_op, execute};
 use sequencer_core::history::ExecutedInputCount;
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::SignedUserOp;
 
 use catch_up::{catch_up_application, catch_up_snapshot};
@@ -189,7 +188,7 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn maybe_advance_safe_frontier(
         &mut self,
         lane_state: &mut LaneState,
-        safe_inputs: &mut Vec<StoredDirectInput>,
+        safe_inputs: &mut Vec<Direct>,
     ) -> Result<(), InclusionLaneError> {
         if !lane_state.frontier_check_due(self.config.frontier_min_interval) {
             return Ok(());
@@ -234,6 +233,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             &mut lane_state.head,
             frontier.safe_block,
             leading_direct_range,
+            A::scheduler_limits().max_direct_payload_bytes,
             &executions,
         )?;
         lane_state.next_safe_input_index = frontier.end_exclusive;
@@ -247,20 +247,32 @@ impl<A: Application + 'static> InclusionLane<A> {
         Ok(())
     }
 
+    /// Execute the directs `range` drains. Storage hands out only those that
+    /// execute: no batch-submitter input and none over the application's
+    /// payload cap, which therefore get no execution row.
     fn execute_direct_range(
         &mut self,
         range: SafeInputRange,
-        chunk: &mut Vec<StoredDirectInput>,
+        chunk: &mut Vec<Direct>,
     ) -> Result<Vec<crate::storage::DirectInputExecution>, InclusionLaneError> {
+        let max_direct_payload_bytes = A::scheduler_limits().max_direct_payload_bytes;
         let mut executions = Vec::new();
         for chunk_range in range.chunks(self.config.safe_input_buffer_capacity.max(1) as u64) {
-            self.storage.fill_direct_inputs(chunk_range, chunk)?;
-            for input in chunk.iter() {
-                let receipt = execute_direct_input(&mut self.app, &input.input)
-                    .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
+            self.storage
+                .fill_direct_inputs(chunk_range, max_direct_payload_bytes, chunk)?;
+            for direct in chunk.drain(..) {
+                let safe_input_index = direct.input_index;
+                let offset = match execute(&mut self.app, &L2Tx::Direct(direct))
+                    .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?
+                {
+                    Executed::Done { offset, .. } => offset,
+                    Executed::Skipped(reason) => {
+                        unreachable!("the executor never skips a direct, got {reason}")
+                    }
+                };
                 executions.push(crate::storage::DirectInputExecution {
-                    safe_input_index: input.safe_input_index,
-                    executed_input_offset: receipt.offset,
+                    safe_input_index,
+                    executed_input_offset: offset,
                 });
             }
         }
@@ -344,6 +356,9 @@ fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) ->
     age >= config.max_batch_open
 }
 
+/// Refuse the op with its 422 text, or execute it in the open frame at the
+/// frame's price and safe block. The pre-check runs the executor's own nonce
+/// rule, so an admitted op that `execute` skips is a terminal lane fault.
 fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
@@ -351,35 +366,59 @@ fn execute_user_op(
     frame_safe_block: u64,
     included: &mut Vec<IncludedUserOp>,
 ) -> Result<(), InclusionLaneError> {
-    match validate_and_execute_user_op(
-        app,
-        item.signed.sender,
-        &item.signed.user_op,
-        current_frame_fee,
-        frame_safe_block,
-    ) {
-        Ok(ExecutionOutcome::Included(receipt)) => included.push(IncludedUserOp {
-            pending: item,
-            executed_input_offset: receipt.offset,
-        }),
-        Ok(ExecutionOutcome::Invalid(reason)) => {
+    let sender = item.signed.sender;
+    let op = &item.signed.user_op;
+    match check_live_user_op(app, sender, op, current_frame_fee) {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
             let _ = item
                 .respond_to
-                .send(Err(SequencerError::invalid(reason.to_string())));
+                .send(Err(SequencerError::invalid(refusal.to_string())));
+            return Ok(());
         }
-        // An application error has no canonical successor. Discard the
-        // application-owned state; this op is never persisted or acknowledged.
-        Err(err) => {
-            // The client gets a fixed message: the application's reason and
-            // any I/O detail travel on the lane error and the log, never
-            // into the public 500 body.
-            let _ = item.respond_to.send(Err(SequencerError::internal(
-                "application internal error".to_string(),
-            )));
-            return Err(InclusionLaneError::ExecuteUserOp { source: err });
+        Err(source) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::ExecuteUserOp { source },
+            ));
+        }
+    }
+    let tx = L2Tx::UserOp(UserOpTx::new(
+        sender,
+        op,
+        current_frame_fee,
+        frame_safe_block,
+    ));
+    match execute(app, &tx) {
+        Ok(Executed::Done { offset, .. }) => included.push(IncludedUserOp {
+            pending: item,
+            executed_input_offset: offset,
+        }),
+        Ok(Executed::Skipped(reason)) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::AdmittedOpSkipped { reason },
+            ));
+        }
+        Err(source) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::ExecuteUserOp { source },
+            ));
         }
     }
     Ok(())
+}
+
+/// An op whose execution failed has no canonical successor, so the lane stops
+/// and the op is never persisted or acknowledged. The client gets a fixed
+/// message: the cause travels on the lane error and the log, never into the
+/// public 500 body.
+fn fail_user_op(item: PendingUserOp, error: InclusionLaneError) -> InclusionLaneError {
+    let _ = item.respond_to.send(Err(SequencerError::internal(
+        "application internal error".to_string(),
+    )));
+    error
 }
 
 /// Dequeue and execute up to `max_chunk` user ops, stopping early if the batch

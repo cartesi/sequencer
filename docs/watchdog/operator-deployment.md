@@ -196,13 +196,10 @@ but checkpoints.
 A retained checkpoint is a trusted machine at a known block. It can bootstrap
 a new state directory ([initialize](#initialize)), serve as the trusted source
 for `replay` in the [runbook](incident-runbook.md#2-find-the-faulty-side), and
-feed the canonical-to-native export of
-[cockroach recovery](../recovery/cockroach.md#incident-playbook). It is not a
-sequencer restore archive; that is `/finalized_snapshot`
+be the base machine of cockroach recovery, which arrives with `setup --base`
+([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)).
+It is not a sequencer restore archive; that is `/finalized_snapshot`
 ([recovery exports](../snapshots/lifecycle.md#http-and-recovery-exports)).
-Complete the application's
-[recovery readiness drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
-before production.
 
 ## Deployment facts
 
@@ -415,9 +412,9 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
   A watchdog state mismatch independently signals application-state
   disagreement ([incident runbook](incident-runbook.md)). Diagnose the cause
-  and follow the [incident playbook](../recovery/cockroach.md#incident-playbook)
-  for a fresh-directory rebuild when needed; standard recovery does not repair
-  bugs.
+  and follow the [incident runbook](incident-runbook.md#3-resolve); a
+  fresh-directory rebuild arrives with `setup --base`, and standard recovery
+  does not repair bugs.
 
 ## Troubleshooting (live deployments)
 

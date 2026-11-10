@@ -146,7 +146,15 @@ where
 
     // ── Recovery ─────────────────────────────────────────────
     // Local terminal facts are inspected before the first provider call.
-    crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
+    // The cap is the lane's, so the reopened Tip executes the same directs.
+    crate::recovery::run_startup_recovery(
+        &db_path,
+        &mut input_reader,
+        &l1_config,
+        &timing,
+        A::scheduler_limits().max_direct_payload_bytes,
+    )
+    .await?;
 
     // Setup persisted a real first price, so run performs no synchronous
     // fee-source I/O and fee availability never precedes recovery's local

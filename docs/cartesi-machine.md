@@ -1,9 +1,9 @@
 # Cartesi Machine Facts We Rely On
 
 The canonical application runs inside the Cartesi Machine (CM). The watchdog
-drives it, the canonical guest is built for it, and cockroach recovery needs an
-application-specific exporter, not yet in-tree, to extract native state from
-it. This page records the CM behavior those components depend on,
+drives it, the canonical guest is built for it, and cockroach recovery, which
+arrives with `setup --base`, will read its `state` and `scheduler` inspect
+reports. This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
 [`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
@@ -73,9 +73,10 @@ prints all four inputs to compare; compare cold builds, since a warm `target/`
 can hold crates compiled before `rust-src` arrived. A move that is meant to preserve behavior is
 checked against [`tests/fixtures/consensus_vectors_v1.json`](../tests/fixtures/consensus_vectors_v1.json),
 which pins the consensus bytes (EIP-712 hashes, signature recovery, SSZ, fee
-table, output payloads) natively and, through `canonical-test`'s golden cases,
-in the built image, where each signature variant is checked for running as the
-signer or not. The fixture is never regenerated: a mismatch is a behavior
+table, output payloads) natively. `canonical-test`'s golden cases, which replay
+its guest scenarios in the built image, are ignored: those scenarios post
+frames at their inclusion block, which strict frames reject, and their
+successors arrive with the next vectors. The fixture is never regenerated: a mismatch is a behavior
 change to explain. A release that moves the hash says so, and deployed
 applications keep their old image, which the watchdog checks against the
 on-chain hash.
@@ -258,6 +259,11 @@ answering an inspect query:
   rootfs. Without `xhalt`, a failing entrypoint halts with payload 0. The
   watchdog test guest ships musl stand-ins for both; the canonical wallet image
   does not, so its panics halt with exit code 0.
+- **The canonical guest answers two inspect queries.** `state` (or an empty
+  query) reports the application's comparison bytes, and `scheduler` reports
+  the scheduler's export: six little-endian `u64` (`SchedulerExport` in
+  [`sequencer-core/src/scheduler/mod.rs`](../sequencer-core/src/scheduler/mod.rs)).
+  Any other query gets the report `unsupported inspect query`, not a halt.
 - **trolley has no exception call.** A guest that must raise a CMIO exception
   does it through `libcmt-sys` directly (see `watchdog/test-guest`).
 - **The last input stays in the machine.** The CMIO receive buffer keeps it,

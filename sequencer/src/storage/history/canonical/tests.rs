@@ -12,7 +12,7 @@ use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::initialize_history_in;
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
+    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
     DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
@@ -109,6 +109,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
             &mut head,
             10,
             SafeInputRange::new(0, 2),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(1),
@@ -128,32 +129,25 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     assert_eq!(first.rows.len(), 2);
     assert_eq!(first.rows[0].offset, ExecutedInputCount::ZERO);
     match &first.rows[0].context {
-        L2TxContext::UserOp {
-            tx,
-            nonce,
-            safe_block,
-            batch_nonce,
-        } => {
+        L2TxContext::UserOp { tx, batch_nonce } => {
             assert_eq!(tx.sender, SENDER_B);
             assert_eq!(tx.data, vec![0x11]);
             assert_eq!(tx.fee, first_fee);
-            assert_eq!((*nonce, *safe_block, *batch_nonce), (7, 0, 0));
+            assert_eq!((tx.nonce, tx.block, *batch_nonce), (7, 0, 0));
         }
         other => panic!("expected user op, got {other:?}"),
     }
     assert_eq!(first.rows[1].offset, ExecutedInputCount::new(1));
     match &first.rows[1].context {
-        L2TxContext::DirectInput {
+        L2TxContext::Direct {
             tx,
-            input_index,
             batch_nonce,
-            block_timestamp,
             transaction_hash: actual_hash,
         } => {
             assert_eq!(tx.sender, SENDER_B);
             assert_eq!(tx.payload, vec![0x22]);
-            assert_eq!(tx.block_number, 10);
-            assert_eq!((*input_index, *batch_nonce, *block_timestamp), (0, 1, 100));
+            assert_eq!(tx.block, 10);
+            assert_eq!((tx.input_index, *batch_nonce, tx.timestamp), (0, 1, 100));
             assert_eq!(*actual_hash, transaction_hash);
         }
         other => panic!("expected direct input, got {other:?}"),
@@ -164,15 +158,10 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     assert_eq!(last.rows.len(), 1);
     assert_eq!(last.rows[0].offset, ExecutedInputCount::new(2));
     match &last.rows[0].context {
-        L2TxContext::UserOp {
-            tx,
-            nonce,
-            safe_block,
-            batch_nonce,
-        } => {
+        L2TxContext::UserOp { tx, batch_nonce } => {
             assert_eq!(tx.data, vec![0x33]);
             assert_eq!(tx.fee, head.frame_fee);
-            assert_eq!((*nonce, *safe_block, *batch_nonce), (8, 10, 1));
+            assert_eq!((tx.nonce, tx.block, *batch_nonce), (8, 10, 1));
         }
         other => panic!("expected user op, got {other:?}"),
     }

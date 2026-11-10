@@ -10,6 +10,16 @@ use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
 use super::{BatchPolicy, WriteHead};
 
+/// Whether a safe input executes as a direct when its range drains: any input
+/// but the batch submitter's, unless its payload is over the application's
+/// cap. Every query that picks the directs to execute uses this one predicate,
+/// so the lane's executions and storage's derivation of them always agree.
+/// It binds `:batch_submitter` and `:max_direct_payload_bytes`. `length` takes
+/// the bare column, so SQLite answers it from the record header without
+/// reading the payload; every writer stores the payload as a blob.
+pub(super) const DIRECT_EXECUTES_SQL: &str = "(sender != :batch_submitter \
+     AND length(payload) <= :max_direct_payload_bytes)";
+
 // ── Write-head loading ───────────────────────────────────────────────────
 //
 // Used by ingress (initialize/resume open state) and recovery (open recovery
@@ -172,6 +182,44 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
 mod tests {
     use crate::storage::Storage;
     use crate::test_support::temp_db;
+
+    /// The frame close derives its executions inside the write transaction;
+    /// measuring a payload must not load it, overflow pages included.
+    #[test]
+    fn the_direct_predicate_measures_payloads_without_reading_them() {
+        // SQLite's OP_Column flag for a column read only by length().
+        const OPFLAG_LENGTHARG: i64 = 0x40;
+        let db = temp_db("direct-predicate-plan");
+        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut statement = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN SELECT {} FROM safe_inputs",
+                super::DIRECT_EXECUTES_SQL
+            ))
+            .expect("explain the predicate");
+        let program: Vec<(String, i64)> = statement
+            .query_map(
+                rusqlite::named_params! {
+                    ":batch_submitter": [0_u8; 20].as_slice(),
+                    ":max_direct_payload_bytes": 1024_i64,
+                },
+                |row| Ok((row.get("opcode")?, row.get("p5")?)),
+            )
+            .expect("read the program")
+            .collect::<rusqlite::Result<_>>()
+            .expect("program rows");
+        assert!(
+            program.iter().all(|(opcode, _)| opcode != "Cast"),
+            "{program:?}"
+        );
+        assert!(
+            program
+                .iter()
+                .any(|(opcode, p5)| opcode == "Column" && p5 & OPFLAG_LENGTHARG != 0),
+            "{program:?}"
+        );
+    }
 
     #[test]
     fn negative_batch_size_target_floors_to_zero() {

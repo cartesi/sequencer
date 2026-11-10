@@ -2,8 +2,9 @@
 
 An app plugs into the sequencer by implementing
 [`Application`](../../sequencer-core/src/application/mod.rs). It owns its state,
-including execution progress; the protocol defines how that progress advances.
-The shared execution boundary verifies each successful transition. Application
+including each sender's nonce and its executed-input count; the protocol
+defines how they advance, and the shared executor decides which transactions
+run and verifies each successful transition. Application
 code remains self-trusted: Rust capabilities cannot establish the correctness
 of a native engine, its FFI, or its canonical counterpart
 ([threat model](../threat-model/README.md), "Self-trust").
@@ -19,49 +20,54 @@ a reference wallet integration.
 
 | Method | Contract |
 |---|---|
-| `validate_user_op(sender, op, current_fee) -> Result<ValidationOutcome, AppError>` | Pure predicate: `Accept`, `Reject(InvalidReason)`, or fatal engine failure. No state change. |
-| `apply_valid_user_op(valid, safe_block) -> Result<AppOutputs, AppError>` | Execute and advance embedded progress exactly once on success, using the frame clock. |
-| `apply_direct_input(input) -> Result<AppOutputs, AppError>` | Execute and advance embedded progress exactly once on success, using the input's L1 block. |
-| `progress() -> ApplicationProgress` | Return the count/clock pair from the engine by value. |
+| `user_nonce(sender) -> Result<u32, AppError>` | Report the sender's next nonce, zero for an address that has sent nothing, without changing state. |
+| `apply_user_op(op) -> Result<AppOutputs, AppError>` | Execute a user op found at its sender's next nonce, advancing that nonce and the count by exactly one each. |
+| `apply_direct(direct) -> Result<AppOutputs, AppError>` | Execute a direct, advancing the count by exactly one and moving no nonce. |
+| `executed_input_count() -> ExecutedInputCount` | Report the count ([§4](#4-canonical-history-cursor-executed_input_count)). |
 
-Execution callers use `validate_and_execute_user_op`, `execute_valid_user_op`,
-and `execute_direct_input`. The first enforces `max_fee >= current_fee` before
-app validation and rejects an accepted op at the exhausted nonce `u32::MAX`
-after it. App validation checks the nonce and fee balance; a rejection is not
-persisted. Trusted replay
-uses the stored `ValidUserOp`, whose fee and sender were established at
-inclusion, without validating a second time.
+A transaction reaches the application only through the shared executor,
+[`execute`](../../sequencer-core/src/application/mod.rs), in the canonical
+machine, the lane and every replay alike. It runs a direct always. For a user
+op it reads `user_nonce` and skips the op, changing nothing, when the op's
+nonce is not the sender's next or that next nonce is `u32::MAX`
+([user nonces](#user-nonces)); otherwise it calls `apply_user_op`. A user op
+reaches the application with its sender, signed nonce, the frame's fee
+exponent and the frame's safe block as its block
+([`UserOpTx`](../../sequencer-core/src/l2_tx.rs)); a direct, with its sender,
+inclusion block, input index, timestamp and payload
+([`Direct`](../../sequencer-core/src/l2_tx.rs)). The application keeps no clock;
+the [scheduler clock](scheduler-semantics.md#the-scheduler-clock) is the
+scheduler's.
 
-Before an apply hook, the boundary computes the checked expected successor.
-After `Ok`, it asserts that the engine reports exactly that successor and
-returns the input's pre-execution count as its history offset. An engine may
-use `ApplicationProgress::advance` or implement the same transition natively.
-Adapters report the engine-owned progress rather than maintaining a separate
-count or clock mirror.
-Overflow fails before the hook runs. An error defines no successor: callers
-terminate the execution path and discard the instance, without attempting to
-roll back or inspect partially updated state.
+`apply_user_op` never refuses: whatever the op does or pays, even a fee the
+sender cannot cover, it executes. Charging what the sender has, a saturating
+subtraction, is the recommendation; the wallet charges the smaller of the fee
+and the balance and credits the sequencer with exactly that amount.
 
-`Application::max_method_payload_bytes()` returns the engine's stable method
-payload bound without constructing an instance. Zero permits only empty method
-payloads. HTTP rejects oversized method payloads; the lane uses the declared
-bound plus signed-op metadata to compute batch capacity. It is not a canonical
-scheduler rejection rule.
+Before an apply hook, the executor computes the checked successor of the
+count. After `Ok`, it asserts that the engine reports exactly that successor
+and, for a user op, that the sender's nonce advanced by exactly one, and it
+returns the pre-execution count as the transaction's history offset. An engine
+may use `ExecutedInputCount::advance` or implement the same transition
+natively. Adapters report the engine-owned count rather than maintaining a
+separate mirror. Overflow fails before the hook runs. An error defines no
+successor: callers terminate the execution path and discard the instance,
+without attempting to roll back or inspect partially updated state.
 
 ## Cross-cutting contracts
 
 ### 1. Determinism & purity
 
-Execution must be deterministic over `(input, current state)`, including output
-bytes and their order. Do not depend on wall time, randomness, pointer values,
-nondeterministic iteration, or host-specific arithmetic in consensus paths.
-Validation is read-only even though it may run on a different schedule during
-live execution, canonical execution, and replay. State changes happen through
-apply hooks; dump creation may change backing resources but preserves logical
-state.
+Execution must be deterministic over `(transaction, current state)`, including
+output bytes and their order. Do not depend on wall time, randomness, pointer
+values, nondeterministic iteration, or host-specific arithmetic in consensus
+paths. `user_nonce` and admission are read-only, and they run on a different
+schedule during live execution, canonical execution, and replay. State changes
+happen through apply hooks; dump creation may change backing resources but
+preserves logical state.
 
-Wrapping an existing engine must preserve its transaction encoding,
-rejection/inclusion semantics, and canonical state bytes.
+Wrapping an existing engine must preserve its transaction encoding, inclusion
+semantics, and canonical state bytes.
 
 `Application: Send + Sized` permits moving the engine to the lane's blocking
 worker. It requires neither `Sync` nor `Clone`: the lane owns one mutable
@@ -74,88 +80,99 @@ rules.
 
 These outcomes have different protocol meanings:
 
-- A validation rejection changes no state, consumes no nonce or fee, and is
-  not persisted. `InvalidReason` covers nonce mismatch, an exhausted nonce,
-  insufficient max fee, and insufficient fee balance.
-- A successfully applied input is included even if the business operation
-  fails or is ignored. It advances progress, and an included user op consumes
-  its sender's nonce ([below](#user-nonces)). The wallet also charges the fee
-  for a malformed method or failed transfer after validation; malformed direct
-  inputs are included no-ops. These semantics must agree with the canonical
-  application.
-- `AppError`, whether `Internal` or `Io`, is fatal in validation and execution.
-  It must not be disguised as a client rejection or an included no-op.
-  Fatal here means discarding the engine: the host still distinguishes a
-  terminal `Internal` fault from an operational I/O failure that may clear
-  after restart.
+- A **skipped** user op, one the executor finds at the wrong nonce, changes
+  no state and consumes no nonce or fee. A **refused** op, one the lane turns
+  away at `POST /tx` ([§3](#3-admission--policy-never-consensus)), is never
+  included. Neither is persisted.
+- An **executed** transaction is included even if the business operation
+  fails, is ignored, or cannot pay its whole fee. It advances the count, and an
+  executed user op consumes its sender's nonce ([below](#user-nonces)). The
+  wallet also charges the fee for a malformed method or failed transfer;
+  malformed direct inputs are included no-ops. These semantics must agree with
+  the canonical application.
+- `AppError`, whether `Internal` or `Io`, is fatal in every method. It must not
+  be disguised as a refusal or an included no-op. Fatal here means discarding
+  the engine: the host still distinguishes a terminal `Internal` fault from an
+  operational I/O failure that may clear after restart.
 
-Every input executed successfully live must execute successfully against the
-same prior state on replay. The sequencer persists included inputs and replays
-them on restart. It does not recover an instance after a failed hook.
+Every transaction executed live must execute against the same prior state on
+replay. The sequencer persists included transactions and replays them on
+restart through the same executor, without admission. A stored user op the
+executor skips on replay, or a live op it skips after the lane's pre-check
+passed, is an impossible state: the lane stops with a terminal error. It does
+not recover an instance after a failed hook.
 
 #### User nonces
 
-Every application follows one nonce rule. The sequencer relies on it:
-`GET /nonce` derives a sender's next nonce from the user ops it persisted,
-without asking the engine.
+Every application follows one nonce rule, and the executor applies it the same
+way for all of them. The sequencer relies on it: `GET /nonce` derives a
+sender's next nonce from the user ops it persisted, without asking the engine.
 
 - A genesis state starts every account at nonce 0.
-- Validation accepts an op only when its nonce equals the sender's expected
-  nonce.
-- Each included user op, business failures included, advances its sender's
-  expected nonce by exactly one. Nothing else changes a nonce: not direct
-  inputs, not other senders' ops.
+- The executor runs an op only when its nonce equals the sender's next nonce,
+  as `user_nonce` reports it.
+- Each executed user op, business failures and unpaid fees included, advances
+  its sender's next nonce by exactly one, which the executor asserts. Nothing
+  else changes a nonce: not direct inputs, not other senders' ops. The executor
+  cannot check a direct's side, since it cannot enumerate the senders a direct
+  might touch.
 - Nonces are `u32`. `u32::MAX` has no successor, so an account that reaches
-  it is exhausted: when app validation accepts an op at `u32::MAX`, the shared
-  execution boundary rejects it (`NonceExhausted`). Any other op carrying
-  `u32::MAX` fails app validation with the expected nonce.
+  it is exhausted: the executor skips its op at `u32::MAX`
+  (`NonceExhausted`). Any other op carrying `u32::MAX` is skipped as a wrong
+  nonce.
 
-Under this rule a sender's expected nonce is one past its latest included op.
-The exception is a sender with no surviving op since the era baseline. A
-genesis baseline puts it at 0, but a [rebuilt baseline](../recovery/cockroach.md)
+Under this rule a sender's next nonce is one past its latest included op. The
+exception is a sender with no surviving op since the era baseline. A genesis
+baseline puts it at 0, but a [rebuilt baseline](application-history.md#era-baseline)
 carries nonces the rebuilt database has no ops for, so `GET /nonce` reads 0
 until that sender's first op, and again if a later recovery invalidates all of
-its post-rebuild ops. An engine outside the rule (gapped or keyed
-nonces, a deposit that resets one) makes `GET /nonce` quote nonces the engine
-rejects.
+its post-rebuild ops. An engine outside the rule (gapped or keyed nonces, a
+deposit that resets one) makes `GET /nonce` quote nonces the lane refuses.
 
 The rule keeps every account's nonce in state forever. A batch-scoped
 alternative makes replay state prunable and lets the fee move to the batch; it
 is a [deferred design](../plans/2026-10-batch-scoped-replay-protection.md).
 
-### 3. The safe-block clock — `last_executed_safe_block`
+### 3. Admission — policy, never consensus
 
-The clock is the maximum block carried by an executed input: frame `safe_block`
-for user ops, L1 inclusion block for directs, or zero at genesis. On success,
-the engine advances it with `max(old_clock, input_clock)`. Input clocks are
-not monotone: [gate d](scheduler-semantics.md#processing-an-input) orders
-frame clocks only within a batch, so after faulty sequencing a later batch's
-user ops may run at a `safe_block` below an earlier input's clock, by less than
-`MAX_WAIT_BLOCKS` since gate e bounds a batch's age (a direct never runs below
-the stored clock); the `max` keeps the stored clock monotone. Count zero
-implies clock zero. Both fields survive checkpoint round-trips.
+Admission answers whether the operator wants an op. Only the sequencer's lane
+asks: the canonical machine never does, a guest build need not link it, and
+its answer never changes what an included op does
+([a user op's fate](scheduler-semantics.md#a-user-ops-fate)).
 
-The [frame-clock policy](scheduler-semantics.md#sequencer-frame-clock-policy)
-may deliver a delayed head jump as one step. Newly covered directs execute
-first with their exact inclusion blocks; all user ops in the frame receive
-the same frame clock. An empty clock-only frame does not execute an input or
-advance the app clock.
+| Method | Contract |
+|---|---|
+| `admit_user_op(sender, op, fee) -> Result<Admission, AppError>` | Say, without changing state and without checking the nonce, whether the operator wants the op at this fee exponent. |
+| `max_method_payload_bytes() -> usize` | Return the engine's stable method payload bound without constructing an instance. |
+| `scheduler_limits() -> SchedulerLimits` | Return the fridge bound and direct payload cap the application's template compiles in. |
 
-Recovery reads this clock as `A`, the safe block reflected in the checkpoint;
-a wrong clock mis-defines the reconstructed `(A, B]` fridge range
-([cockroach recovery](../recovery/cockroach.md)).
+The lane checks a live op with
+[`check_live_user_op`](../../sequencer-core/src/application/mod.rs), in the
+order whose texts clients see: the fee cap against the frame's price, then the
+executor's own nonce rule, then `admit_user_op`. A refusal is the `POST /tx`
+422, with the refusal's text as its body. `Underfunded` covers a sender who
+cannot pay the frame fee; `Other` carries any other policy, its text verbatim.
+The wallet refuses only underfunded ops.
+
+A zero method payload bound permits only empty method payloads. HTTP rejects
+oversized method payloads; the lane uses the declared bound plus signed-op
+metadata to compute batch capacity. It is not a canonical scheduler rule. The
+scheduler limits are canonical: the [fridge](scheduler-semantics.md#the-fridge)
+admits by them, and the lane drops the same oversized directs.
 
 ### 4. Canonical history cursor: `executed_input_count`
 
-The count is the next application-history offset, never a SQLite cursor.
-An input executed at count `X` returns offset `X` and advances to `X + 1`.
-Included no-ops count; rejections, merely queued inputs, envelopes, and empty
-batches do not. Arithmetic is checked, never wrapping or saturating.
+The count is the next application-history offset, never a SQLite cursor. It
+counts executed L2 transactions, not L1 inputs. A transaction executed at
+count `X` returns offset `X` and advances it to `X + 1`. Included no-ops count;
+skipped ops, refusals, queued or dropped directs, envelopes, and empty batches
+do not ([what counts](scheduler-semantics.md#what-counts)). Arithmetic is
+checked, never wrapping or saturating.
 
 The count belongs to the checkpoint's logical state. Standard recovery may
-roll it back to a retained prefix and then advance over replacement inputs;
-cockroach recovery supplies an absolute starting count from the recovered
-engine. SQLite stores an independent expected snapshot count and per-input
+roll it back to a retained prefix and then advance over replacement inputs; a
+recovery from a canonical machine starts at that machine's count
+([§7](#7-canonical-recovery-integration)). SQLite stores an independent expected snapshot count and per-input
 execution offsets, checked during catch-up.
 
 HTTP snapshot metadata and mandatory WS claims carry the history version and
@@ -217,9 +234,9 @@ checkpoint and must not depend on the process:
   which may become a file or directory. On `Ok`, all files and directory
   entries referencing them, including the parent of `prefix`, must be durable
   against an immediate kernel crash. SQLite references the checkpoint only
-  after this returns. The live logical state and progress stay unchanged;
+  after this returns. The live logical state and its count stay unchanged;
   subsequent execution cannot mutate the checkpoint.
-- `from_dump(prefix)` restores equivalent logical state, including progress,
+- `from_dump(prefix)` restores equivalent logical state, including the count,
   into an independent mutable engine. Execution cannot change the source
   checkpoint or another restored instance. The restored engine must remain
   usable after the source checkpoint is garbage-collected.
@@ -244,38 +261,33 @@ a broken referenced checkpoint versus a retryable storage failure.
 
 Genesis construction stays on the concrete engine because its inputs vary by
 implementation. `CanonicalState::canonical_snapshot_bytes` is a separate
-inspection trait required by the shared Rust scheduler's inspection method and
-canonical harness, not by the native sequencer. Human-readable debugging state
+inspection trait required by `CanonicalRunner::inspect` and the canonical
+harness, not by the native sequencer. Human-readable debugging state
 also stays on the concrete application.
 
 ### 7. Canonical recovery integration
 
-Every supported production application must provide a reproducible mapping from
-a trusted canonical machine checkpoint and pinned deployment configuration to
-its native recovery artifact. All logical state needed for future application
-execution, including progress, must be recoverable this way. Native caches and
-backing resources may be reconstructed; indispensable mutable application state
-cannot exist only in the sequencer's local storage.
+Every supported production application must rebuild its native instance from
+a trusted canonical machine. `from_canonical_state(state_file, count)` builds
+an instance from the machine's comparison bytes, read through the deployment's
+state source, at the machine's executed-input count, which the machine's
+`scheduler` report carries with the rest of the scheduler's state
+([state export](scheduler-semantics.md#state-export)). A dump of the result
+holds the same comparison bytes. The count is passed in because an
+application's bytes need not hold it; the wallet's do, and it refuses a file
+whose count differs.
 
-For the native DEX integration, the native application state is the designated
-canonical machine drive/memory region. The integration must pin its location,
-layout, and extraction procedure for each supported image. Other applications
-may require a different mapping. The recovery bundle also needs the exact L1
-boundary and next scheduler nonce, obtained from trusted canonical execution;
-these are separate from merely extracting application bytes.
-The exporter must also verify the canonical pending-direct queue satisfies
-[checkpoint eligibility](../recovery/cockroach.md#checkpoint-eligibility).
-An accurate application clock and `A < B` do not prove that condition after
-faulty sequencing. Current images export neither the queue nor the nonce; the
-eligibility section says how to derive both from the input prefix.
+So all logical state needed for future execution lives in the comparison
+bytes. Native caches and backing resources may be rebuilt, but indispensable
+mutable application state cannot exist only in the sequencer's local storage.
+For the native DEX integration, the comparison bytes are the designated
+canonical machine drive or memory region; the integration pins its location
+and layout for each supported image.
 
-Each integration supplies a versioned export command and operator procedure,
-and demonstrates recovery from a non-genesis canonical checkpoint before
-production use. The [recovery readiness requirements](../recovery/cockroach.md#recovery-readiness-before-deployment)
-own the procedure and drill. This is an integration/release requirement, not a
-claim that the private engine or current tooling has passed it.
-
-Canonical extraction belongs to application-specific recovery tooling. The
-runtime `Application` trait stays independent of machine image layouts and host
-export tooling; requiring a method to compile would establish its availability,
-not the correctness or operational readiness of the recovery path.
+The sequencer's recovery from a canonical machine arrives with `setup --base`
+([recovery plan](../plans/2026-11-sequencer-recovery/README.md)). Until then,
+each integration's conformance tests check the projection, and no end-to-end
+test recovers a sequencer from a machine.
+The runtime `Application` trait stays independent of machine image layouts and
+host tooling: reading the state source and the `scheduler` report is the
+host's work.

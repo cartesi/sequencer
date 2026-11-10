@@ -143,13 +143,12 @@ regression; the watchdog idles.
 submitter key ([restart policy](operator-deployment.md#sequencer-restart-policy)),
 and fix the bug. Then rebuild the sequencer with
 [cockroach recovery](../recovery/cockroach.md) from a trusted canonical
-checkpoint: `incident/canonical` at B (or step 2's `replay --out` directory
-when `incident/canonical` is absent), or the head at P. `setup --recovery`
-loads a native bundle, not a machine: export one with the application's
-rehearsed exporter and check its
-[eligibility](../recovery/cockroach.md#checkpoint-eligibility) first
-([obtaining the artifact](../recovery/cockroach.md#obtaining-the-recovery-artifact)).
-Resume the sequencer, realign affected readers
+machine: `incident/canonical` at B (or step 2's `replay --out` directory
+when `incident/canonical` is absent), or the head at P. This build has no
+rebuild command; it arrives with `setup --base`
+([Recovering the sequencer](../plans/2026-11-sequencer-recovery/operations.md)),
+and until then the sequencer stays stopped and the latch stays. After the
+rebuild, resume the sequencer, realign affected readers
 ([reader state](../recovery/cockroach.md#application-specific-reader-state)),
 then clear the latch:
 
@@ -191,8 +190,7 @@ gas estimation, and every recovery cycle sends a few no-op flush transactions.
 | Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong non-genesis bootstrap latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
-| Sequencer wrong: the rebuild | `setup_recovery_round_trip_test` (and its C-host twin) in `just test-rollups-e2e` | `setup --recovery` from a sequencer archive, resumed sequencing, and a watchdog comparison after the new era's first accepted batch |
-| Sequencer wrong: export and readers | none yet; [sequencer recovery](../plans/2026-11-sequencer-recovery/todo.md#build) plans them | a rebuild that starts from a machine, and reader realignment |
+| Sequencer wrong: the rebuild and readers | none yet; [sequencer recovery](../plans/2026-11-sequencer-recovery/todo.md#build) plans them | a rebuild that starts from a machine, resumed sequencing, a watchdog comparison after the new era's first accepted batch, and reader realignment |
 | Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 

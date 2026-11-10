@@ -65,7 +65,7 @@ This section is the map.
 
 Scheduler-acceptance semantics exist in exactly three implementations that must agree:
 
-1. the canonical fold — `Scheduler<A>` ([`sequencer-core/src/scheduler/mod.rs`](sequencer-core/src/scheduler/mod.rs)), the same source compiled into the on-chain machine and driven bare-metal by the recovery fold;
+1. the canonical scheduler — `Scheduler` ([`sequencer-core/src/scheduler/mod.rs`](sequencer-core/src/scheduler/mod.rs)), driven with the executor by `CanonicalRunner` ([`scheduler/driver.rs`](sequencer-core/src/scheduler/driver.rs)): the same source the on-chain machine compiles;
 2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), which feeds `safe_accepted_batches`;
 3. the inclusion lane's live prediction (drain + execution order).
 
@@ -75,7 +75,7 @@ the others.
 
 Two mechanical facts the agreement rests on:
 
-- **Drain attribution.** Accumulated newly-safe directs land in the clock-advanced frame — frame K reads "directs ≤ S_K, then user ops validated on top", exactly the scheduler's drain-before-ops rule ([I2](docs/invariants.md)).
+- **Drain attribution.** Accumulated newly-safe directs land in the clock-advanced frame — frame K reads "directs ≤ S_K, then the frame's user ops", exactly the scheduler's drain-before-ops rule ([I2](docs/invariants.md)).
 - **Empty batches are never stale and consume the nonce** (no first frame to measure staleness against). Consistent across all implementations, test-pinned.
 
 ## Batch Staleness and Recovery
@@ -92,10 +92,10 @@ so invalidation cascades through the suffix, open batch included
   danger detector stops the process at a threshold before staleness, and startup
   settles outstanding submissions and replaces the invalid suffix
   ([automatic recovery](docs/recovery/README.md)).
-- **Cockroach recovery** (`setup --recovery`) rebuilds a fresh data directory from
-  a trusted canonical checkpoint and L1 history, including after a sequencer bug
-  ([cockroach recovery](docs/recovery/cockroach.md)). Its successor for the
-  next template is proposed in [sequencer recovery](docs/plans/2026-11-sequencer-recovery/README.md).
+- **Cockroach recovery** rebuilds a fresh data directory from a trusted
+  canonical machine and L1 history, including after a sequencer bug. This
+  build has no manual rebuild: it arrives with `setup --base`, designed in
+  [sequencer recovery](docs/plans/2026-11-sequencer-recovery/operations.md).
 
 ## Threat Model (brief)
 
@@ -117,7 +117,7 @@ signing, and SSZ batch encoding.
 ### Workspace
 
 - `sequencer/` — sequencer **library** (no binary). App crates compose it into a binary.
-- `sequencer-core/` — shared domain types (`Application`, `SignedUserOp`, `SequencedL2Tx`, `Batch`, `Frame`).
+- `sequencer-core/` — the canonical scheduler, the executor and shared domain types (`Application`, `SignedUserOp`, `L2Tx`, `Batch`, `Frame`).
 - `examples/app-core/` — placeholder wallet app implementing the `Application` trait.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
 - `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
@@ -141,7 +141,7 @@ Paths below are relative to `sequencer/src/`:
 - `ingress/` — public HTTP handlers and the single inclusion lane.
 - `egress/` — internal HTTP/WS API and DB-backed application-input feed.
 - `l1/` — safe-input reader, batch submitter, fee oracle, shared EIP-1559 estimation, and provider access.
-- `recovery/` — automatic startup repair, danger detector, and mempool flusher; the manual rebuild lives in `commands/setup/`.
+- `recovery/` — automatic startup repair, danger detector, and mempool flusher.
 - `storage/` — each writer role's persistence operations, shared queries, and schema.
 - `http.rs` and `clock.rs` — shared HTTP errors/server setup and the crate-wide wall clock. `L1Config` lives in `l1/`.
 
@@ -160,19 +160,19 @@ Paths below are relative to `sequencer/src/`:
 - API validates the EIP-712 signature and enqueues a `SignedUserOp`. Method payload decoding happens during application execution, not at ingress.
 - **Deposits are direct-input-only** (L1 → L2) and must not be represented as user ops.
 - **InputBox payload classification** is by authenticated sender, never by a tag byte: the batch submitter's inputs are batches; any other sender's are direct inputs, stored verbatim ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
-- A rejected user op changes no state and is not persisted; the [application contract](docs/protocol/application-contract.md) owns which layer produces each rejection. The charge is a "fee", not "gas": it tracks DA.
+- The lane refuses a live user op through `sequencer_core::application::check_live_user_op` (fee cap, nonce, then the application's `admit_user_op`); a refused op changes no state and is not persisted. An included op always executes at its sender's next nonce, even when its sender cannot pay the fee in full ([application contract](docs/protocol/application-contract.md)). The charge is a "fee", not "gas": it tracks DA.
 - **The user-nonce rule is contract, not wallet detail** ([user nonces](docs/protocol/application-contract.md#user-nonces)); `GET /nonce` relies on it instead of asking the app.
 - **EIP-712 domain:** both sides build it with `sequencer_core::build_input_domain` ([user-op signatures](docs/protocol/scheduler-semantics.md#user-op-signatures)); setup pins the chain id and app address, validating the chain id against RPC.
 
 ## Application Trait Contract
 
-The [application contract](docs/protocol/application-contract.md) owns the `Application` trait; the [C binding guide](docs/protocol/c-application-binding.md) maps it to native engines. Two rules carry the duality: **any input that succeeded live must succeed on replay** (`AppError` is fatal and defines no canonical successor), and the inclusion lane, canonical scheduler, catch-up, and recovery fold execute inputs only through the shared boundary in `sequencer_core::application`, which checks the engine's reported progress.
+The [application contract](docs/protocol/application-contract.md) owns the `Application` trait; the [C binding guide](docs/protocol/c-application-binding.md) maps it to native engines. Two rules carry the duality: **any input that succeeded live must succeed on replay** (`AppError` is fatal and defines no canonical successor), and the inclusion lane, the canonical runner, catch-up and setup execute transactions only through `sequencer_core::application::execute`, which decides whether a user op runs (its nonce) and checks the count and nonce the engine reports afterwards.
 
 ## Type Boundaries
 
 - `SignedUserOp` — ingress/API signature domain (post-validation, pre-execution).
-- `ValidUserOp` — application execution domain (after validation boundary).
-- `SequencedL2Tx` — application input payload sum (`UserOp | DirectInput`).
+- `UserOpTx` — a user op as the application executes it: the recovered sender, its signed nonce, the frame's fee and safe block.
+- `L2Tx` — what the scheduler hands out and the executor takes (`Direct | UserOp`).
 - `ExecutedInputCount` — canonical application-history boundary (`X` means the
   next input is entry `X`), never a SQLite cursor. Checked arithmetic only.
 - `ApplicationInputRow` — crate-private pairing of a mandatory application offset
@@ -201,7 +201,7 @@ changing configuration.
 
 - Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::history`).
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
-- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a recovery boot, a retry, `setup --recovery`).
+- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a recovery boot, a retry, a setup refusal).
 - Avoid introducing heavy dependencies without strong reason.
 - **Impossible states fail loud; they are never handled or absorbed.** The [check policy](docs/invariants.md#the-check-policy-fail-loud) owns the decision test and its reasons; [Self-trust](docs/threat-model/README.md#self-trust) owns the trust boundary.
 
@@ -336,7 +336,7 @@ work reaches another boundary.
 | Inclusion lane, storage writes, or runtime concurrency | [Invariant register](docs/invariants.md) — enforcement and consumers; [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md) — ownership, acknowledgement, admission, and terminal stop. |
 | Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
 | Automatic recovery or danger detection | [Automatic recovery](docs/recovery/README.md), then [preemptive.tla](docs/recovery/preemptive.tla) and [admission.tla](docs/recovery/admission.tla) — repair ordering and the models' bounded guarantees. |
-| Manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — trusted checkpoint, fixed input boundary, and fresh baseline. |
+| Manual rebuild after lost state or a sequencer bug | [Sequencer recovery operations](docs/plans/2026-11-sequencer-recovery/operations.md) — the planned `setup --base`; this build has none. |
 | API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |

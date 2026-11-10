@@ -1,13 +1,13 @@
 # Application history and replay
 
-Application history is the sequencer's current execution order: included user
+Application history is the sequencer's current execution order: executed user
 operations and external direct inputs. It contains an optimistic suffix that
 recovery may replace. A stable offset identifies an input only together with
 its history version; receiving it does not establish L1 acceptance.
 
 This document owns history coordinates, recovery boundaries, and replica
 bootstrap. The [Application contract](application-contract.md) owns execution
-and progress; the [snapshot lifecycle](../snapshots/lifecycle.md) owns artifact
+and the count; the [snapshot lifecycle](../snapshots/lifecycle.md) owns artifact
 publication, selection, and retention; the [README API](../../README.md#api)
 owns routes, wire fields, and refusal codes.
 
@@ -17,33 +17,35 @@ These facts answer different questions:
 
 | Fact | Meaning |
 |---|---|
-| `ExecutedInputCount` | Number of application inputs already executed. At count `N`, entry `N` executes next. |
-| `ApplicationProgress.last_executed_safe_block` | Maximum clock carried by an executed input: frame safe block for user ops, inclusion block for directs. |
+| `ExecutedInputCount` | Number of L2 transactions already executed; at count `N`, entry `N` executes next. |
 | Latest surviving frame's `safe_block` | Complete L1 interval accounted for by local ordering, bounded below by the era baseline. |
 | `safe_accepted_batches` | Safe L1 landings accepted by the scheduler rules and matched to local sealed bytes. |
 
 A frame can account for an empty interval or only batch envelopes, advancing
 L1 accounting without executing an application input. An accepted batch can
 confirm existing execution without adding an input. Empty batches can share
-an application count. Neither the count nor the app clock substitutes for the
-L1 accounting boundary or acceptance facts. Nor does the clock identify a
-position: every op of a frame shares it, it can lag the L1 boundary without
-limit, and input clocks are not monotone
-([application contract](application-contract.md#3-the-safe-block-clock--last_executed_safe_block)).
+an application count. The count substitutes for neither the L1 accounting
+boundary nor the acceptance facts.
 
 `safe_inputs` retains all InputBox observations, including batch envelopes.
 `application_inputs` contains only the current ordered application sequence;
 each row has a mandatory pre-execution offset, an owning batch/frame, and
 exactly one reference to a user op or external direct input. Payloads remain
-in those source tables. Included business failures and malformed-direct no-ops
-advance the count; validation rejections and envelopes do not.
+in those source tables. Included business failures, underfunded ops and
+malformed-direct no-ops advance the count; refusals and envelopes do not. A
+direct whose payload is over the application's cap never executes, as in the
+[canonical fridge](scheduler-semantics.md#the-fridge), so it gets no row and no
+offset: one storage predicate filters it from every query that enumerates
+directs to execute.
 
-Restart and egress read this same sequence. Replay executes stored valid
-user ops with their recorded fee and frame clock, without revalidation;
-directs use their original inclusion block. Timestamps and transaction hashes
-are provenance, not extra application-transition inputs. The
+Restart and egress read this same sequence. Replay runs each stored user op
+through the shared executor with its recorded fee and frame safe block, without
+admission; the executor's nonce check still runs, and a stored op it skips is
+an impossible state that stops the lane. A direct replays with its inclusion
+block, input index and timestamp, which are application inputs. Transaction
+hashes are provenance, not transition inputs. The
 [execution contract](application-contract.md#the-execution-methods) defines the
-shared execution boundary.
+shared executor.
 
 ## Identity and available history
 
@@ -102,7 +104,7 @@ another recovery wins the race with subscription, query again using that saved
 version. A stale response cannot weaken WS admission. The query proves prefix
 preservation under standard recovery's trusted local bookkeeping; it does not
 inspect client state or establish trust after a software bug. A new era requires
-the [manual projection recovery procedure](projection-replay.md#client-checkpoints),
+a [bootstrap from the era's L1 prefix](projection-replay.md#bootstrap-and-handoff),
 which the proposed [sequencer recovery](../plans/2026-11-sequencer-recovery/operations.md#the-clients-playbook)
 replaces.
 
@@ -114,13 +116,10 @@ history identity. Ordinary direct ordering and accepted-batch scanning begin
 after `C`. The baseline's metadata survives root invalidation and artifact GC;
 no padding inputs or separate mutable processing cursor represent its prefix.
 
-Cockroach recovery drains queued directs through `C`, including young directs
-that the canonical scheduler has not executed yet. Its output is a stable
-restart baseline; its bytes need not equal canonical state at block `C`.
-A later accepted batch snapshot supplies the first comparison checkpoint in that era.
-Genesis supplies the trusted block-zero comparison state. The
-[rebuild guide](../recovery/cockroach.md) owns checkpoint requirements and the
-fixed stopping boundary.
+Plain setup publishes the genesis baseline: count 0, stop block 0 and batch
+nonce 0, and genesis supplies the trusted block-zero comparison state. A
+baseline at a later stop block is a rebuilt one, which a recovery from a
+canonical machine publishes; that recovery arrives with `setup --base`.
 
 ## Consumers of checkpoints
 

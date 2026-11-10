@@ -4,8 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use sequencer_core::application::{ExecutionOutcome, validate_and_execute_user_op};
+use sequencer_core::application::check_live_user_op;
 use sequencer_core::history::{HistoryVersion, RecoveryGeneration};
+use sequencer_core::l2_tx::UserOpTx;
 use sequencer_core::user_op::SignedUserOp;
 use sequencer_rust_client::{
     HistoryPolicyError, HistoryReadError, SubscribeError, SubscribeStream,
@@ -74,13 +75,11 @@ fn append_transfer(
         .as_ssz_bytes()
         .into(),
     };
-    let outcome =
-        validate_and_execute_user_op(app, signer.address(), &op, head.frame_fee, head.safe_block)
-            .unwrap();
-    let ExecutionOutcome::Included(execution) = outcome else {
-        panic!("fixture transfer rejected: {outcome:?}")
-    };
-    history.extend(notices(execution.outputs));
+    let refusal = check_live_user_op(app, signer.address(), &op, head.frame_fee).unwrap();
+    assert_eq!(refusal, None, "fixture transfer refused");
+    let tx = UserOpTx::new(signer.address(), &op, head.frame_fee, head.safe_block);
+    let (offset, outputs) = execute_done(app, &L2Tx::UserOp(tx));
+    history.extend(notices(outputs));
     let (respond_to, _response) = oneshot::channel();
     let included = IncludedUserOp {
         pending: PendingUserOp {
@@ -94,7 +93,7 @@ fn append_transfer(
             respond_to,
             received_at: SystemTime::now(),
         },
-        executed_input_offset: execution.offset,
+        executed_input_offset: offset,
     };
     storage
         .append_executed_user_ops_chunk(head, &[included])
@@ -149,7 +148,12 @@ fn recover_tip(storage: &mut Storage, head: &mut WriteHead, safe_block: u64) {
         .append_safe_inputs(safe_block, &[], SUBMITTER, &protocol)
         .unwrap();
     let invalidated = storage
-        .recover_aging_tip_for_recovery(head.batch_index, &protocol, crate::clock::unix_now_ms())
+        .recover_aging_tip_for_recovery(
+            head.batch_index,
+            &protocol,
+            crate::clock::unix_now_ms(),
+            WalletApp::scheduler_limits().max_direct_payload_bytes,
+        )
         .unwrap();
     assert_eq!(invalidated, vec![head.batch_index]);
     *head = storage.open_state().unwrap().unwrap();
@@ -177,18 +181,16 @@ async fn replay_one(stream: &mut SubscribeStream, app: &mut WalletApp, history: 
     else {
         panic!("expected transfer")
     };
-    assert_eq!(offset, app.executed_input_count().get());
-    let op = UserOp {
+    let tx = UserOpTx {
+        sender: sender.parse().unwrap(),
         nonce,
-        max_fee: fee,
-        data: alloy_primitives::hex::decode(data).unwrap().into(),
+        fee,
+        block: safe_block,
+        data: alloy_primitives::hex::decode(data).unwrap(),
     };
-    let outcome =
-        validate_and_execute_user_op(app, sender.parse().unwrap(), &op, fee, safe_block).unwrap();
-    let ExecutionOutcome::Included(execution) = outcome else {
-        panic!("feed transfer rejected: {outcome:?}")
-    };
-    history.extend(notices(execution.outputs));
+    let (executed_at, outputs) = execute_done(app, &L2Tx::UserOp(tx));
+    assert_eq!(executed_at.get(), offset);
+    history.extend(notices(outputs));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -231,24 +233,29 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
         )
         .unwrap();
     let mut executions = Vec::new();
-    for (index, direct) in directs.into_iter().enumerate() {
-        let execution = execute_direct_input(
-            &mut app,
-            &DirectInput {
-                sender: direct.sender,
-                payload: direct.payload,
-                block_number: direct.block_number,
-            },
-        )
-        .unwrap();
-        history.extend(notices(execution.outputs));
+    for (input_index, direct) in (0_u64..).zip(directs) {
+        let tx = L2Tx::Direct(Direct {
+            input_index,
+            sender: direct.sender,
+            block: direct.block_number,
+            timestamp: direct.block_timestamp,
+            payload: direct.payload,
+        });
+        let (offset, outputs) = execute_done(&mut app, &tx);
+        history.extend(notices(outputs));
         executions.push(DirectInputExecution {
-            safe_input_index: index as u64,
-            executed_input_offset: execution.offset,
+            safe_input_index: input_index,
+            executed_input_offset: offset,
         });
     }
     storage
-        .close_frame_only_with_executions(&mut head, 10, SafeInputRange::new(0, 2), &executions)
+        .close_frame_only_with_executions(
+            &mut head,
+            10,
+            SafeInputRange::new(0, 2),
+            WalletApp::scheduler_limits().max_direct_payload_bytes,
+            &executions,
+        )
         .unwrap();
     append_transfer(&mut storage, &mut head, &mut app, &mut history, &signer, 10);
     close_and_accept(&mut storage, &mut head, &mut app, dumps.path(), 20);

@@ -752,9 +752,10 @@ mod tests {
 
     #[test]
     fn sim_accepted_foreign_batch_freezes_frontier_with_divergence_marker() {
-        // `scheduler_accepts` deliberately omits the two structural
-        // rejections (future safe_block, non-monotonic frames) under
-        // self-trust — the sequencer never produces them. Before the
+        // `scheduler_accepts` deliberately omits the canonical scheduler's
+        // structural rejections (a frame safe_block not below the inclusion
+        // block, non-monotonic frames) under self-trust — the sequencer never
+        // produces them. Before the
         // content-identity check, such a foreign batch at the
         // expected nonce would be sim-accepted and silently desync the
         // frontier forever. With the check, it fails the local-batch lookup

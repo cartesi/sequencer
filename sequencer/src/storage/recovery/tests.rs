@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, all_ordered_l2_txs, default_protocol_timing, local_batch_payload,
-    make_stale_batch_payload, open_temp_storage, seed_closed_batches,
-    seed_safe_inputs_with_batch_nonces,
+    RecoveryFixture, SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, all_ordered_l2_txs,
+    default_protocol_timing, local_batch_payload, make_stale_batch_payload, open_temp_storage,
+    seed_closed_batches, seed_safe_inputs_with_batch_nonces,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use crate::storage::{DirectInputExecution, ExecutedInputCount, SafeInputRange, Storage};
 use alloy_primitives::Address;
-use sequencer_core::l2_tx::SequencedL2Tx;
+use sequencer_core::l2_tx::L2Tx;
 use sequencer_core::protocol::ProtocolTiming;
 
 fn generation_cuts(storage: &Storage) -> Vec<(i64, i64)> {
@@ -79,7 +79,11 @@ mod guarded_phases {
         assert_eq!(open_tip_count(&storage), 0);
 
         storage
-            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .ensure_open_tip_for_recovery(
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect("clean no-Tip facts authorize one Tip");
         assert_eq!(open_tip_count(&storage), 1);
     }
@@ -93,7 +97,11 @@ mod guarded_phases {
             .expect("a stale phase opened the Tip");
 
         let error = storage
-            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .ensure_open_tip_for_recovery(
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("missing finalized state must outrank the stale Tip decision");
         assert!(matches!(
             error,
@@ -109,7 +117,11 @@ mod guarded_phases {
         crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 0);
 
         let error = storage
-            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .ensure_open_tip_for_recovery(
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("divergence must outrank Tip creation");
         assert!(matches!(
             error,
@@ -126,7 +138,11 @@ mod guarded_phases {
             .expect("a competing phase opened the Tip");
 
         let error = storage
-            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .ensure_open_tip_for_recovery(
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("an unexpected open Tip must be rejected");
         assert!(matches!(error, RecoveryMutationError::TipAlreadyOpen));
         assert_eq!(open_tip_count(&storage), 1);
@@ -160,7 +176,11 @@ mod guarded_phases {
         let mut storage = Storage::open(db.path.as_str()).expect("reopen");
 
         let error = storage
-            .ensure_open_tip_for_recovery(&protocol, crate::clock::unix_now_ms())
+            .ensure_open_tip_for_recovery(
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("a phase that leaves no Tip must refuse, not commit");
         assert!(
             matches!(error, RecoveryMutationError::TipMissingAfterOpen),
@@ -207,7 +227,12 @@ mod guarded_phases {
         crate::storage::test_helpers::record_canonical_divergence(&mut storage, 0, 0);
 
         let error = storage
-            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .recover_post_flush_for_recovery(
+                1_201,
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("divergence must refuse before lag");
         assert!(matches!(
             error,
@@ -222,7 +247,12 @@ mod guarded_phases {
         let protocol = default_protocol_timing();
 
         let error = storage
-            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .recover_post_flush_for_recovery(
+                1_201,
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("lagging post-flush view must retry");
         assert!(matches!(
             error,
@@ -244,7 +274,12 @@ mod guarded_phases {
             .expect("remove finalized snapshot fact");
 
         let error = storage
-            .recover_post_flush_for_recovery(1_201, &protocol, crate::clock::unix_now_ms())
+            .recover_post_flush_for_recovery(
+                1_201,
+                &protocol,
+                crate::clock::unix_now_ms(),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .expect_err("missing finalized state must outrank a lagging view");
         assert!(matches!(
             error,
@@ -276,7 +311,7 @@ mod guarded_phases {
             .expect("seed finalized snapshot");
 
         let error = storage
-            .recover_aging_tip_for_recovery(1, &protocol, 1_000_000)
+            .recover_aging_tip_for_recovery(1, &protocol, 1_000_000, TEST_MAX_DIRECT_PAYLOAD_BYTES)
             .expect_err("a stale expected Tip must not mutate");
         assert!(matches!(
             error,
@@ -307,7 +342,7 @@ mod guarded_phases {
             .expect("advance safe head");
 
         let error = storage
-            .recover_aging_tip_for_recovery(0, &protocol, 1_000_000)
+            .recover_aging_tip_for_recovery(0, &protocol, 1_000_000, TEST_MAX_DIRECT_PAYLOAD_BYTES)
             .expect_err("missing finalized state must refuse Tip recovery");
         assert!(matches!(
             error,
@@ -369,7 +404,7 @@ mod invalid_batches {
         let filtered = all_ordered_l2_txs(&mut storage);
         assert_eq!(filtered.len(), 1);
         match &filtered[0] {
-            SequencedL2Tx::Direct(d) => assert_eq!(d.payload.as_slice(), &[0xaa]),
+            L2Tx::Direct(d) => assert_eq!(d.payload.as_slice(), &[0xaa]),
             _ => panic!("expected direct input"),
         }
     }
@@ -965,6 +1000,7 @@ mod tip_staleness {
                 &mut head,
                 10,
                 SafeInputRange::new(0, 1),
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
                 &[DirectInputExecution {
                     safe_input_index: 0,
                     executed_input_offset: ExecutedInputCount::ZERO,
@@ -1096,9 +1132,7 @@ mod tip_staleness {
         let direct_payloads: Vec<&[u8]> = after
             .iter()
             .filter_map(|tx| match tx {
-                SequencedL2Tx::Direct(d) if d.sender != batch_submitter => {
-                    Some(d.payload.as_slice())
-                }
+                L2Tx::Direct(d) if d.sender != batch_submitter => Some(d.payload.as_slice()),
                 _ => None,
             })
             .collect();
@@ -1114,7 +1148,7 @@ mod tip_staleness {
             .expect("load recovery batch txs");
         let recovery_direct_count = recovery_txs
             .iter()
-            .filter(|tx| matches!(tx, SequencedL2Tx::Direct(d) if d.sender != batch_submitter))
+            .filter(|tx| matches!(tx, L2Tx::Direct(d) if d.sender != batch_submitter))
             .count();
         assert_eq!(
             recovery_direct_count, 2,
@@ -1144,7 +1178,7 @@ mod tip_staleness {
         assert!(
             before.iter().all(|tx| !matches!(
                 tx,
-                SequencedL2Tx::Direct(d) if d.sender == non_submitter
+                L2Tx::Direct(d) if d.sender == non_submitter
             )),
             "undrained deposit must not be sequenced before drain",
         );
@@ -1160,7 +1194,7 @@ mod tip_staleness {
         let deposit_payloads: Vec<&[u8]> = recovery_txs
             .iter()
             .filter_map(|tx| match tx {
-                SequencedL2Tx::Direct(d) if d.sender == non_submitter => Some(d.payload.as_slice()),
+                L2Tx::Direct(d) if d.sender == non_submitter => Some(d.payload.as_slice()),
                 _ => None,
             })
             .collect();
@@ -1198,8 +1232,8 @@ mod tip_staleness {
         let user_visible: Vec<_> = recovery_txs
             .iter()
             .filter(|tx| match tx {
-                SequencedL2Tx::Direct(d) => d.sender != batch_submitter,
-                SequencedL2Tx::UserOp(_) => true,
+                L2Tx::Direct(d) => d.sender != batch_submitter,
+                L2Tx::UserOp(_) => true,
             })
             .collect();
         assert!(
@@ -1946,7 +1980,7 @@ mod recovery_snapshot_selection {
                 .expect("no stable fallback")
         );
         let err = storage
-            .recover_post_flush_for_recovery(1500, &protocol, now)
+            .recover_post_flush_for_recovery(1500, &protocol, now, TEST_MAX_DIRECT_PAYLOAD_BYTES)
             .expect_err("refuse before losing only snapshot");
         assert!(matches!(
             err,

@@ -512,16 +512,20 @@ fn assert_ws_message_matches_tx(
                 sender,
                 block_number,
                 payload,
+                input_index,
+                block_timestamp,
                 ..
             },
-            L2TxContext::DirectInput { tx: expected, .. },
+            L2TxContext::Direct { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
                 decode_hex_prefixed(sender.as_str()),
                 expected.sender.as_slice()
             );
-            assert_eq!(block_number, expected.block_number);
+            assert_eq!(block_number, expected.block);
+            assert_eq!(input_index, expected.input_index);
+            assert_eq!(block_timestamp, expected.timestamp);
             assert_eq!(
                 decode_hex_prefixed(payload.as_str()),
                 expected.payload.as_slice()

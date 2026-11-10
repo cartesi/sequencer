@@ -40,6 +40,15 @@ impl ExecutedInputCount {
             None => None,
         }
     }
+
+    /// Advance by one executed transaction, as an application does on every
+    /// success. A count with no successor has no canonical next state, so
+    /// this panics rather than wrap.
+    pub fn advance(&mut self) {
+        *self = self
+            .checked_next()
+            .expect("executed input count overflow: no canonical successor");
+    }
 }
 
 /// One durable setup/rebuild era.
@@ -334,6 +343,16 @@ mod tests {
             ExecutedInputCount::new(7).checked_add(5),
             Some(ExecutedInputCount::new(12))
         );
+
+        let mut count = ExecutedInputCount::new(u64::MAX - 1);
+        count.advance();
+        assert_eq!(count, ExecutedInputCount::new(u64::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "executed input count overflow: no canonical successor")]
+    fn executed_input_count_advance_fails_loud_without_a_successor() {
+        ExecutedInputCount::new(u64::MAX).advance();
     }
 
     fn history_bounds(base: u64, head: u64) -> HistoryBounds {

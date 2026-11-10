@@ -6,7 +6,7 @@ use std::path::Path;
 use super::*;
 use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
+    SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
     DirectInputExecution, FrontierMode, IngestedSafeInput, LifecycleCommand, SafeInputRange,
@@ -457,6 +457,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             &mut head,
             110,
             SafeInputRange::new(0, 1),
+            TEST_MAX_DIRECT_PAYLOAD_BYTES,
             &[DirectInputExecution {
                 safe_input_index: 0,
                 executed_input_offset: ExecutedInputCount::new(41),
@@ -474,7 +475,12 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
     );
     assert_eq!(
         storage
-            .recover_aging_tip_for_recovery(head.batch_index, &protocol, now)
+            .recover_aging_tip_for_recovery(
+                head.batch_index,
+                &protocol,
+                now,
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )
             .unwrap(),
         [0]
     );

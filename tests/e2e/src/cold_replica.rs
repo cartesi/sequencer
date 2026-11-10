@@ -119,7 +119,11 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         .await?;
 
     // Already at the tip: these inputs must arrive through live continuation.
-    let clock_before_live = replica.last_executed_safe_block();
+    // The replica matches the reference, so the reference's last block is
+    // also the replica's.
+    let block_before_live = reference
+        .last_applied_block()
+        .ok_or("the reference applied messages before going live")?;
     let live_deposit = alice_l1
         .mint_and_deposit_supported_token(U256::from(80_000))
         .await?;
@@ -127,14 +131,15 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     record(&mut reference_ws, &mut reference, &mut history).await?;
     alice_l2.transfer(bob_address, U256::from(5_000)).await?;
     record(&mut reference_ws, &mut reference, &mut history).await?;
-    consume_until(
+    let live_block = consume_until(
         &mut replica_ws,
         &mut replica,
         reference.executed_input_count(),
     )
     .await?;
     assert_same_state(&mut replica, &reference)?;
-    assert!(replica.last_executed_safe_block() > clock_before_live);
+    assert_eq!(live_block, reference.last_applied_block());
+    assert!(live_block.is_some_and(|block| block > block_before_live));
     assert_eq!(
         reference.current_user_balance(bob_address),
         U256::from(15_000)
@@ -301,16 +306,19 @@ async fn record(
     Ok(())
 }
 
+/// Applies feed messages until `app` reaches `target`. Returns the L1 block
+/// of the last message applied, which the application no longer keeps.
 async fn consume_until<A: Application>(
     ws: &mut WsClient,
     app: &mut A,
     target: u64,
-) -> ScenarioResult<()> {
+) -> ScenarioResult<Option<u64>> {
+    let mut last_block = None;
     while app.executed_input_count().get() < target {
-        apply_ws_message(app, ws.next_message().await?)?;
+        last_block = Some(apply_ws_message(app, ws.next_message().await?)?);
     }
     assert_eq!(app.executed_input_count().get(), target);
-    Ok(())
+    Ok(last_block)
 }
 
 fn replay_prefix(history: &[WsTxMessage], count: u64) -> ScenarioResult<ReplayWalletApp> {
@@ -325,27 +333,20 @@ pub(crate) fn assert_same_state<A: Application>(
     actual: &mut A,
     expected: &ReplayWalletApp,
 ) -> ScenarioResult<()> {
-    assert_eq!(
-        actual.executed_input_count().get(),
-        expected.executed_input_count()
-    );
-    assert_eq!(
-        actual.last_executed_safe_block(),
-        expected.last_executed_safe_block()
-    );
-    let progress = actual.progress();
+    let count = actual.executed_input_count();
+    assert_eq!(count.get(), expected.executed_input_count());
     let directory = tempfile::tempdir()?;
     let checkpoint = directory.path().join("checkpoint");
     actual.create_dump(&checkpoint)?;
     assert_eq!(
-        actual.progress(),
-        progress,
+        actual.executed_input_count(),
+        count,
         "checkpoint creation preserves state"
     );
     assert_eq!(
         std::fs::read(A::state_file_in_dump(&checkpoint))?,
         expected.canonical_snapshot_bytes()?,
-        "all wallet state, including balances, nonces, config, count, and clock"
+        "all wallet state, including balances, nonces, config and count"
     );
     Ok(())
 }

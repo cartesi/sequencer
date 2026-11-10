@@ -12,9 +12,7 @@ pub mod flush;
 pub mod run;
 pub mod setup;
 
-pub use error::{
-    BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,
-};
+pub use error::{BootstrapError, CommandError, IdentityError, SetupRefuse, WorkerExit};
 
 use std::time::Duration;
 

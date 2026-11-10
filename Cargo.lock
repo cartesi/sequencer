@@ -1475,6 +1475,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "app-core",
+ "ethereum_ssz",
  "k256",
  "rollups-types",
  "sequencer-core",
@@ -4036,11 +4037,9 @@ dependencies = [
  "sequencer-rust-client",
  "serde",
  "serde_json",
- "tar",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
- "toml",
 ]
 
 [[package]]

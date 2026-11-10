@@ -78,6 +78,8 @@ pub enum LifecycleError {
 
 impl Storage {
     /// Publish a durable setup dump and its complete baseline atomically.
+    /// `recovery` roots the batch tree at a rebuilt baseline; no command takes
+    /// it until `setup --base` reuses it, so its tests are that command's spec.
     pub(crate) fn complete_baseline_setup(
         &mut self,
         prefix: &std::path::Path,

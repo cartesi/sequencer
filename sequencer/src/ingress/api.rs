@@ -94,8 +94,9 @@ pub(crate) fn router(submit: Arc<SubmitState>, read: Arc<ReadState>) -> Router {
         )
 }
 
-/// Admission checks only size and signature. Nonce and `max_fee` are left to the
-/// lane, where a stale op costs an in-memory comparison and no transaction; a
+/// Admission checks only size and signature. The fee cap, the nonce and the
+/// application's admission are left to the lane, whose refusal comes back as the
+/// 422; there a stale op costs an in-memory comparison and no transaction; a
 /// pre-check here would add a SQLite read to every honest submit, and a future
 /// nonce or fresh address bypasses it. Revisit if persistent `429`s trace back to
 /// stale-nonce floods.

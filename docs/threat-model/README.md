@@ -114,9 +114,10 @@ The sequencer trusts its own code in a specific sense: **impossible states are n
 
 If a bug corrupts local state or causes the sequencer to emit malformed batches,
 frames, or user operations, the operator must diagnose and fix it. Then
-[cockroach recovery](../recovery/cockroach.md) can rebuild from a trusted canonical
-application checkpoint and L1. The checkpoint must be trusted independently of
-the faulty local state. Historical inputs, including malformed batches, receive
+[cockroach recovery](../recovery/cockroach.md) rebuilds from a trusted canonical
+machine and L1; this build has no rebuild command, which arrives with
+`setup --base`. The machine must be trusted independently of the faulty local
+state. Historical inputs, including malformed batches, receive
 the canonical scheduler's normal treatment during replay.
 
 This is **not** a prohibition on checking: internal invariants are asserted loudly wherever a check is near-free (types, SQL constraints and triggers, boundary assertions). The [check policy](../invariants.md#the-check-policy-fail-loud) owns the rule, its reasons, and the decision test.

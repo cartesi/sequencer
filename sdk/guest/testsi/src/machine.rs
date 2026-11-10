@@ -36,6 +36,8 @@ pub enum TestsiMachineError {
     InputRejected,
     #[error("machine is not awaiting an input (expected a manual rx_accepted yield): {state}")]
     NotAwaitingInput { state: String },
+    #[error("an inspect query emitted {count} output(s); only reports are allowed")]
+    InspectEmittedOutputs { count: usize },
     #[error("machine did not take the {len}-byte input (the cmio rx buffer holds 2 MiB)")]
     InputNotDelivered { len: usize },
     #[error("machine execution timed out after {elapsed:?} (timeout {timeout:?})")]
@@ -173,8 +175,36 @@ impl Machine {
         Ok((outputs, reports))
     }
 
-    pub fn inspect(&self) -> Result<()> {
-        panic!("testsi::Machine does not support inspect() yet")
+    /// Sends an inspect query and returns its reports. Unlike a node's host,
+    /// which runs the query on a snapshot it discards, this runs it on the
+    /// live machine: fine for a guest whose inspect only reads, but the root
+    /// hash moves, so never use it on a machine whose hash must be kept.
+    pub fn inspect(&mut self, query: &[u8]) -> Result<Vec<Vec<u8>>> {
+        expect_awaiting_input(&mut self.cartesi_machine)?;
+        self.cartesi_machine
+            .send_cmio_response(cmio::CmioResponseReason::Inspect, query, None)?;
+        if self.cartesi_machine.iflags_y()? {
+            return Err(TestsiMachineError::InputNotDelivered { len: query.len() });
+        }
+
+        let mut outputs = OutputsForInput::default();
+        let mut reports = Vec::new();
+        let execution_started_at = Instant::now();
+        while let ControlFlow::Continue(_) = run_machine_increment(
+            &mut self.cartesi_machine,
+            &mut outputs,
+            &mut reports,
+            execution_started_at,
+            self.builder.execution_timeout,
+        )? {}
+
+        // An inspect has no outputs tree to write to.
+        if !outputs.list().is_empty() {
+            return Err(TestsiMachineError::InspectEmittedOutputs {
+                count: outputs.list().len(),
+            });
+        }
+        Ok(reports)
     }
 }
 

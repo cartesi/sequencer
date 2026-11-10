@@ -15,12 +15,20 @@ use super::MAX_METHOD_PAYLOAD_BYTES as WALLET_MAX_METHOD_PAYLOAD_BYTES;
 use super::Method;
 use super::{DepositNotice, TransferNotice};
 use sequencer_core::application::{
-    AppError, AppOutput, AppOutputs, Application, ApplicationProgress, CanonicalState,
-    InvalidReason, ValidationOutcome,
+    Admission, AppError, AppOutput, AppOutputs, Application, CanonicalState, PolicyRefusal,
+    SchedulerLimits,
 };
 use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::ValidUserOp;
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
+
+/// The wallet template's scheduler constants. Provisional: a deposit's payload
+/// is 72 bytes plus its exec-layer data, so 1 KiB leaves that data room, and a
+/// full fridge then holds at most 16 MiB of payloads.
+pub const WALLET_SCHEDULER_LIMITS: SchedulerLimits = SchedulerLimits {
+    fridge_bound: 16_384,
+    max_direct_payload_bytes: 1024,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct WalletConfig {
@@ -61,7 +69,7 @@ pub struct WalletApp {
     // canonical entry order.
     balances: BTreeMap<Address, U256>,
     nonces: BTreeMap<Address, u32>,
-    execution_progress: ApplicationProgress,
+    executed_input_count: ExecutedInputCount,
 }
 
 /// Rollups-contracts v3.0.0-alpha.10 Erc20Portal. The contracts deploy at
@@ -92,38 +100,23 @@ impl WalletApp {
             config,
             balances: BTreeMap::new(),
             nonces: BTreeMap::new(),
-            execution_progress: ApplicationProgress::default(),
+            executed_input_count: ExecutedInputCount::ZERO,
         }
     }
 
     /// Reconstruct from decoded snapshot parts. Used by `crate::wallet_snapshot::decode`.
-    ///
-    /// The progress pair comes from untrusted dump bytes, so an incoherent
-    /// pair is a typed decode error like every other corrupt-snapshot case —
-    /// not a panic escaping `from_dump`'s `Result`.
     pub(crate) fn from_snapshot_parts(
         config: WalletConfig,
         balances: BTreeMap<Address, U256>,
         nonces: BTreeMap<Address, u32>,
         executed_input_count: u64,
-        last_executed_safe_block: u64,
-    ) -> Result<Self, AppError> {
-        let execution_progress = ApplicationProgress::try_new(
-            ExecutedInputCount::new(executed_input_count),
-            last_executed_safe_block,
-        )
-        .ok_or_else(|| AppError::Internal {
-            reason: format!(
-                "snapshot progress is incoherent: zero executed inputs with \
-                 nonzero safe-block clock {last_executed_safe_block}"
-            ),
-        })?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             config,
             balances,
             nonces,
-            execution_progress,
-        })
+            executed_input_count: ExecutedInputCount::new(executed_input_count),
+        }
     }
 
     // Accessors for the canonical snapshot encoder (`crate::wallet_snapshot`).
@@ -151,20 +144,15 @@ impl WalletApp {
 
     #[cfg(test)]
     pub(crate) fn set_executed_input_count(&mut self, count: u64) {
-        self.execution_progress = ApplicationProgress::try_new(
-            ExecutedInputCount::new(count),
-            self.execution_progress.last_executed_safe_block(),
-        )
-        .expect("coherent progress");
+        self.executed_input_count = ExecutedInputCount::new(count);
     }
 
     fn balance_of(&self, addr: &Address) -> U256 {
         *self.balances.get(addr).unwrap_or(&U256::ZERO)
     }
 
-    // Wallet-specific read queries (not on the Application trait — the
-    // sequencer never asks: it derives nonces from persisted ops under the
-    // contract's nonce rule, and app-specific query surface belongs to the app).
+    // Wallet-specific read queries for tests and tooling. The sequencer reads
+    // the nonce through `Application::user_nonce`, which answers the same.
     pub fn current_user_nonce(&self, sender: Address) -> u32 {
         self.expected_nonce(&sender)
     }
@@ -191,6 +179,8 @@ impl WalletApp {
         self.nonces.get(addr).copied().unwrap_or(0)
     }
 
+    /// The shared executor skips an op whose sender is at `u32::MAX` before it
+    /// reaches the wallet, so overflow here is an impossible state.
     fn bump_nonce(&mut self, addr: Address) {
         let next = self
             .expected_nonce(&addr)
@@ -207,61 +197,25 @@ impl Default for WalletApp {
 }
 
 impl Application for WalletApp {
-    fn max_method_payload_bytes() -> usize {
-        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError> {
+        Ok(self.expected_nonce(&sender))
     }
 
-    fn validate_user_op(
-        &self,
-        sender: Address,
-        user_op: &UserOp,
-        current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
-        let expected_nonce = self.expected_nonce(&sender);
-        if user_op.nonce != expected_nonce {
-            return Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
-                expected: expected_nonce,
-                got: user_op.nonce,
-            }));
-        }
-
-        // max_fee < current_fee is already checked by the free function
-        // validate_and_execute_user_op. No need to repeat here.
-
-        let fee_cost = sequencer_core::fee::fee_to_linear(current_fee);
+    /// Charges what the sender has, up to the fee, and credits the sequencer
+    /// exactly that, so an underfunded op neither fails nor mints. The method
+    /// then runs on the remaining balance: one code path for every op.
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError> {
+        let sender = op.sender;
+        let fee_cost = sequencer_core::fee::fee_to_linear(op.fee);
         let balance = self.balance_of(&sender);
-        if balance < fee_cost {
-            return Ok(ValidationOutcome::Reject(
-                InvalidReason::InsufficientFeeBalance {
-                    required: fee_cost,
-                    available: balance,
-                },
-            ));
-        }
-
-        Ok(ValidationOutcome::Accept)
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        let sender = user_op.sender;
-        let fee_cost = sequencer_core::fee::fee_to_linear(user_op.fee);
-        let balance = self.balance_of(&sender);
-        if balance < fee_cost {
-            return Err(AppError::Internal {
-                reason: "validated user op cannot pay fee".to_string(),
-            });
-        }
+        let charged = balance.min(fee_cost);
 
         self.bump_nonce(sender);
-        self.balances.insert(sender, balance - fee_cost);
-        self.credit(self.config.sequencer_address, fee_cost);
+        self.balances.insert(sender, balance - charged);
+        self.credit(self.config.sequencer_address, charged);
         let mut outputs = Vec::new();
 
-        let method = Method::from_ssz_bytes(user_op.data.as_slice()).ok();
+        let method = Method::from_ssz_bytes(op.data.as_slice()).ok();
         match method.as_ref() {
             Some(Method::Transfer(transfer)) if self.debit_if_possible(sender, transfer.amount) => {
                 self.credit(transfer.to, transfer.amount);
@@ -290,17 +244,14 @@ impl Application for WalletApp {
             _ => {}
         }
 
-        self.execution_progress.advance(safe_block);
+        self.executed_input_count.advance();
         Ok(outputs)
     }
 
-    fn apply_direct_input(
-        &mut self,
-        input: &sequencer_core::l2_tx::DirectInput,
-    ) -> Result<AppOutputs, AppError> {
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError> {
         let mut outputs = Vec::new();
-        let deposit = (input.sender == self.config.erc20_portal_address)
-            .then(|| Erc20Deposit::decode(&input.payload))
+        let deposit = (direct.sender == self.config.erc20_portal_address)
+            .then(|| Erc20Deposit::decode(&direct.payload))
             .transpose();
         match deposit {
             Ok(Some(deposit)) => {
@@ -316,10 +267,11 @@ impl Application for WalletApp {
                     ));
                 } else {
                     warn!(
-                        portal = %input.sender,
+                        portal = %direct.sender,
                         token = %deposit.token,
                         sender = %deposit.sender,
-                        block_number = input.block_number,
+                        input_index = direct.input_index,
+                        block_number = direct.block,
                         "ignoring unsupported ERC-20 deposit token"
                     );
                 }
@@ -327,20 +279,48 @@ impl Application for WalletApp {
             Ok(None) => {}
             Err(reason) => {
                 error!(
-                    portal = %input.sender,
-                    block_number = input.block_number,
+                    portal = %direct.sender,
+                    input_index = direct.input_index,
+                    block_number = direct.block,
                     error = %reason,
                     "ignoring malformed trusted ERC-20 deposit payload"
                 );
             }
         }
 
-        self.execution_progress.advance(input.block_number);
+        self.executed_input_count.advance();
         Ok(outputs)
     }
 
-    fn progress(&self) -> ApplicationProgress {
-        self.execution_progress
+    fn executed_input_count(&self) -> ExecutedInputCount {
+        self.executed_input_count
+    }
+
+    fn max_method_payload_bytes() -> usize {
+        WALLET_MAX_METHOD_PAYLOAD_BYTES
+    }
+
+    fn scheduler_limits() -> SchedulerLimits {
+        WALLET_SCHEDULER_LIMITS
+    }
+
+    /// Refuses an op the sender cannot pay for in full: it would pay the
+    /// operator less than the L1 data it costs. The nonce is not checked here.
+    fn admit_user_op(
+        &self,
+        sender: Address,
+        _op: &UserOp,
+        fee: u16,
+    ) -> Result<Admission, AppError> {
+        let required = sequencer_core::fee::fee_to_linear(fee);
+        let available = self.balance_of(&sender);
+        if available < required {
+            return Ok(Admission::Refuse(PolicyRefusal::Underfunded {
+                required,
+                available,
+            }));
+        }
+        Ok(Admission::Admit)
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
@@ -379,6 +359,26 @@ impl Application for WalletApp {
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
         prefix.join("state")
     }
+
+    /// The wallet's bytes hold its count, so a count that disagrees with the
+    /// machine's means a corrupt or misread export, never a state to install.
+    fn from_canonical_state(
+        state_file: &Path,
+        executed_input_count: ExecutedInputCount,
+    ) -> Result<Self, AppError> {
+        let bytes = std::fs::read(state_file)?;
+        let app = crate::wallet_snapshot::decode(&bytes)?;
+        if app.executed_input_count != executed_input_count {
+            return Err(AppError::Internal {
+                reason: format!(
+                    "canonical state holds L2 tx count {}, but the machine reports {}",
+                    app.executed_input_count.get(),
+                    executed_input_count.get()
+                ),
+            });
+        }
+        Ok(app)
+    }
 }
 
 impl CanonicalState for WalletApp {
@@ -396,23 +396,58 @@ mod tests {
     use rollups_types::alloy_sol_types::SolCall;
     use rollups_types::{Erc20Deposit, Erc20Transfer};
 
-    use super::{ApplicationProgress, ExecutedInputCount, WalletApp, WalletConfig};
+    use super::{ExecutedInputCount, WalletApp, WalletConfig};
     use crate::application::{DepositNotice, Transfer, TransferNotice, Withdrawal};
     use sequencer_core::application::{
-        AppError, AppOutput, Application, CanonicalState, InvalidReason, ValidationOutcome,
+        Admission, AppError, AppOutput, AppOutputs, Application, CanonicalState, Executed,
+        PolicyRefusal, Refusal, SkipReason, check_live_user_op, execute,
     };
-    use sequencer_core::application::{
-        ExecutionOutcome, execute_direct_input, execute_valid_user_op, validate_and_execute_user_op,
-    };
-    use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+    use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
     use sequencer_core::user_op::UserOp;
+
+    fn user_tx(sender: Address, nonce: u32, fee: u16, data: Vec<u8>) -> L2Tx {
+        L2Tx::UserOp(UserOpTx {
+            sender,
+            nonce,
+            fee,
+            block: 123,
+            data,
+        })
+    }
+
+    fn direct_tx(sender: Address, payload: Vec<u8>) -> L2Tx {
+        L2Tx::Direct(Direct {
+            input_index: 7,
+            sender,
+            block: 123,
+            timestamp: 1_700_000_000,
+            payload,
+        })
+    }
+
+    /// Run `tx` through the shared executor and return its outputs.
+    fn executed(app: &mut WalletApp, tx: &L2Tx) -> AppOutputs {
+        match execute(app, tx).expect("execute") {
+            Executed::Done { outputs, .. } => outputs,
+            Executed::Skipped(reason) => panic!("expected execution, skipped: {reason}"),
+        }
+    }
+
+    fn total_supply(app: &WalletApp) -> U256 {
+        app.balances.values().copied().sum()
+    }
+
+    fn transfer_data(amount: u64, to: Address) -> Vec<u8> {
+        ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
+            amount: U256::from(amount),
+            to,
+        }))
+    }
 
     #[test]
     fn sepolia_dedicated_submitter_is_the_batch_sender_and_fee_recipient() {
         use sequencer_core::batch::Batch;
-        use sequencer_core::scheduler::{
-            ProcessOutcome, Scheduler, SchedulerConfig, SchedulerInput,
-        };
+        use sequencer_core::scheduler::{InputOutcome, L1Input, Scheduler, SchedulerConfig};
         use ssz::Encode;
 
         let submitter = address!("0x79b88d2f598d8D001832D69f5201332A3f1e14c8");
@@ -421,14 +456,16 @@ mod tests {
         assert_eq!(config.sequencer_address, submitter);
         assert_eq!(WalletConfig::default().sequencer_address, submitter);
 
-        let mut scheduler = Scheduler::new(
-            WalletApp::new(config),
-            SchedulerConfig::new(super::SEPOLIA_SEQUENCER_ADDRESS),
-        );
-        let input = |sender| SchedulerInput {
+        let mut scheduler = Scheduler::genesis(SchedulerConfig::for_application::<WalletApp>(
+            super::SEPOLIA_SEQUENCER_ADDRESS,
+        ));
+        let input = |index, sender| L1Input {
+            index,
             sender,
-            inclusion_block: 10,
-            domain: sequencer_core::build_input_domain(11155111, Address::ZERO),
+            block: 10,
+            timestamp: 0,
+            chain_id: 11155111,
+            app_contract: Address::ZERO,
             payload: Batch {
                 nonce: 0,
                 frames: Vec::new(),
@@ -436,17 +473,17 @@ mod tests {
             .as_ssz_bytes(),
         };
 
-        let previous = scheduler.process_input(input(previous_submitter)).unwrap();
-        assert_eq!(previous.outcome, ProcessOutcome::DirectEnqueued);
-        assert_eq!(scheduler.next_expected_batch_nonce(), 0);
+        let previous = scheduler.feed(input(0, previous_submitter));
+        assert_eq!(previous, InputOutcome::DirectQueued);
+        assert_eq!(scheduler.state().next_batch_nonce, 0);
 
-        let current = scheduler.process_input(input(submitter)).unwrap();
-        assert_eq!(current.outcome, ProcessOutcome::BatchExecuted);
-        assert_eq!(scheduler.next_expected_batch_nonce(), 1);
+        let current = scheduler.feed(input(1, submitter));
+        assert_eq!(current, InputOutcome::BatchAccepted);
+        assert_eq!(scheduler.state().next_batch_nonce, 1);
     }
 
     #[test]
-    fn validation_is_repeatable_and_preserves_the_entire_state() {
+    fn admission_is_repeatable_and_preserves_state() {
         let mut app = WalletApp::default();
         let sender = Address::from_slice(&[0x11; 20]);
         app.balances.insert(sender, U256::from(10_u64));
@@ -458,29 +495,93 @@ mod tests {
         };
 
         for _ in 0..2 {
-            assert_eq!(
-                app.validate_user_op(sender, &user_op, 0).unwrap(),
-                ValidationOutcome::Accept
-            );
-            user_op.nonce = 1;
-            assert_eq!(
-                app.validate_user_op(sender, &user_op, 0).unwrap(),
-                ValidationOutcome::Reject(InvalidReason::InvalidNonce {
-                    expected: 0,
-                    got: 1
-                })
-            );
-            user_op.nonce = 0;
+            // Admission ignores the nonce: the executor's rule comes first.
+            for nonce in [0, 1] {
+                user_op.nonce = nonce;
+                assert_eq!(
+                    app.admit_user_op(sender, &user_op, 0).unwrap(),
+                    Admission::Admit
+                );
+            }
             assert!(matches!(
-                app.validate_user_op(Address::ZERO, &user_op, 0).unwrap(),
-                ValidationOutcome::Reject(InvalidReason::InsufficientFeeBalance { .. })
+                app.admit_user_op(Address::ZERO, &user_op, 0).unwrap(),
+                Admission::Refuse(PolicyRefusal::Underfunded { .. })
             ));
+            assert_eq!(app.user_nonce(sender).unwrap(), 0);
             assert_eq!(app.canonical_snapshot_bytes().unwrap(), before);
         }
     }
 
     #[test]
-    fn execute_valid_user_op_charges_current_fee() {
+    fn admission_refuses_an_underfunded_op_with_the_served_text() {
+        let mut app = WalletApp::default();
+        let sender = Address::from_slice(&[0x11; 20]);
+        let fee: u16 = 1000;
+        let required = sequencer_core::fee::fee_to_linear(fee);
+        let available = required - U256::from(1_u64);
+        app.balances.insert(sender, available);
+        let user_op = UserOp {
+            nonce: 0,
+            max_fee: fee,
+            data: Vec::new().into(),
+        };
+
+        let underfunded = PolicyRefusal::Underfunded {
+            required,
+            available,
+        };
+        assert_eq!(
+            app.admit_user_op(sender, &user_op, fee).unwrap(),
+            Admission::Refuse(underfunded.clone())
+        );
+        let refusal = check_live_user_op(&app, sender, &user_op, fee).unwrap();
+        assert_eq!(refusal, Some(Refusal::Policy(underfunded)));
+        assert_eq!(
+            refusal.unwrap().to_string(),
+            format!("insufficient balance for fee: required {required}, available {available}")
+        );
+
+        app.balances.insert(sender, required);
+        assert_eq!(
+            check_live_user_op(&app, sender, &user_op, fee).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn user_nonce_reports_next_nonce() {
+        let mut app = WalletApp::default();
+        let sender = Address::from_slice(&[0x11; 20]);
+        let other = Address::from_slice(&[0x22; 20]);
+        assert_eq!(app.user_nonce(sender).unwrap(), 0);
+
+        for expected in 1..=3 {
+            executed(&mut app, &user_tx(sender, expected - 1, 0, Vec::new()));
+            assert_eq!(app.user_nonce(sender).unwrap(), expected);
+            assert_eq!(app.current_user_nonce(sender), expected);
+        }
+        assert_eq!(app.user_nonce(other).unwrap(), 0);
+    }
+
+    #[test]
+    fn wrong_nonce_is_skipped_without_state_change() {
+        let mut app = WalletApp::default();
+        let sender = Address::from_slice(&[0x11; 20]);
+        app.balances.insert(sender, U256::from(10_000_u64));
+        let before = app.canonical_snapshot_bytes().unwrap();
+
+        assert_eq!(
+            execute(&mut app, &user_tx(sender, 1, 100, Vec::new())).unwrap(),
+            Executed::Skipped(SkipReason::WrongNonce {
+                expected: 0,
+                got: 1
+            })
+        );
+        assert_eq!(app.canonical_snapshot_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn execute_user_op_charges_current_fee() {
         let mut app = WalletApp::new(WalletConfig::default());
         let sender = Address::from_slice(&[0x22; 20]);
         let initial_balance = U256::from(1000_u64);
@@ -488,21 +589,91 @@ mod tests {
 
         // fee exponent 100 → fee_to_linear(100) ≈ 2 ((129/128)^100 ≈ 2.17, truncated)
         let fee_exponent: u16 = 100;
-        let valid = ValidUserOp {
-            sender,
-            fee: fee_exponent,
-            data: Vec::new(),
-        };
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let outputs = execute_valid_user_op(&mut app, &valid, 123)
-            .expect("execute valid op")
-            .outputs;
+        let outputs = executed(&mut app, &user_tx(sender, 0, fee_exponent, Vec::new()));
 
         assert_eq!(app.current_user_nonce(sender), 1);
         assert_eq!(app.current_user_balance(sender), initial_balance - gas_cost);
         assert_eq!(app.executed_input_count().get(), 1);
-        assert_eq!(app.last_executed_safe_block(), 123);
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn underfunded_op_executes_charging_what_the_sender_has() {
+        let sequencer = address!("0x9999999999999999999999999999999999999999");
+        let mut app = WalletApp::new(WalletConfig {
+            sequencer_address: sequencer,
+            ..WalletConfig::default()
+        });
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        let recipient = address!("0x2222222222222222222222222222222222222222");
+        let fee: u16 = 1000;
+        let fee_cost = sequencer_core::fee::fee_to_linear(fee);
+        let balance = fee_cost - U256::from(1_u64);
+        app.balances.insert(sender, balance);
+        app.balances.insert(sequencer, U256::from(5_u64));
+
+        let outputs = executed(
+            &mut app,
+            &user_tx(sender, 0, fee, transfer_data(1, recipient)),
+        );
+
+        assert!(outputs.is_empty(), "nothing is left to transfer");
+        assert_eq!(app.current_user_balance(sender), U256::ZERO);
+        assert_eq!(
+            app.current_user_balance(sequencer),
+            U256::from(5_u64) + balance,
+            "the sequencer gains exactly what was charged"
+        );
+        assert_eq!(app.current_user_balance(recipient), U256::ZERO);
+        assert_eq!(app.current_user_nonce(sender), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
+    }
+
+    #[test]
+    fn underfunded_ops_conserve_total_supply() {
+        let sequencer = address!("0x9999999999999999999999999999999999999999");
+        let mut app = WalletApp::new(WalletConfig {
+            sequencer_address: sequencer,
+            ..WalletConfig::default()
+        });
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        let bystander = address!("0x3333333333333333333333333333333333333333");
+        let fee: u16 = 1000;
+        app.balances.insert(sender, U256::from(7_u64));
+        app.balances.insert(bystander, U256::from(11_u64));
+        app.balances.insert(sequencer, U256::from(13_u64));
+        let supply = total_supply(&app);
+
+        // The sequencer's own underfunded op pays itself: no net change. The
+        // transfers exceed every balance, so only the fees move.
+        for (from, nonce) in [(sender, 0), (sender, 1), (sequencer, 0)] {
+            let data = transfer_data(1_000_000, bystander);
+            executed(&mut app, &user_tx(from, nonce, fee, data));
+            assert_eq!(total_supply(&app), supply);
+        }
+        assert_eq!(app.current_user_balance(sender), U256::ZERO);
+        assert_eq!(app.current_user_balance(bystander), U256::from(11_u64));
+        assert_eq!(app.current_user_balance(sequencer), U256::from(20_u64));
+        assert_eq!(app.executed_input_count().get(), 3);
+    }
+
+    #[test]
+    fn zero_balance_op_charges_nothing_and_counts() {
+        let sequencer = address!("0x9999999999999999999999999999999999999999");
+        let mut app = WalletApp::new(WalletConfig {
+            sequencer_address: sequencer,
+            ..WalletConfig::default()
+        });
+        let sender = address!("0x1111111111111111111111111111111111111111");
+
+        let outputs = executed(&mut app, &user_tx(sender, 0, 1000, Vec::new()));
+
+        assert!(outputs.is_empty());
+        assert_eq!(app.current_user_balance(sender), U256::ZERO);
+        assert_eq!(app.current_user_balance(sequencer), U256::ZERO);
+        assert_eq!(app.current_user_nonce(sender), 1);
+        assert_eq!(app.executed_input_count().get(), 1);
     }
 
     fn encode_erc20_deposit_payload(token: Address, sender: Address, value: U256) -> Vec<u8> {
@@ -521,20 +692,17 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = execute_direct_input(
+        let outputs = executed(
             &mut app,
-            &DirectInput {
-                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-                block_number: 123,
-                payload: encode_erc20_deposit_payload(
+            &direct_tx(
+                super::SEPOLIA_ERC20_PORTAL_ADDRESS,
+                encode_erc20_deposit_payload(
                     super::SEPOLIA_USDC_ADDRESS,
                     nested_sender,
                     U256::from(250_u64),
                 ),
-            },
-        )
-        .expect("execute deposit direct input")
-        .outputs;
+            ),
+        );
 
         assert_eq!(
             app.current_user_balance(nested_sender),
@@ -559,20 +727,17 @@ mod tests {
         let nested_sender = address!("0x7777777777777777777777777777777777777777");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = execute_direct_input(
+        let outputs = executed(
             &mut app,
-            &DirectInput {
-                sender: address!("0x3333333333333333333333333333333333333333"),
-                block_number: 123,
-                payload: encode_erc20_deposit_payload(
+            &direct_tx(
+                address!("0x3333333333333333333333333333333333333333"),
+                encode_erc20_deposit_payload(
                     super::SEPOLIA_USDC_ADDRESS,
                     nested_sender,
                     U256::from(250_u64),
                 ),
-            },
-        )
-        .expect("execute non-portal direct input")
-        .outputs;
+            ),
+        );
 
         assert_eq!(app.current_user_balance(nested_sender), before);
         assert_eq!(app.executed_input_count().get(), 1);
@@ -586,20 +751,13 @@ mod tests {
         let unsupported_token = address!("0x9999999999999999999999999999999999999999");
 
         let before = app.current_user_balance(nested_sender);
-        let outputs = execute_direct_input(
+        let outputs = executed(
             &mut app,
-            &DirectInput {
-                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-                block_number: 123,
-                payload: encode_erc20_deposit_payload(
-                    unsupported_token,
-                    nested_sender,
-                    U256::from(250_u64),
-                ),
-            },
-        )
-        .expect("unsupported token should be ignored")
-        .outputs;
+            &direct_tx(
+                super::SEPOLIA_ERC20_PORTAL_ADDRESS,
+                encode_erc20_deposit_payload(unsupported_token, nested_sender, U256::from(250_u64)),
+            ),
+        );
 
         assert_eq!(app.current_user_balance(nested_sender), before);
         assert_eq!(app.executed_input_count().get(), 1);
@@ -610,19 +768,12 @@ mod tests {
     fn malformed_trusted_portal_deposit_is_a_no_op() {
         let mut app = WalletApp::new(WalletConfig::default());
 
-        let outputs = execute_direct_input(
+        let outputs = executed(
             &mut app,
-            &DirectInput {
-                sender: super::SEPOLIA_ERC20_PORTAL_ADDRESS,
-                block_number: 123,
-                payload: vec![0xaa; 10],
-            },
-        )
-        .expect("malformed trusted portal payload should be ignored")
-        .outputs;
+            &direct_tx(super::SEPOLIA_ERC20_PORTAL_ADDRESS, vec![0xaa; 10]),
+        );
 
         assert_eq!(app.executed_input_count().get(), 1);
-        assert_eq!(app.last_executed_safe_block(), 123);
         assert!(outputs.is_empty());
     }
 
@@ -636,18 +787,10 @@ mod tests {
         // fee exponent 10 → fee_to_linear(10) = 1 ((129/128)^10 ≈ 1.08, truncated)
         let fee_exponent: u16 = 10;
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let valid = ValidUserOp {
-            sender,
-            fee: fee_exponent,
-            data: ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
-                amount: U256::from(123_u64),
-                to: recipient,
-            })),
-        };
-
-        let outputs = execute_valid_user_op(&mut app, &valid, 0)
-            .expect("execute transfer")
-            .outputs;
+        let outputs = executed(
+            &mut app,
+            &user_tx(sender, 0, fee_exponent, transfer_data(123, recipient)),
+        );
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -674,17 +817,11 @@ mod tests {
 
         let fee_exponent: u16 = 10;
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let valid = ValidUserOp {
-            sender,
-            fee: fee_exponent,
-            data: ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal {
-                amount: U256::from(123_u64),
-            })),
-        };
+        let data = ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal {
+            amount: U256::from(123_u64),
+        }));
 
-        let outputs = execute_valid_user_op(&mut app, &valid, 0)
-            .expect("execute withdrawal")
-            .outputs;
+        let outputs = executed(&mut app, &user_tx(sender, 0, fee_exponent, data));
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -709,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn business_failures_after_fee_validation_charge_fee_and_consume_nonce() {
+    fn business_failures_after_fee_admission_charge_fee_and_consume_nonce() {
         let sequencer = address!("0x9999999999999999999999999999999999999999");
         let mut app = WalletApp::new(WalletConfig {
             sequencer_address: sequencer,
@@ -721,22 +858,21 @@ mod tests {
         app.balances.insert(sender, funded);
         let fee: u16 = 10;
         let fee_cost = sequencer_core::fee::fee_to_linear(fee);
-        let too_much = U256::from(1_000_u64);
+        let too_much = 1_000_u64;
         // Selector 2 was the retired `Deposit { amount, to }` method, laid out
         // like `Transfer`; an op shaped like it must not mint to `to`.
         let mut retired_deposit = vec![2];
         retired_deposit.extend(ssz::Encode::as_ssz_bytes(&Transfer {
-            amount: too_much,
+            amount: U256::from(too_much),
             to: recipient,
         }));
         let mut replay = app.clone();
 
         for (i, data) in [
-            ssz::Encode::as_ssz_bytes(&super::Method::Transfer(Transfer {
-                amount: too_much,
-                to: recipient,
+            transfer_data(too_much, recipient),
+            ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal {
+                amount: U256::from(too_much),
             })),
-            ssz::Encode::as_ssz_bytes(&super::Method::Withdrawal(Withdrawal { amount: too_much })),
             retired_deposit,
         ]
         .into_iter()
@@ -749,25 +885,27 @@ mod tests {
                 max_fee: fee,
                 data: data.clone().into(),
             };
-            let ExecutionOutcome::Included(live) =
-                validate_and_execute_user_op(&mut app, sender, &user_op, fee, safe_block).unwrap()
-            else {
-                panic!("a fee-funded op is included even when its method fails");
-            };
-            // Restart catch-up replays the persisted op without validation.
-            let replayed =
-                execute_valid_user_op(&mut replay, &ValidUserOp { sender, fee, data }, safe_block)
-                    .unwrap();
+            // The lane's sequence: the pre-check admits it, then it executes.
+            assert_eq!(
+                check_live_user_op(&app, sender, &user_op, fee).unwrap(),
+                None
+            );
+            let tx = L2Tx::UserOp(UserOpTx::new(sender, &user_op, fee, safe_block));
+            let live = execute(&mut app, &tx).unwrap();
+            assert!(
+                matches!(&live, Executed::Done { outputs, .. } if outputs.is_empty()),
+                "a fee-funded op is included even when its method fails"
+            );
+            // Restart catch-up replays the persisted op without admission.
+            let replayed = execute(&mut replay, &tx).unwrap();
             assert_eq!(replayed, live);
 
-            assert!(live.outputs.is_empty());
             let charged = fee_cost * U256::from(nonce + 1);
             assert_eq!(app.current_user_nonce(sender), nonce + 1);
             assert_eq!(app.current_user_balance(sender), funded - charged);
             assert_eq!(app.current_user_balance(sequencer), charged);
             assert_eq!(app.current_user_balance(recipient), U256::ZERO);
             assert_eq!(app.executed_input_count().get(), u64::from(nonce) + 1);
-            assert_eq!(app.last_executed_safe_block(), safe_block);
         }
         assert_eq!(
             replay.canonical_snapshot_bytes().unwrap(),
@@ -788,12 +926,7 @@ mod tests {
 
         let fee_exponent: u16 = 100;
         let gas_cost = sequencer_core::fee::fee_to_linear(fee_exponent);
-        let valid = ValidUserOp {
-            sender,
-            fee: fee_exponent,
-            data: Vec::new(),
-        };
-        execute_valid_user_op(&mut app, &valid, 0).expect("execute op");
+        executed(&mut app, &user_tx(sender, 0, fee_exponent, Vec::new()));
 
         assert_eq!(
             app.current_user_balance(sender),
@@ -819,8 +952,7 @@ mod tests {
         app.balances.insert(bob, U256::from(5678_u64));
         app.nonces.insert(alice, 4);
         app.nonces.insert(bob, 9);
-        app.execution_progress = ApplicationProgress::try_new(ExecutedInputCount::new(42), 777)
-            .expect("coherent progress");
+        app.executed_input_count = ExecutedInputCount::new(42);
 
         let prefix = temp_dump_prefix();
         app.create_dump(&prefix).expect("create dump");
@@ -844,7 +976,36 @@ mod tests {
         );
         assert_eq!(restored.balances, app.balances);
         assert_eq!(restored.nonces, app.nonces);
-        assert_eq!(restored.execution_progress, app.execution_progress);
+        assert_eq!(restored.executed_input_count, app.executed_input_count);
+    }
+
+    #[test]
+    fn from_canonical_state_round_trips_and_rejects_count_mismatch() {
+        let mut app = WalletApp::default();
+        let sender = address!("0x1111111111111111111111111111111111111111");
+        app.balances.insert(sender, U256::from(1234_u64));
+        app.nonces.insert(sender, 4);
+        app.executed_input_count = ExecutedInputCount::new(42);
+        let bytes = app.canonical_snapshot_bytes().unwrap();
+
+        let prefix = temp_dump_prefix();
+        app.create_dump(&prefix).expect("create dump");
+        let state_file = WalletApp::state_file_in_dump(&prefix);
+
+        let restored = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(42))
+            .expect("matching count");
+        let mismatch = WalletApp::from_canonical_state(&state_file, ExecutedInputCount::new(41));
+        std::fs::remove_dir_all(&prefix).expect("cleanup dump");
+
+        assert_eq!(restored.canonical_snapshot_bytes().unwrap(), bytes);
+        assert_eq!(restored.executed_input_count().get(), 42);
+        match mismatch {
+            Err(AppError::Internal { reason }) => assert_eq!(
+                reason,
+                "canonical state holds L2 tx count 42, but the machine reports 41"
+            ),
+            other => panic!("expected a count mismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -863,15 +1024,10 @@ mod tests {
 
         let mut first = WalletApp::from_dump(&prefix).unwrap();
         let second = WalletApp::from_dump(&prefix).unwrap();
-        let user_op = ValidUserOp {
-            sender,
-            fee: 0,
-            data: Vec::new(),
-        };
-        execute_valid_user_op(&mut first, &user_op, 11).unwrap();
+        executed(&mut first, &user_tx(sender, 0, 0, Vec::new()));
         assert_ne!(first.canonical_snapshot_bytes().unwrap(), before);
         assert_eq!(live.canonical_snapshot_bytes().unwrap(), before);
-        execute_valid_user_op(&mut live, &user_op, 12).unwrap();
+        executed(&mut live, &user_tx(sender, 0, 0, Vec::new()));
         assert_ne!(live.canonical_snapshot_bytes().unwrap(), before);
         assert_eq!(second.canonical_snapshot_bytes().unwrap(), before);
         assert_eq!(
@@ -879,45 +1035,8 @@ mod tests {
             before
         );
         std::fs::remove_dir_all(&prefix).unwrap();
-        execute_valid_user_op(&mut first, &user_op, 13).unwrap();
+        executed(&mut first, &user_tx(sender, 1, 0, Vec::new()));
         assert_eq!(first.executed_input_count().get(), 2);
-    }
-
-    #[test]
-    fn safe_block_clock_advances_by_max_on_both_execution_paths() {
-        let mut app = WalletApp::new(WalletConfig::default());
-        let sender = Address::from_slice(&[0x77; 20]);
-        app.balances.insert(sender, U256::from(10_000_u64));
-        assert_eq!(app.last_executed_safe_block(), 0);
-
-        // User op carries its covering frame's safe block.
-        let valid = ValidUserOp {
-            sender,
-            fee: 0,
-            data: Vec::new(),
-        };
-        execute_valid_user_op(&mut app, &valid, 100).expect("execute op");
-        assert_eq!(app.last_executed_safe_block(), 100);
-
-        // A direct input advances the clock via its own inclusion block.
-        let direct = sequencer_core::l2_tx::DirectInput {
-            sender: Address::from_slice(&[0x88; 20]),
-            block_number: 150,
-            payload: Vec::new(),
-        };
-        execute_direct_input(&mut app, &direct).expect("execute direct");
-        assert_eq!(app.last_executed_safe_block(), 150);
-
-        // max(): an older block must never regress the clock. A direct's
-        // inclusion block is <= its covering frame's safe block, so replays
-        // legitimately present blocks below the current clock.
-        let older_direct = sequencer_core::l2_tx::DirectInput {
-            sender: Address::from_slice(&[0x88; 20]),
-            block_number: 120,
-            payload: Vec::new(),
-        };
-        execute_direct_input(&mut app, &older_direct).expect("execute older direct");
-        assert_eq!(app.last_executed_safe_block(), 150);
     }
 
     #[test]

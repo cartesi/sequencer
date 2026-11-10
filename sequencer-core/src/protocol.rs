@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Protocol timing: the scheduler's staleness rule and its off-chain acceptance
-//! predicate, which must agree with the canonical fold (I1), plus sequencer-only
+//! predicate, which must agree with the canonical scheduler (I1), plus sequencer-only
 //! knobs for when the sequencer stops issuing soft confirmations against stale
 //! or unknowable L1 state.
 
@@ -311,17 +311,22 @@ impl ProtocolTiming {
     /// nonce mismatch) return `None` without advancing — matching what the
     /// scheduler does on-chain.
     ///
-    /// **Deliberately omitted structural rejects.** The canonical fold's
-    /// `batch_reject_reason_for_block` additionally rejects a batch whose frames
-    /// have a `safe_block` above the inclusion block
-    /// (`SafeBlockAboveInclusionBlock`) or that decrease across frames
-    /// (`NonMonotonicSafeBlocks`), or whose fee exceeds `MAX_EXPONENT`
-    /// (`FeePriceOutOfRange`). This predicate does not re-check those: a
-    /// well-formed batch submitter never builds such a batch, so they are
-    /// reachable only under a buggy or forked submitter — already outside the
-    /// duality boundary. The I1 duality test pins this as a *documented*
-    /// asymmetry; mirror those checks here if the submitter ever stops being
-    /// trusted to be well-formed.
+    /// **Deliberately omitted rejects: a self-trust.** The canonical scheduler
+    /// also rejects a batch with a frame whose `safe_block` is not strictly
+    /// below the inclusion block (`SafeBlockNotBelowInclusionBlock`), with
+    /// safe blocks that decrease across frames (`NonMonotonicSafeBlocks`), or
+    /// with a fee above `MAX_EXPONENT` (`FeePriceOutOfRange`): gate d. Gate f
+    /// rejects one whose first frame lies below the scheduler clock
+    /// (`FirstFrameBelowClock`). This predicate re-checks none of them. A
+    /// correct submitter never trips them: it opens frames in order, only at
+    /// safe heads it has already seen, so its batch lands in a later block.
+    /// Gate f belongs to the same omission for a further reason: the clock
+    /// rises with every executed direct, backstop and overflow drains
+    /// included, so the predicate could know it only by replaying the
+    /// directs. An overflow drain can still make gate f reject a sealed batch;
+    /// the watchdog's divergence latch reports that, and a manual recovery
+    /// answers it. The I1 duality test pins every omission as a *documented*
+    /// asymmetry; mirror them here if the submitter stops being trusted.
     pub fn scheduler_accepts(
         &self,
         batch_submitter: Address,

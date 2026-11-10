@@ -7,11 +7,12 @@
 use std::path::Path;
 
 use alloy_primitives::{Address, B256};
+use app_core::application::WALLET_SCHEDULER_LIMITS;
 use rusqlite::params;
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx, ValidUserOp};
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::protocol::ProtocolTiming;
 
-use super::convert::{from_unix_ms, i64_to_u16, i64_to_u64, now_unix_ms, u64_to_i64};
+use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::next_executed_input_count_in;
 use super::ingress::{
     insert_tip_rows, open_fresh_tip_in_tx, open_successor_frame_in, seal_and_open_next_batch,
@@ -28,6 +29,12 @@ use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
 pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
+
+/// The direct payload cap every fixture opens frames under: the wallet's,
+/// which `StubApp` shares, so fixtures and either test lane drain the same
+/// directs.
+pub(crate) const TEST_MAX_DIRECT_PAYLOAD_BYTES: u64 =
+    WALLET_SCHEDULER_LIMITS.max_direct_payload_bytes;
 
 /// Default protocol timing for tests that don't care about specific tuning.
 /// Sender-independent (timing carries no address); pair with a submitter
@@ -53,7 +60,13 @@ impl Storage {
                 "open state already exists"
             );
             let batch_index = insert_tip_rows(tx, Some(0), None, safe_block)?;
-            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
+            persist_frame_direct_sequence_derived(
+                tx,
+                batch_index,
+                0,
+                leading_direct_range,
+                TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            )?;
             Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
         })
     }
@@ -65,7 +78,7 @@ impl Storage {
             if load_current_write_head(tx)?.is_some() {
                 return Ok(());
             }
-            open_fresh_tip_in_tx(tx)
+            open_fresh_tip_in_tx(tx, TEST_MAX_DIRECT_PAYLOAD_BYTES)
         })
     }
 
@@ -202,7 +215,7 @@ impl Storage {
     pub(crate) fn ordered_l2_txs_for_batch(
         &mut self,
         batch_index: u64,
-    ) -> rusqlite::Result<Vec<SequencedL2Tx>> {
+    ) -> rusqlite::Result<Vec<L2Tx>> {
         const SQL: &str = "
             SELECT
                 CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END AS kind,
@@ -211,10 +224,14 @@ impl Storage {
                     WHEN s.safe_input_index IS NOT NULL THEN d.sender
                     ELSE NULL
                 END AS sender,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END AS data,
-                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee  ELSE NULL END AS fee,
-                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.payload      ELSE NULL END AS payload,
-                CASE WHEN s.safe_input_index   IS NOT NULL THEN d.block_number ELSE NULL END AS block_number
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data  ELSE NULL END AS data,
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN f.fee   ELSE NULL END AS fee,
+                CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END AS nonce,
+                f.safe_block,
+                s.safe_input_index,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.payload         ELSE NULL END AS payload,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_number    ELSE NULL END AS block_number,
+                CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp ELSE NULL END AS block_timestamp
             FROM application_inputs s
             LEFT JOIN user_ops u
               ON u.batch_index    = s.batch_index
@@ -229,16 +246,7 @@ impl Storage {
             ORDER BY s.offset ASC
         ";
         let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![u64_to_i64(batch_index)], |row| {
-            Ok(decode_l2_tx_row(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![u64_to_i64(batch_index)], decode_l2_tx_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     }
 
@@ -258,7 +266,9 @@ impl Storage {
         &mut self,
         danger_threshold: u64,
     ) -> rusqlite::Result<Vec<u64>> {
-        self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
+        self.write(|tx| {
+            recover_post_flush_inner(tx, danger_threshold, TEST_MAX_DIRECT_PAYLOAD_BYTES)
+        })
     }
 
     /// The unguarded twin of `recover_aging_tip_for_recovery`.
@@ -266,7 +276,9 @@ impl Storage {
         &mut self,
         danger_threshold: u64,
     ) -> rusqlite::Result<Vec<u64>> {
-        self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
+        self.write(|tx| {
+            recover_aging_tip_inner(tx, danger_threshold, TEST_MAX_DIRECT_PAYLOAD_BYTES)
+        })
     }
 
     pub(crate) fn insert_batch_snapshot(
@@ -315,35 +327,45 @@ fn synthetic_row(input: &StoredSafeInput) -> IngestedSafeInput {
     }
 }
 
-fn decode_l2_tx_row(
-    kind: i64,
-    sender: Option<Vec<u8>>,
-    data: Option<Vec<u8>>,
-    fee: Option<i64>,
-    payload: Option<Vec<u8>>,
-    block_number: Option<i64>,
-) -> SequencedL2Tx {
-    let sender_bytes = sender.expect("ordered replay row: missing sender");
+/// One row of [`Storage::ordered_l2_txs_for_batch`], built the way the
+/// canonical history page builds its rows: a user op carries its frame's fee
+/// and safe block, a direct its L1 index, block and timestamp.
+fn decode_l2_tx_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<L2Tx> {
+    let sender_bytes: Vec<u8> = row
+        .get::<_, Option<Vec<u8>>>(1)?
+        .expect("ordered replay row: missing sender");
     assert_eq!(
         sender_bytes.len(),
         20,
         "ordered replay row: sender must be 20 bytes"
     );
-    if kind == 0 {
-        SequencedL2Tx::UserOp(ValidUserOp {
-            sender: Address::from_slice(sender_bytes.as_slice()),
-            // Replay uses the persisted frame fee (log-space exponent) to mirror canonical execution.
-            fee: i64_to_u16(fee.expect("ordered replay row: missing fee")),
-            data: data.expect("ordered replay row: missing data"),
-        })
+    let sender = Address::from_slice(sender_bytes.as_slice());
+    let required = |index: usize, column: &str| -> rusqlite::Result<i64> {
+        Ok(row
+            .get::<_, Option<i64>>(index)?
+            .unwrap_or_else(|| panic!("ordered replay row: missing {column}")))
+    };
+    if row.get::<_, i64>(0)? == 0 {
+        Ok(L2Tx::UserOp(UserOpTx {
+            sender,
+            nonce: i64_to_u32(required(4, "nonce")?),
+            // The persisted frame fee (log-space exponent), as canonical execution sees it.
+            fee: i64_to_u16(required(3, "fee")?),
+            block: i64_to_u64(required(5, "safe_block")?),
+            data: row
+                .get::<_, Option<Vec<u8>>>(2)?
+                .expect("ordered replay row: missing data"),
+        }))
     } else {
-        SequencedL2Tx::Direct(DirectInput {
-            sender: Address::from_slice(sender_bytes.as_slice()),
-            block_number: i64_to_u64(
-                block_number.expect("ordered replay row: missing block_number"),
-            ),
-            payload: payload.expect("ordered replay row: missing payload"),
-        })
+        Ok(L2Tx::Direct(Direct {
+            input_index: i64_to_u64(required(6, "safe_input_index")?),
+            sender,
+            block: i64_to_u64(required(8, "block_number")?),
+            timestamp: i64_to_u64(required(9, "block_timestamp")?),
+            payload: row
+                .get::<_, Option<Vec<u8>>>(7)?
+                .expect("ordered replay row: missing payload"),
+        }))
     }
 }
 
@@ -374,6 +396,7 @@ fn close_frame_derived_in(
         head.batch_index,
         next_frame_in_batch,
         leading_direct_range,
+        TEST_MAX_DIRECT_PAYLOAD_BYTES,
     )?;
     Ok(policy)
 }
@@ -469,7 +492,7 @@ pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
 
 /// Pull every valid sequenced L2 tx out of storage, dropping the offset.
 /// Test-only convenience around `canonical_history_page`.
-pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
+pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<L2Tx> {
     let bounds = storage.history_bounds().expect("history bounds");
     storage
         .canonical_history_page(
@@ -483,8 +506,8 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<SequencedL2Tx> {
         .rows
         .into_iter()
         .map(|row| match row.context {
-            super::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
-            super::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
+            super::L2TxContext::UserOp { tx, .. } => L2Tx::UserOp(tx),
+            super::L2TxContext::Direct { tx, .. } => L2Tx::Direct(tx),
         })
         .collect()
 }

@@ -65,8 +65,9 @@ pub const EXIT_RESTART_EXPECT_RECOVERY: u8 = 10;
 pub const EXIT_RESTART_TRANSIENT: u8 = 20;
 /// Do not restart; page an operator.
 pub const EXIT_TERMINAL: u8 = 30;
-/// Do not restart: a previous instance left work past the checkpoint, so wipe
-/// the uncompleted data dir and run `setup --recovery`.
+/// Do not restart: a previous instance left work past the checkpoint, so a
+/// genesis setup would diverge. Recovery from a canonical machine arrives with
+/// `setup --base`.
 pub const EXIT_SETUP_NEEDS_RECOVERY: u8 = 40;
 /// Unclassified operational failure; restart with backoff.
 pub const EXIT_UNCLASSIFIED: u8 = 1;
@@ -94,7 +95,7 @@ impl CommandFailureVerdict {
 
     /// Exit-line severity: ERROR when the cause is a fault or unknown, WARN
     /// when the verdict names a planned procedure (a recovery boot, a retry,
-    /// `setup --recovery`). Alert on the exit code, not the level.
+    /// a setup refusal). Alert on the exit code, not the level.
     pub(crate) const fn logs_at_error(self) -> bool {
         matches!(self, Self::Terminal | Self::Unclassified)
     }
@@ -106,7 +107,7 @@ impl CommandFailureVerdict {
             Self::Retryable => "restart with backoff; alert if it persists",
             Self::Terminal => "do not restart; page an operator",
             Self::SetupRecoveryRequired => {
-                "do not restart; wipe the data dir and run setup --recovery"
+                "do not restart; recovery from a canonical machine arrives with setup --base"
             }
             Self::Unclassified => "restart with backoff",
         }
@@ -280,7 +281,6 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         | BootstrapError::SignerMisconfig { .. }
         | BootstrapError::SetupNotComplete { .. }
         | BootstrapError::CheckpointBeforeAppDeployment { .. }
-        | BootstrapError::SetupRecovery(_)
         | BootstrapError::Identity(IdentityError::Mismatch { .. } | IdentityError::OrphanedState) => {
             CommandFailureVerdict::Terminal
         }
@@ -402,9 +402,9 @@ pub enum BootstrapError {
     #[error("setup detection: could not read submitter wallet nonce from RPC: {message}")]
     DetectionWalletNonceRead { message: String },
     /// `setup`'s read-only detection gate found a previous instance left work
-    /// this checkpoint cannot account for. Sticky: only wiping the uncompleted
-    /// data dir and running `setup --recovery` resolves it — a plain
-    /// `setup` restart re-detects and re-refuses.
+    /// this checkpoint cannot account for. Sticky: a plain `setup` restart
+    /// re-detects and re-refuses; recovery from a canonical machine arrives
+    /// with `setup --base`.
     #[error(transparent)]
     SetupRefuse(#[from] SetupRefuse),
     /// `setup --checkpoint-block` predates the application's deployment block:
@@ -418,69 +418,14 @@ pub enum BootstrapError {
         checkpoint_block: u64,
         app_deployment_block: u64,
     },
-    /// `setup --recovery` failed in a way only the operator can fix (bad config,
-    /// a checkpoint that can't be loaded or doesn't fit the chain, or a DB that
-    /// is already set up). Terminal — see [`SetupRecoveryError`].
-    #[error(transparent)]
-    SetupRecovery(#[from] SetupRecoveryError),
-}
-
-/// Terminal failures of the `setup --recovery` procedure — the ones an
-/// operator must resolve. All map to [`EXIT_TERMINAL`]: a plain restart
-/// re-runs the same bad inputs and re-fails identically. Other failures take
-/// other paths: the flush as [`BootstrapError::Flush`], the post-flush
-/// re-sync as a [`WorkerExit::InputReader`] exit, and a re-sync behind the
-/// flush or a stopping block behind the checkpoint as a retryable
-/// [`RecoveryError`].
-#[derive(Debug, Error)]
-pub enum SetupRecoveryError {
-    /// Cross-field config validation failed (recovery missing its dump dir /
-    /// checkpoint block / key, or a plain `setup` carrying recovery-only args).
-    /// See [`crate::commands::config::SetupConfig::validate`].
-    #[error("invalid recovery configuration: {message}")]
-    InvalidConfig { message: String },
-    /// `setup --recovery` was invoked against a DB that is already set up.
-    /// Recovery is a strict one-shot on a freshly-wiped DB (wipe and re-run with
-    /// `--recovery`); re-pointing a live deployment at a different checkpoint
-    /// would strand its existing state.
-    #[error(
-        "`setup --recovery` requires a freshly-wiped data dir, but this one is \
-         already set up — wipe it and re-run"
-    )]
-    AlreadySetUp,
-    /// The checkpoint dump could not be loaded (missing/corrupt `info.toml`, or
-    /// the app's `from_dump` failed). Operator must supply a valid **sequencer**
-    /// recovery export (`info.toml` + `checkpoint.toml` + `state/`), not a watchdog CM checkpoint.
-    #[error("failed to load checkpoint dump at {path}: {message}")]
-    CheckpointLoad { path: String, message: String },
-    /// Outside empty genesis, A must precede B: equality can exclude pending
-    /// directs in B from the seed range. A < B alone does not certify queue
-    /// eligibility; the exporter must also verify no pending direct is at or
-    /// below A (docs/recovery/cockroach.md).
-    #[error(
-        "checkpoint last-executed safe block {executed_safe_block} (A) must precede \
-         checkpoint block {checkpoint_block} (B), except for empty genesis; \
-         equality can omit pending same-block directs"
-    )]
-    CheckpointNotBeforeBlock {
-        executed_safe_block: u64,
-        checkpoint_block: u64,
-    },
-    /// The input reader reported a successful post-flush sync without
-    /// persisting the safe-head observation that the recovery fold requires.
-    #[error(
-        "post-flush L1 resync completed without a persisted safe-head observation: \
-         internal storage invariant violation"
-    )]
-    MissingResyncedSafeHead,
 }
 
 /// `setup`'s read-only detection gate: the reasons a
 /// fresh `setup` refuses because a *previous* instance left work past the
 /// checkpoint. The gate runs before baseline publication and leaves setup
-/// incomplete. Rebuild in a fresh data directory with `setup --recovery` to
-/// flush/fold the outstanding batches; a plain `setup` restart re-detects and
-/// re-refuses (hence [`EXIT_SETUP_NEEDS_RECOVERY`], not auto-recovery class 10).
+/// incomplete. A plain `setup` restart re-detects and re-refuses (hence
+/// [`EXIT_SETUP_NEEDS_RECOVERY`], not auto-recovery class 10); recovery from a
+/// canonical machine arrives with `setup --base`.
 ///
 /// Both variants carry diagnostic fields for the refusal log line.
 #[derive(Debug, Error)]
@@ -492,8 +437,8 @@ pub enum SetupRefuse {
     /// this check; bounded at runtime by the content-identity check.
     #[error(
         "batch-submitter wallet nonce not settled (pending {pending} > safe \
-         {safe}) — a previous instance left in-flight batch txs; wipe this \
-         uncompleted data dir, then run `setup --recovery`"
+         {safe}) — a previous instance left in-flight batch txs; recovery from \
+         a canonical machine arrives with `setup --base`"
     )]
     WalletNonceUnsettled { pending: u64, safe: u64 },
     /// Step 2: a batch-submitter tx exists in `(checkpoint_block, safe]` — a
@@ -501,8 +446,8 @@ pub enum SetupRefuse {
     /// genesis-style bootstrap would silently diverge from canonical state.
     #[error(
         "batch-submitter input found at block {found_block} past checkpoint \
-         block {checkpoint_block} (safe_input_index {safe_input_index}) — wipe \
-         this uncompleted data dir, then run `setup --recovery`"
+         block {checkpoint_block} (safe_input_index {safe_input_index}) — \
+         recovery from a canonical machine arrives with `setup --base`"
     )]
     BatchPastCheckpoint {
         checkpoint_block: u64,
@@ -741,12 +686,6 @@ impl From<SetupRefuse> for CommandError {
     }
 }
 
-impl From<SetupRecoveryError> for CommandError {
-    fn from(e: SetupRecoveryError) -> Self {
-        CommandError::Bootstrap(BootstrapError::SetupRecovery(e))
-    }
-}
-
 impl From<FeeOracleError> for CommandError {
     fn from(error: FeeOracleError) -> Self {
         match error {
@@ -900,13 +839,6 @@ mod tests {
                     flush_observed_safe_block: 2,
                 }),
                 "a resync behind the flush's observed view",
-            ),
-            (
-                recovery_retry(RecoveryRetryReason::CheckpointAheadOfStop {
-                    checkpoint_block: 901,
-                    stop_block: 899,
-                }),
-                "a valid manual recovery checkpoint ahead of the RPC stopping block",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(
@@ -1173,12 +1105,6 @@ mod tests {
                 })),
                 "a pinned-identity mismatch",
             ),
-            // `setup --recovery` operator-fixable failures are terminal (a
-            // restart re-runs the same bad inputs).
-            (
-                CommandError::from(SetupRecoveryError::AlreadySetUp),
-                "setup --recovery over an already set-up directory",
-            ),
             // A checkpoint predating genesis is operator misconfig — terminal
             // (30), not a recovery trigger (40).
             (
@@ -1263,10 +1189,9 @@ mod tests {
         rows
     }
 
-    /// Class 40: sticky setup refusals. The operator must wipe the
-    /// uncompleted data dir and run `setup --recovery`, not plain-restart
-    /// (which would re-detect and re-refuse) — so they get a dedicated code,
-    /// distinct from the auto-recovery class (10).
+    /// Class 40: sticky setup refusals. A plain restart would re-detect and
+    /// re-refuse, so they get a dedicated code, distinct from the
+    /// auto-recovery class (10).
     fn setup_needs_recovery() -> Vec<Row> {
         vec![
             (
