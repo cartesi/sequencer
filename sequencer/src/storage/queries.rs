@@ -234,7 +234,7 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::Storage;
+    use crate::storage::test_helpers::{SENDER_A, set_up_storage};
     use crate::test_support::temp_db;
 
     /// The frame close derives its executions inside the write transaction;
@@ -244,7 +244,7 @@ mod tests {
         // SQLite's OP_Column flag for a column read only by length().
         const OPFLAG_LENGTHARG: i64 = 0x40;
         let db = temp_db("direct-predicate-plan");
-        let storage = Storage::open(db.path.as_str()).expect("open storage");
+        let storage = set_up_storage(&db.path, SENDER_A);
         let mut statement = storage
             .conn
             .prepare(&format!(
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn negative_batch_size_target_floors_to_zero() {
         let db = temp_db("floor-batch-target");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // This row satisfies every schema constraint while deriving a negative
         // target: 1403 - 2000 - 419 = -1016.
@@ -301,7 +301,7 @@ mod tests {
     #[should_panic(expected = "batch policy derived recommended fee")]
     fn negative_recommended_fee_fails_loud() {
         let db = temp_db("negative-recommended-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // A negative derived fee is ruled out by the column constraints. Model
         // corruption/tampering that bypassed them and ensure the read cannot
@@ -321,7 +321,7 @@ mod tests {
     #[should_panic(expected = "batch policy derived batch size target")]
     fn oversized_batch_size_target_fails_loud() {
         let db = temp_db("oversized-batch-target");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // This is schema-valid: the derived target is 17984, which remains
         // below the row's configured log_max_batch_bytes of 20000. It is still

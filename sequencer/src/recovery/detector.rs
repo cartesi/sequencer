@@ -176,7 +176,7 @@ fn map_storage_task_join(err: tokio::task::JoinError) -> DangerDetectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
+    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, set_up_storage};
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
     use std::time::Duration;
@@ -184,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn exits_on_shutdown_when_safe() {
         let db = temp_db("detector-shutdown");
-        let mut storage = Storage::open(&db.path).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -217,7 +217,7 @@ mod tests {
         // Closed frontier batch is aged past `danger_threshold` against the
         // observed safe block — the closed-batch arm of `check_danger` trips.
         let db = temp_db("detector-observed-closed-danger");
-        let mut storage = Storage::open(&db.path).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -281,7 +281,7 @@ mod tests {
         // `wall_clock_adjusted_danger_threshold`
         // — a completely separate code path that deserves its own test.
         let db = temp_db("detector-estimated-danger");
-        let mut storage = Storage::open(&db.path).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");

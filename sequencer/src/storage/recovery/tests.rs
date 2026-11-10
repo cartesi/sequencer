@@ -4,7 +4,7 @@
 use super::super::test_helpers::{
     RecoveryFixture, SENDER_A, all_ordered_l2_txs, batch_ids, default_protocol_timing,
     local_batch_payload, make_stale_batch_payload, open_temp_storage, seed_closed_batches,
-    seed_safe_inputs_with_batch_nonces,
+    seed_safe_inputs_with_batch_nonces, temp_db_with_default_deployment_identity,
 };
 use super::{find_closed_frontier_batch_in_danger, find_first_batch_in_danger};
 use crate::storage::{BatchId, DirectInputExecution, L2TxCount, SafeInputRange, Storage};
@@ -51,7 +51,9 @@ mod guarded_phases {
         name: &str,
         with_recovery_checkpoint: bool,
     ) -> (crate::test_support::TestDb, Storage, ProtocolTiming) {
-        let (db, mut storage) = open_temp_storage(name);
+        // No baseline: the fixture registers one only when asked.
+        let db = temp_db_with_default_deployment_identity(name);
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let protocol = default_protocol_timing();
         let now_ms = crate::clock::unix_now_ms();
         storage
@@ -168,7 +170,9 @@ mod guarded_phases {
     }
 
     fn cascade_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
-        let (db, mut storage) = open_temp_storage(name);
+        // No baseline: the test registers its own snapshots.
+        let db = temp_db_with_default_deployment_identity(name);
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let protocol = default_protocol_timing();
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -241,7 +245,9 @@ mod guarded_phases {
 
     #[test]
     fn tip_guard_reasserts_the_exact_reducer_decision() {
-        let (db, mut storage) = open_temp_storage("guarded-tip-decision");
+        // No baseline: the test registers its own snapshots.
+        let db = temp_db_with_default_deployment_identity("guarded-tip-decision");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let protocol = default_protocol_timing();
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -269,7 +275,9 @@ mod guarded_phases {
 
     #[test]
     fn tip_guard_refuses_missing_snapshot_without_tree_mutation() {
-        let (_db, mut storage) = open_temp_storage("guarded-tip-no-snapshot");
+        // No baseline: the test is the refusal without one.
+        let db = temp_db_with_default_deployment_identity("guarded-tip-no-snapshot");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let protocol = default_protocol_timing();
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -1790,7 +1798,9 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn cascade_hides_every_doomed_snapshot_and_retains_baseline() {
-        let (_db, mut storage) = open_temp_storage("recovery-baseline-fallback");
+        // No baseline: the test registers its own snapshots.
+        let db = temp_db_with_default_deployment_identity("recovery-baseline-fallback");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         let baseline_id = baseline(&mut storage);
         seed_closed_batches(&mut storage, 3);
         for index in 0..3 {
@@ -1821,7 +1831,9 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn accepted_snapshot_survives_cascade_after_baseline_gc_and_restart() {
-        let (db, mut storage) = open_temp_storage("recovery-accepted-fallback");
+        // No baseline: the test registers its own snapshots.
+        let db = temp_db_with_default_deployment_identity("recovery-accepted-fallback");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         baseline(&mut storage);
         seed_closed_batches(&mut storage, 2);
         let accepted_id = batch_snapshot(&mut storage, 0);
@@ -1864,7 +1876,9 @@ mod recovery_snapshot_selection {
 
     #[test]
     fn an_optimistic_snapshot_alone_does_not_admit_recovery() {
-        let (_db, mut storage) = open_temp_storage("recovery-optimistic-is-not-fallback");
+        // No baseline: an optimistic snapshot is the only one here.
+        let db = temp_db_with_default_deployment_identity("recovery-optimistic-is-not-fallback");
+        let mut storage = Storage::open(&db.path).expect("open storage");
         seed_closed_batches(&mut storage, 1);
         batch_snapshot(&mut storage, 0);
         let protocol = default_protocol_timing();
@@ -1910,14 +1924,16 @@ mod recovery_snapshot_selection {
 
 mod check_danger {
     use crate::clock::unix_now_ms;
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing, local_batch_payload};
-    use crate::storage::{BatchId, SafeInputRange, Storage, StoredSafeInput};
+    use crate::storage::test_helpers::{
+        SENDER_A, default_protocol_timing, local_batch_payload, set_up_storage,
+    };
+    use crate::storage::{BatchId, SafeInputRange, StoredSafeInput};
     use crate::test_support::temp_db;
 
     #[test]
     fn check_danger_reports_observed_closed_batch_danger() {
         let db = temp_db("check-danger-observed-closed");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -1960,7 +1976,7 @@ mod check_danger {
         // blocks: the effective threshold drops to 1100, so batch 1 reaches
         // danger via the wall-clock correction.
         let db = temp_db("check-danger-estimated");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(100, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -2011,7 +2027,7 @@ mod check_danger {
         // `danger_threshold`, route to observed closed-batch recovery. The
         // wall-clock arm is a fallback, not a mask over observed danger.
         let db = temp_db("check-danger-observed-closed-wins");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -2055,7 +2071,7 @@ mod check_danger {
         // puts the Tip in danger, recover the Tip directly instead of refusing
         // under the wall-clock classification.
         let db = temp_db("check-danger-observed-tip-wins");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -2102,7 +2118,7 @@ mod check_danger {
     #[test]
     fn check_danger_refuses_when_l1_view_is_stale() {
         let db = temp_db("check-danger-l1-view-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -2131,7 +2147,7 @@ mod check_danger {
     #[test]
     fn check_danger_refuses_when_safe_block_timestamp_is_in_the_future() {
         let db = temp_db("check-danger-future-safe-timestamp");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
@@ -2174,7 +2190,7 @@ mod check_danger {
     #[test]
     fn check_danger_refuses_when_local_progress_timestamp_is_in_the_future() {
         let db = temp_db("check-danger-future-progress");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
         let now_ms = 1_000_000_u64;
 
@@ -2218,7 +2234,7 @@ mod check_danger {
     #[test]
     fn observed_batch_danger_outranks_regressed_progress_clock() {
         let db = temp_db("check-danger-future-progress-priority");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -2276,7 +2292,7 @@ mod check_danger {
         // Fresh DB, no prior safe block timestamp. The L1 view is unusable
         // until the input reader records a real safe-head observation.
         let db = temp_db("check-danger-never-synced");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let status = storage
             .check_danger(&default_protocol_timing(), unix_now_ms())
             .expect("check_danger");
@@ -2286,7 +2302,7 @@ mod check_danger {
     #[test]
     fn check_danger_errors_when_valid_tip_has_no_first_frame() {
         let db = temp_db("check-danger-missing-first-frame");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");

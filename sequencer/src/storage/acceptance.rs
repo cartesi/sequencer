@@ -293,7 +293,7 @@ mod tests {
     use crate::clock::unix_now_ms;
     use crate::storage::test_helpers::{
         SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-        seed_safe_inputs_with_batch_nonces,
+        seed_safe_inputs_with_batch_nonces, set_up_storage,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn record_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         let mut head = storage
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         // Local batch 0 (first frame safe_block=1900) and batch 1 (first frame
@@ -543,7 +543,7 @@ mod tests {
         // be the keccak256 of exactly the bytes the submitter will broadcast
         // (`pending_batches`'s encoding) — same code path, by construction.
         let db = temp_db("seal-stamps-payload-hash");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -574,7 +574,7 @@ mod tests {
         // 'mismatch' marker atomically with the sync and freezes the
         // frontier; later syncs stay frozen.
         let db = temp_db("mismatch-divergence");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -643,7 +643,7 @@ mod tests {
         // sync, the frontier freezes, and `check_danger` reports
         // `CanonicalDivergence` ahead of every other arm.
         let db = temp_db("frontier-future-safe-block");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, Address::repeat_byte(0xCC));
 
         let future_safe_block_payload = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
             nonce: 0,
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn record_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         let mut head = storage
@@ -856,7 +856,7 @@ mod tests {
     #[test]
     fn record_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         let mut head = storage
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn record_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         let mut head = storage
@@ -1007,8 +1007,8 @@ mod tests {
         use crate::storage::IngestedSafeInput;
 
         let db = temp_db("accepted-era-without-identity");
-        // The crate-test open creates the genesis era and pins nothing.
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // An era with no identity pinned.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         let err = storage
             .append_ingested_safe_inputs_with_timestamp(
                 20,

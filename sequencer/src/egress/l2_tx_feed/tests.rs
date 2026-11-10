@@ -12,6 +12,7 @@ use crate::egress::test_era;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
+use crate::storage::test_helpers::{SENDER_A, set_up_storage};
 use crate::storage::{IngestedSafeInput, SafeInputRange, Storage};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::history::{HistoryClaim, HistoryPolicyError, L2TxCount, RecoveryGeneration};
@@ -87,7 +88,7 @@ async fn subscription_refuses_ahead_and_stale_claims() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_cap() {
     let db = temp_db("subscription-deep-history");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();

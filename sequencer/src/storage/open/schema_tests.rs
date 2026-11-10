@@ -9,7 +9,7 @@ use rusqlite::params;
 
 use super::super::test_helpers::{
     RecoveryFixture, SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-    open_temp_storage,
+    open_temp_storage, set_up_storage,
 };
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 
@@ -789,7 +789,8 @@ fn schema_rejects_deployment_identity_with_zero_chain_id() {
     // and break signature recovery; the CHECK refuses to persist it
     // in the first place.
     let db = crate::test_support::temp_db("schema-deployment-chain-id-zero");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    // No identity yet: the test inserts the row itself.
+    let storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
     let address = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO deployment_identity \
@@ -810,7 +811,8 @@ fn schema_rejects_deployment_identity_with_zero_chain_id() {
 #[test]
 fn schema_rejects_deployment_identity_with_negative_direct_payload_cap() {
     let db = crate::test_support::temp_db("schema-deployment-negative-cap");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    // No identity yet: the test inserts the row itself.
+    let storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
     let address = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO deployment_identity \
@@ -953,7 +955,7 @@ fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
 #[test]
 fn batch_policy_check_rejects_unsafe_alpha() {
     let db = crate::test_support::temp_db("unsafe-alpha");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let storage = set_up_storage(&db.path, SENDER_A);
     // log_alpha=-350 → log_batch_size_target = 1403-(-350)-419 = 1334 >= log_max_batch_bytes=1333
     let err = storage.conn.execute(
         "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0",
@@ -973,7 +975,7 @@ fn seeded_log_slack_is_the_exponent_nearest_tenfold() {
     use sequencer_core::fee::fee_to_linear;
 
     let db = crate::test_support::temp_db("seeded-log-slack");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let storage = set_up_storage(&db.path, SENDER_A);
     let slack: u16 = storage
         .conn
         .query_row(
@@ -996,7 +998,7 @@ fn seeded_log_slack_is_the_exponent_nearest_tenfold() {
 #[test]
 fn schema_rejects_safe_input_update_and_delete() {
     let db = crate::test_support::temp_db("safe-inputs-append-only");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let inputs = vec![
         StoredSafeInput {
             sender: SENDER_B,

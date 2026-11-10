@@ -580,7 +580,7 @@ mod tests {
         SafeFrontierState, SafeInputFrontier, SafeInputRange, Storage, StoredSafeInput, WriteHead,
         test_helpers::{
             SENDER_A, TEST_MAX_DIRECT_PAYLOAD_BYTES, WriteHeadParts, default_protocol_timing,
-            record_canonical_divergence,
+            record_canonical_divergence, set_up_storage,
         },
     };
     use crate::test_support::{pin_test_deployment_identity, temp_db};
@@ -618,7 +618,8 @@ mod tests {
     #[test]
     fn snapshot_registration_failure_rolls_back_batch_close_and_cached_head() {
         let db = temp_db("snapshot-close-rollback");
-        let mut storage = Storage::open(&db.path).unwrap();
+        // No baseline yet: the test registers its own at a known prefix.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .unwrap();
@@ -732,7 +733,7 @@ mod tests {
     /// A Tip at batch 1, frame 1 of the batch, with one user op in each frame.
     fn tip_past_genesis(name: &str) -> (crate::test_support::TestDb, Storage, WriteHead) {
         let db = temp_db(name);
-        let mut storage = Storage::open(&db.path).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .unwrap();
@@ -846,7 +847,7 @@ mod tests {
     #[should_panic(expected = "frame clock cannot regress")]
     fn frame_clock_cannot_regress_even_when_the_l1_interval_has_no_inputs() {
         let db = temp_db("empty-frame-clock-regression");
-        let mut storage = Storage::open(&db.path).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .unwrap();
@@ -858,7 +859,7 @@ mod tests {
     #[test]
     fn open_state_is_idempotent_and_rotation_is_atomic() {
         let db = temp_db("open-state");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         assert!(
             storage.open_state().expect("load open state").is_none(),
@@ -898,7 +899,7 @@ mod tests {
     #[test]
     fn safe_frontier_state_withholds_poisoned_projection() {
         let db = temp_db("safe-frontier-state-poison");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .append_safe_inputs(12, &[], SENDER_A, &default_protocol_timing())
             .expect("record safe head");
@@ -927,7 +928,7 @@ mod tests {
     #[test]
     fn append_counter_overflow_happens_before_the_transaction() {
         let db = temp_db("append-counter-overflow-before-write");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -958,7 +959,7 @@ mod tests {
     #[test]
     fn mismatched_execution_offset_rolls_back_source_and_history() {
         let db = temp_db("user-execution-offset-atomicity");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -990,8 +991,7 @@ mod tests {
     #[test]
     fn live_direct_rotation_requires_complete_classified_attribution() {
         let db = temp_db("direct-execution-attribution-complete");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1050,7 +1050,7 @@ mod tests {
     #[test]
     fn invalidation_rewinds_and_replacement_reuses_logical_offset() {
         let db = temp_db("execution-offset-invalidation-reuse");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn saturated_block_bound_counts_every_representable_block() {
         let db = temp_db("saturated-block-bound");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .append_safe_inputs(
                 10,
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn next_frame_fee_comes_from_batch_policy() {
         let db = temp_db("batch-policy-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let policy = storage.batch_policy().expect("default policy");
         // Default: log_gas_price=0, log_recommended_fee = 0+296+20+419+621 = 1356
         assert_eq!(policy.recommended_fee, 1356);
@@ -1169,7 +1169,7 @@ mod tests {
         // frame know the fee they're paying, regardless of upstream policy
         // drift during their round-trip.
         let db = temp_db("frame-fee-immutable");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -1247,8 +1247,7 @@ mod tests {
     #[test]
     fn next_undrained_input_is_derived_from_accounted_frame_block() {
         let db = temp_db("safe-cursor");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         assert_eq!(
             storage
                 .next_undrained_safe_input_index()
@@ -1368,7 +1367,7 @@ mod tests {
     #[test]
     fn initialize_open_state_creates_first_real_batch_and_frame() {
         let db = temp_db("initialize-open-state");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         let head = storage
             .initialize_open_state(12, SafeInputRange::empty_at(0))
@@ -1390,8 +1389,7 @@ mod tests {
     #[test]
     fn replay_returns_direct_inputs_in_drain_order() {
         let db = temp_db("replay-order");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1437,8 +1435,7 @@ mod tests {
     #[test]
     fn ensure_open_tip_opens_genesis_and_sequences_leading_range() {
         let db = temp_db("ensure-tip-genesis");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // Pre-existing L1 history: two safe inputs at block 10, and an
         // observed safe head of 10 (as the startup recovery sync would leave).
@@ -1519,7 +1516,7 @@ mod tests {
     #[test]
     fn ensure_open_tip_is_noop_when_tip_already_exists() {
         let db = temp_db("ensure-tip-noop");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // Seed an explicit open Tip at safe_block 5. Note: no safe-head
         // observation is recorded, so a genesis-branch `current_safe_block`
@@ -1595,8 +1592,7 @@ mod tests {
     #[test]
     fn envelopes_advance_accounting_without_becoming_application_inputs() {
         let db = temp_db("envelope-only-accounting");
-        let mut storage = Storage::open(&db.path).unwrap();
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();
@@ -1633,7 +1629,7 @@ mod tests {
         let alice = Address::repeat_byte(0xa1);
         let bob = Address::repeat_byte(0xb0);
         let db = temp_db("next-user-nonce");
-        let mut storage = Storage::open(&db.path).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();
@@ -1698,7 +1694,7 @@ mod tests {
     #[test]
     fn next_user_nonce_seeks_the_sender_index_without_sorting() {
         let db = temp_db("next-user-nonce-plan");
-        let storage = Storage::open(&db.path).unwrap();
+        let storage = set_up_storage(&db.path, SENDER_A);
         let plan: Vec<String> = storage
             .conn
             .prepare(&format!(
@@ -1750,8 +1746,7 @@ mod tests {
     #[test]
     fn an_over_cap_direct_never_executes_and_later_directs_keep_contiguous_offsets() {
         let db = temp_db("direct-payload-cap");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
@@ -1849,8 +1844,7 @@ mod tests {
     #[test]
     fn a_derived_drain_skips_the_over_cap_direct_too() {
         let db = temp_db("direct-payload-cap-derived");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        pin_test_deployment_identity(&mut storage, SENDER_A);
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         seed_directs_around_the_payload_cap(&mut storage);
 
         storage.ensure_open_tip().expect("open genesis tip");

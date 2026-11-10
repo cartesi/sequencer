@@ -175,6 +175,7 @@ pub(super) fn load_batch_frames_in(
 mod tests {
     use super::super::test_helpers::{
         SENDER_A, default_protocol_timing, seed_closed_batches, seed_safe_inputs_with_batch_nonces,
+        set_up_storage,
     };
     use crate::storage::{SafeInputRange, Storage};
     use crate::test_support::temp_db;
@@ -190,7 +191,7 @@ mod tests {
         // decoding the payload must round-trip back to that nonce, and the
         // frame body must match what storage persisted.
         let db = temp_db("pending-batches-nonce-baked-in");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         let mut head = storage
             .initialize_open_state(12, SafeInputRange::empty_at(0))
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn batch_level_helpers_expose_latest_index_frames_and_txs() {
         let db = temp_db("batch-level-helpers");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // Before initialization there should be no batches.
         assert!(
@@ -271,7 +272,7 @@ mod tests {
         // contract: open batches are NOT pulled into the submission pipeline,
         // and closed batches ARE, at the schema-guaranteed nonce.
         let db = temp_db("closed-batch-eligible");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -322,7 +323,7 @@ mod tests {
     #[test]
     fn wallet_nonce_watermark_is_monotonic_and_absent_at_genesis() {
         let db = temp_db("wallet-nonce-watermark");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         assert_eq!(
             storage.wallet_nonce_watermark().expect("read"),
@@ -354,7 +355,7 @@ mod tests {
     #[test]
     fn submitter_frontier_returns_zero_when_no_batches_were_accepted() {
         let db = temp_db("submitter-frontier-empty");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
             .expect("record observed safe head");
@@ -389,7 +390,7 @@ mod tests {
     #[test]
     fn submitter_frontier_tracks_accepted_prefix() {
         let db = temp_db("submitter-frontier-prefix");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         // Local closed batches 0 and 1 — their landings carry the real wire
         // bytes (content-identity check); 3..5 stay synthetic, which is fine
         // because the nonce gap means the fold never accepts them.
@@ -410,7 +411,7 @@ mod tests {
     #[test]
     fn pending_batches_skips_invalidated_and_respects_min_nonce() {
         let db = temp_db("load-pending-batches-filter");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         seed_closed_batches(&mut storage, 3);
         storage.insert_invalid_batch(1).expect("invalidate batch 1");
 
@@ -445,7 +446,7 @@ mod tests {
         // 0 — reusing the nonce of the original genesis. The scheduler's "expected next nonce" also
         // resets to 0, since no accepted batches were ever submitted.
         let db = temp_db("nonce-reuse-after-torn-cascade");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))

@@ -7,7 +7,7 @@
 //! `l1_submission`, `recovery`) — each adds its own `impl Storage`.
 
 use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
-use rusqlite_migration::{HookResult, M, Migrations};
+use rusqlite_migration::{M, Migrations};
 
 use super::{LifecycleCommand, StorageOpenError};
 
@@ -52,9 +52,10 @@ impl Storage {
     /// on the fly would create an ownerless schema with no creating command —
     /// database absence means uninitialized, never create-and-proceed.
     /// On an existing file that was never migrated it creates the schema
-    /// with no era, so the database is not set up. Crate tests keep
-    /// create-on-open as their fixture idiom, with the genesis era that
-    /// [`baseline_migration`] inserts only in test builds.
+    /// with no era, so the database is not set up. In crate tests it also
+    /// creates a missing file, with the genesis era that
+    /// [`baseline_migration`] inserts only in test builds; a set-up test
+    /// database comes from `test_helpers::set_up_storage`.
     pub(crate) fn open(path: &str) -> Result<Self, StorageOpenError> {
         #[cfg(not(test))]
         if !std::path::Path::new(path).exists() {
@@ -171,34 +172,28 @@ pub(super) fn run_migrations(
     conn: &mut Connection,
     initial_command: Option<LifecycleCommand>,
 ) -> Result<(), StorageOpenError> {
-    let migration = baseline_migration(initial_command, None);
+    let migration = baseline_migration(initial_command);
     Migrations::from_slice(&[migration]).to_latest(conn)?;
     Ok(())
 }
 
-type PostInitialMetadataHook = fn(&Transaction<'_>) -> HookResult;
+/// The schema migration: the schema alone, so only setup's publish ever
+/// writes an era.
+#[cfg(not(test))]
+fn baseline_migration(_initial_command: Option<LifecycleCommand>) -> M<'static> {
+    M::up(MIGRATION_0001_SCHEMA)
+}
 
-/// Build the exact baseline migration used in production. The optional hook
-/// exists only so the atomicity test can fail *after* observing the
-/// fixture era insert, without maintaining a shadow migration.
-///
-/// `initial_command: None` is [`Storage::open`]'s path. In crate tests it
-/// inserts the genesis era (create-on-open fixtures); production builds
-/// compile no era insert here, so only setup's publish ever writes one.
-fn baseline_migration(
-    initial_command: Option<LifecycleCommand>,
-    post_initial_metadata: Option<PostInitialMetadataHook>,
-) -> M<'static> {
-    M::up_with_hook(MIGRATION_0001_SCHEMA, move |tx: &Transaction<'_>| {
-        #[cfg(test)]
-        if initial_command.is_none() {
-            super::history::insert_era_in(tx, &super::NewEra::EMPTY_GENESIS)?;
-        }
-        #[cfg(not(test))]
-        let _ = initial_command;
-        if let Some(hook) = post_initial_metadata {
-            hook(tx)?;
-        }
+/// The schema migration in crate tests: [`Storage::open`]'s path
+/// (`initial_command: None`) also inserts the genesis era, in the
+/// migration's transaction, for the create-on-open fixtures.
+#[cfg(test)]
+fn baseline_migration(initial_command: Option<LifecycleCommand>) -> M<'static> {
+    if initial_command.is_some() {
+        return M::up(MIGRATION_0001_SCHEMA);
+    }
+    M::up_with_hook(MIGRATION_0001_SCHEMA, |tx: &Transaction<'_>| {
+        super::history::insert_era_in(tx, &super::NewEra::EMPTY_GENESIS)?;
         Ok(())
     })
 }
@@ -207,37 +202,19 @@ fn baseline_migration(
 mod tests {
     use super::*;
 
-    fn fail_after_observing_initial_metadata(tx: &Transaction<'_>) -> HookResult {
-        let history_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM era \
-             WHERE singleton_id = 0 AND base_l2_tx_count = 0 \
-               AND stop_block = 0 AND anchor_batch_nonce = 0",
-            [],
-            |row| row.get(0),
-        )?;
-        if history_count != 1 {
-            return Err(rusqlite_migration::HookError::Hook(
-                "fixture genesis era insert was not observed".to_string(),
-            ));
-        }
-        Err(rusqlite_migration::HookError::Hook(
-            "injected failure after the genesis era insert".to_string(),
-        ))
-    }
-
+    /// The schema migration is all or nothing: a failure after its last
+    /// statement leaves no table and the version unset.
     #[test]
-    fn failing_initial_hook_rolls_back_schema_and_era_together() {
+    fn failing_schema_migration_leaves_no_schema() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic-init.sqlite");
         let mut conn = open_writer_connection(path.to_str().expect("utf8")).expect("open");
-        let definitions = [baseline_migration(
-            None,
-            Some(fail_after_observing_initial_metadata),
-        )];
+        let failing = format!("{MIGRATION_0001_SCHEMA}\nCREATE TABLE era (duplicate INTEGER);");
+        let definitions = [M::up(failing.as_str())];
         let migrations = Migrations::from_slice(&definitions);
         migrations
             .to_latest(&mut conn)
-            .expect_err("the injected hook failure must abort migration");
+            .expect_err("the failing last statement must abort the migration");
 
         let table_count: i64 = conn
             .query_row(

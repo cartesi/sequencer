@@ -24,6 +24,8 @@ mod snapshots;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+#[cfg(test)]
+pub(crate) use test_helpers::StoredSafeInput;
 
 pub(crate) use convert::is_persistent_storage_error;
 
@@ -45,17 +47,6 @@ pub use sequencer_core::history::L2TxCount;
 pub use snapshots::{
     FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot, SnapshotLeases,
 };
-
-/// One safe input as stored on the L1 InputBox: sender, opaque payload, and
-/// the L1 block where it was included. Test fixtures seed inputs with it.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredSafeInput {
-    pub sender: alloy_primitives::Address,
-    pub payload: Vec<u8>,
-    /// Chain block number where this input was included (e.g. InputAdded event block).
-    pub block_number: u64,
-}
 
 /// One InputBox event with the L1 provenance persisted for feed consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,11 +80,6 @@ impl SafeInputRange {
             start_inclusive,
             end_exclusive,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty_at(index: u64) -> Self {
-        Self::new(index, index)
     }
 
     pub fn start(self) -> u64 {
@@ -186,17 +172,6 @@ pub struct BatchId(u64);
 impl BatchId {
     fn new(raw: u64) -> Self {
         Self(raw)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// For tests outside storage that read the database with raw SQL.
-    #[cfg(test)]
-    pub(crate) fn to_raw(self) -> u64 {
-        self.0
     }
 }
 
@@ -349,16 +324,6 @@ impl WriteHead {
 
     pub(crate) fn max_batch_user_op_bytes(&self) -> u64 {
         self.max_batch_user_op_bytes
-    }
-
-    #[cfg(test)]
-    pub(crate) fn frame_in_batch(&self) -> u32 {
-        self.frame_in_batch
-    }
-
-    #[cfg(test)]
-    pub(crate) fn open_frame_user_op_count(&self) -> u32 {
-        self.open_frame_user_op_count
     }
 
     /// A private copy, so a counter advance is validated before the

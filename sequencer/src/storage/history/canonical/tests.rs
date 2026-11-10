@@ -12,7 +12,7 @@ use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::insert_era_in;
 use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
+    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload, set_up_storage,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
@@ -49,7 +49,6 @@ fn claim(bounds: HistoryBounds, next: u64) -> HistoryClaim {
 }
 
 fn seed_aging_tip(storage: &mut Storage) {
-    pin_test_deployment_identity(storage, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
@@ -68,8 +67,7 @@ fn seed_aging_tip(storage: &mut Storage) {
 #[test]
 fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() {
     let db = temp_db("canonical-page-context");
-    let mut storage = Storage::open(&db.path).unwrap();
-    pin_test_deployment_identity(&mut storage, SENDER_A);
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
@@ -177,7 +175,7 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
 #[test]
 fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replacement() {
     let db = temp_db("canonical-page-recovery");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     seed_aging_tip(&mut storage);
     let before = storage.history_bounds().unwrap();
     assert_eq!(before.head, L2TxCount::new(2));
@@ -432,7 +430,7 @@ fn a_missing_rebuilt_row_below_the_end_fails_loud() {
 #[test]
 fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
     let db = temp_db("canonical-page-deep-backlog");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
@@ -462,7 +460,7 @@ fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
 #[test]
 fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery() {
     let db = temp_db("canonical-page-read-snapshot");
-    let mut writer = Storage::open(&db.path).unwrap();
+    let mut writer = set_up_storage(&db.path, SENDER_A);
     seed_aging_tip(&mut writer);
     let mut reader = Storage::open_read_only(&db.path).unwrap();
     let tx = reader.conn.transaction().unwrap();
@@ -528,7 +526,7 @@ fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
 #[should_panic(expected = "canonical history page has an attribution gap")]
 fn an_interior_history_hole_fails_loud() {
     let db = temp_db("canonical-page-corrupt-attribution");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();

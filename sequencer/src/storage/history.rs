@@ -43,19 +43,6 @@ pub struct NewEra {
     pub anchor_batch_nonce: u64,
 }
 
-impl NewEra {
-    /// An era at genesis that rebuilt nothing, with stop block 0 and anchor 0:
-    /// what the crate-test open path and seeded harnesses publish.
-    #[cfg(test)]
-    pub const EMPTY_GENESIS: Self = Self {
-        base: L2TxCount::ZERO,
-        rebuilt_end: L2TxCount::ZERO,
-        stop_block: 0,
-        first_queued_input: 0,
-        anchor_batch_nonce: 0,
-    };
-}
-
 /// One direct a drained range executed, at its history offset. A drained
 /// range may hold inputs without one: the batch submitter's own inputs and
 /// directs over the application's payload cap never execute.
@@ -217,7 +204,7 @@ pub(super) fn preserved_input_count_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::era;
+    use crate::storage::test_helpers::{SENDER_A, era, set_up_storage};
     use crate::storage::{LifecycleCommand, Storage};
     use crate::test_support::temp_db;
 
@@ -331,7 +318,7 @@ mod tests {
     #[test]
     fn the_generation_is_the_greatest_cut_and_advances_one_at_a_time() {
         let db = temp_db("history-generation");
-        let mut storage = Storage::open(&db.path).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let original = storage.history_version().unwrap();
         assert_eq!(original.recovery_generation.get(), 0);
         let result: Result<()> = storage.write(|tx| {

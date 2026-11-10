@@ -22,10 +22,79 @@ use super::queries::{load_current_write_head, query_batch_policy};
 use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
 use super::snapshots::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
-    BatchId, BatchPolicy, IngestedSafeInput, L2TxCount, SafeInputRange, Storage, StorageOpenError,
-    StoredSafeInput, WriteHead,
+    BatchId, BatchPolicy, IngestedSafeInput, L2TxCount, LifecycleCommand, NewEra, SafeInputRange,
+    Storage, StorageOpenError, WriteHead,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
+
+/// One safe input as stored on the L1 InputBox: sender, opaque payload, and
+/// the L1 block where it was included. Test fixtures seed inputs with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredSafeInput {
+    pub sender: Address,
+    pub payload: Vec<u8>,
+    /// Chain block number where this input was included (e.g. InputAdded event block).
+    pub block_number: u64,
+}
+
+impl NewEra {
+    /// An era at genesis that rebuilt nothing, with stop block 0 and anchor 0:
+    /// what [`set_up_storage`], the crate-test open path and seeded harnesses
+    /// publish.
+    pub(crate) const EMPTY_GENESIS: Self = Self {
+        base: L2TxCount::ZERO,
+        rebuilt_end: L2TxCount::ZERO,
+        stop_block: 0,
+        first_queued_input: 0,
+        anchor_batch_nonce: 0,
+    };
+}
+
+impl BatchId {
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// For tests outside storage that read the database with raw SQL.
+    pub(crate) fn to_raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl SafeInputRange {
+    pub(crate) fn empty_at(index: u64) -> Self {
+        Self::new(index, index)
+    }
+}
+
+impl WriteHead {
+    pub(crate) fn frame_in_batch(&self) -> u32 {
+        self.frame_in_batch
+    }
+
+    pub(crate) fn open_frame_user_op_count(&self) -> u32 {
+        self.open_frame_user_op_count
+    }
+}
+
+/// A database in the state `setup` leaves it, built through setup's own
+/// calls: the schema, the test deployment identity with `batch_submitter`,
+/// and the genesis era published with its baseline snapshot (a `baseline`
+/// prefix beside the database file). A test that needs no identity or no
+/// baseline yet opens through `Storage::open_with_era` instead; one that
+/// needs no era, through `Storage::initialize_for_command`.
+pub(crate) fn set_up_storage(path: &str, batch_submitter: Address) -> Storage {
+    let mut storage =
+        Storage::initialize_for_command(path, LifecycleCommand::Setup).expect("create schema");
+    pin_test_deployment_identity(&mut storage, batch_submitter);
+    storage
+        .publish_era(
+            &Path::new(path).with_file_name("baseline"),
+            &NewEra::EMPTY_GENESIS,
+        )
+        .expect("publish the genesis era");
+    storage
+}
 
 /// Batch ids from raw indices, to compare against a cascade's invalidated list.
 pub(crate) fn batch_ids(raw: &[u64]) -> Vec<BatchId> {
@@ -187,13 +256,39 @@ impl Storage {
     }
 }
 
+/// Reads only tests make. The danger check reads the safe-head columns
+/// through the `queries` functions inside its own transaction.
+impl Storage {
+    /// Unix-ms of the last successful `log_gas_price` write. `0` means never
+    /// written (migration default); completed setup guarantees a nonzero value.
+    pub(crate) fn log_gas_price_updated_at_ms(&self) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT log_gas_price_updated_at_ms FROM batch_policy WHERE singleton_id = 0",
+            [],
+            |row| Ok(i64_to_u64(row.get::<_, i64>(0)?)),
+        )
+    }
+
+    /// L1 timestamp (Unix seconds) of the observed safe block, or `None`
+    /// before the first safe-head observation.
+    pub(crate) fn current_safe_block_timestamp(&mut self) -> rusqlite::Result<Option<u64>> {
+        super::queries::current_safe_block_timestamp(&self.conn)
+    }
+
+    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
+    /// or `None` before the first safe-head observation.
+    pub(crate) fn last_safe_progress_ms(&self) -> rusqlite::Result<Option<u64>> {
+        super::queries::last_safe_progress_ms(&self.conn)
+    }
+}
+
 /// Seeding and inspection levers. Each bypasses the guard, provenance or
 /// wall clock its production counterpart enforces.
 impl Storage {
-    /// A fresh database set up with `era`: setup's schema, then the era row
-    /// through `publish_era`'s insert, without a baseline snapshot (callers
-    /// that need one add it). For fixtures whose era is not the genesis one
-    /// `Storage::open` creates.
+    /// A fresh database with `era`: setup's schema, then the era row through
+    /// `publish_era`'s insert, with no identity and no baseline snapshot
+    /// (callers that need either add it). For fixtures whose era is not the
+    /// genesis one, or that need no identity or no baseline yet.
     pub(crate) fn open_with_era(path: &str, era: &super::NewEra) -> Storage {
         let mut storage =
             Storage::initialize_for_command(path, super::LifecycleCommand::Setup).expect("schema");
@@ -496,12 +591,12 @@ fn close_frame_derived_in(
     Ok(policy)
 }
 
-/// Recovery-storage fixture with the same prerequisite ordering as setup:
-/// baseline schema first, then the persisted deployment identity, then any L1
-/// facts or batch-tree mutations driven by the individual test.
+/// A fresh database with the genesis era and the test identity
+/// ([`SENDER_A`]) but no baseline snapshot, for recovery tests that register
+/// their own snapshots or test their absence.
 pub(crate) fn temp_db_with_default_deployment_identity(name: &str) -> TestDb {
     let db = temp_db(name);
-    let mut storage = Storage::open(db.path.as_str()).expect("open test storage");
+    let mut storage = Storage::open_with_era(&db.path, &NewEra::EMPTY_GENESIS);
     pin_test_deployment_identity(&mut storage, SENDER_A);
     db
 }
@@ -697,10 +792,11 @@ impl RecoveryFixture for Storage {
     }
 }
 
-/// A storage over a fresh pinned database. Bind the [`TestDb`] as `_db`, never
-/// `_`: dropping it deletes the directory under the open connection.
+/// A storage over a fresh set-up database ([`set_up_storage`], submitter
+/// [`SENDER_A`]). Bind the [`TestDb`] as `_db`, never `_`: dropping it
+/// deletes the directory under the open connection.
 pub(crate) fn open_temp_storage(name: &str) -> (TestDb, Storage) {
-    let db = temp_db_with_default_deployment_identity(name);
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let db = temp_db(name);
+    let storage = set_up_storage(&db.path, SENDER_A);
     (db, storage)
 }

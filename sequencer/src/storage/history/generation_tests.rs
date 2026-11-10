@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::storage::Storage;
+use crate::storage::test_helpers::{SENDER_A, set_up_storage};
 use crate::test_support::temp_db;
 
 fn ledger(storage: &Storage) -> Vec<(i64, i64)> {
@@ -36,7 +37,7 @@ fn seed_cuts(storage: &mut Storage, cuts: &[u64]) {
 #[test]
 fn generation_and_cut_are_atomic_and_immutable() {
     let db = temp_db("generation-cut-atomic");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let result: Result<()> = storage.write(|tx| {
         advance_recovery_generation_in(tx)?;
         Err(rusqlite::Error::InvalidQuery)
@@ -76,7 +77,7 @@ fn generation_and_cut_are_atomic_and_immutable() {
 #[test]
 fn compatibility_uses_every_intervening_cut_and_the_current_head() {
     let db = temp_db("generation-cut-minimum");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     seed_cuts(&mut storage, &[3, 5, 2, 4]);
     for (from, current, head, expected) in [
         (0, 1, 9, 3),
@@ -108,7 +109,7 @@ fn compatibility_uses_every_intervening_cut_and_the_current_head() {
 #[should_panic(expected = "history generation lineage is incomplete")]
 fn missing_intermediate_cut_fails_instead_of_certifying_a_partial_minimum() {
     let db = temp_db("generation-cut-gap");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     seed_cuts(&mut storage, &[3, 1, 5]);
     storage
         .conn
@@ -128,7 +129,7 @@ fn missing_intermediate_cut_fails_instead_of_certifying_a_partial_minimum() {
 #[test]
 fn current_head_may_be_the_boundary_after_the_maximum_sqlite_offset() {
     let db = temp_db("generation-cut-max-head");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let max = i64::MAX as u64;
     seed_cuts(&mut storage, &[max]);
     let head = L2TxCount::new(max + 1);

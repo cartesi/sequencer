@@ -29,8 +29,8 @@ fn close(storage: &mut Storage, head: &mut WriteHead) -> i64 {
 /// A baseline at `prefix(0)` and an open genesis Tip.
 fn baseline_and_tip(name: &str) -> (crate::test_support::TestDb, Storage, i64, WriteHead) {
     let db = temp_db(name);
-    let mut storage = Storage::open(&db.path).unwrap();
-    pin_test_deployment_identity(&mut storage, SENDER_A);
+    // No baseline yet: the fixture registers its own at `prefix(0)`.
+    let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
     let baseline = storage
         .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
         .unwrap();

@@ -255,8 +255,9 @@ Test placement: unit tests are a child module of the code under test, inline
 large, never `#[path]`. Cross-module in-process tests go in
 `sequencer/src/integration_tests/`; devnet, machine and binary tests go in the
 `tests/*` crates. Shared fixtures live in `crate::test_support`;
-`storage::test_helpers` keeps the storage-domain ones (seeding, the recovery
-fixture trait, divergence markers); cross-crate signing helpers live in
+`storage::test_helpers` keeps the storage-domain ones (the set-up database
+`set_up_storage`, seeding, the recovery fixture trait, divergence markers, and
+the test-only `Storage` reads); cross-crate signing helpers live in
 `sequencer_core::test_support` behind its `test-support` feature.
 
 Some `sequencer` tests use Anvil (Foundry). They run by default and fail with a

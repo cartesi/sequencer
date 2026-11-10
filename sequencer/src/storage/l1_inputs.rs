@@ -56,11 +56,6 @@ impl Storage {
         current_safe_block(&self.conn)
     }
 
-    #[cfg(test)]
-    pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
-        super::queries::current_safe_block_timestamp(&self.conn)
-    }
-
     /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
     /// ascending `safe_input_index`, or `None`. Read-only; `setup`'s detection
     /// gate uses it to find any previous-instance batch past the checkpoint
@@ -280,13 +275,6 @@ impl Storage {
         })
     }
 
-    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
-    /// or `None` if no real safe-head observation has occurred yet.
-    #[cfg(test)]
-    pub fn last_safe_progress_ms(&self) -> Result<Option<u64>> {
-        super::queries::last_safe_progress_ms(&self.conn)
-    }
-
     /// Read the deployment identity this DB is pinned to. Returns `None` on
     /// first startup, before L1 bootstrap has discovered the InputBox stream.
     pub fn deployment_identity(&self) -> Result<Option<DeploymentIdentity>> {
@@ -442,6 +430,7 @@ mod tests {
         StoredSafeInput,
         test_helpers::{
             SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
+            set_up_storage,
         },
     };
     use crate::test_support::{pin_test_deployment_identity, temp_db};
@@ -462,7 +451,7 @@ mod tests {
     #[test]
     fn safe_input_end_exclusive_counts_appended_inputs() {
         let db = temp_db("safe-input-api");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
@@ -494,7 +483,7 @@ mod tests {
     #[test]
     fn first_batch_submitter_input_after_block_scans_strictly_past() {
         let db = temp_db("first-submitter-input-after");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         // index 0: submitter @5; index 1: non-submitter @12; index 2: submitter @18.
@@ -603,7 +592,8 @@ mod tests {
     #[test]
     fn l1_inputs_page_reads_an_index_range_in_bounded_pages() {
         let db = temp_db("l1-inputs-page");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         seed_classified_inputs(&mut storage);
         let identity = storage
             .deployment_identity()
@@ -639,7 +629,8 @@ mod tests {
     #[test]
     fn export_check_counts_admitted_directs_above_the_clock() {
         let db = temp_db("export-check");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         seed_classified_inputs(&mut storage);
         let check = |storage: &mut Storage, count, clock| {
             storage
@@ -694,7 +685,8 @@ mod tests {
     #[test]
     fn counts_the_admitted_directs_in_an_index_range() {
         let db = temp_db("admitted-in-range");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         seed_classified_inputs(&mut storage);
         let count = |storage: &mut Storage, start, end| {
             storage
@@ -714,7 +706,8 @@ mod tests {
     #[test]
     fn the_pinned_cap_decides_which_directs_execute() {
         let db = temp_db("pinned-cap");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         storage
             .pin_deployment_identity(DeploymentIdentity {
                 max_direct_payload_bytes: 0,
@@ -740,7 +733,7 @@ mod tests {
     #[test]
     fn new_db_has_no_observed_safe_head() {
         let db = temp_db("new-db-no-safe-head");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -766,7 +759,8 @@ mod tests {
     #[test]
     fn external_values_outside_sqlite_integer_range_are_typed_refusals() {
         let db = temp_db("external-integer-range");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test's refused pins must leave none.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         let protocol = default_protocol_timing();
 
         let identity_err = storage
@@ -864,7 +858,8 @@ mod tests {
     #[test]
     fn deployment_identity_is_inserted_once() {
         let db = temp_db("deployment-identity-insert-once");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins the first one.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         let first = identity();
 
         assert_eq!(
@@ -903,7 +898,7 @@ mod tests {
     #[test]
     fn append_safe_inputs_creates_and_advances_safe_head() {
         let db = temp_db("append-safe-inputs-creates-safe-head");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let protocol = default_protocol_timing();
 
         storage
