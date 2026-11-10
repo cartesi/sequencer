@@ -83,7 +83,7 @@ setup's own sync.
 | Field | Value |
 |---|---|
 | Base count | The base's L2 tx count, where the era's history starts. |
-| Stop block | The safe block pinned after the flush, stored as `base_safe_block`. |
+| Stop block | The safe block pinned after the flush, stored as `stop_block`. |
 | Rebuilt history end | The L2 tx count at the end of the stop block, where the live rows start. |
 | First queued input | The InputBox index of the oldest direct still queued at the end of the stop block, or the input count through it when none is. |
 | Anchor batch nonce | The scheduler's next batch nonce at the end of the stop block. |
@@ -148,8 +148,9 @@ empty but for the lock file, so retrying in the same directory is safe.
    An executed row records its L2 tx count; a skipped one keeps none. An
    application error stops setup with the row's input index and position.
 7. **Publishes the new era.** It writes the baseline dump, then one transaction
-   records the era, sets the batch tree's anchor, registers the baseline and
-   marks setup complete. Setup opens no root frame and no Tip.
+   inserts the era row, which carries the batch tree's anchor and whose
+   existence marks setup complete, and registers the baseline. Setup opens no
+   root frame and no Tip.
 
 Every pass reads and writes the tables in pages of 1024 rows, so memory stays
 bounded however long the rebuilt range is. Nothing is published until step 7.
@@ -368,7 +369,7 @@ it exist only on L1.
 | The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, whose unit tests drive every failure arm through a scripted emulator, and `canonical-test`'s `export` cases run on the built image. |
 | Export check, rebuild and execution | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs). |
 | Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
-| The rebuilt history table and the era record | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
+| The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`, `history_version_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
 | The root frame's drain from the first queued input | `next_undrained_safe_input_index_in` in [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs). |
 | The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshot_dumps.rs`](../../sequencer/src/storage/snapshot_dumps.rs). |
 | The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |

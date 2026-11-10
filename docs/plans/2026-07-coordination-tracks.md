@@ -100,7 +100,7 @@ Remaining checks need the actual consumer:
   Proposed: an `Application` nonce query plus an enumeration method. Setup
   already holds the baseline engine when it publishes the baseline, so it can
   enumerate it into a write-once `baseline_nonces` table in the same
-  transaction, the user-nonce counterpart of `batch_tree_anchor`. The point
+  transaction, the user-nonce counterpart of the era's `anchor_batch_nonce`. The point
   query also lets the shared execution boundary check the one-step nonce
   advance per op, as it checks progress. Both need C ABI exports and the
   engine owner's agreement.

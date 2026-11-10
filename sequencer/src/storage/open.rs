@@ -54,8 +54,10 @@ impl Storage {
     /// deployment mistake (mistyped `--data-dir`, wrong mount). Creating one
     /// on the fly would create an ownerless schema with no creating command —
     /// database absence means uninitialized, never create-and-proceed.
-    /// Crate tests keep create-on-open as their fixture idiom; the
-    /// command-less baseline in [`baseline_migration`] exists for them.
+    /// On an existing file that was never migrated it creates the schema
+    /// with no era, so the database is not set up. Crate tests keep
+    /// create-on-open as their fixture idiom, with the genesis era that
+    /// [`baseline_migration`] inserts only in test builds.
     pub(crate) fn open(path: &str) -> Result<Self, StorageOpenError> {
         #[cfg(not(test))]
         if !std::path::Path::new(path).exists() {
@@ -71,8 +73,8 @@ impl Storage {
         })
     }
 
-    /// Create the schema for setup in one migration transaction. The era
-    /// record is published later, with setup's completion. On
+    /// Create the schema for setup in one migration transaction. The era is
+    /// published later, and its row is setup's completion. On
     /// an already-migrated database the hook does not run; callers must
     /// inspect the existing facts.
     pub(crate) fn initialize_for_command(
@@ -198,19 +200,22 @@ type PostInitialMetadataHook = fn(&Transaction<'_>) -> HookResult;
 
 /// Build the exact baseline migration used in production. The optional hook
 /// exists only so the atomicity test can fail *after* observing the
-/// production history insert, without maintaining a shadow migration.
+/// fixture era insert, without maintaining a shadow migration.
 ///
-/// `initial_command: None` is the crate-test fixture path (create-on-open
-/// with genesis history bases); production cannot reach it because
-/// [`Storage::open`] refuses paths with no database file.
+/// `initial_command: None` is [`Storage::open`]'s path. In crate tests it
+/// inserts the genesis era (create-on-open fixtures); production builds
+/// compile no era insert here, so only setup's publish ever writes one.
 fn baseline_migration(
     initial_command: Option<LifecycleCommand>,
     post_initial_metadata: Option<PostInitialMetadataHook>,
 ) -> M<'static> {
     M::up_with_hook(MIGRATION_0001_SCHEMA, move |tx: &Transaction<'_>| {
+        #[cfg(test)]
         if initial_command.is_none() {
-            super::history::initialize_history_in(tx, &super::EraRecord::EMPTY_GENESIS)?;
+            super::history::insert_era_in(tx, &super::NewEra::EMPTY_GENESIS)?;
         }
+        #[cfg(not(test))]
+        let _ = initial_command;
         if let Some(hook) = post_initial_metadata {
             hook(tx)?;
         }
@@ -224,25 +229,24 @@ mod tests {
 
     fn fail_after_observing_initial_metadata(tx: &Transaction<'_>) -> HookResult {
         let history_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM history_state \
-             WHERE singleton_id = 0 AND recovery_generation = 0 \
-               AND base_l2_tx_count = 0 \
-               AND base_safe_block = 0",
+            "SELECT COUNT(*) FROM era \
+             WHERE singleton_id = 0 AND base_l2_tx_count = 0 \
+               AND stop_block = 0 AND anchor_batch_nonce = 0",
             [],
             |row| row.get(0),
         )?;
         if history_count != 1 {
             return Err(rusqlite_migration::HookError::Hook(
-                "production initial history insert was not observed".to_string(),
+                "fixture genesis era insert was not observed".to_string(),
             ));
         }
         Err(rusqlite_migration::HookError::Hook(
-            "injected failure after initial history insert".to_string(),
+            "injected failure after the genesis era insert".to_string(),
         ))
     }
 
     #[test]
-    fn failing_initial_hook_rolls_back_schema_and_history_together() {
+    fn failing_initial_hook_rolls_back_schema_and_era_together() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic-init.sqlite");
         let mut conn = open_writer_connection(path.to_str().expect("utf8")).expect("open");
@@ -271,11 +275,11 @@ mod tests {
     }
 
     #[test]
-    fn setup_registers_history_only_with_complete_baseline() {
+    fn setup_schema_has_no_era_until_one_is_inserted() {
         let setup_dir = tempfile::tempdir().unwrap();
         let mut eras = Vec::new();
         for (name, era) in [
-            ("genesis.sqlite", super::super::EraRecord::EMPTY_GENESIS),
+            ("genesis.sqlite", super::super::NewEra::EMPTY_GENESIS),
             ("machine.sqlite", super::super::test_helpers::era(8, 8, 100)),
         ] {
             let path = setup_dir.path().join(name);
@@ -283,18 +287,19 @@ mod tests {
                 Storage::initialize_for_command(path.to_str().unwrap(), LifecycleCommand::Setup)
                     .unwrap();
             assert!(matches!(
-                setup.history_state(),
+                setup.era(),
                 Err(rusqlite::Error::QueryReturnedNoRows)
             ));
+            assert!(!setup.is_setup_complete().unwrap());
             setup
-                .write(|tx| super::super::history::initialize_history_in(tx, &era))
+                .write(|tx| super::super::history::insert_era_in(tx, &era))
                 .unwrap();
-            eras.push(setup.history_state().unwrap());
+            eras.push(setup.era().unwrap());
         }
-        assert_ne!(eras[0].version.era_id, eras[1].version.era_id);
-        assert_eq!(eras[1].base_l2_tx_count, 8);
-        assert_eq!(eras[1].base_safe_block, 100);
-        assert_eq!(eras[1].rebuilt_history_end, 8);
+        assert_ne!(eras[0].id, eras[1].id);
+        assert_eq!(eras[1].base.get(), 8);
+        assert_eq!(eras[1].stop_block, 100);
+        assert_eq!(eras[1].rebuilt_end.get(), 8);
     }
 }
 

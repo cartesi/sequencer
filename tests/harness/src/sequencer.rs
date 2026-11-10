@@ -107,8 +107,8 @@ pub struct BatchNonceFrontier {
     pub safe_accepted: Option<u64>,
 }
 
-/// The era a setup published, read from `history_state` and the batch-tree
-/// anchor. Returned by [`ManagedSequencer::published_era`].
+/// The era a setup published, read from the `era` row. Returned by
+/// [`ManagedSequencer::published_era`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublishedEra {
     /// The base's L2 tx count, where the era's history starts.
@@ -690,9 +690,10 @@ impl ManagedSequencer {
         })
     }
 
-    /// The batch-tree anchor nonce, read from the run DB read-only: the
-    /// resume nonce of a rebuilt deployment, `0` for a genesis one. The
-    /// batch-tree checks state root and contiguity relative to it (I16).
+    /// The batch-tree anchor nonce (the era's `anchor_batch_nonce`), read
+    /// from the run DB read-only: the resume nonce of a rebuilt deployment,
+    /// `0` for a genesis one. The batch-tree checks state root and contiguity
+    /// relative to it (I16). Fails when the era is absent.
     pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
         let db_path = self.data_dir_path.join("sequencer.db");
         let conn = rusqlite::Connection::open_with_flags(
@@ -702,11 +703,11 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
         let anchor: i64 = conn
             .query_row(
-                "SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0",
+                "SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|err| io_other(format!("read batch_tree_anchor: {err}")))?;
+            .map_err(|err| io_other(format!("read the era's anchor nonce: {err}")))?;
         Ok(anchor as u64)
     }
 
@@ -721,11 +722,9 @@ impl ManagedSequencer {
             i64,
         ) = conn
             .query_row(
-                "SELECT h.base_l2_tx_count, h.base_safe_block, h.rebuilt_history_end, \
-                        h.first_queued_input, a.nonce \
-                 FROM history_state h \
-                 JOIN batch_tree_anchor a ON a.singleton_id = 0 \
-                 WHERE h.singleton_id = 0",
+                "SELECT base_l2_tx_count, stop_block, rebuilt_history_end, \
+                        first_queued_input, anchor_batch_nonce \
+                 FROM era WHERE singleton_id = 0",
                 [],
                 |row| {
                     Ok((
@@ -1462,7 +1461,9 @@ impl ManagedSequencer {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         let (era, generation): (Vec<u8>, i64) = conn.query_row(
-            "SELECT era_id, recovery_generation FROM history_state",
+            "SELECT era_id, \
+                    (SELECT COALESCE(MAX(recovery_generation), 0) FROM history_generation_cuts) \
+               FROM era WHERE singleton_id = 0",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;

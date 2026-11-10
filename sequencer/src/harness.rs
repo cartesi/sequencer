@@ -168,7 +168,7 @@ mod tests {
         storage
             .publish_era(
                 &std::path::Path::new(&data_dir).join("baseline"),
-                &crate::storage::EraRecord::EMPTY_GENESIS,
+                &crate::storage::NewEra::EMPTY_GENESIS,
             )
             .expect("complete setup");
         drop(storage);

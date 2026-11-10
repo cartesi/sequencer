@@ -9,8 +9,8 @@
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
+use super::history::{era_in, find_era_in};
 use super::l1_inputs::query_deployment_identity;
-use super::mutations::batch_tree_anchor_in;
 use sequencer_core::protocol::{AcceptedBatch, ProtocolTiming, SafeInputView};
 
 /// One row of `safe_accepted_batches`, exposing just the columns the
@@ -61,7 +61,7 @@ pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
         // (`first_non_gold_closed_batch`) is unaffected: no valid batch sits
         // below the anchor (I16), so `nonce >= 0` and `nonce >= N'` select the
         // same row. (See I16 / docs/recovery/cockroach.md.)
-        None => batch_tree_anchor_in(conn),
+        None => Ok(era_in(conn)?.anchor_batch_nonce),
     }
 }
 
@@ -101,28 +101,17 @@ pub(super) fn populate_safe_accepted_batches(
     // The prefix through the stop block is the baseline's. Replaying it from
     // the anchor could accept an old future-nonce submission the scheduler
     // rejected at its original position. Only inputs after it belong here.
-    let Some(base_safe_block) = conn
-        .query_row(
-            "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-    else {
+    let Some(era) = find_era_in(conn)? else {
         // Setup's sync, before the era exists: its stop block and anchor are
         // not known yet, and judging the old instance's landings against an
         // empty tree would record a false divergence (I15).
-        let complete: bool =
-            conn.query_row("SELECT EXISTS(SELECT 1 FROM setup_complete)", [], |row| {
-                row.get(0)
-            })?;
-        assert!(!complete, "completed setup has no history baseline");
         return Ok(());
     };
+    let stop_block = u64_to_i64(era.stop_block);
     let batch_submitter = query_deployment_identity(conn)?
         .ok_or(rusqlite::Error::QueryReturnedNoRows)?
         .batch_submitter_address;
-    let anchor = batch_tree_anchor_in(conn)?;
+    let anchor = era.anchor_batch_nonce;
     let latest_accepted = query_latest_safe_accepted_batch(conn)?;
     let mut cursor = latest_accepted
         .map(|row| row.safe_input_index)
@@ -139,12 +128,7 @@ pub(super) fn populate_safe_accepted_batches(
         let page: Vec<(i64, Vec<u8>, i64, Vec<u8>)> = {
             let mut stmt = conn.prepare_cached(SELECT_SQL)?;
             stmt.query_map(
-                params![
-                    batch_submitter.as_slice(),
-                    cursor,
-                    base_safe_block,
-                    PAGE_SIZE
-                ],
+                params![batch_submitter.as_slice(), cursor, stop_block, PAGE_SIZE],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?
             .collect::<Result<_>>()?
@@ -412,14 +396,14 @@ mod tests {
                 .expect("ingest opaque prefix");
             storage
                 .write(|tx| {
-                    super::super::history::initialize_history_in(
+                    super::super::history::insert_era_in(
                         tx,
-                        &crate::storage::EraRecord {
-                            base_count: L2TxCount::new(41),
-                            rebuilt_history_end: L2TxCount::new(41),
+                        &crate::storage::NewEra {
+                            base: L2TxCount::new(41),
+                            rebuilt_end: L2TxCount::new(41),
                             stop_block: 30,
                             first_queued_input: 2,
-                            next_batch_nonce: 1,
+                            anchor_batch_nonce: 1,
                         },
                     )
                 })
@@ -813,13 +797,18 @@ mod tests {
         // passing against the genuine local batch. Every other populate test
         // uses anchor=0, so the N' > 0 acceptance path had no coverage.
         let db = temp_db("populate-at-anchor");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = Storage::open_with_era(
+            db.path.as_str(),
+            &crate::storage::NewEra {
+                anchor_batch_nonce: 7,
+                ..crate::storage::NewEra::EMPTY_GENESIS
+            },
+        );
         let protocol = default_protocol_timing();
         let submitter = SENDER_A;
 
-        // Root the tree at N' = 7, then build + seal one local batch — it carries
+        // The tree roots at N' = 7: build + seal one local batch — it carries
         // nonce 7 (compute_next_nonce(None) reads the anchor).
-        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -877,10 +866,15 @@ mod tests {
         // frontier and force a false recovery). Pins the anchor-aware-frontier
         // (I15) skip arm — the inverse of the foreign-batch freeze test above.
         let db = temp_db("populate-below-anchor");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = Storage::open_with_era(
+            db.path.as_str(),
+            &crate::storage::NewEra {
+                anchor_batch_nonce: 7,
+                ..crate::storage::NewEra::EMPTY_GENESIS
+            },
+        );
         let protocol = default_protocol_timing();
         let submitter = SENDER_A;
-        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
 
         // Old-generation batches at nonces 0, 1, 2 (< anchor) land from the submitter.
         let mk = |nonce: u64| {
@@ -1143,7 +1137,7 @@ mod tests {
 
     #[test]
     fn the_first_append_after_the_era_judges_every_input_past_the_stop_block() {
-        use crate::storage::{EraRecord, LifecycleCommand};
+        use crate::storage::{LifecycleCommand, NewEra};
 
         let db = temp_db("accepted-first-after-era");
         let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
@@ -1176,8 +1170,8 @@ mod tests {
         storage
             .publish_era(
                 &db._dir.path().join("baseline"),
-                &EraRecord {
-                    next_batch_nonce: 1,
+                &NewEra {
+                    anchor_batch_nonce: 1,
                     ..crate::storage::test_helpers::era(0, 0, 30)
                 },
             )

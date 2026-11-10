@@ -50,7 +50,8 @@ close logs the creation time as `snapshot_ms`, at DEBUG, or at WARN once it
 reaches half the `POST /tx` acknowledgement budget.
 
 Setup similarly makes the baseline artifact durable before one transaction
-publishes the era, registers the baseline snapshot and marks setup complete;
+inserts the era row (which marks setup complete) and registers the baseline
+snapshot;
 it opens no root frame, which `run`'s startup does
 ([cockroach recovery](../recovery/cockroach.md#what-setup-does)). The rows of
 the era's rebuilt history, from its base count to the baseline, have no

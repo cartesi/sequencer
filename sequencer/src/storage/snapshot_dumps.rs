@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
 use sequencer_core::history::{HistoryVersion, L2TxCount};
 
 use super::convert::{i64_to_u64, u64_to_i64};
-use super::history::{next_l2_tx_count_in, query_history_state};
+use super::history::{era_in, history_version_in, next_l2_tx_count_in};
 use super::{Storage, is_persistent_storage_error, is_persistent_storage_open_error};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +175,7 @@ impl Storage {
                 Ok(None) => return Ok(Ok(None)),
                 Err(error) => return Ok(Err(error)),
             };
-            let history_version = query_history_state(tx)?.version;
+            let history_version = history_version_in(tx)?;
             acquire_dump_lease_in(tx, snapshot.dump.id)?;
             Ok(Ok(Some((snapshot, history_version))))
         })??;
@@ -207,7 +207,7 @@ impl Storage {
             let Some(snapshot) = latest_snapshot_in(tx)? else {
                 return Ok(None);
             };
-            let history_version = query_history_state(tx)?.version;
+            let history_version = history_version_in(tx)?;
             let next_batch_nonce = snapshot_next_nonce_in(tx, snapshot.dump.id)?;
             acquire_dump_lease_in(tx, snapshot.dump.id)?;
             Ok(Some((snapshot, history_version, next_batch_nonce)))
@@ -357,17 +357,16 @@ pub(super) fn finalized_dump_in(
     let Some(snapshot) = baseline_snapshot_in(conn)? else {
         return Ok(None);
     };
-    let history = query_history_state(conn)?;
+    let era = era_in(conn)?;
     assert_eq!(
-        snapshot.l2_tx_count.get(),
-        history.rebuilt_history_end,
+        snapshot.l2_tx_count, era.rebuilt_end,
         "the era baseline sits at the rebuilt history's end"
     );
     Ok(Some(FinalizedDump {
         dump: snapshot.dump,
         l2_tx_count: snapshot.l2_tx_count,
-        inclusion_block: history.base_safe_block,
-        next_batch_nonce: super::mutations::batch_tree_anchor_in(conn)?,
+        inclusion_block: era.stop_block,
+        next_batch_nonce: era.anchor_batch_nonce,
     }))
 }
 
@@ -395,7 +394,7 @@ fn snapshot_next_nonce_in(conn: &Connection, dump_id: i64) -> Result<u64> {
         Some(index) => Ok(batch_nonce_in(conn, i64_to_u64(index))?
             .checked_add(1)
             .expect("batch nonce overflow")),
-        None => super::mutations::batch_tree_anchor_in(conn),
+        None => Ok(era_in(conn)?.anchor_batch_nonce),
     }
 }
 
@@ -559,8 +558,8 @@ mod tests {
         storage
             .publish_era(
                 &prefix(0),
-                &crate::storage::EraRecord {
-                    next_batch_nonce: 7,
+                &crate::storage::NewEra {
+                    anchor_batch_nonce: 7,
                     ..era(41, 41, 100)
                 },
             )
@@ -714,10 +713,7 @@ mod tests {
         let id = storage
             .insert_baseline_snapshot(&prefix(0), L2TxCount::ZERO)
             .unwrap();
-        storage
-            .conn
-            .execute_batch("DROP TABLE history_state")
-            .unwrap();
+        storage.conn.execute_batch("DROP TABLE era").unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let counter = count.clone();
         let schedule: ReleaseScheduler = Arc::new(move |_| {

@@ -14,10 +14,11 @@
 -- The **Tip** is the one batch currently accepting ops: sealed_at_ms IS NULL
 -- AND invalidated_at_ms IS NULL. A partial unique index enforces at-most-one.
 --
--- `nonce` is structural: equal to `parent.nonce + 1`, or the batch-tree anchor's
--- nonce for the parentless root (0 at genesis). Enforced by trigger on INSERT. The scheduler's view of a batch's
--- identity; reused across recovery cascades (new Tip forks from last valid
--- ancestor, inheriting nonce via the +1 rule).
+-- `nonce` is structural: equal to `parent.nonce + 1`, or the era's
+-- `anchor_batch_nonce` for the parentless root (0 at genesis). Enforced by
+-- trigger on INSERT. The scheduler's view of a batch's identity; reused across
+-- recovery cascades (new Tip forks from last valid ancestor, inheriting nonce
+-- via the +1 rule).
 -- ---------------------------------------------------------------------------
 -- `sealed_at_ms` / `invalidated_at_ms` are write-once observability stamps from
 -- the wall clock, deliberately not cross-checked against `created_at_ms`:
@@ -68,18 +69,6 @@ CREATE VIEW IF NOT EXISTS valid_closed_batches AS
 CREATE VIEW IF NOT EXISTS valid_open_batch AS
     SELECT * FROM valid_batches WHERE sealed_at_ms IS NULL;
 
--- Batch-tree anchor (I16): the nonce the single valid parentless root carries,
--- the scheduler's next batch nonce at the era's stop block, so `run`'s first
--- Tip roots there without replaying history. Read by
--- `trg_enforce_nonce_contiguity` and `compute_next_nonce`. Setup writes it once,
--- with the era record; `trg_batch_tree_anchor_write_once` then freezes it,
--- since re-anchoring a live deployment would strand its spine.
-CREATE TABLE IF NOT EXISTS batch_tree_anchor (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    nonce        INTEGER NOT NULL CHECK (nonce >= 0)
-) STRICT;
-INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
-
 -- ── Triggers ───────────────────────────────────────────────────────────────
 --
 -- These enforce invariants the writer could otherwise violate with a bug.
@@ -92,8 +81,10 @@ INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 -- every column before any trigger runs, so trigger arithmetic, frontier folds
 -- and comparisons only ever see the declared class (integers where they count).
 
--- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
--- (the era's next batch nonce at its stop block) for the parentless root.
+-- Nonce contiguity: `nonce = parent.nonce + 1`, or the era's
+-- `anchor_batch_nonce` (its next batch nonce at the stop block) for the
+-- parentless root. With no era the anchor subquery is NULL, `IS NOT` holds, and
+-- a parentless root aborts: the batch tree never roots before the era exists.
 CREATE TRIGGER IF NOT EXISTS trg_enforce_nonce_contiguity
 AFTER INSERT ON batches
 FOR EACH ROW
@@ -102,7 +93,7 @@ BEGIN
         -- A parentless root must carry exactly the deployment's anchor nonce,
         -- so a buggy root at any other nonce ABORTs.
         WHEN NEW.parent_batch_index IS NULL
-         AND NEW.nonce != (SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0)
+         AND NEW.nonce IS NOT (SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0)
             THEN RAISE(ABORT, 'parentless root must carry the batch-tree anchor nonce')
         -- At most one *valid* parentless root. A fully-torn cascade invalidates
         -- the old root, then re-roots parentless at the anchor (the documented
@@ -403,7 +394,7 @@ CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_insert
 BEFORE INSERT ON rebuilt_history FOR EACH ROW
 BEGIN
     SELECT CASE
-        WHEN EXISTS (SELECT 1 FROM history_state)
+        WHEN EXISTS (SELECT 1 FROM era)
             THEN RAISE(ABORT, 'rebuilt history is sealed once its era is published')
         WHEN NEW.l2_tx_count IS NOT NULL
             THEN RAISE(ABORT, 'a rebuilt row is inserted before it executes')
@@ -426,7 +417,7 @@ CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_count_once
 BEFORE UPDATE ON rebuilt_history FOR EACH ROW
 BEGIN
     SELECT CASE
-        WHEN EXISTS (SELECT 1 FROM history_state)
+        WHEN EXISTS (SELECT 1 FROM era)
           OR OLD.l2_tx_count IS NOT NULL OR NEW.l2_tx_count IS NULL
           OR NEW.l1_input_index IS NOT OLD.l1_input_index
           OR NEW.position IS NOT OLD.position
@@ -449,31 +440,32 @@ CREATE TRIGGER IF NOT EXISTS trg_rebuilt_history_not_deletable
 BEFORE DELETE ON rebuilt_history FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'rebuilt history is retained for the database lifetime'); END;
 
--- The era record, written once when setup publishes. Its history starts at
--- the base count; setup's rebuild covers [base, rebuilt_history_end) and the
--- live rows follow. `base_safe_block` is the stop block, and the lane drains
--- directs from `first_queued_input` until a frame of the era accounts for
--- more. Only the recovery generation changes during this database's lifetime.
-CREATE TABLE IF NOT EXISTS history_state (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    era_id BLOB NOT NULL CHECK (
+-- The era: one immutable row, written by setup's publish. Its history starts
+-- at the base count; setup's rebuild covers [base_l2_tx_count,
+-- rebuilt_history_end) and the live rows follow. The lane drains directs from
+-- `first_queued_input` until a frame of the era accounts for more.
+-- `anchor_batch_nonce` is the nonce the batch tree's parentless root carries
+-- (I16). A database is set up exactly when this row exists.
+CREATE TABLE IF NOT EXISTS era (
+    singleton_id        INTEGER PRIMARY KEY CHECK (singleton_id = 0),
+    era_id              BLOB    NOT NULL CHECK (
         length(era_id) = 16
         AND substr(hex(era_id), 13, 1) = '4'
         AND substr(hex(era_id), 17, 1) IN ('8', '9', 'A', 'B')),
-    era_created_at_ms INTEGER NOT NULL CHECK (era_created_at_ms >= 0),
-    recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 0),
-    base_l2_tx_count INTEGER NOT NULL CHECK (base_l2_tx_count >= 0),
-    base_safe_block INTEGER NOT NULL CHECK (base_safe_block >= 0),
+    published_at_ms     INTEGER NOT NULL CHECK (published_at_ms >= 0),
+    base_l2_tx_count    INTEGER NOT NULL CHECK (base_l2_tx_count >= 0),
     rebuilt_history_end INTEGER NOT NULL CHECK (rebuilt_history_end >= base_l2_tx_count),
-    first_queued_input INTEGER NOT NULL CHECK (first_queued_input >= 0)
+    stop_block          INTEGER NOT NULL CHECK (stop_block >= 0),
+    first_queued_input  INTEGER NOT NULL CHECK (first_queued_input >= 0),
+    anchor_batch_nonce  INTEGER NOT NULL CHECK (anchor_batch_nonce >= 0)
 ) STRICT;
 -- The era's counts are exactly the span of the executed rebuilt rows, and its
 -- first queued input lies among the inputs through the stop block. A direct
 -- never skips, and the scheduler drains its queue in input order, so every
 -- rebuilt direct is counted and lies before the first one still queued: an
 -- uncounted one would vanish from the feed, and a queued one would run twice.
-CREATE TRIGGER IF NOT EXISTS trg_history_state_era_fits
-BEFORE INSERT ON history_state FOR EACH ROW
+CREATE TRIGGER IF NOT EXISTS trg_era_fits
+BEFORE INSERT ON era FOR EACH ROW
 BEGIN
     SELECT CASE
         WHEN NEW.base_l2_tx_count != COALESCE(
@@ -491,59 +483,65 @@ BEGIN
             THEN RAISE(ABORT, 'a rebuilt direct is never still queued')
         WHEN NEW.first_queued_input > COALESCE(
                 (SELECT safe_input_index + 1 FROM safe_inputs
-                  WHERE block_number <= NEW.base_safe_block
+                  WHERE block_number <= NEW.stop_block
                   ORDER BY block_number DESC, safe_input_index DESC LIMIT 1), 0)
             THEN RAISE(ABORT, 'the first queued input lies past the stop block')
     END;
 END;
--- One cut for each transition, measured after invalidation removes the old
--- suffix and before reopening attributes replacement direct inputs.
+-- `INSERT OR REPLACE` deletes the old row without firing DELETE triggers
+-- (`recursive_triggers` is off), so only this BEFORE INSERT trigger stops it.
+CREATE TRIGGER IF NOT EXISTS trg_era_single_insert
+BEFORE INSERT ON era FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM era)
+BEGIN SELECT RAISE(ABORT, 'the era is inserted once per database'); END;
+CREATE TRIGGER IF NOT EXISTS trg_era_immutable
+BEFORE UPDATE ON era FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'the era is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_era_not_deletable
+BEFORE DELETE ON era FOR EACH ROW
+BEGIN SELECT RAISE(ABORT, 'the era is retained for the database lifetime'); END;
+-- One cut for each recovery transition, measured after invalidation removes
+-- the old suffix and before reopening attributes replacement direct inputs.
+-- The recovery generation is the greatest cut's (0 with none): there is no
+-- stored counter, so this ledger is the generation's only home.
 CREATE TABLE IF NOT EXISTS history_generation_cuts (
     recovery_generation INTEGER PRIMARY KEY CHECK (recovery_generation > 0),
     preserved_l2_tx_count INTEGER NOT NULL CHECK (preserved_l2_tx_count >= 0)
 ) STRICT;
+-- With no era the subquery yields no row, `IS NOT` compares with NULL and
+-- holds, and the insert aborts: a cut never exists without its era.
+CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_contiguous
+BEFORE INSERT ON history_generation_cuts FOR EACH ROW
+WHEN NEW.recovery_generation IS NOT (
+    SELECT COALESCE((SELECT MAX(recovery_generation) FROM history_generation_cuts), 0) + 1
+      FROM era WHERE singleton_id = 0)
+BEGIN SELECT RAISE(ABORT, 'a cut advances the recovery generation by exactly one, within an era'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_immutable
 BEFORE UPDATE ON history_generation_cuts FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'history generation cuts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_not_deletable
 BEFORE DELETE ON history_generation_cuts FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'history generation cuts are retained throughout the era'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_state_single_insert
-BEFORE INSERT ON history_state FOR EACH ROW
-WHEN EXISTS (SELECT 1 FROM history_state)
-BEGIN SELECT RAISE(ABORT, 'history state is inserted once per database'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_identity_write_once
-BEFORE UPDATE OF singleton_id, era_id, era_created_at_ms,
-    base_l2_tx_count, base_safe_block, rebuilt_history_end,
-    first_queued_input ON history_state FOR EACH ROW
-BEGIN SELECT RAISE(ABORT, 'history baseline is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_generation_monotonic
-BEFORE UPDATE OF recovery_generation ON history_state FOR EACH ROW
-WHEN OLD.recovery_generation = 9223372036854775807
-  OR NEW.recovery_generation != OLD.recovery_generation + 1
-  OR NOT EXISTS (SELECT 1 FROM history_generation_cuts
-                 WHERE recovery_generation = NEW.recovery_generation)
-BEGIN SELECT RAISE(ABORT, 'recovery generation must advance by exactly one with a recorded cut'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_state_not_deletable
-BEFORE DELETE ON history_state FOR EACH ROW
-BEGIN SELECT RAISE(ABORT, 'history state is write-once per database'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_target_must_be_tip
 BEFORE INSERT ON application_inputs FOR EACH ROW
 WHEN NOT EXISTS (SELECT 1 FROM batches WHERE batch_index = NEW.batch_index
     AND sealed_at_ms IS NULL AND invalidated_at_ms IS NULL)
 BEGIN SELECT RAISE(ABORT, 'application input must target the current valid Tip'); END;
-CREATE TRIGGER IF NOT EXISTS trg_application_inputs_requires_baseline
-BEFORE INSERT ON application_inputs FOR EACH ROW
-WHEN NOT EXISTS (SELECT 1 FROM history_state)
-BEGIN SELECT RAISE(ABORT, 'application history baseline is missing'); END;
--- Live rows continue the era's rebuilt history.
+-- Live rows continue the era's rebuilt history. With no era the subquery is
+-- NULL, `IS NOT` holds and the insert aborts.
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_contiguous
 BEFORE INSERT ON application_inputs FOR EACH ROW
-WHEN NEW.l2_tx_count != (SELECT MAX(rebuilt_history_end,
+WHEN NEW.l2_tx_count IS NOT (SELECT MAX(rebuilt_history_end,
     COALESCE((SELECT MAX(l2_tx_count) + 1 FROM application_inputs), 0))
-    FROM history_state WHERE singleton_id = 0)
+    FROM era WHERE singleton_id = 0)
 BEGIN SELECT RAISE(ABORT, 'application input offset must equal next count'); END;
+-- The same refusal with a clearer message. SQLite fires the most recently
+-- created trigger first, so this one, created after the arm above, speaks.
+CREATE TRIGGER IF NOT EXISTS trg_application_inputs_requires_baseline
+BEFORE INSERT ON application_inputs FOR EACH ROW
+WHEN NOT EXISTS (SELECT 1 FROM era)
+BEGIN SELECT RAISE(ABORT, 'application history baseline is missing'); END;
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_immutable
 BEFORE UPDATE ON application_inputs FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'application inputs are immutable'); END;
@@ -561,7 +559,7 @@ BEGIN DELETE FROM application_inputs WHERE batch_index = NEW.batch_index; END;
 -- best-effort recorded before death. DELIBERATELY NOT AN ADMISSION GATE:
 -- admission
 -- is governed by facts — the kernel process lock excludes concurrent
--- owners, `setup_complete` orders commands (two-sided), and
+-- owners, the era's existence orders commands (two-sided), and
 -- `canonical_divergence` is the one absorbing refusal (cockroach rebuild is
 -- the only exit). Restart policy after a terminal fault is the exit-code
 -- contract (30 = do not restart, page), not a database gate. Nothing reads
@@ -618,28 +616,6 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
             AND fee_oracle_pool IS NOT NULL AND fee_oracle_twap_window_secs IS NOT NULL)
     )
 ) STRICT;
-
--- Setup publishes the era record, its baseline snapshot, the anchor and this
--- marker in one final transaction after artifact durability. A setup that
--- fails earlier leaves a directory to discard; run cannot admit it.
-CREATE TABLE IF NOT EXISTS setup_complete (
-    singleton_id    INTEGER PRIMARY KEY CHECK (singleton_id = 0),
-    completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
-) STRICT;
-
--- The batch-tree anchor is frozen once setup completes. `setup` writes it
--- (the next batch nonce at the stop block) with the `setup_complete` marker;
--- after the marker exists, re-anchoring a live deployment would strand the
--- existing batch spine, so any further UPDATE aborts. Defense-in-depth: the
--- lifecycle check already makes setup's publish a one-shot on a fresh DB.
-CREATE TRIGGER IF NOT EXISTS trg_batch_tree_anchor_write_once
-BEFORE UPDATE OF nonce ON batch_tree_anchor
-FOR EACH ROW
-WHEN EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)
-BEGIN
-    SELECT RAISE(ABORT, 'batch-tree anchor is frozen after setup completes');
-END;
-
 
 -- ---------------------------------------------------------------------------
 -- Batch policy singleton

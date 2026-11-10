@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use super::*;
+use crate::storage::Storage;
 use crate::test_support::temp_db;
 
 fn ledger(storage: &Storage) -> Vec<(i64, i64)> {
@@ -26,10 +27,6 @@ fn seed_cuts(storage: &mut Storage, cuts: &[u64]) {
                     "INSERT INTO history_generation_cuts (recovery_generation,preserved_l2_tx_count) VALUES (?1,?2)",
                     params![generation, u64_to_i64(*cut)],
                 )?;
-                tx.execute(
-                    "UPDATE history_state SET recovery_generation=?1 WHERE singleton_id=0",
-                    [generation],
-                )?;
             }
             Ok(())
         })
@@ -47,19 +44,8 @@ fn generation_and_cut_are_atomic_and_immutable() {
     assert!(result.is_err());
     assert!(ledger(&storage).is_empty());
     assert_eq!(
-        storage
-            .history_state()
-            .unwrap()
-            .version
-            .recovery_generation
-            .get(),
+        storage.history_version().unwrap().recovery_generation.get(),
         0
-    );
-    assert!(
-        storage
-            .conn
-            .execute("UPDATE history_state SET recovery_generation=1", [])
-            .is_err()
     );
 
     storage.write(advance_recovery_generation_in).unwrap();
@@ -75,13 +61,12 @@ fn generation_and_cut_are_atomic_and_immutable() {
         assert!(storage.conn.execute(sql, []).is_err(), "{sql}");
     }
     drop(storage);
-    let reopened = Storage::open(&db.path).unwrap();
+    let mut reopened = Storage::open(&db.path).unwrap();
     assert_eq!(ledger(&reopened), [(1, 0)]);
     assert_eq!(
         reopened
-            .history_state()
+            .history_version()
             .unwrap()
-            .version
             .recovery_generation
             .get(),
         1

@@ -10,13 +10,13 @@ use tokio::sync::oneshot;
 use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
-use crate::storage::history::initialize_history_in;
+use crate::storage::history::insert_era_in;
 use crate::storage::rebuilt_history::RebuiltKey;
 use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, EraRecord, IngestedSafeInput, LifecycleCommand, SafeInputRange,
+    DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
 };
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 use sequencer_core::l2_tx::L2Tx;
@@ -303,12 +303,12 @@ fn seed_two_table_era(storage: &mut Storage) {
     storage
         .publish_era(
             std::path::Path::new("/snapshot/era"),
-            &EraRecord {
-                base_count: L2TxCount::new(41),
-                rebuilt_history_end: L2TxCount::new(45),
+            &NewEra {
+                base: L2TxCount::new(41),
+                rebuilt_end: L2TxCount::new(45),
                 stop_block: 10,
                 first_queued_input: 3,
-                next_batch_nonce: 5,
+                anchor_batch_nonce: 5,
             },
         )
         .unwrap();
@@ -481,8 +481,8 @@ fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery
     writer
         .append_executed_user_ops_chunk(&mut head, &[included(1, 1, 0xcc)])
         .unwrap();
-    let state = query_history_state(&tx).unwrap();
-    let retained = canonical_page_in(&tx, &state, before, L2TxCount::new(1), 2).unwrap();
+    let era = crate::storage::history::era_in(&tx).unwrap();
+    let retained = canonical_page_in(&tx, &era, before, L2TxCount::new(1), 2).unwrap();
     assert_eq!(retained.bounds, before);
     assert_eq!(history_bounds_in(&tx).unwrap(), before);
     assert_eq!(retained.rows.len(), 1);
@@ -509,7 +509,7 @@ fn tail_after_the_largest_sqlite_offset_is_empty_without_clamping() {
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     let last = i64::MAX as u64;
     storage
-        .write(|tx| initialize_history_in(tx, &crate::storage::test_helpers::era(last, last, 0)))
+        .write(|tx| insert_era_in(tx, &crate::storage::test_helpers::era(last, last, 0)))
         .unwrap();
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))

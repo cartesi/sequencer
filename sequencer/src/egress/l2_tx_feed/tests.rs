@@ -352,16 +352,15 @@ async fn corrupt_feed_head_trips_terminal_storage_fault() {
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
     let start = claim(&db.path, 0);
-    // STRICT refuses a text generation, so drop STRICT from this table first.
+    // An era id of the wrong length: the head read decodes it and fails with
+    // a storage error, not a panic. The era is immutable and its CHECK bounds
+    // the length, so both are lifted for the corruption.
     conn.execute_batch(
-        "PRAGMA writable_schema = ON; \
-         UPDATE sqlite_schema SET sql = replace(sql, ') STRICT', ')') WHERE name = 'history_state'; \
-         PRAGMA writable_schema = OFF;",
+        "PRAGMA ignore_check_constraints = ON; \
+         DROP TRIGGER trg_era_immutable; \
+         UPDATE era SET era_id = X'0102';",
     )
-    .expect("make history_state non-STRICT");
-    drop(conn);
-    let conn = Storage::open_connection(db.path.as_str()).expect("reopened raw connection");
-    conn.execute_batch("PRAGMA ignore_check_constraints = ON; DROP TRIGGER trg_history_generation_monotonic; UPDATE history_state SET recovery_generation = 'broken';").expect("corrupt generation");
+    .expect("corrupt the era id");
     drop(conn);
 
     let shutdown = RuntimeScope::default();
@@ -468,9 +467,9 @@ fn seed_ordered_txs(db_path: &str) {
 }
 
 fn claim(db_path: &str, next: u64) -> HistoryClaim {
-    let storage = Storage::open_read_only(db_path).unwrap();
+    let mut storage = Storage::open_read_only(db_path).unwrap();
     HistoryClaim {
-        version: storage.history_state().unwrap().version,
+        version: storage.history_version().unwrap(),
         next_input: L2TxCount::new(next),
     }
 }

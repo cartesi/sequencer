@@ -16,7 +16,7 @@ use super::convert::{
     from_unix_ms, i64_to_u32, i64_to_u64, now_unix_ms, saturating_query_bound, to_unix_ms,
     u64_to_i64,
 };
-use super::history::{next_l2_tx_count_in, query_history_state};
+use super::history::{era_in, next_l2_tx_count_in};
 use super::mutations::{
     insert_new_batch, insert_open_frame, persist_frame_direct_sequence,
     persist_frame_direct_sequence_derived, seal_batch,
@@ -334,7 +334,7 @@ fn insert_draining_tip_with_executions(
 /// the first queued input, past submitter and over-cap inputs that never
 /// execute. A cascade that tears every batch of the era drains from there too.
 fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
-    let era = query_history_state(tx)?;
+    let era = era_in(tx)?;
     let latest_frame: Option<i64> = tx
         .query_row(
             "SELECT safe_block FROM frames
@@ -346,7 +346,7 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
         .optional()?;
     match latest_frame {
         Some(frame_block) => {
-            safe_input_count_through_block_in(tx, era.base_safe_block.max(i64_to_u64(frame_block)))
+            safe_input_count_through_block_in(tx, era.stop_block.max(i64_to_u64(frame_block)))
         }
         None => Ok(era.first_queued_input),
     }
@@ -1100,9 +1100,9 @@ mod tests {
         storage
             .publish_era(
                 std::path::Path::new("/snapshot/era"),
-                &crate::storage::EraRecord {
+                &crate::storage::NewEra {
                     first_queued_input: 1,
-                    next_batch_nonce: 6,
+                    anchor_batch_nonce: 6,
                     ..era(1, 1, 10)
                 },
             )
@@ -1313,21 +1313,28 @@ mod tests {
         let db = temp_db("application-history-baseline-required");
         let mut storage =
             Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
-        let mut head = storage
-            .initialize_open_state(0, SafeInputRange::empty_at(0))
-            .unwrap();
-        assert!(
-            storage
-                .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
-                .is_err()
-        );
+        // Before the era: no Tip can root, and no application row lands.
+        assert!(matches!(
+            storage.initialize_open_state(0, SafeInputRange::empty_at(0)),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+        let err = storage
+            .conn
+            .execute(
+                "INSERT INTO application_inputs \
+                 (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame) \
+                 VALUES (0, 0, 0, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "application history baseline is missing");
         storage
             .write(|tx| {
-                super::super::history::initialize_history_in(
-                    tx,
-                    &crate::storage::EraRecord::EMPTY_GENESIS,
-                )
+                super::super::history::insert_era_in(tx, &crate::storage::NewEra::EMPTY_GENESIS)
             })
+            .unwrap();
+        let mut head = storage
+            .initialize_open_state(0, SafeInputRange::empty_at(0))
             .unwrap();
         storage
             .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])

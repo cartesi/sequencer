@@ -322,16 +322,11 @@ impl Storage {
         })
     }
 
-    /// Whether `setup` has completed on this DB. `run` refuses to boot when
-    /// this is `false`: setup either never ran or crashed midway, both of
-    /// which require `setup` (re-)run, not `run`.
+    /// Whether `setup` has completed on this DB: whether its era exists.
+    /// `run` refuses to boot when this is `false`: setup either never ran or
+    /// crashed midway, both of which require `setup` (re-)run, not `run`.
     pub fn is_setup_complete(&self) -> Result<bool> {
-        let present: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(present != 0)
+        super::lifecycle::is_set_up_in(&self.conn)
     }
 }
 
@@ -647,27 +642,6 @@ mod tests {
                 .expect("count"),
             5
         );
-    }
-
-    #[test]
-    fn batch_tree_anchor_roundtrips_and_freezes_after_setup() {
-        let db = temp_db("anchor-roundtrip");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        assert_eq!(storage.batch_tree_anchor().expect("default"), 0);
-        storage.set_batch_tree_anchor(1200).expect("set anchor");
-        assert_eq!(storage.batch_tree_anchor().expect("read back"), 1200);
-        storage
-            .conn
-            .execute(
-                "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
-                [],
-            )
-            .expect("seed setup completion fact");
-        assert!(
-            storage.set_batch_tree_anchor(1300).is_err(),
-            "anchor must be frozen after setup_complete"
-        );
-        assert_eq!(storage.batch_tree_anchor().expect("unchanged"), 1200);
     }
 
     #[test]

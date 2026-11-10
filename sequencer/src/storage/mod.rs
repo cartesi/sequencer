@@ -33,7 +33,7 @@ use thiserror::Error;
 pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
 pub(crate) use history::ApplicationInputRow;
-pub use history::{DirectInputExecution, EraRecord, HistoryState};
+pub use history::{DirectInputExecution, Era, NewEra};
 pub(crate) use history::{HistoryReadError, L2TxContext};
 pub use l1_inputs::AdmittedDirects;
 pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};

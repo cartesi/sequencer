@@ -76,10 +76,11 @@ the launched lane.
 ### 2. Fact-derived admission and the terminal-fault black box
 
 Admission is governed by three facts, each with one owner: the kernel
-process lock (concurrent owners), two-sided `setup_complete` (command
+process lock (concurrent owners), the era's existence, two-sided (command
 ordering), and `canonical_divergence` (the one absorbing refusal — only a
-fresh-directory cockroach rebuild proceeds); baseline schema and history
-creation and setup completion are each one `synchronous=FULL` transaction.
+fresh-directory cockroach rebuild proceeds); baseline schema creation and
+the era's publication (which is setup's completion) are each one
+`synchronous=FULL` transaction.
 There is no lifecycle admission state machine or operator acknowledgement.
 Standard recovery is automatic, and restart policy after a terminal fault
 is the exit contract (30 or SIGABRT = do not restart, page), which the

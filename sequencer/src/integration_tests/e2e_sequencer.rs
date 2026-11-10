@@ -1434,9 +1434,8 @@ fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
     HistoryClaim {
         version: Storage::open_read_only(db_path)
             .unwrap()
-            .history_state()
-            .unwrap()
-            .version,
+            .history_version()
+            .unwrap(),
         next_input: L2TxCount::new(next),
     }
 }

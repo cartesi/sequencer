@@ -5,7 +5,7 @@ use alloy_primitives::B256;
 
 use super::*;
 use crate::storage::test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, era};
-use crate::storage::{EraRecord, IngestedSafeInput, LifecycleCommand};
+use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 fn key(l1_input_index: u64, position: u64) -> RebuiltKey {
@@ -269,14 +269,14 @@ fn the_published_era_seals_its_rebuilt_rows() {
     storage
         .publish_era(
             prefix,
-            &EraRecord {
+            &NewEra {
                 first_queued_input: 3,
-                next_batch_nonce: 2,
+                anchor_batch_nonce: 2,
                 ..era(41, 43, 9)
             },
         )
         .unwrap();
-    assert_eq!(storage.history_state().unwrap().rebuilt_history_end, 43);
+    assert_eq!(storage.era().unwrap().rebuilt_end.get(), 43);
 
     let sealed = "rebuilt history is sealed once its era is published";
     let error = storage
@@ -314,7 +314,7 @@ fn an_era_with_an_uncounted_direct_is_refused() {
     let error = storage
         .publish_era(
             std::path::Path::new("/snapshot/era"),
-            &EraRecord {
+            &NewEra {
                 first_queued_input: 3,
                 ..era(41, 42, 9)
             },
@@ -344,7 +344,7 @@ fn an_era_queueing_a_rebuilt_direct_is_refused() {
     let error = storage
         .publish_era(
             prefix,
-            &EraRecord {
+            &NewEra {
                 first_queued_input: 2,
                 ..era(41, 43, 9)
             },
@@ -359,7 +359,7 @@ fn an_era_queueing_a_rebuilt_direct_is_refused() {
     storage
         .publish_era(
             prefix,
-            &EraRecord {
+            &NewEra {
                 first_queued_input: 3,
                 ..era(41, 43, 9)
             },

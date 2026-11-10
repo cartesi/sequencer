@@ -471,8 +471,8 @@ mod recover_post_flush {
     #[test]
     fn is_idempotent() {
         let (_db, mut storage) = open_temp_storage("detect-idempotent");
-        let initial_history = storage.history_state().expect("initial history");
-        assert_eq!(initial_history.version.recovery_generation.get(), 0);
+        let initial_history = storage.history_version().expect("initial history");
+        assert_eq!(initial_history.recovery_generation.get(), 0);
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -489,9 +489,8 @@ mod recover_post_flush {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after recovery")
-                .version
                 .recovery_generation
                 .get(),
             1,
@@ -499,11 +498,10 @@ mod recover_post_flush {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after recovery")
-                .version
                 .era_id,
-            initial_history.version.era_id,
+            initial_history.era_id,
             "standard recovery stays within the same era"
         );
 
@@ -516,9 +514,8 @@ mod recover_post_flush {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after no-op")
-                .version
                 .recovery_generation
                 .get(),
             1,
@@ -551,9 +548,8 @@ mod recover_post_flush {
         assert_eq!(first, vec![0, 1]);
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("generation one")
-                .version
                 .recovery_generation
                 .get(),
             1
@@ -611,9 +607,8 @@ mod recover_post_flush {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("generation two")
-                .version
                 .recovery_generation
                 .get(),
             2
@@ -752,9 +747,8 @@ mod tip_staleness {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after Tip recovery")
-                .version
                 .recovery_generation
                 .get(),
             1,
@@ -876,9 +870,8 @@ mod tip_staleness {
         assert!(invalidated.is_empty(), "no new invalidations");
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after structural repair")
-                .version
                 .recovery_generation
                 .get(),
             0,
@@ -1010,9 +1003,8 @@ mod tip_staleness {
         );
         assert_eq!(
             storage
-                .history_state()
+                .history_version()
                 .expect("history after rollback")
-                .version
                 .recovery_generation
                 .get(),
             0,
@@ -1663,7 +1655,7 @@ mod tree_invariants {
     /// every write; invalidation is an UPDATE no trigger checks, so assert the
     /// valid spine here. The e2e harness asserts the same on the binary's DB.
     fn assert_valid_spine_from_anchor(storage: &mut Storage) {
-        let anchor = u64_to_i64(storage.batch_tree_anchor().expect("anchor"));
+        let anchor = u64_to_i64(storage.era().expect("era").anchor_batch_nonce);
         let nonces: Vec<i64> = storage
             .conn
             .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")

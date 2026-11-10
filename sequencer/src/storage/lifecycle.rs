@@ -75,13 +75,13 @@ pub enum LifecycleError {
 
 impl Storage {
     /// Publish the new era with its durable baseline dump, in one transaction:
-    /// the era record, the anchor, the baseline snapshot at the rebuilt
-    /// history's end and the setup-complete marker. Setup opens no Tip;
-    /// `run`'s startup roots the batch tree at the anchor.
+    /// the era row (which also makes the database set up) and the baseline
+    /// snapshot at the rebuilt history's end. Setup opens no Tip; `run`'s
+    /// startup roots the batch tree at the era's anchor.
     pub(crate) fn publish_era(
         &mut self,
         baseline_prefix: &std::path::Path,
-        era: &super::EraRecord,
+        era: &super::NewEra,
     ) -> Result<(), LifecycleError> {
         let tx = self
             .conn
@@ -96,16 +96,8 @@ impl Storage {
                 "an era is published before any batch exists".to_string(),
             ));
         }
-        super::history::initialize_history_in(&tx, era)?;
-        super::snapshot_dumps::insert_baseline_snapshot_in(
-            &tx,
-            baseline_prefix,
-            era.rebuilt_history_end,
-        )?;
-        tx.execute(
-            "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, ?1)",
-            [now_unix_ms()],
-        )?;
+        super::history::insert_era_in(&tx, era)?;
+        super::snapshot_dumps::insert_baseline_snapshot_in(&tx, baseline_prefix, era.rebuilt_end)?;
         tx.commit()?;
         Ok(())
     }
@@ -183,24 +175,20 @@ impl Storage {
 }
 
 /// The two-sided completion rule — the one command-ordering fact: setup
-/// never restarts over a completed setup (completion is once per database),
-/// run and maintenance never start before one exists. Run and maintenance
-/// reach it through `preflight_lifecycle_command`; setup inside
+/// never restarts once the era exists (an era is published once per
+/// database), run and maintenance never start before it does. Run and
+/// maintenance reach it through `preflight_lifecycle_command`; setup inside
 /// `publish_era`'s transaction.
 fn require_command_fits_completion(
     conn: &rusqlite::Connection,
     command: LifecycleCommand,
 ) -> Result<(), LifecycleError> {
-    let setup_complete = setup_complete_exists(conn)?;
+    let set_up = is_set_up_in(conn)?;
     let (fits, reason) = match command {
-        LifecycleCommand::Setup => (
-            !setup_complete,
-            "setup is already complete for this data directory",
-        ),
-        LifecycleCommand::Run | LifecycleCommand::MaintenanceFlush => (
-            setup_complete,
-            "setup has not completed for this data directory",
-        ),
+        LifecycleCommand::Setup => (!set_up, "setup is already complete for this data directory"),
+        LifecycleCommand::Run | LifecycleCommand::MaintenanceFlush => {
+            (set_up, "setup has not completed for this data directory")
+        }
     };
     if !fits {
         return Err(LifecycleError::NotAdmissible {
@@ -211,12 +199,10 @@ fn require_command_fits_completion(
     Ok(())
 }
 
-fn setup_complete_exists(conn: &rusqlite::Connection) -> Result<bool, LifecycleError> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?)
+/// Whether setup has completed: exactly when the era row exists. The one
+/// home of "set up" for admission and `Storage::is_setup_complete`.
+pub(super) fn is_set_up_in(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS (SELECT 1 FROM era)", [], |row| row.get(0))
 }
 
 fn refuse_on_canonical_divergence(conn: &rusqlite::Connection) -> Result<(), LifecycleError> {
@@ -251,7 +237,7 @@ mod tests {
         storage
             .publish_era(
                 std::path::Path::new("/tmp/facts-genesis"),
-                &crate::storage::EraRecord::EMPTY_GENESIS,
+                &crate::storage::NewEra::EMPTY_GENESIS,
             )
             .expect("complete setup");
     }
@@ -317,7 +303,7 @@ mod tests {
         assert!(matches!(
             storage.publish_era(
                 std::path::Path::new("/tmp/facts-genesis"),
-                &crate::storage::EraRecord::EMPTY_GENESIS,
+                &crate::storage::NewEra::EMPTY_GENESIS,
             ),
             Err(LifecycleError::CanonicalDivergence { nonce: 7 })
         ));
@@ -325,40 +311,47 @@ mod tests {
 
     #[test]
     fn publish_era_is_atomic_and_one_shot() {
-        use crate::storage::EraRecord;
+        use crate::storage::NewEra;
         use crate::storage::test_helpers::era;
         let (_db, mut storage) = seeded(LifecycleCommand::Setup);
         let prefix = std::path::Path::new("/tmp/era-baseline");
-        let unspanned = EraRecord {
-            next_batch_nonce: 5,
+        let unspanned = NewEra {
+            anchor_batch_nonce: 5,
             ..era(3, 4, 0)
         };
+        let refused = storage
+            .publish_era(prefix, &unspanned)
+            .expect_err("trg_era_fits refuses an era past its rebuilt rows");
+        assert!(
+            matches!(&refused, LifecycleError::Storage(error)
+                if error.to_string() == "the era must span exactly its executed rebuilt rows"),
+            "{refused}"
+        );
+        // Nothing of the refused era survives: no era and no snapshot.
         assert!(matches!(
-            storage.publish_era(prefix, &unspanned),
-            Err(LifecycleError::Storage(_))
+            storage.era(),
+            Err(rusqlite::Error::QueryReturnedNoRows)
         ));
-        // Nothing of the refused era survives: no record, anchor, snapshot or marker.
-        assert!(storage.history_state().is_err());
-        assert_eq!(storage.batch_tree_anchor().unwrap(), 0);
         assert!(storage.list_dump_rows().unwrap().is_empty());
         assert!(!storage.is_setup_complete().unwrap());
 
-        let published = EraRecord {
-            next_batch_nonce: 5,
+        let published = NewEra {
+            anchor_batch_nonce: 5,
             ..era(3, 3, 0)
         };
         storage.publish_era(prefix, &published).expect("publish");
-        let state = storage.history_state().unwrap();
+        assert!(storage.is_setup_complete().unwrap());
+        let state = storage.era().unwrap();
         assert_eq!(
             (
-                state.base_l2_tx_count,
-                state.rebuilt_history_end,
-                state.base_safe_block,
-                state.first_queued_input
+                state.base.get(),
+                state.rebuilt_end.get(),
+                state.stop_block,
+                state.first_queued_input,
+                state.anchor_batch_nonce
             ),
-            (3, 3, 0, 0)
+            (3, 3, 0, 0, 5)
         );
-        assert_eq!(storage.batch_tree_anchor().unwrap(), 5);
         assert_eq!(
             storage.latest_snapshot().unwrap().unwrap().l2_tx_count,
             sequencer_core::history::L2TxCount::new(3)
@@ -374,24 +367,26 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(storage.history_state().unwrap(), state);
+        assert_eq!(storage.era().unwrap(), state);
     }
 
     #[test]
     fn publish_era_refuses_a_directory_with_a_batch() {
         let (_db, mut storage) = seeded(LifecycleCommand::Setup);
+        // The schema refuses a parentless root before the era exists, so the
+        // seed drops that arm: the Rust guard is what this test exercises.
         storage
             .conn
-            .execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-                 VALUES (0, NULL, 0, 0)",
-                [],
+            .execute_batch(
+                "DROP TRIGGER trg_enforce_nonce_contiguity; \
+                 INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+                 VALUES (0, NULL, 0, 0);",
             )
             .expect("seed a batch");
         assert!(matches!(
             storage.publish_era(
                 std::path::Path::new("/tmp/era-baseline"),
-                &crate::storage::EraRecord::EMPTY_GENESIS
+                &crate::storage::NewEra::EMPTY_GENESIS
             ),
             Err(LifecycleError::Malformed(_))
         ));

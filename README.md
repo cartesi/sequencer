@@ -494,7 +494,8 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `user_ops`: included user operations
 - `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
 - `safe_inputs`: every raw InputBox observation, including batch envelopes
-- `history_state`: immutable era record (base count, stop block, rebuilt history end, first queued input) plus recovery generation
+- `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
+- `history_generation_cuts`: one immutable cut per standard-recovery transition; the greatest is the recovery generation
 - `rebuilt_history`: the transactions setup rebuilt from the base through the stop block, each executed one with its count; the feed serves them before the live rows
 - `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is derived from `safe_accepted_batches`
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.

@@ -80,8 +80,9 @@ repair selection and guards.
 
 Each generation transition records the surviving application count after the
 invalidated rows are removed and before the replacement Tip adds any directs.
-This cut commits atomically with invalidation, the generation advance, and
-reopening. An invalidated empty batch still creates a transition with the old
+This cut commits atomically with invalidation and reopening, and it is the
+generation advance: the current generation is the greatest cut's (0 before
+any). An invalidated empty batch still creates a transition with the old
 head as its cut; a repair that invalidates nothing creates neither. The cuts are
 immutable and retained for the era's lifetime.
 
@@ -118,7 +119,8 @@ rebuilds the history from L1 through a stop block it pins after flushing the
 submitter's wallet
 ([what setup does](../recovery/cockroach.md#what-setup-does)).
 Once the baseline's artifact is durable, setup publishes the era in one
-transaction, and nothing of it changes afterwards except the generation:
+transaction: one immutable row in the `era` table, whose existence is what
+makes the database set up, and the baseline snapshot. It publishes:
 
 | Field | Value |
 |---|---|
@@ -138,7 +140,7 @@ as the comparison checkpoint: inclusion block `C`, count `E`, next nonce `N'`.
 Setup opens no batch. `run`'s first frame drains the directs still queued at
 `C`, from the first queued input on, as the canonical scheduler's next frame
 does; a cascade that tears every batch of the era drains from there again.
-Accepted-batch scanning begins after `C`. The era record survives root
+Accepted-batch scanning begins after `C`. The era row survives root
 invalidation and baseline artifact GC.
 
 ### The rebuilt history

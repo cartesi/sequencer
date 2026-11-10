@@ -30,7 +30,7 @@ use crate::commands::error::{
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError, sample_safe_block};
 use crate::recovery::MempoolFlusher;
 use crate::runtime::process_lock::ProcessLock;
-use crate::storage::{DeploymentIdentity, EraRecord, FeeOracleIdentity, LifecycleCommand, Storage};
+use crate::storage::{DeploymentIdentity, FeeOracleIdentity, LifecycleCommand, NewEra, Storage};
 use base::{Base, ReadMachineExport};
 
 /// The process lock's anchor file. It survives every command, so a directory
@@ -426,7 +426,7 @@ pub(crate) struct SetupSummary {
     /// The stop block; for a dry run, the safe head it synced to.
     pub(crate) through_block: u64,
     /// The published era; `None` for a dry run.
-    pub(crate) era: Option<EraRecord>,
+    pub(crate) era: Option<NewEra>,
 }
 
 impl SetupSummary {
@@ -475,7 +475,7 @@ impl std::fmt::Display for SetupSummary {
                 f,
                 "\nstop block: {}\nL2 tx count at its end: {}",
                 era.stop_block,
-                era.rebuilt_history_end.get()
+                era.rebuilt_end.get()
             )?;
         }
         Ok(())
@@ -848,7 +848,7 @@ mod tests {
         let mut storage =
             Storage::initialize_for_command(db.to_str().unwrap(), LifecycleCommand::Setup).unwrap();
         storage
-            .publish_era(&data_dir.path().join("baseline"), &EraRecord::EMPTY_GENESIS)
+            .publish_era(&data_dir.path().join("baseline"), &NewEra::EMPTY_GENESIS)
             .unwrap();
         drop(storage);
         let before = entries(data_dir.path());
@@ -985,10 +985,10 @@ mod tests {
         assert!(summary.to_string().contains("only moves directs"));
         summary.unsettled_wallet_txs = 1;
         assert!(summary.to_string().contains("re-judges"));
-        summary.era = Some(EraRecord {
+        summary.era = Some(NewEra {
             stop_block: 130,
-            rebuilt_history_end: L2TxCount::new(9),
-            ..EraRecord::EMPTY_GENESIS
+            rebuilt_end: L2TxCount::new(9),
+            ..NewEra::EMPTY_GENESIS
         });
         let text = summary.to_string();
         assert!(text.contains("stop block: 130"), "{text}");

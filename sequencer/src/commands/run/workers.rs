@@ -832,7 +832,7 @@ mod tests {
         )
         .expect("open storage");
         storage
-            .publish_era(&finalized, &crate::storage::EraRecord::EMPTY_GENESIS)
+            .publish_era(&finalized, &crate::storage::NewEra::EMPTY_GENESIS)
             .expect("register finalized dump");
         storage
             .append_safe_inputs(0, &[], submitter_address, &timing)

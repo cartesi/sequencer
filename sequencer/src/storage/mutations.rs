@@ -4,16 +4,16 @@
 //! Write helpers shared across writer roles. Like [`super::queries`], they take a
 //! `&Transaction` so they compose inside a larger atomic unit.
 
-use rusqlite::{Connection, Result, Transaction, named_params, params};
+use rusqlite::{Result, Transaction, named_params, params};
 
 use super::convert::{i64_to_u64, saturating_query_bound, u64_to_i64};
-use super::history::next_l2_tx_count_in;
+use super::history::{era_in, next_l2_tx_count_in};
 use super::l1_inputs::query_deployment_identity;
 use super::queries::DIRECT_EXECUTES_SQL;
 use super::{DirectInputExecution, SafeInputRange};
 
 /// Insert a new batch. Nonce is derived from `parent_batch_index`:
-/// `parent.nonce + 1`, or the deployment's anchor for a parentless root
+/// `parent.nonce + 1`, or the era's anchor for a parentless root
 /// (genesis, cockroach recovery, or a fully invalidated branch).
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
@@ -60,10 +60,10 @@ pub(super) fn insert_new_batch(
 
 fn compute_next_nonce(tx: &Transaction<'_>, parent_batch_index: Option<u64>) -> Result<u64> {
     match parent_batch_index {
-        // A parentless root carries the deployment's batch-tree anchor nonce:
-        // the era's next batch nonce at its stop block. Mirrored by
-        // `trg_enforce_nonce_contiguity`'s parentless arm.
-        None => batch_tree_anchor_in(tx),
+        // A parentless root carries the era's anchor nonce: its next batch
+        // nonce at the stop block. Mirrored by `trg_enforce_nonce_contiguity`'s
+        // parentless arm; with no era both refuse.
+        None => Ok(era_in(tx)?.anchor_batch_nonce),
         Some(parent_bi) => {
             let parent_nonce: i64 = tx.query_row(
                 "SELECT nonce FROM batches WHERE batch_index = ?1",
@@ -122,37 +122,6 @@ pub(super) fn insert_open_frame(
         ],
     )?;
     Ok(())
-}
-
-/// Set the batch-tree anchor nonce — the nonce the single parentless root
-/// carries: the era's next batch nonce at its stop block. Composes inside
-/// `publish_era`'s transaction. `trg_batch_tree_anchor_write_once`
-/// rejects this once `setup_complete` exists, so it is callable only during
-/// setup, before its atomic completion.
-pub(super) fn set_batch_tree_anchor_in(tx: &Transaction<'_>, nonce: u64) -> Result<()> {
-    let changed = tx.execute(
-        "UPDATE batch_tree_anchor SET nonce = ?1 WHERE singleton_id = 0",
-        params![u64_to_i64(nonce)],
-    )?;
-    if changed != 1 {
-        return Err(rusqlite::Error::StatementChangedRows(changed));
-    }
-    Ok(())
-}
-
-/// Read the batch-tree anchor nonce (default 0). Mirrors
-/// [`set_batch_tree_anchor_in`]. The single home for the anchor-read query:
-/// takes `&Connection` (not `&Transaction`) so both the in-transaction writer
-/// ([`compute_next_nonce`]) and the connection-level frontier readers
-/// (`frontier_nonce`, `populate_safe_accepted_batches`) share it. A
-/// `&Transaction` coerces to `&Connection` at the call site.
-pub(super) fn batch_tree_anchor_in(conn: &Connection) -> Result<u64> {
-    let anchor: i64 = conn.query_row(
-        "SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(i64_to_u64(anchor))
 }
 
 /// Commit the exact direct inputs executed while opening a frame.

@@ -4,15 +4,16 @@
 use std::path::Path;
 
 use alloy_primitives::{Address, B256};
+use sequencer_core::history::L2TxCount;
 
 use super::*;
-use crate::storage::history::{advance_recovery_generation_in, initialize_history_in};
+use crate::storage::history::{advance_recovery_generation_in, insert_era_in};
 use crate::storage::test_helpers::{
     SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing, era as era_record,
     local_batch_payload,
 };
 use crate::storage::{
-    DirectInputExecution, EraRecord, IngestedSafeInput, LifecycleCommand, SafeInputRange,
+    DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
@@ -20,13 +21,11 @@ fn fixture(name: &str, stop: u64, count: u64, nonce: u64) -> (TestDb, Storage) {
     let db = temp_db(name);
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     pin_test_deployment_identity(&mut storage, SENDER_A);
-    let record = EraRecord {
-        next_batch_nonce: nonce,
+    let record = NewEra {
+        anchor_batch_nonce: nonce,
         ..era_record(count, count, stop)
     };
-    storage
-        .write(|tx| initialize_history_in(tx, &record))
-        .unwrap();
+    storage.write(|tx| insert_era_in(tx, &record)).unwrap();
     storage
         .insert_baseline_snapshot(Path::new("/snapshot/baseline"), L2TxCount::new(count))
         .unwrap();
@@ -54,8 +53,8 @@ fn append(storage: &mut Storage, safe_block: u64, inputs: &[IngestedSafeInput]) 
         .unwrap();
 }
 
-fn era(storage: &Storage) -> EraId {
-    storage.history_state().unwrap().version.era_id
+fn era(storage: &mut Storage) -> EraId {
+    storage.history_version().unwrap().era_id
 }
 
 #[test]
@@ -132,7 +131,7 @@ fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
 #[test]
 fn metadata_refuses_another_era() {
     let (_db, mut storage) = fixture("historical-claim", 0, 0, 0);
-    let current = storage.history_state().unwrap().version;
+    let current = storage.history_version().unwrap();
     let other: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
     assert_ne!(other, current.era_id);
     assert!(matches!(
@@ -228,7 +227,7 @@ fn missing_baseline_is_not_reported_as_an_absent_accepted_checkpoint() {
 #[test]
 fn compatibility_requires_an_era_and_rejects_future_generations_after_era_validation() {
     let (_db, mut storage) = fixture("historical-generation-query", 0, 0, 0);
-    let current = era(&storage);
+    let current = era(&mut storage);
     assert!(matches!(
         storage.history_info(None, Some(RecoveryGeneration::new(0))),
         Err(HistoricalReadError::BadRequest(_))
@@ -286,7 +285,7 @@ fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
             }],
         )
         .unwrap();
-    let current = era(&storage);
+    let current = era(&mut storage);
     let before = storage
         .history_info(Some(current), Some(RecoveryGeneration::new(0)))
         .unwrap();

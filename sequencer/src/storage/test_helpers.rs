@@ -36,14 +36,14 @@ pub(crate) const SENDER_B: Address = Address::repeat_byte(0xBB);
 pub(crate) const TEST_MAX_DIRECT_PAYLOAD_BYTES: u64 =
     WALLET_SCHEDULER_LIMITS.max_direct_payload_bytes;
 
-/// An era record with nothing queued and anchor 0; fixtures override fields.
-pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::EraRecord {
-    super::EraRecord {
-        base_count: L2TxCount::new(base),
-        rebuilt_history_end: L2TxCount::new(rebuilt_end),
+/// An era with nothing queued and anchor 0; fixtures override fields.
+pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::NewEra {
+    super::NewEra {
+        base: L2TxCount::new(base),
+        rebuilt_end: L2TxCount::new(rebuilt_end),
         stop_block,
         first_queued_input: 0,
-        next_batch_nonce: 0,
+        anchor_batch_nonce: 0,
     }
 }
 
@@ -127,20 +127,31 @@ impl Storage {
         query_batch_policy(&self.conn)
     }
 
-    /// The batch-tree anchor nonce (default 0).
-    pub(crate) fn batch_tree_anchor(&mut self) -> rusqlite::Result<u64> {
-        self.read(|tx| super::mutations::batch_tree_anchor_in(tx))
+    /// The published era; errors before setup publishes one.
+    pub(crate) fn era(&mut self) -> rusqlite::Result<super::Era> {
+        self.read(|tx| super::history::era_in(tx))
+    }
+
+    /// The era id and the recovery generation (the greatest cut).
+    pub(crate) fn history_version(&mut self) -> rusqlite::Result<super::HistoryVersion> {
+        self.read(|tx| super::history::history_version_in(tx))
     }
 }
 
 /// Seeding and inspection levers. Each bypasses the guard, provenance or
 /// wall clock its production counterpart enforces.
 impl Storage {
-    /// Set the batch-tree anchor nonce directly; production sets it once, in
-    /// `publish_era`. Aborts if `setup_complete` already exists
-    /// (`trg_batch_tree_anchor_write_once`).
-    pub(crate) fn set_batch_tree_anchor(&mut self, nonce: u64) -> rusqlite::Result<()> {
-        self.write(|tx| super::mutations::set_batch_tree_anchor_in(tx, nonce))
+    /// A fresh database set up with `era`: setup's schema, then the era row
+    /// through `publish_era`'s insert, without a baseline snapshot (callers
+    /// that need one add it). For fixtures whose era is not the genesis one
+    /// `Storage::open` creates.
+    pub(crate) fn open_with_era(path: &str, era: &super::NewEra) -> Storage {
+        let mut storage =
+            Storage::initialize_for_command(path, super::LifecycleCommand::Setup).expect("schema");
+        storage
+            .write(|tx| super::history::insert_era_in(tx, era))
+            .expect("insert era");
+        storage
     }
 
     pub(crate) fn next_l2_tx_count(&mut self) -> rusqlite::Result<L2TxCount> {

@@ -1181,7 +1181,7 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         .expect("seed genesis safe head");
     storage.ensure_open_tip().expect("open genesis Tip");
     let mut head = storage.open_state().unwrap().unwrap();
-    let initial_history = storage.history_state().expect("initial history");
+    let initial_history = storage.history_version().expect("initial history");
     let mut live_app = StubApp::default();
 
     // Batch 0 is the surviving prefix. Its pending snapshot reflects exactly
@@ -1306,12 +1306,12 @@ fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
         )
         .expect("standard recovery cascade");
     assert_eq!(invalidated, vec![1, 2]);
-    let recovered_history = storage.history_state().expect("recovered history");
+    let recovered_history = storage.history_version().expect("recovered history");
     assert_eq!(
-        recovered_history.version.era_id, initial_history.version.era_id,
+        recovered_history.era_id, initial_history.era_id,
         "standard recovery must stay in the same era"
     );
-    assert_eq!(recovered_history.version.recovery_generation.get(), 1);
+    assert_eq!(recovered_history.recovery_generation.get(), 1);
     assert_eq!(
         storage.next_l2_tx_count().unwrap(),
         L2TxCount::new(2),

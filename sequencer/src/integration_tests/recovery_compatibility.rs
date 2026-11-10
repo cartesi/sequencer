@@ -337,7 +337,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
     let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
     pin_test_deployment_identity(&mut storage, SUBMITTER);
     storage
-        .publish_era(&baseline, &crate::storage::EraRecord::EMPTY_GENESIS)
+        .publish_era(&baseline, &crate::storage::NewEra::EMPTY_GENESIS)
         .unwrap();
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -381,7 +381,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
         .unwrap();
     append_transfer(&mut storage, &mut head, &mut app, &mut history, &signer, 10);
     close_and_accept(&mut storage, &mut head, &mut app, dumps.path(), 20);
-    let generation_zero = storage.history_state().unwrap().version;
+    let generation_zero = storage.history_version().unwrap();
     let good_zero = Backup::save(dumps.path(), "g0-at3", &mut app, &history, generation_zero);
     append_transfer(&mut storage, &mut head, &mut app, &mut history, &signer, 11);
     let bad_zero = Backup::save(dumps.path(), "g0-at4", &mut app, &history, generation_zero);
@@ -391,7 +391,7 @@ async fn checkpoint_compatibility_survives_missed_recoveries_and_retries_admissi
     let era = generation_zero.era_id;
     recover_tip(&mut storage, &mut head, 1500);
     (app, history) = good_zero.restore();
-    let generation_one = storage.history_state().unwrap().version;
+    let generation_one = storage.history_version().unwrap();
     assert_eq!(generation_one.recovery_generation.get(), 1);
     append_transfer(&mut storage, &mut head, &mut app, &mut history, &signer, 20);
     let middle_one = Backup::save(dumps.path(), "g1-at4", &mut app, &history, generation_one);

@@ -370,8 +370,13 @@ mod tests {
         // frontier_nonce/anchor asymmetry (frontier_nonce defaulted to 0 while
         // populate_safe_accepted_batches seeds `expected` from the anchor).
         let db = temp_db("submitter-frontier-anchor");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        storage.set_batch_tree_anchor(7).expect("anchor at N'=7");
+        let mut storage = Storage::open_with_era(
+            db.path.as_str(),
+            &crate::storage::NewEra {
+                anchor_batch_nonce: 7,
+                ..crate::storage::NewEra::EMPTY_GENESIS
+            },
+        );
         storage
             .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
             .expect("record observed safe head");

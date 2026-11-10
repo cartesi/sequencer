@@ -1,12 +1,12 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Immutable era baseline and the preserved prefix at each recovery generation.
+//! The era (one immutable row) and the preserved prefix at each recovery
+//! generation; the generation is the greatest cut.
 
-use rusqlite::{Connection, Result, Transaction, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, Result, Transaction, params, types::Type};
 use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};
 
-use super::Storage;
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 
 mod canonical;
@@ -14,43 +14,44 @@ mod canonical;
 pub(crate) use canonical::ApplicationInputRow;
 pub(crate) use canonical::{HistoryReadError, L2TxContext};
 
+/// The published era, as read. Immutable for the database's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HistoryState {
-    pub version: HistoryVersion,
-    pub era_created_at_ms: u64,
-    /// The base's L2 tx count, where the era's history starts.
-    pub base_l2_tx_count: u64,
-    /// The stop block: the L1 prefix the era's baseline accounts for.
-    pub base_safe_block: u64,
-    /// The L2 tx count at the end of the stop block, where live rows start.
-    pub rebuilt_history_end: u64,
+pub struct Era {
+    pub id: EraId,
+    pub published_at_ms: u64,
+    /// Where the era's history starts.
+    pub base: L2TxCount,
+    /// Where the live rows start: the baseline's count.
+    pub rebuilt_end: L2TxCount,
+    /// The L1 prefix the era's baseline accounts for.
+    pub stop_block: u64,
     /// The oldest direct still queued at the stop block, or the input count
     /// through it when none is: where the era's first frame drains from.
     pub first_queued_input: u64,
+    /// The nonce the batch tree's parentless root carries (I16): the
+    /// scheduler's next batch nonce at the stop block.
+    pub anchor_batch_nonce: u64,
 }
 
-/// What setup publishes about the new era, written once with its baseline.
+/// What setup publishes: an [`Era`] without the id and time storage assigns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EraRecord {
-    /// The base's L2 tx count.
-    pub base_count: L2TxCount,
-    /// The L2 tx count after the rebuilt history: the baseline's count.
-    pub rebuilt_history_end: L2TxCount,
+pub struct NewEra {
+    pub base: L2TxCount,
+    pub rebuilt_end: L2TxCount,
     pub stop_block: u64,
     pub first_queued_input: u64,
-    /// The scheduler's next batch nonce at the stop block: the anchor.
-    pub next_batch_nonce: u64,
+    pub anchor_batch_nonce: u64,
 }
 
-impl EraRecord {
-    /// An era at genesis that rebuilt nothing, with stop block 0: what the
-    /// command-less fixture open path and seeded harnesses publish.
+impl NewEra {
+    /// An era at genesis that rebuilt nothing, with stop block 0 and anchor 0:
+    /// what the crate-test open path and seeded harnesses publish.
     pub const EMPTY_GENESIS: Self = Self {
-        base_count: L2TxCount::ZERO,
-        rebuilt_history_end: L2TxCount::ZERO,
+        base: L2TxCount::ZERO,
+        rebuilt_end: L2TxCount::ZERO,
         stop_block: 0,
         first_queued_input: 0,
-        next_batch_nonce: 0,
+        anchor_batch_nonce: 0,
     };
 }
 
@@ -63,83 +64,113 @@ pub struct DirectInputExecution {
     pub l2_tx_index: L2TxCount,
 }
 
-impl Storage {
-    pub fn history_state(&self) -> Result<HistoryState> {
-        query_history_state(&self.conn)
-    }
+const ERA_SQL: &str = "SELECT era_id, published_at_ms, base_l2_tx_count, rebuilt_history_end,
+            stop_block, first_queued_input, anchor_batch_nonce
+       FROM era WHERE singleton_id = 0";
+
+fn decode_era_id(row: &rusqlite::Row<'_>, index: usize) -> Result<EraId> {
+    let blob = row.get::<_, Vec<u8>>(index)?;
+    EraId::try_from(blob.as_slice()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, Type::Blob, Box::new(error))
+    })
 }
 
-pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
+fn decode_era(row: &rusqlite::Row<'_>) -> Result<Era> {
+    Ok(Era {
+        id: decode_era_id(row, 0)?,
+        published_at_ms: i64_to_u64(row.get(1)?),
+        base: L2TxCount::new(i64_to_u64(row.get(2)?)),
+        rebuilt_end: L2TxCount::new(i64_to_u64(row.get(3)?)),
+        stop_block: i64_to_u64(row.get(4)?),
+        first_queued_input: i64_to_u64(row.get(5)?),
+        anchor_batch_nonce: i64_to_u64(row.get(6)?),
+    })
+}
+
+/// The published era. Fails with `QueryReturnedNoRows` before setup
+/// publishes: every caller runs inside a set-up database.
+pub(super) fn era_in(conn: &Connection) -> Result<Era> {
+    conn.query_row(ERA_SQL, [], decode_era)
+}
+
+/// The published era, or `None` before setup publishes it. Only for setup's
+/// own appends, to which "no era yet" is a real state.
+pub(super) fn find_era_in(conn: &Connection) -> Result<Option<Era>> {
+    conn.query_row(ERA_SQL, [], decode_era).optional()
+}
+
+/// The era id and recovery generation, read in one statement. The generation
+/// is the greatest cut (0 with none): no other counter exists.
+pub(super) fn history_version_in(conn: &Connection) -> Result<HistoryVersion> {
     conn.query_row(
-        "SELECT era_id, era_created_at_ms, recovery_generation,
-                base_l2_tx_count, base_safe_block,
-                rebuilt_history_end, first_queued_input
-           FROM history_state WHERE singleton_id = 0",
+        "SELECT era_id,
+                (SELECT COALESCE(MAX(recovery_generation), 0) FROM history_generation_cuts)
+           FROM era WHERE singleton_id = 0",
         [],
         |row| {
-            let era_blob = row.get::<_, Vec<u8>>(0)?;
-            let era_id = EraId::try_from(era_blob.as_slice()).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Blob, Box::new(error))
-            })?;
-            Ok(HistoryState {
-                version: HistoryVersion {
-                    era_id,
-                    recovery_generation: RecoveryGeneration::new(i64_to_u64(row.get(2)?)),
-                },
-                era_created_at_ms: i64_to_u64(row.get(1)?),
-                base_l2_tx_count: i64_to_u64(row.get(3)?),
-                base_safe_block: i64_to_u64(row.get(4)?),
-                rebuilt_history_end: i64_to_u64(row.get(5)?),
-                first_queued_input: i64_to_u64(row.get(6)?),
+            Ok(HistoryVersion {
+                era_id: decode_era_id(row, 0)?,
+                recovery_generation: RecoveryGeneration::new(i64_to_u64(row.get(1)?)),
             })
         },
     )
 }
 
-/// Write the era record and its anchor under a fresh era id. The schema
-/// checks the counts against the executed rebuilt rows and seals them.
-pub(super) fn initialize_history_in(tx: &Transaction<'_>, era: &EraRecord) -> Result<()> {
+/// Insert the era under a fresh v4 era id, stamped now. The schema checks
+/// the counts against the executed rebuilt rows, seals them, and refuses a
+/// second era. Used by `publish_era` and the test fixture `open_with_era`.
+pub(super) fn insert_era_in(tx: &Transaction<'_>, era: &NewEra) -> Result<()> {
     let mut bytes: [u8; EraId::BYTE_LEN] =
         tx.query_row("SELECT randomblob(16)", [], |row| row.get(0))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let era_id = EraId::from_bytes(bytes).expect("UUID bits were set above");
     tx.execute(
-        "INSERT INTO history_state
-         (singleton_id, era_id, era_created_at_ms, recovery_generation,
-          base_l2_tx_count, base_safe_block, rebuilt_history_end,
-          first_queued_input) VALUES (0, ?1, ?2, 0, ?3, ?4, ?5, ?6)",
+        "INSERT INTO era
+         (singleton_id, era_id, published_at_ms, base_l2_tx_count, rebuilt_history_end,
+          stop_block, first_queued_input, anchor_batch_nonce)
+         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             era_id.as_bytes().as_slice(),
             now_unix_ms(),
-            u64_to_i64(era.base_count.get()),
+            u64_to_i64(era.base.get()),
+            u64_to_i64(era.rebuilt_end.get()),
             u64_to_i64(era.stop_block),
-            u64_to_i64(era.rebuilt_history_end.get()),
             u64_to_i64(era.first_queued_input),
+            u64_to_i64(era.anchor_batch_nonce),
         ],
     )?;
-    super::mutations::set_batch_tree_anchor_in(tx, era.next_batch_nonce)
+    Ok(())
 }
 
 /// The next history offset: one past the last live row, or the rebuilt
 /// history's end before the era has any.
 pub(super) fn next_l2_tx_count_in(conn: &Connection) -> Result<L2TxCount> {
-    let rebuilt_end = query_history_state(conn)?.rebuilt_history_end;
+    next_l2_tx_count_of(conn, &era_in(conn)?)
+}
+
+/// [`next_l2_tx_count_in`] for a caller that already read the era.
+pub(super) fn next_l2_tx_count_of(conn: &Connection, era: &Era) -> Result<L2TxCount> {
+    let rebuilt_end = era.rebuilt_end;
     let greatest: Option<i64> = conn.query_row(
         "SELECT MAX(l2_tx_count) FROM application_inputs",
         [],
         |row| row.get(0),
     )?;
-    Ok(L2TxCount::new(greatest.map_or(rebuilt_end, |offset| {
-        i64_to_u64(offset)
-            .checked_add(1)
-            .expect("application input count overflow")
-    })))
+    Ok(greatest.map_or(rebuilt_end, |offset| {
+        L2TxCount::new(
+            i64_to_u64(offset)
+                .checked_add(1)
+                .expect("application input count overflow"),
+        )
+    }))
 }
 
-/// Called after suffix deletion and before the replacement Tip attributes directs.
+/// Record the next recovery generation's cut. Called after suffix deletion
+/// and before the replacement Tip attributes directs; the cut is the new
+/// generation, since the generation is the greatest cut.
 pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<RecoveryGeneration> {
-    let current = query_history_state(tx)?.version.recovery_generation.get();
+    let current = history_version_in(tx)?.recovery_generation.get();
     let next = current
         .checked_add(1)
         .expect("recovery generation exhausted");
@@ -149,13 +180,6 @@ pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<Rec
          VALUES (?1, ?2)",
         params![u64_to_i64(next), u64_to_i64(preserved.get())],
     )?;
-    let changed = tx.execute(
-        "UPDATE history_state SET recovery_generation = ?1 WHERE singleton_id = 0",
-        [u64_to_i64(next)],
-    )?;
-    if changed != 1 {
-        return Err(rusqlite::Error::StatementChangedRows(changed));
-    }
     Ok(RecoveryGeneration::new(next))
 }
 
@@ -192,21 +216,22 @@ pub(super) fn preserved_input_count_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LifecycleCommand;
     use crate::storage::test_helpers::era;
+    use crate::storage::{LifecycleCommand, Storage};
     use crate::test_support::temp_db;
 
     #[test]
-    fn complete_baseline_is_immutable_and_survives_restart() {
+    fn the_era_is_one_immutable_row_that_survives_restart() {
         let db = temp_db("history-baseline");
         let mut storage =
             Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
         assert!(matches!(
-            storage.history_state(),
+            storage.era(),
             Err(rusqlite::Error::QueryReturnedNoRows)
         ));
+        assert_eq!(storage.read(|tx| find_era_in(tx)).unwrap(), None);
         let mismatched = storage
-            .write(|tx| initialize_history_in(tx, &era(41, 42, 70)))
+            .write(|tx| insert_era_in(tx, &era(41, 42, 70)))
             .expect_err("an empty rebuild cannot end past its base");
         assert_eq!(
             mismatched.to_string(),
@@ -214,9 +239,9 @@ mod tests {
         );
         let past_stop = storage
             .write(|tx| {
-                initialize_history_in(
+                insert_era_in(
                     tx,
-                    &EraRecord {
+                    &NewEra {
                         first_queued_input: 1,
                         ..era(41, 41, 70)
                     },
@@ -229,52 +254,68 @@ mod tests {
         );
         storage
             .write(|tx| {
-                initialize_history_in(
+                insert_era_in(
                     tx,
-                    &EraRecord {
-                        next_batch_nonce: 9,
+                    &NewEra {
+                        anchor_batch_nonce: 9,
                         ..era(41, 41, 70)
                     },
                 )
             })
             .unwrap();
-        let state = storage.history_state().unwrap();
+        let published = storage.era().unwrap();
         assert_eq!(
-            (state.rebuilt_history_end, state.first_queued_input),
-            (41, 0)
+            (
+                published.base,
+                published.rebuilt_end,
+                published.stop_block,
+                published.first_queued_input,
+                published.anchor_batch_nonce
+            ),
+            (L2TxCount::new(41), L2TxCount::new(41), 70, 0, 9)
         );
-        assert_eq!(storage.batch_tree_anchor().unwrap(), 9);
+        assert_eq!(storage.read(|tx| find_era_in(tx)).unwrap(), Some(published));
         let duplicate = storage
-            .write(|tx| initialize_history_in(tx, &era(41, 41, 70)))
-            .expect_err("even identical baseline values cannot initialize another era");
+            .write(|tx| insert_era_in(tx, &era(41, 41, 70)))
+            .expect_err("even identical values cannot publish another era");
         assert_eq!(
             duplicate.to_string(),
-            "history state is inserted once per database"
+            "the era is inserted once per database"
         );
         for (sql, expected) in [
             (
-                "UPDATE history_state SET era_id = X'00000000000040008000000000000001'",
-                "history baseline is immutable",
+                "INSERT OR REPLACE INTO era (singleton_id, era_id, published_at_ms, \
+                 base_l2_tx_count, rebuilt_history_end, stop_block, first_queued_input, \
+                 anchor_batch_nonce) \
+                 VALUES (0, X'00000000000040008000000000000001', 0, 41, 41, 70, 0, 9)",
+                "the era is inserted once per database",
+            ),
+            ("UPDATE era SET singleton_id = 0", "the era is immutable"),
+            (
+                "UPDATE era SET era_id = X'00000000000040008000000000000001'",
+                "the era is immutable",
+            ),
+            ("UPDATE era SET published_at_ms = 1", "the era is immutable"),
+            (
+                "UPDATE era SET base_l2_tx_count = 42",
+                "the era is immutable",
             ),
             (
-                "UPDATE history_state SET base_l2_tx_count = 42",
-                "history baseline is immutable",
+                "UPDATE era SET rebuilt_history_end = 42",
+                "the era is immutable",
+            ),
+            ("UPDATE era SET stop_block = 71", "the era is immutable"),
+            (
+                "UPDATE era SET first_queued_input = 1",
+                "the era is immutable",
             ),
             (
-                "UPDATE history_state SET base_safe_block = 71",
-                "history baseline is immutable",
+                "UPDATE era SET anchor_batch_nonce = 10",
+                "the era is immutable",
             ),
             (
-                "UPDATE history_state SET rebuilt_history_end = 42",
-                "history baseline is immutable",
-            ),
-            (
-                "UPDATE history_state SET first_queued_input = 1",
-                "history baseline is immutable",
-            ),
-            (
-                "DELETE FROM history_state",
-                "history state is write-once per database",
+                "DELETE FROM era",
+                "the era is retained for the database lifetime",
             ),
         ] {
             let error = storage.conn.execute(sql, []).expect_err(sql);
@@ -282,42 +323,55 @@ mod tests {
         }
         drop(storage);
         let mut reopened = Storage::open(&db.path).unwrap();
-        assert_eq!(reopened.history_state().unwrap(), state);
+        assert_eq!(reopened.era().unwrap(), published);
         assert_eq!(reopened.next_l2_tx_count().unwrap().get(), 41);
     }
 
     #[test]
-    fn generation_advances_exactly_once_and_transaction_rollback_preserves_it() {
+    fn the_generation_is_the_greatest_cut_and_advances_one_at_a_time() {
         let db = temp_db("history-generation");
         let mut storage = Storage::open(&db.path).unwrap();
-        let original = storage.history_state().unwrap();
+        let original = storage.history_version().unwrap();
+        assert_eq!(original.recovery_generation.get(), 0);
         let result: Result<()> = storage.write(|tx| {
             advance_recovery_generation_in(tx)?;
             Err(rusqlite::Error::InvalidQuery)
         });
         assert!(result.is_err());
-        assert_eq!(storage.history_state().unwrap(), original);
-        storage.write(advance_recovery_generation_in).unwrap();
+        assert_eq!(storage.history_version().unwrap(), original);
+        for expected in [1, 2] {
+            assert_eq!(
+                storage.write(advance_recovery_generation_in).unwrap(),
+                RecoveryGeneration::new(expected)
+            );
+            let version = storage.history_version().unwrap();
+            assert_eq!(version.era_id, original.era_id);
+            assert_eq!(version.recovery_generation.get(), expected);
+        }
+        for sql in [
+            "INSERT INTO history_generation_cuts VALUES (4, 0)",
+            "INSERT INTO history_generation_cuts VALUES (2, 0)",
+        ] {
+            let error = storage.conn.execute(sql, []).expect_err(sql);
+            assert_eq!(
+                error.to_string(),
+                "a cut advances the recovery generation by exactly one, within an era",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_without_an_era_aborts() {
+        let db = temp_db("history-generation-no-era");
+        let storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
+        let error = storage
+            .conn
+            .execute("INSERT INTO history_generation_cuts VALUES (1, 0)", [])
+            .expect_err("no era");
         assert_eq!(
-            storage
-                .history_state()
-                .unwrap()
-                .version
-                .recovery_generation
-                .get(),
-            1
-        );
-        assert!(
-            storage
-                .conn
-                .execute("UPDATE history_state SET recovery_generation = 3", [])
-                .is_err()
-        );
-        assert!(
-            storage
-                .conn
-                .execute("UPDATE history_state SET recovery_generation = 0", [])
-                .is_err()
+            error.to_string(),
+            "a cut advances the recovery generation by exactly one, within an era"
         );
     }
 }

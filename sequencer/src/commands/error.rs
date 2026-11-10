@@ -377,7 +377,7 @@ pub enum BootstrapError {
     #[error(transparent)]
     Identity(#[from] IdentityError),
     /// `run` (or `flush-mempool`) was invoked against a DB where `setup`
-    /// has not completed — its completion fact is absent (setup never ran, or
+    /// has not completed — its era is absent (setup never ran, or
     /// crashed midway), or its outputs are incomplete. The
     /// operator must run `setup` first; restarting `run` cannot self-heal.
     #[error("setup has not completed for data dir {data_dir} — run `setup` first")]

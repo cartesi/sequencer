@@ -59,10 +59,10 @@ by writer and are write-once (`0001_schema.sql`).
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `dumps`/`snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `safe_accepted_batches`, `canonical_divergence` (the divergence poison marker) |
 | recovery (startup) | the era's root Tip on `run`'s first boot, `batches.invalidated_at_ms`, Tip reopen, current `application_inputs` suffix deletion and replacement direct-input rows |
-| history metadata (setup/recovery) | `history_state` — the era record (base count, stop block, rebuilt history end, first queued input), written once by setup, and the generation, advanced by recovery; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades |
+| history metadata (setup/recovery) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts written with non-empty standard-recovery cascades, whose greatest key is the recovery generation |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | egress (HTTP) | `dumps.lease_count` (leases); `run`'s startup hygiene resets it to zero as the crash backstop |
-| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), `batch_tree_anchor` (the root nonce, frozen once setup completes), the baseline `dumps` + `snapshots` rows (atomic with the era record, the anchor and completion; no `batches` or `frames`), the `setup_complete` fact (written once), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
+| setup | `deployment_identity` (pinned once), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `dumps` + `snapshots` rows (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
 | snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete `snapshots` and unreferenced `dumps` row deletion (`gc_unreferenced_dumps`), including a superseded baseline artifact |
 | command brackets (run, setup, flush) | `terminal_faults` (append-only, best-effort at settlement) |
 | fee oracle | `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (Uniswap mode only; stamps on every successful refresh) |
@@ -166,7 +166,7 @@ by writer and are write-once (`0001_schema.sql`).
 ### I8. A rollback-safe snapshot and valid Tip exist before the lane starts
 
 - **Holds:** setup publishes the durable era baseline, at the rebuilt history
-  end `E`, before completion; recovery retains the newest accepted snapshot, or
+  end `E`, in the transaction that inserts the era; recovery retains the newest accepted snapshot, or
   that baseline until first acceptance. The baseline is the application's
   state at the end of stop block `C`, which the canonical machine reaches too,
   so until a batch of the era is accepted it is the comparison checkpoint
@@ -347,7 +347,7 @@ by writer and are write-once (`0001_schema.sql`).
   `C` is opaque
   ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
   Later scans resume after the last acceptance. Storage maintains the
-  accepted frontier exactly when the era record exists, reading the batch
+  accepted frontier exactly when the era row exists, reading the batch
   submitter from the pinned deployment identity: before the era (every setup
   sync, genesis included) there is no stop block or anchor, and the old
   instance's batches would read as `Foreign` and falsely freeze the frontier.
@@ -358,9 +358,9 @@ by writer and are write-once (`0001_schema.sql`).
 
 - **Holds:** every batch's nonce is
   `parent.nonce + 1`, except the single parentless root, which carries the
-  `batch_tree_anchor` nonce — the scheduler's next batch nonce at the end of
-  the era's stop block, which setup's rebuild ends with and publishes with the
-  era. The first
+  era's `anchor_batch_nonce` — the scheduler's next batch nonce at the end of
+  the era's stop block, which setup's rebuild ends with and publishes in the
+  era row. No root exists before the era does. The first
   Tip is that root (there is no separate sentinel batch): setup leaves its
   creation to startup recovery. A fully-torn cascade re-roots parentless at the
   same anchor via `open_fresh_tip_in_tx`'s `parent = None` path, after
@@ -369,11 +369,13 @@ by writer and are write-once (`0001_schema.sql`).
 - **Enforced by:** the parent foreign key (enabled on every writer) rejects
   dangling parents; `trg_enforce_nonce_contiguity` checks nonce succession.
   Its parentless arm is an
-  *exact* match `nonce == (SELECT nonce FROM batch_tree_anchor)` (tighter
-  than a bare "must be 0"), plus an at-most-one-valid-parentless-root guard
-  scoped to `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the
-  same anchor; `trg_batch_tree_anchor_write_once` freezes the anchor once
-  `setup_complete` exists.
+  *exact* match `nonce IS (SELECT anchor_batch_nonce FROM era)` (tighter
+  than a bare "must be 0"; with no era it compares against NULL and aborts),
+  plus an at-most-one-valid-parentless-root guard scoped to
+  `invalidated_at_ms IS NULL`; `compute_next_nonce(None)` reads the same
+  anchor and fails when the era is absent; the era row is immutable
+  (`trg_era_immutable`, `trg_era_not_deletable`, `trg_era_single_insert`), so
+  a live deployment is never re-anchored.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
   `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
   defaults to the anchor while `safe_accepted_batches` is still empty, so the
@@ -411,14 +413,18 @@ by writer and are write-once (`0001_schema.sql`).
 
 ### I18. History identity is published with the era
 
-- **Holds:** file-first setup publishes the era record
-  `(EraId, generation=0, K, C, E, first queued input)`, the anchor `N'`, the
-  baseline snapshot at `E`, and setup completion in one `IMMEDIATE`
-  transaction (`publish_era`), with no batch in the database. The history row
-  is absent before this boundary. The record's fields remain immutable even
-  after baseline artifact GC or root invalidation.
+- **Holds:** file-first setup publishes the era row
+  `(EraId, published at, K, E, C, first queued input, anchor N')` and the
+  baseline snapshot at `E` in one `IMMEDIATE` transaction (`publish_era`),
+  with no batch in the database; the row's existence is setup's completion.
+  The era row is absent before this boundary. Its fields remain immutable even
+  after baseline artifact GC or root invalidation. The recovery generation is
+  not stored: it is the greatest key of `history_generation_cuts` (0 with
+  none), and a cut cannot exist without an era. If the cut ledger is ever
+  retired, a log of generations must remain, because the generation has no
+  other home.
 - **Rebuilt history:** `rebuilt_history` gains rows, in scheduling order, and
-  their counts, once each, contiguous in row order, only while the history row
+  their counts, once each, contiguous in row order, only while the era row
   is absent; no row is ever deleted. The era's `K` and `E` are exactly the
   span of the counted rows, its first queued input is at most the input count
   through `C`, and the live rows continue at `E`. A client of an older era
@@ -429,10 +435,12 @@ by writer and are write-once (`0001_schema.sql`).
   before replacement directs. The entire transition commits in the cascade
   transaction. Clean restart changes neither token. Every intervening cut is
   required to authorize reusing a checkpoint from an older generation.
-- **Enforced by:** `publish_era`, the write-once era and
-  `history_generation_cuts` triggers, `trg_history_state_era_fits`, the
-  `trg_rebuilt_history_*` triggers, the exact-`+1` generation trigger requiring
-  its cut, and `cascade_and_reopen`. `preserved_input_count_in` asserts that
+- **Enforced by:** `publish_era`, the era triggers (`trg_era_fits`,
+  `trg_era_single_insert`, `trg_era_immutable`, `trg_era_not_deletable`), the
+  `history_generation_cuts` triggers (`trg_history_generation_cuts_contiguous`
+  admits only the next generation, and only within an era; the others make
+  cuts immutable and undeletable), the `trg_rebuilt_history_*` triggers, and
+  `cascade_and_reopen`. `preserved_input_count_in` asserts that
   every intervening generation has a cut before computing compatibility.
 - **Depended on by:** mandatory snapshot-derived WS claims, `/history`
   checkpoint compatibility across standard recoveries, the adopt rule, and the

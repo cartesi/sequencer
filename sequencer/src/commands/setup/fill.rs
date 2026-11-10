@@ -15,7 +15,7 @@ use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{
     self, CreateDumpDirError, create_dump_dir_with_info,
 };
-use crate::storage::{EraRecord, Storage};
+use crate::storage::{NewEra, Storage};
 
 /// Publish the era: `app` has executed the whole rebuilt history, and
 /// `scheduler` is the scheduler at the end of the stop block. Every rebuilt
@@ -27,15 +27,15 @@ pub(crate) fn publish<A: Application>(
     base_count: L2TxCount,
     stop_block: u64,
     scheduler: SchedulerState,
-) -> Result<EraRecord, CommandError> {
-    let era = EraRecord {
-        base_count,
-        rebuilt_history_end: app.l2_tx_count(),
+) -> Result<NewEra, CommandError> {
+    let era = NewEra {
+        base: base_count,
+        rebuilt_end: app.l2_tx_count(),
         stop_block,
         first_queued_input: scheduler.first_queued_input,
-        next_batch_nonce: scheduler.next_batch_nonce,
+        anchor_batch_nonce: scheduler.next_batch_nonce,
     };
-    let prefix = write_baseline_dump(app, era.next_batch_nonce, dumps_dir)?;
+    let prefix = write_baseline_dump(app, era.anchor_batch_nonce, dumps_dir)?;
     storage.publish_era(&prefix, &era)?;
     Ok(era)
 }
@@ -220,20 +220,20 @@ mod tests {
 
         assert_eq!(
             era,
-            EraRecord {
-                base_count: L2TxCount::new(41),
-                rebuilt_history_end: L2TxCount::new(41),
+            NewEra {
+                base: L2TxCount::new(41),
+                rebuilt_end: L2TxCount::new(41),
                 stop_block: 100,
                 first_queued_input: 1,
-                next_batch_nonce: 3,
+                anchor_batch_nonce: 3,
             }
         );
         assert!(storage.is_setup_complete().unwrap());
-        assert_eq!(storage.batch_tree_anchor().unwrap(), 3);
-        let history = storage.history_state().unwrap();
-        assert_eq!(history.base_l2_tx_count, 41);
-        assert_eq!(history.rebuilt_history_end, 41);
-        assert_eq!(history.base_safe_block, 100);
+        let history = storage.era().unwrap();
+        assert_eq!(history.anchor_batch_nonce, 3);
+        assert_eq!(history.base, L2TxCount::new(41));
+        assert_eq!(history.rebuilt_end, L2TxCount::new(41));
+        assert_eq!(history.stop_block, 100);
         assert_eq!(history.first_queued_input, 1);
         assert!(
             storage.open_state().unwrap().is_none(),
@@ -262,7 +262,7 @@ mod tests {
             err,
             CommandError::Lifecycle(crate::storage::LifecycleError::NotAdmissible { .. })
         ));
-        assert_eq!(storage.history_state().unwrap(), history);
+        assert_eq!(storage.era().unwrap(), history);
     }
 
     /// Run's root frame drains from the era's first queued input, and so does
@@ -280,7 +280,7 @@ mod tests {
             queued_at_stop(3),
         )
         .unwrap();
-        let generation = storage.history_state().unwrap().version.recovery_generation;
+        let generation = storage.history_version().unwrap().recovery_generation;
         storage
             .ensure_open_tip_for_recovery(
                 &default_protocol_timing(),
@@ -291,11 +291,11 @@ mod tests {
         assert_eq!(storage.open_state().unwrap().unwrap().safe_block, 1500);
 
         let drained = |storage: &mut Storage| {
-            let current = storage.history_state().unwrap();
+            let version = storage.history_version().unwrap();
             let page = storage
                 .canonical_history_page(
                     HistoryClaim {
-                        version: current.version,
+                        version,
                         next_input: L2TxCount::new(41),
                     },
                     16,
@@ -318,13 +318,13 @@ mod tests {
             .append_safe_inputs(2800, &[], SUBMITTER, &default_protocol_timing())
             .unwrap();
         assert_eq!(storage.recover_aging_tip(1200).unwrap(), vec![0]);
-        let current = storage.history_state().unwrap();
         assert_eq!(
-            current.version.recovery_generation.get(),
+            storage.history_version().unwrap().recovery_generation.get(),
             generation.get() + 1
         );
-        assert_eq!(current.base_safe_block, 100);
-        assert_eq!(current.rebuilt_history_end, 41);
+        let current = storage.era().unwrap();
+        assert_eq!(current.stop_block, 100);
+        assert_eq!(current.rebuilt_end, L2TxCount::new(41));
         assert_eq!(drained(&mut storage), vec![(41, 1)]);
         assert!(
             storage.latest_snapshot().unwrap().is_some(),

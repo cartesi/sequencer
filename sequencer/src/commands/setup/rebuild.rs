@@ -525,15 +525,15 @@ mod tests {
         assert_eq!(summary.inputs_to_replay, 8);
         assert_eq!(
             summary.era,
-            Some(crate::storage::EraRecord {
-                base_count: L2TxCount::ZERO,
-                rebuilt_history_end: L2TxCount::new(7),
+            Some(crate::storage::NewEra {
+                base: L2TxCount::ZERO,
+                rebuilt_end: L2TxCount::new(7),
                 stop_block: STOP,
                 first_queued_input: 8,
-                next_batch_nonce: 2,
+                anchor_batch_nonce: 2,
             })
         );
-        assert_eq!(storage.batch_tree_anchor().unwrap(), 2);
+        assert_eq!(storage.era().unwrap().anchor_batch_nonce, 2);
         // The first live frame drains from the first input past the stop block.
         assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 8);
 
@@ -897,12 +897,12 @@ mod tests {
         assert!(stored(&mut storage).is_empty());
         assert_eq!(
             summary.era,
-            Some(crate::storage::EraRecord {
-                base_count: L2TxCount::new(export.l2_tx_count),
-                rebuilt_history_end: L2TxCount::new(export.l2_tx_count),
+            Some(crate::storage::NewEra {
+                base: L2TxCount::new(export.l2_tx_count),
+                rebuilt_end: L2TxCount::new(export.l2_tx_count),
                 stop_block: 12,
                 first_queued_input: 2,
-                next_batch_nonce: 1,
+                anchor_batch_nonce: 1,
             })
         );
     }
@@ -947,17 +947,18 @@ mod tests {
         let state = at_stop.scheduler().state();
         assert_eq!(
             summary.era,
-            Some(crate::storage::EraRecord {
-                base_count: L2TxCount::ZERO,
-                rebuilt_history_end: at_stop.app().l2_tx_count(),
+            Some(crate::storage::NewEra {
+                base: L2TxCount::ZERO,
+                rebuilt_end: at_stop.app().l2_tx_count(),
                 stop_block: 17,
                 first_queued_input: state.first_queued_input,
-                next_batch_nonce: state.next_batch_nonce,
+                anchor_batch_nonce: state.next_batch_nonce,
             })
         );
         assert_eq!(summary.inputs_to_replay, 8);
-        assert_eq!(storage.history_state().unwrap().base_safe_block, 17);
-        assert_eq!(storage.batch_tree_anchor().unwrap(), state.next_batch_nonce);
+        let published = storage.era().unwrap();
+        assert_eq!(published.stop_block, 17);
+        assert_eq!(published.anchor_batch_nonce, state.next_batch_nonce);
         assert!(
             stored(&mut storage).iter().all(|(index, _, _)| *index < 8),
             "no row comes from an input past the stop block"
@@ -1061,7 +1062,7 @@ mod tests {
             .unwrap()
             .era
             .unwrap();
-        assert_eq!((era.first_queued_input, era.next_batch_nonce), (1, 1));
+        assert_eq!((era.first_queued_input, era.anchor_batch_nonce), (1, 1));
 
         // Run's startup opens the root at its own safe head.
         storage
@@ -1069,12 +1070,12 @@ mod tests {
             .unwrap();
         let root = storage.open_state().unwrap().expect("the root is open");
         assert_eq!(root.safe_block, 30);
-        let version = storage.history_state().unwrap().version;
+        let version = storage.history_version().unwrap();
         let drained: Vec<(u64, u64, u64)> = storage
             .canonical_history_page(
                 sequencer_core::history::HistoryClaim {
                     version,
-                    next_input: era.rebuilt_history_end,
+                    next_input: era.rebuilt_end,
                 },
                 16,
             )
@@ -1096,7 +1097,7 @@ mod tests {
         let root_batch = IngestedSafeInput {
             sender: SUBMITTER,
             payload: Batch {
-                nonce: era.next_batch_nonce,
+                nonce: era.anchor_batch_nonce,
                 frames: vec![Frame {
                     safe_block: root.safe_block,
                     fee_price: 0,

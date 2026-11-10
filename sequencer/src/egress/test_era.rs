@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::egress::l2_tx_feed::BroadcastTxMessage;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::test_helpers::default_protocol_timing;
-use crate::storage::{EraRecord, IngestedSafeInput, LifecycleCommand, RebuiltKey, Storage};
+use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra, RebuiltKey, Storage};
 use crate::test_support::pin_test_deployment_identity;
 
 pub(crate) const BASE: u64 = 41;
@@ -119,12 +119,12 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
     storage
         .publish_era(
             baseline_prefix,
-            &EraRecord {
-                base_count: L2TxCount::new(BASE),
-                rebuilt_history_end: L2TxCount::new(REBUILT_END),
+            &NewEra {
+                base: L2TxCount::new(BASE),
+                rebuilt_end: L2TxCount::new(REBUILT_END),
                 stop_block: STOP_BLOCK,
                 first_queued_input: FIRST_QUEUED_INPUT,
-                next_batch_nonce: NEXT_BATCH_NONCE,
+                anchor_batch_nonce: NEXT_BATCH_NONCE,
             },
         )
         .expect("publish the era");

@@ -83,10 +83,7 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address) {
         .expect("seed deployment identity");
     let snapshot_prefix = std::path::Path::new(db_path).with_file_name("seed-finalized");
     storage
-        .publish_era(
-            &snapshot_prefix,
-            &sequencer::storage::EraRecord::EMPTY_GENESIS,
-        )
+        .publish_era(&snapshot_prefix, &sequencer::storage::NewEra::EMPTY_GENESIS)
         .expect("seed finalized snapshot fact");
 }
 

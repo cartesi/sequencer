@@ -3,17 +3,16 @@
 
 //! `/history`'s metadata: the era, its baseline and the accepted checkpoint, in one read.
 
-use sequencer_core::history::{
-    EraId, HistoryBounds, HistoryPolicyError, L2TxCount, RecoveryGeneration,
-};
+use sequencer_core::history::{EraId, HistoryBounds, HistoryPolicyError, RecoveryGeneration};
 use sequencer_core::history_api::{
     AcceptedCheckpoint, HistoryBaseline, HistoryCompatibility, HistoryDeployment, HistoryInfo,
 };
 
 use crate::storage::Storage;
-use crate::storage::history::{next_l2_tx_count_in, preserved_input_count_in, query_history_state};
+use crate::storage::history::{
+    era_in, history_version_in, next_l2_tx_count_of, preserved_input_count_in,
+};
 use crate::storage::l1_inputs::query_deployment_identity;
-use crate::storage::mutations::batch_tree_anchor_in;
 use crate::storage::queries::safe_input_count_through_block_in;
 use crate::storage::snapshot_dumps::{
     FinalizedSelectionError, finalized_dump_in, has_rollback_safe_snapshot_in,
@@ -38,19 +37,19 @@ impl Storage {
         from_generation: Option<RecoveryGeneration>,
     ) -> Result<HistoryInfo, HistoricalReadError> {
         self.read(|tx| {
-            let state = query_history_state(tx)?;
-            if expected_era.is_some_and(|era| era != state.version.era_id) {
-                return Ok(Err(HistoryPolicyError::EraChanged {
-                    current: state.version,
-                }
-                .into()));
+            let era = era_in(tx)?;
+            let version = history_version_in(tx)?;
+            if expected_era.is_some_and(|expected| expected != version.era_id) {
+                return Ok(Err(
+                    HistoryPolicyError::EraChanged { current: version }.into()
+                ));
             }
             if from_generation.is_some() && expected_era.is_none() {
                 return Ok(Err(HistoricalReadError::BadRequest(
                     "era_id is required with from_generation".to_owned(),
                 )));
             }
-            if from_generation.is_some_and(|from| from > state.version.recovery_generation) {
+            if from_generation.is_some_and(|from| from > version.recovery_generation) {
                 return Ok(Err(HistoricalReadError::BadRequest(
                     "from_generation exceeds the current recovery generation".to_owned(),
                 )));
@@ -67,10 +66,10 @@ impl Storage {
                     "history has no rollback-safe snapshot"
                 );
             }
-            let head = next_l2_tx_count_in(tx)?;
+            let head = next_l2_tx_count_of(tx, &era)?;
             let compatibility = from_generation
                 .map(|from| {
-                    preserved_input_count_in(tx, from, state.version.recovery_generation, head).map(
+                    preserved_input_count_in(tx, from, version.recovery_generation, head).map(
                         |preserved_input_count| HistoryCompatibility {
                             from_generation: from,
                             preserved_input_count,
@@ -87,18 +86,15 @@ impl Storage {
                     batch_submitter_address: deployment.batch_submitter_address,
                 },
                 history: HistoryBounds {
-                    version: state.version,
-                    available_from: L2TxCount::new(state.base_l2_tx_count),
+                    version,
+                    available_from: era.base,
                     head,
                 },
                 baseline: HistoryBaseline {
-                    l1_stop_block: state.base_safe_block,
-                    l1_end_input_index: safe_input_count_through_block_in(
-                        tx,
-                        state.base_safe_block,
-                    )?,
-                    next_batch_nonce: batch_tree_anchor_in(tx)?,
-                    rebuilt_history_end: L2TxCount::new(state.rebuilt_history_end),
+                    l1_stop_block: era.stop_block,
+                    l1_end_input_index: safe_input_count_through_block_in(tx, era.stop_block)?,
+                    next_batch_nonce: era.anchor_batch_nonce,
+                    rebuilt_history_end: era.rebuilt_end,
                 },
                 accepted_checkpoint: accepted.map(|snapshot| AcceptedCheckpoint {
                     inclusion_block: snapshot.inclusion_block,

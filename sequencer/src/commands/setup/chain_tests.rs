@@ -287,7 +287,7 @@ fn with_key(extra: &[&'static str]) -> Vec<&'static str> {
 
 /// The rows the feed serves from `from` on.
 fn feed(storage: &mut Storage, from: u64) -> Vec<Row> {
-    let version = storage.history_state().unwrap().version;
+    let version = storage.history_version().unwrap();
     let page = storage
         .canonical_history_page(
             HistoryClaim {
@@ -346,8 +346,8 @@ fn assert_matches_reference(
 ) -> CanonicalRunner<WalletApp> {
     let mut storage = Storage::open(db_path).unwrap();
     let era = summary.era.expect("setup publishes an era");
-    let history = storage.history_state().unwrap();
-    let stop_block = history.base_safe_block;
+    let history = storage.era().unwrap();
+    let stop_block = history.stop_block;
     assert_eq!(era.stop_block, stop_block);
     let through_stop = storage.safe_input_count_through_block(stop_block).unwrap();
     assert_eq!(
@@ -357,23 +357,20 @@ fn assert_matches_reference(
     let (runner, reference) = chain.reference(&mut storage, through_stop);
     let state = runner.scheduler().state();
 
-    assert_eq!(history.base_l2_tx_count, base_count);
-    assert_eq!(
-        history.rebuilt_history_end,
-        runner.app().l2_tx_count().get()
-    );
+    assert_eq!(history.base.get(), base_count);
+    assert_eq!(history.rebuilt_end, runner.app().l2_tx_count());
     assert_eq!(history.first_queued_input, state.first_queued_input);
     assert_eq!((state.first_queued_input, state.fridge_len), (4, 2));
-    assert_eq!(storage.batch_tree_anchor().unwrap(), state.next_batch_nonce);
+    assert_eq!(history.anchor_batch_nonce, state.next_batch_nonce);
     assert_eq!(state.next_batch_nonce, 2);
     assert_eq!(
         era,
-        EraRecord {
-            base_count: L2TxCount::new(base_count),
-            rebuilt_history_end: runner.app().l2_tx_count(),
+        NewEra {
+            base: L2TxCount::new(base_count),
+            rebuilt_end: runner.app().l2_tx_count(),
             stop_block,
             first_queued_input: 4,
-            next_batch_nonce: 2,
+            anchor_batch_nonce: 2,
         }
     );
 
@@ -660,7 +657,7 @@ async fn a_deployment_not_yet_safe_exits_20_and_leaves_the_directory_empty() {
     )
     .await
     .unwrap();
-    assert_eq!(summary.era.unwrap().rebuilt_history_end, L2TxCount::ZERO);
+    assert_eq!(summary.era.unwrap().rebuilt_end, L2TxCount::ZERO);
 }
 
 /// The dry run needs no key, reports the base and the old instance's

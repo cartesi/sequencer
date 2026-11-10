@@ -62,9 +62,30 @@ fn schema_rejects_bad_nonce_contiguity() {
 }
 
 #[test]
+fn schema_rejects_a_parentless_root_before_the_era_exists() {
+    // The anchor is the era's: with no era the comparison is against NULL,
+    // `IS NOT` holds, and every parentless root ABORTs, whatever its nonce.
+    let db = crate::test_support::temp_db("schema-root-without-era");
+    let storage =
+        Storage::initialize_for_command(db.path.as_str(), crate::storage::LifecycleCommand::Setup)
+            .expect("setup schema, no era");
+    for nonce in [0, 7] {
+        let err = storage.conn.execute(
+            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
+             VALUES (0, NULL, ?1, 100)",
+            [nonce],
+        );
+        assert!(
+            format!("{err:?}").contains("parentless root must carry the batch-tree anchor nonce"),
+            "a root before the era must abort, got: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn schema_rejects_genesis_with_nonzero_nonce() {
-    // Default anchor is 0, so a parentless root at a non-zero nonce ABORTs
-    // (genesis must be 0) — the exact-match form of the contiguity rule.
+    // The genesis era's anchor is 0, so a parentless root at a non-zero nonce
+    // ABORTs — the exact-match form of the contiguity rule.
     let (_db, storage) = open_temp_storage("schema-genesis-nonzero");
     let err = storage.conn.execute(
         "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
@@ -79,19 +100,18 @@ fn schema_rejects_genesis_with_nonzero_nonce() {
 
 #[test]
 fn schema_allows_parentless_root_at_anchor_nonce() {
-    // With the anchor set to N' (a recovered deployment), a parentless root
+    // With an era anchored at N' (a recovered deployment), a parentless root
     // at N' is permitted — the recovery generalization of "genesis at 0".
     // (Rows are inserted sealed so the single-Tip partial index, which only
     // covers open rows, doesn't mask the contiguity trigger under test.)
-    let db = temp_db("schema-anchor-root");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    storage
-        .conn
-        .execute(
-            "UPDATE batch_tree_anchor SET nonce = 42 WHERE singleton_id = 0",
-            [],
-        )
-        .expect("set anchor");
+    let db = crate::test_support::temp_db("schema-anchor-root");
+    let storage = Storage::open_with_era(
+        db.path.as_str(),
+        &crate::storage::NewEra {
+            anchor_batch_nonce: 42,
+            ..crate::storage::NewEra::EMPTY_GENESIS
+        },
+    );
     // A root at the anchor nonce (42) is accepted...
     storage
         .conn
@@ -155,36 +175,6 @@ fn schema_rejects_second_valid_parentless_root() {
             [],
         )
         .expect("re-root parentless after the old root is invalidated");
-}
-
-#[test]
-fn schema_freezes_anchor_after_setup_complete() {
-    // The anchor is write-once: once `setup_complete` exists, UPDATEs abort.
-    let db = temp_db("schema-anchor-frozen");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    // Pre-marker: UPDATE is allowed (this is what recovery setup does).
-    storage
-        .conn
-        .execute(
-            "UPDATE batch_tree_anchor SET nonce = 7 WHERE singleton_id = 0",
-            [],
-        )
-        .expect("anchor settable before setup_complete");
-    storage
-        .conn
-        .execute(
-            "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
-            [],
-        )
-        .expect("mark setup complete");
-    let err = storage.conn.execute(
-        "UPDATE batch_tree_anchor SET nonce = 8 WHERE singleton_id = 0",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("batch-tree anchor is frozen after setup completes"),
-        "expected anchor-freeze trigger, got: {err:?}"
-    );
 }
 
 #[test]

@@ -170,7 +170,7 @@ pub(crate) fn batch_submitter_address_from_private_key(
 }
 
 /// Gate `run`/`flush` on a completed `setup` and return the pinned identity.
-/// A missing completion fact — or a completion fact without an identity (a
+/// A missing era — or an era without an identity (a
 /// corrupt/incomplete setup) — is a terminal `SetupNotComplete`: the operator must
 /// (re-)run `setup`, not retry `run`.
 pub(crate) fn load_setup_identity(data_dir: &str) -> Result<DeploymentIdentity, CommandError> {
