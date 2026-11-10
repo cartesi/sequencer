@@ -323,9 +323,10 @@ unverified paths.
 - **Release notes owe three items.** `HistoryBaseline.rebuilt_history_end` is
   a required field, so an older SDK build fails to decode `/history`; the
   released binaries link the emulator statically, so they need the Ubuntu
-  24.04 or Debian 13 C++ runtime; and the new template hashes. Read from this
-  tree's images on 2026-11-10, the devnet template is `0x8268d15a…92b5` and
-  the Sepolia template `0x96c69616…a1a2`; publish the released images' own.
+  24.04 or Debian 13 C++ runtime; and the new template hashes. Read them from
+  the released images (`just canonical-print-build-hashes`), not from an
+  earlier build: any source change in a guest crate moves them, a rename
+  included ([what moves the template hash](../cartesi-machine.md)).
 - **One unexplained memory reading in the rebuild.** Setup streams its passes
   in pages, and a test process rebuilding 10^6 inputs, sampled every 5 s,
   stayed between 26 and 55 MB resident. `/usr/bin/time -l` around one such
