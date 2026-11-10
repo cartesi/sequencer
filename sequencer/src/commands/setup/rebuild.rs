@@ -461,6 +461,88 @@ mod tests {
         );
     }
 
+    /// The worked boundary, with the 1200-block wait bound. A malformed batch
+    /// from the submitter consumes no batch nonce, yet the backstop runs
+    /// before decoding and executes the overdue directs; the last frame
+    /// drains the direct at its own safe block, so nothing stays queued.
+    ///
+    /// | L1 input | Block | Input | Executes |
+    /// |---:|---:|---|---|
+    /// | 0 | 5 | `D0` | queued |
+    /// | 1 | 12 | `D1` | queued |
+    /// | 2 | 20 | batch 0, safe block 10, `U0` | `D0`, `U0` |
+    /// | 3 | 20 | `D2`, after the batch | queued |
+    /// | 4 | 24 | `D3` | queued |
+    /// | 5 | 1230 | malformed batch | the backstop: `D1`, `D2`, `D3` |
+    /// | 6 | 1231 | `D4` | queued |
+    /// | 7 | 1232 | batch 1, safe block 1231, `U1` | `D4`, `U1` |
+    ///
+    /// At stop block 1240 the era has 7 transactions, next batch nonce 2 and
+    /// first queued input 8, the input count through the stop block.
+    #[test]
+    fn the_worked_boundary_rebuilds_seven_transactions_and_queues_nothing() {
+        const STOP: u64 = 1240;
+        let inputs = vec![
+            direct(5, vec![1]),
+            direct(12, vec![2]),
+            batch(0, 20, 10, 0),
+            direct(20, vec![3]),
+            direct(24, vec![4]),
+            IngestedSafeInput {
+                sender: SUBMITTER,
+                ..direct(1230, vec![0])
+            },
+            direct(1231, vec![5]),
+            batch(1, 1232, 1231, 1),
+        ];
+        let (_db, mut storage) = synced("rebuild-worked-boundary", &inputs, STOP);
+        let data_dir = tempfile::tempdir().unwrap();
+        let summary = finish(&mut storage, STOP, STOP, (3, 3), data_dir.path()).unwrap();
+
+        // Each row: the L1 input that released it, the direct's input index
+        // (`None` for a user op), and its L2 tx index.
+        let rows: Vec<(u64, Option<u64>, u64)> = stored(&mut storage)
+            .into_iter()
+            .map(|(l1_input_index, scheduled, count)| {
+                let direct = match scheduled.tx {
+                    L2Tx::Direct(direct) => Some(direct.input_index),
+                    L2Tx::UserOp(_) => None,
+                };
+                let count = count.expect("every row of this trace executes");
+                (l1_input_index, direct, count.get())
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (2, Some(0), 0),
+                (2, None, 1),
+                (5, Some(1), 2),
+                (5, Some(3), 3),
+                (5, Some(4), 4),
+                (7, Some(6), 5),
+                (7, None, 6),
+            ]
+        );
+        assert_eq!(summary.inputs_to_replay, 8);
+        assert_eq!(
+            summary.era,
+            Some(crate::storage::EraRecord {
+                base_count: L2TxCount::ZERO,
+                rebuilt_history_end: L2TxCount::new(7),
+                stop_block: STOP,
+                first_queued_input: 8,
+                next_batch_nonce: 2,
+            })
+        );
+        assert_eq!(storage.batch_tree_anchor().unwrap(), 2);
+        // The first live frame drains from the first input past the stop block.
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 8);
+
+        let mut runner = reference(&inputs, 0);
+        assert_eq!(stored(&mut storage), expected(&mut runner, &inputs, 0, 8));
+    }
+
     /// A base in the middle with two directs queued: the rebuild resumes with
     /// them and lands where the reference over the whole range does.
     #[test]
