@@ -312,14 +312,9 @@ unverified paths.
   so a seam would have no second implementation to test it.
 - **Unverified on GitHub Actions:** the release workflow's native arm64
   runner (`ubuntu-24.04-arm`) and the amd64 release link, now that the
-  sequencer links the emulator; and the `rollups-e2e` job's run of the six
-  recovery scenarios and the divergence drill, which now also need the
-  `cartesi-machine` CLI, the watchdog's Lua modules and both canonical images.
-  The whole devnet suite passed locally on 2026-11-10, 53 scenarios with none
-  ignored, and each recovery scenario three times more. Evidence:
-  [`release.yml`](../../.github/workflows/release.yml),
-  [`ci.yml`](../../.github/workflows/ci.yml),
-  [`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs).
+  sequencer links the emulator. That workflow runs only on a tag or by hand,
+  so no pull request exercises it. Evidence:
+  [`release.yml`](../../.github/workflows/release.yml).
 - **Release notes owe three items.** `HistoryBaseline.rebuilt_history_end` is
   a required field, so an older SDK build fails to decode `/history`; the
   released binaries link the emulator statically, so they need the Ubuntu

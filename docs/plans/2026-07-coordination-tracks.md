@@ -18,7 +18,7 @@ freely at this stage — no backward-compatibility constraints.
 
 **Current campaign order:**
 
-1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. [Sequencer recovery](2026-11-sequencer-recovery/README.md) is built: `setup --base <MACHINE_DIR>` rebuilds the sequencer from a canonical machine's exported state through `from_canonical_state` ([cockroach recovery](../recovery/cockroach.md#what-setup-does)), and each client realigns through the feed from its own count. Its devnet round-trip drills pass on a local devnet but have not yet run on GitHub Actions ([register](../review/register.md#sequencer-recovery-follow-ups)), and the rest is in its [to do](2026-11-sequencer-recovery/todo.md).
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. [Sequencer recovery](2026-11-sequencer-recovery/README.md) is built: `setup --base <MACHINE_DIR>` rebuilds the sequencer from a canonical machine's exported state through `from_canonical_state` ([cockroach recovery](../recovery/cockroach.md#what-setup-does)), and each client realigns through the feed from its own count. Its devnet round-trip drills run in CI, and the rest is in its [to do](2026-11-sequencer-recovery/todo.md).
 2. Application integrators/operators validate the private engine, its `from_canonical_state` and the recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
@@ -68,9 +68,8 @@ table with Bart and ship it with the other guest-image changes.
 The [Application contract](../protocol/application-contract.md) owns execution,
 engine progress, and checkpoint semantics. The [C binding guide](../protocol/c-application-binding.md)
 maps that contract to native engines. Its reference conformance suite and C-host
-process scenarios cover snapshot-to-live bootstrap, restart and standard
-recovery; the C host's rebuild from genesis passes on a local devnet but has
-not yet run on GitHub Actions.
+process scenarios cover snapshot-to-live bootstrap, restart, standard
+recovery and the rebuild from genesis and from a stored machine.
 Reference bridge conformance cannot establish private-engine correctness.
 
 Remaining checks need the actual consumer:
