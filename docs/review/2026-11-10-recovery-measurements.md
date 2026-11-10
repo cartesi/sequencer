@@ -9,11 +9,11 @@ recovery drills end to end.
 Retained for the register's
 [sequencer recovery follow-ups](register.md#sequencer-recovery-follow-ups) and
 its [fridge bound](register.md#bound-the-canonical-direct-input-fridge) entry.
-Measured on the uncommitted working tree over `f83b51f` that adds `setup
---base`, with the devnet image `examples/canonical-app/out/canonical-machine-image`
-built from it. Replace the guest numbers when libdex's guest exists, since
-every one of them is the reference wallet's; re-measure the rebuild if its
-signature recovery changes; delete this record when no register entry cites it.
+Measured at `36337b9`, with the devnet image
+`examples/canonical-app/out/canonical-machine-image` built from it. Replace
+the guest numbers when libdex's guest exists, since every one of them is the
+reference wallet's; re-measure the rebuild if its signature recovery changes;
+delete this record when no register entry cites it.
 
 ## Environment
 
