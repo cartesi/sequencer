@@ -352,6 +352,15 @@ async fn corrupt_feed_head_trips_terminal_storage_fault() {
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
     let start = claim(&db.path, 0);
+    // STRICT refuses a text generation, so drop STRICT from this table first.
+    conn.execute_batch(
+        "PRAGMA writable_schema = ON; \
+         UPDATE sqlite_schema SET sql = replace(sql, ') STRICT', ')') WHERE name = 'history_state'; \
+         PRAGMA writable_schema = OFF;",
+    )
+    .expect("make history_state non-STRICT");
+    drop(conn);
+    let conn = Storage::open_connection(db.path.as_str()).expect("reopened raw connection");
     conn.execute_batch("PRAGMA ignore_check_constraints = ON; DROP TRIGGER trg_history_generation_monotonic; UPDATE history_state SET recovery_generation = 'broken';").expect("corrupt generation");
     drop(conn);
 
@@ -373,8 +382,10 @@ async fn corrupt_feed_page_trips_terminal_storage_fault() {
     let db = temp_db("corrupt-feed-page");
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
-    conn.execute("UPDATE frames SET safe_block = 'not-an-integer'", [])
-        .expect("corrupt safe-block storage type");
+    // A missing frame makes the page's LEFT JOIN read NULL frame columns (fee,
+    // safe block), which the decoder refuses as a wrongly typed stored value.
+    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM frames;")
+        .expect("drop the frames under stored rows");
     drop(conn);
 
     let shutdown = RuntimeScope::default();

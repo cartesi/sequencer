@@ -60,10 +60,9 @@ Later, in light of this plan:
   whose count lies past the rebuilt history end, which today only the client's
   own adopt check catches;
 - `/nonce` after a recovery, which reads only the live rows;
-- the L2 tx count's older name, `executed_input_count`, which the HTTP fields,
-  the `X-Executed-Input-Count` header and the storage columns
-  `history_state.base_executed_input_count` and
-  `snapshots.executed_input_count` still carry;
+- the L2 tx count's older name, `executed_input_count`, which the HTTP fields
+  and the `X-Executed-Input-Count` header still carry (the storage columns say
+  `l2_tx_count`);
 - the WS headers.
 
 ## Machine sourcing

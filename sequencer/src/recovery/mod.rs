@@ -871,7 +871,7 @@ mod tests {
         let rows: Vec<(i64, Option<i64>)> = storage
             .read(|tx| {
                 tx.prepare(
-                    "SELECT offset, safe_input_index FROM application_inputs ORDER BY offset",
+                    "SELECT l2_tx_count, safe_input_index FROM application_inputs ORDER BY l2_tx_count",
                 )?
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect()

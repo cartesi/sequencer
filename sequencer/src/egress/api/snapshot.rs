@@ -724,7 +724,7 @@ mod tests {
         conn.execute_batch("DROP TRIGGER trg_snapshot_immutable")
             .unwrap();
         conn.execute(
-            "UPDATE snapshots SET executed_input_count = -1 WHERE batch_index IS NULL",
+            "UPDATE snapshots SET l2_tx_count = -1 WHERE batch_index IS NULL",
             [],
         )
         .expect("corrupt finalized cursor");

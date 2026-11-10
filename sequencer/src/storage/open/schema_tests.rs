@@ -303,7 +303,7 @@ fn schema_rejects_application_input_into_non_tip() {
     // trigger fires before the safe_input_index FK is evaluated.
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-         (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+         (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
          VALUES (0, 0, 0, NULL, 0)",
         [],
     );
@@ -492,7 +492,7 @@ fn schema_rejects_application_input_with_neither_xor_branch() {
         .expect("initialize");
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-             (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+             (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
              VALUES (0, 0, 0, NULL, NULL)",
         [],
     );
@@ -727,4 +727,50 @@ fn schema_rejects_safe_input_update_and_delete() {
         storage.safe_input_count_through_block(10).expect("count"),
         2
     );
+}
+
+#[test]
+fn every_schema_table_is_strict() {
+    // STRICT is what refuses a mis-classed value before any trigger runs, so a
+    // table added without it would reopen that hole.
+    let (_db, storage) = open_temp_storage("schema-every-table-strict");
+    let mut stmt = storage
+        .conn
+        .prepare(
+            "SELECT name FROM pragma_table_list \
+             WHERE type = 'table' AND strict = 0 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare table list");
+    let lax: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .expect("list tables")
+        .collect::<rusqlite::Result<_>>()
+        .expect("read table names");
+    assert!(lax.is_empty(), "tables without STRICT: {lax:?}");
+}
+
+#[test]
+fn strict_type_refusal_is_a_persistent_storage_error() {
+    let (_db, storage) = open_temp_storage("schema-strict-type-refusal");
+    let err = storage
+        .conn
+        .execute(
+            "INSERT INTO wallet_nonce_watermark (singleton_id, watermark) VALUES (0, ?1)",
+            ["not-an-integer"],
+        )
+        .expect_err("STRICT must refuse text in an INTEGER column");
+    let rusqlite::Error::SqliteFailure(source, _) = &err else {
+        panic!("expected a SQLite failure, got {err:?}");
+    };
+    assert_eq!(
+        source.extended_code,
+        rusqlite::ffi::SQLITE_CONSTRAINT_DATATYPE,
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("cannot store TEXT value in INTEGER column"),
+        "{err}"
+    );
+    assert!(crate::storage::convert::is_persistent_storage_error(&err));
 }

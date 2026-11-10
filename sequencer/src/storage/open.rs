@@ -226,7 +226,7 @@ mod tests {
         let history_count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM history_state \
              WHERE singleton_id = 0 AND recovery_generation = 0 \
-               AND base_executed_input_count = 0 \
+               AND base_l2_tx_count = 0 \
                AND base_safe_block = 0",
             [],
             |row| row.get(0),

@@ -505,7 +505,7 @@ fn insert_executed_user_ops_batch(
         user_ops.iter().map(|item| &item.pending),
     )?;
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO application_inputs (offset, batch_index, frame_in_batch, user_op_pos_in_frame)
+        "INSERT INTO application_inputs (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (position, item) in user_ops.iter().enumerate() {
@@ -871,7 +871,7 @@ mod tests {
 
         let current: Vec<i64> = storage
             .conn
-            .prepare("SELECT offset FROM application_inputs ORDER BY offset")
+            .prepare("SELECT l2_tx_count FROM application_inputs ORDER BY l2_tx_count")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -1333,12 +1333,12 @@ mod tests {
             .append_executed_user_ops_chunk(&mut head, &[included_user_op(0, 0)])
             .unwrap();
         storage.close_frame_and_batch(&mut head, 0).unwrap();
-        let err = storage.conn.execute("INSERT INTO application_inputs (offset,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
+        let err = storage.conn.execute("INSERT INTO application_inputs (l2_tx_count,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
         assert!(err.to_string().contains("current valid Tip"));
         assert!(
             storage
                 .conn
-                .execute("UPDATE application_inputs SET offset = 1", [])
+                .execute("UPDATE application_inputs SET l2_tx_count = 1", [])
                 .is_err()
         );
         assert!(
@@ -1599,7 +1599,9 @@ mod tests {
         assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
         let rows: Vec<(i64, i64)> = storage
             .conn
-            .prepare("SELECT offset, safe_input_index FROM application_inputs ORDER BY offset")
+            .prepare(
+                "SELECT l2_tx_count, safe_input_index FROM application_inputs ORDER BY l2_tx_count",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()

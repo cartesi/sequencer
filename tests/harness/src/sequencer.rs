@@ -721,7 +721,7 @@ impl ManagedSequencer {
             i64,
         ) = conn
             .query_row(
-                "SELECT h.base_executed_input_count, h.base_safe_block, h.rebuilt_history_end, \
+                "SELECT h.base_l2_tx_count, h.base_safe_block, h.rebuilt_history_end, \
                         h.first_queued_input, a.nonce \
                  FROM history_state h \
                  JOIN batch_tree_anchor a ON a.singleton_id = 0 \

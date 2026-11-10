@@ -72,7 +72,7 @@ impl Storage {
 pub(super) fn query_history_state(conn: &Connection) -> Result<HistoryState> {
     conn.query_row(
         "SELECT era_id, era_created_at_ms, recovery_generation,
-                base_executed_input_count, base_safe_block,
+                base_l2_tx_count, base_safe_block,
                 rebuilt_history_end, first_queued_input
            FROM history_state WHERE singleton_id = 0",
         [],
@@ -107,7 +107,7 @@ pub(super) fn initialize_history_in(tx: &Transaction<'_>, era: &EraRecord) -> Re
     tx.execute(
         "INSERT INTO history_state
          (singleton_id, era_id, era_created_at_ms, recovery_generation,
-          base_executed_input_count, base_safe_block, rebuilt_history_end,
+          base_l2_tx_count, base_safe_block, rebuilt_history_end,
           first_queued_input) VALUES (0, ?1, ?2, 0, ?3, ?4, ?5, ?6)",
         params![
             era_id.as_bytes().as_slice(),
@@ -125,10 +125,11 @@ pub(super) fn initialize_history_in(tx: &Transaction<'_>, era: &EraRecord) -> Re
 /// history's end before the era has any.
 pub(super) fn next_l2_tx_count_in(conn: &Connection) -> Result<L2TxCount> {
     let rebuilt_end = query_history_state(conn)?.rebuilt_history_end;
-    let greatest: Option<i64> =
-        conn.query_row("SELECT MAX(offset) FROM application_inputs", [], |row| {
-            row.get(0)
-        })?;
+    let greatest: Option<i64> = conn.query_row(
+        "SELECT MAX(l2_tx_count) FROM application_inputs",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(L2TxCount::new(greatest.map_or(rebuilt_end, |offset| {
         i64_to_u64(offset)
             .checked_add(1)
@@ -144,7 +145,7 @@ pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<Rec
         .expect("recovery generation exhausted");
     let preserved = next_l2_tx_count_in(tx)?;
     tx.execute(
-        "INSERT INTO history_generation_cuts (recovery_generation, preserved_input_count) \
+        "INSERT INTO history_generation_cuts (recovery_generation, preserved_l2_tx_count) \
          VALUES (?1, ?2)",
         params![u64_to_i64(next), u64_to_i64(preserved.get())],
     )?;
@@ -172,7 +173,7 @@ pub(super) fn preserved_input_count_in(
         return Ok(head);
     }
     let (count, minimum): (i64, Option<i64>) = conn.query_row(
-        "SELECT COUNT(*), MIN(preserved_input_count) FROM history_generation_cuts \
+        "SELECT COUNT(*), MIN(preserved_l2_tx_count) FROM history_generation_cuts \
          WHERE recovery_generation > ?1 AND recovery_generation <= ?2",
         params![u64_to_i64(from.get()), u64_to_i64(current.get())],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -256,7 +257,7 @@ mod tests {
                 "history baseline is immutable",
             ),
             (
-                "UPDATE history_state SET base_executed_input_count = 42",
+                "UPDATE history_state SET base_l2_tx_count = 42",
                 "history baseline is immutable",
             ),
             (

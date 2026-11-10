@@ -32,12 +32,12 @@
 CREATE TABLE IF NOT EXISTS batches (
     batch_index        INTEGER PRIMARY KEY,
     parent_batch_index INTEGER REFERENCES batches(batch_index),  -- NULL only for genesis
-    nonce              INTEGER NOT NULL CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
+    nonce              INTEGER NOT NULL CHECK (nonce >= 0),
     created_at_ms      INTEGER NOT NULL,
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     invalidated_at_ms  INTEGER CHECK (invalidated_at_ms IS NULL OR invalidated_at_ms >= 0),
     payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32)
-);
+) STRICT;
 
 -- "At most one valid Tip" — structural via partial unique index. The predicate
 -- references only local columns of `batches`, so SQLite accepts it.
@@ -77,7 +77,7 @@ CREATE VIEW IF NOT EXISTS valid_open_batch AS
 CREATE TABLE IF NOT EXISTS batch_tree_anchor (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     nonce        INTEGER NOT NULL CHECK (nonce >= 0)
-);
+) STRICT;
 INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 
 -- ── Triggers ───────────────────────────────────────────────────────────────
@@ -88,12 +88,9 @@ INSERT OR IGNORE INTO batch_tree_anchor(singleton_id, nonce) VALUES (0, 0);
 -- transition sequence — triggers just ensure the DB never reaches an
 -- inconsistent state if the writer misbehaves.
 --
--- typeof() guards: INTEGER affinity does not reject an unconvertible value,
--- and TEXT/BLOB sort above INTEGER, so a bare `x >= 0` CHECK passes 'abc'.
--- Columns that feed SQL-level arithmetic or comparisons (trigger math,
--- frontier folds, lease counts) therefore carry an explicit
--- typeof(x) = 'integer' guard: a mis-bound positional parameter must refuse,
--- not coerce to 0 inside a trigger.
+-- Every table is STRICT: a value of the wrong storage class is refused for
+-- every column before any trigger runs, so trigger arithmetic, frontier folds
+-- and comparisons only ever see the declared class (integers where they count).
 
 -- Nonce contiguity: `nonce = parent.nonce + 1`, or the batch-tree anchor nonce
 -- (the era's next batch nonce at its stop block) for the parentless root.
@@ -187,7 +184,7 @@ CREATE TABLE IF NOT EXISTS frames (
     -- Claimed safe L1 block frontier for this frame.
     safe_block           INTEGER NOT NULL CHECK (safe_block >= 0),
     PRIMARY KEY(batch_index, frame_in_batch)
-);
+) STRICT;
 
 CREATE TRIGGER IF NOT EXISTS trg_frames_target_must_be_tip
 BEFORE INSERT ON frames
@@ -217,7 +214,7 @@ CREATE TABLE IF NOT EXISTS user_ops (
     received_at_ms   INTEGER NOT NULL,
     PRIMARY KEY(batch_index, frame_in_batch, pos_in_frame),
     FOREIGN KEY(batch_index, frame_in_batch) REFERENCES frames(batch_index, frame_in_batch)
-);
+) STRICT;
 
 -- `GET /nonce` reads a sender's latest op in a valid batch. Rows are never
 -- pruned, so without this index every public read would scan all history.
@@ -245,13 +242,12 @@ CREATE TABLE IF NOT EXISTS safe_inputs (
     sender             BLOB NOT NULL CHECK (length(sender) = 20),
     payload            BLOB NOT NULL,
     -- Block number of the chain block where this direct input was included (e.g. InputAdded event block).
-    block_number       INTEGER NOT NULL
-        CHECK (typeof(block_number) = 'integer' AND block_number >= 0),
+    block_number       INTEGER NOT NULL CHECK (block_number >= 0),
     -- Timestamp of the carrying L1 block.
     block_timestamp    INTEGER NOT NULL CHECK (block_timestamp >= 0),
     -- Hash of the L1 transaction that carried this input.
     transaction_hash   BLOB NOT NULL CHECK (length(transaction_hash) = 32)
-);
+) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_sender
     ON safe_inputs(sender);
@@ -269,7 +265,7 @@ BEGIN SELECT RAISE(ABORT, 'safe inputs are retained for the database lifetime');
 -- Current application order. Recovery replaces only an invalidated suffix;
 -- immutable source payloads remain in their owning tables.
 CREATE TABLE IF NOT EXISTS application_inputs (
-    offset INTEGER PRIMARY KEY CHECK (typeof(offset) = 'integer' AND offset >= 0),
+    l2_tx_count INTEGER PRIMARY KEY CHECK (l2_tx_count >= 0),
     batch_index INTEGER NOT NULL,
     frame_in_batch INTEGER NOT NULL,
     user_op_pos_in_frame INTEGER,
@@ -283,7 +279,7 @@ CREATE TABLE IF NOT EXISTS application_inputs (
         OR (user_op_pos_in_frame IS NULL AND safe_input_index IS NOT NULL)),
     UNIQUE(batch_index, frame_in_batch, user_op_pos_in_frame),
     UNIQUE(safe_input_index)
-);
+) STRICT;
 CREATE INDEX IF NOT EXISTS idx_application_inputs_frame
     ON application_inputs(batch_index, frame_in_batch);
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
@@ -301,10 +297,10 @@ CREATE TABLE IF NOT EXISTS safe_accepted_batches (
     safe_input_index     INTEGER PRIMARY KEY REFERENCES safe_inputs(safe_input_index),
     -- CHECK aligns this column with its siblings (batches.nonce, anchor nonce);
     -- the writer is u64-sourced, so a negative value is corruption.
-    nonce                INTEGER NOT NULL CHECK (typeof(nonce) = 'integer' AND nonce >= 0),
+    nonce                INTEGER NOT NULL CHECK (nonce >= 0),
     first_frame_safe_block INTEGER NOT NULL,
     inclusion_block      INTEGER NOT NULL
-);
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
@@ -315,7 +311,7 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
     -- Wall-clock time (Unix ms) of the last successful L1 sync.
     -- Used for wall-clock danger estimation when L1 is unreachable.
     synced_at_ms INTEGER NOT NULL CHECK (synced_at_ms >= 0)
-);
+) STRICT;
 
 -- Highest wallet nonce ever broadcast by this deployment's batch-submitter
 -- key (the durable realization of the TLA+ spec's `walletNonce`). Write-before-broadcast: any component about to send a tx
@@ -328,7 +324,7 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
 CREATE TABLE IF NOT EXISTS wallet_nonce_watermark (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     watermark    INTEGER NOT NULL CHECK (watermark >= 0)
-);
+) STRICT;
 
 -- Canonical-divergence poison marker. Written by the input
 -- reader's acceptance simulation — atomically with the sync that detected
@@ -347,7 +343,7 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
     safe_input_index INTEGER NOT NULL CHECK (safe_input_index >= 0),
     kind             TEXT    NOT NULL CHECK (kind IN ('foreign', 'mismatch')),
     detected_at_ms   INTEGER NOT NULL CHECK (detected_at_ms >= 0)
-);
+) STRICT;
 
 -- I15 structural enforcement: while the divergence marker exists, the batch
 -- tree and snapshot collection are frozen in the engine
@@ -376,24 +372,17 @@ BEGIN SELECT RAISE(ABORT, 'batch tree frozen: canonical divergence marker presen
 -- NULL for a skipped user op. Only setup writes here, and only before it
 -- publishes the era: rows from safe blocks never change afterwards.
 CREATE TABLE IF NOT EXISTS rebuilt_history (
-    l1_input_index   INTEGER NOT NULL CHECK (
-        typeof(l1_input_index) = 'integer' AND l1_input_index >= 0),
-    position         INTEGER NOT NULL CHECK (
-        typeof(position) = 'integer' AND position >= 0),
+    l1_input_index   INTEGER NOT NULL CHECK (l1_input_index >= 0),
+    position         INTEGER NOT NULL CHECK (position >= 0),
     kind             TEXT NOT NULL CHECK (kind IN ('direct', 'user_op')),
     safe_input_index INTEGER REFERENCES safe_inputs(safe_input_index),
     sender           BLOB CHECK (sender IS NULL OR length(sender) = 20),
-    nonce            INTEGER CHECK (nonce IS NULL OR (
-        typeof(nonce) = 'integer' AND nonce BETWEEN 0 AND 4294967295)),
-    fee              INTEGER CHECK (fee IS NULL OR (
-        typeof(fee) = 'integer' AND fee BETWEEN 0 AND 65535)),
+    nonce            INTEGER CHECK (nonce IS NULL OR nonce BETWEEN 0 AND 4294967295),
+    fee              INTEGER CHECK (fee IS NULL OR fee BETWEEN 0 AND 65535),
     data             BLOB,
-    safe_block       INTEGER CHECK (safe_block IS NULL OR (
-        typeof(safe_block) = 'integer' AND safe_block >= 0)),
-    batch_nonce      INTEGER NOT NULL CHECK (
-        typeof(batch_nonce) = 'integer' AND batch_nonce >= 0),
-    l2_tx_count      INTEGER CHECK (l2_tx_count IS NULL OR (
-        typeof(l2_tx_count) = 'integer' AND l2_tx_count >= 0)),
+    safe_block       INTEGER CHECK (safe_block IS NULL OR safe_block >= 0),
+    batch_nonce      INTEGER NOT NULL CHECK (batch_nonce >= 0),
+    l2_tx_count      INTEGER CHECK (l2_tx_count IS NULL OR l2_tx_count >= 0),
     PRIMARY KEY (l1_input_index, position),
     -- A direct drains while the scheduler processes its own input or a later one.
     CHECK ((kind = 'direct' AND safe_input_index IS NOT NULL
@@ -404,7 +393,7 @@ CREATE TABLE IF NOT EXISTS rebuilt_history (
             AND sender IS NOT NULL AND nonce IS NOT NULL AND fee IS NOT NULL
             AND data IS NOT NULL AND safe_block IS NOT NULL)),
     UNIQUE (safe_input_index)
-);
+) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_rebuilt_history_count
     ON rebuilt_history(l2_tx_count) WHERE l2_tx_count IS NOT NULL;
 
@@ -468,23 +457,16 @@ BEGIN SELECT RAISE(ABORT, 'rebuilt history is retained for the database lifetime
 CREATE TABLE IF NOT EXISTS history_state (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     era_id BLOB NOT NULL CHECK (
-        typeof(era_id) = 'blob' AND length(era_id) = 16
+        length(era_id) = 16
         AND substr(hex(era_id), 13, 1) = '4'
         AND substr(hex(era_id), 17, 1) IN ('8', '9', 'A', 'B')),
-    era_created_at_ms INTEGER NOT NULL CHECK (
-        typeof(era_created_at_ms) = 'integer' AND era_created_at_ms >= 0),
-    recovery_generation INTEGER NOT NULL CHECK (
-        typeof(recovery_generation) = 'integer' AND recovery_generation >= 0),
-    base_executed_input_count INTEGER NOT NULL CHECK (
-        typeof(base_executed_input_count) = 'integer' AND base_executed_input_count >= 0),
-    base_safe_block INTEGER NOT NULL CHECK (
-        typeof(base_safe_block) = 'integer' AND base_safe_block >= 0),
-    rebuilt_history_end INTEGER NOT NULL CHECK (
-        typeof(rebuilt_history_end) = 'integer'
-        AND rebuilt_history_end >= base_executed_input_count),
-    first_queued_input INTEGER NOT NULL CHECK (
-        typeof(first_queued_input) = 'integer' AND first_queued_input >= 0)
-);
+    era_created_at_ms INTEGER NOT NULL CHECK (era_created_at_ms >= 0),
+    recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 0),
+    base_l2_tx_count INTEGER NOT NULL CHECK (base_l2_tx_count >= 0),
+    base_safe_block INTEGER NOT NULL CHECK (base_safe_block >= 0),
+    rebuilt_history_end INTEGER NOT NULL CHECK (rebuilt_history_end >= base_l2_tx_count),
+    first_queued_input INTEGER NOT NULL CHECK (first_queued_input >= 0)
+) STRICT;
 -- The era's counts are exactly the span of the executed rebuilt rows, and its
 -- first queued input lies among the inputs through the stop block. A direct
 -- never skips, and the scheduler drains its queue in input order, so every
@@ -494,12 +476,12 @@ CREATE TRIGGER IF NOT EXISTS trg_history_state_era_fits
 BEFORE INSERT ON history_state FOR EACH ROW
 BEGIN
     SELECT CASE
-        WHEN NEW.base_executed_input_count != COALESCE(
+        WHEN NEW.base_l2_tx_count != COALESCE(
                 (SELECT MIN(l2_tx_count) FROM rebuilt_history WHERE l2_tx_count IS NOT NULL),
-                NEW.base_executed_input_count)
+                NEW.base_l2_tx_count)
           OR NEW.rebuilt_history_end != COALESCE(
                 (SELECT MAX(l2_tx_count) + 1 FROM rebuilt_history WHERE l2_tx_count IS NOT NULL),
-                NEW.base_executed_input_count)
+                NEW.base_l2_tx_count)
             THEN RAISE(ABORT, 'the era must span exactly its executed rebuilt rows')
         WHEN EXISTS (SELECT 1 FROM rebuilt_history
                       WHERE kind = 'direct' AND l2_tx_count IS NULL)
@@ -518,9 +500,8 @@ END;
 -- suffix and before reopening attributes replacement direct inputs.
 CREATE TABLE IF NOT EXISTS history_generation_cuts (
     recovery_generation INTEGER PRIMARY KEY CHECK (recovery_generation > 0),
-    preserved_input_count INTEGER NOT NULL CHECK (
-        typeof(preserved_input_count) = 'integer' AND preserved_input_count >= 0)
-);
+    preserved_l2_tx_count INTEGER NOT NULL CHECK (preserved_l2_tx_count >= 0)
+) STRICT;
 CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_immutable
 BEFORE UPDATE ON history_generation_cuts FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'history generation cuts are immutable'); END;
@@ -533,7 +514,7 @@ WHEN EXISTS (SELECT 1 FROM history_state)
 BEGIN SELECT RAISE(ABORT, 'history state is inserted once per database'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_identity_write_once
 BEFORE UPDATE OF singleton_id, era_id, era_created_at_ms,
-    base_executed_input_count, base_safe_block, rebuilt_history_end,
+    base_l2_tx_count, base_safe_block, rebuilt_history_end,
     first_queued_input ON history_state FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'history baseline is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_history_generation_monotonic
@@ -559,8 +540,8 @@ BEGIN SELECT RAISE(ABORT, 'application history baseline is missing'); END;
 -- Live rows continue the era's rebuilt history.
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_contiguous
 BEFORE INSERT ON application_inputs FOR EACH ROW
-WHEN NEW.offset != (SELECT MAX(rebuilt_history_end,
-    COALESCE((SELECT MAX(offset) + 1 FROM application_inputs), 0))
+WHEN NEW.l2_tx_count != (SELECT MAX(rebuilt_history_end,
+    COALESCE((SELECT MAX(l2_tx_count) + 1 FROM application_inputs), 0))
     FROM history_state WHERE singleton_id = 0)
 BEGIN SELECT RAISE(ABORT, 'application input offset must equal next count'); END;
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_immutable
@@ -591,13 +572,9 @@ CREATE TABLE IF NOT EXISTS terminal_faults (
     command        TEXT    NOT NULL CHECK (command IN (
         'setup', 'run', 'maintenance_flush'
     )),
-    cause          TEXT    NOT NULL CHECK (
-        typeof(cause) = 'text' AND length(cause) > 0
-    ),
-    recorded_at_ms INTEGER NOT NULL CHECK (
-        typeof(recorded_at_ms) = 'integer' AND recorded_at_ms >= 0
-    )
-);
+    cause          TEXT    NOT NULL CHECK (length(cause) > 0),
+    recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0)
+) STRICT;
 
 CREATE TRIGGER IF NOT EXISTS trg_terminal_faults_append_only_update
 BEFORE UPDATE ON terminal_faults
@@ -640,7 +617,7 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
             AND fee_oracle_weth IS NOT NULL AND fee_oracle_fee_token IS NOT NULL
             AND fee_oracle_pool IS NOT NULL AND fee_oracle_twap_window_secs IS NOT NULL)
     )
-);
+) STRICT;
 
 -- Setup publishes the era record, its baseline snapshot, the anchor and this
 -- marker in one final transaction after artifact durability. A setup that
@@ -648,7 +625,7 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
 CREATE TABLE IF NOT EXISTS setup_complete (
     singleton_id    INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
-);
+) STRICT;
 
 -- The batch-tree anchor is frozen once setup completes. `setup` writes it
 -- (the next batch nonce at the stop block) with the `setup_complete` marker;
@@ -725,7 +702,7 @@ CREATE TABLE IF NOT EXISTS batch_policy (
     CHECK (log_base_gas - log_alpha - log_delta < log_max_batch_bytes),
     -- Fee floor: the derived per-op fee never drops below exponent 0.
     CHECK (log_gas_price + log_slack + log_one_plus_alpha + log_delta + log_user_op_bytes >= 0)
-);
+) STRICT;
 
 -- Default values. All log-space exponents with base 129/128:
 --   log_alpha            = log_{129/128}(0.168)          = -229
@@ -776,17 +753,14 @@ FROM batch_policy;
 CREATE TABLE IF NOT EXISTS dumps (
     id           INTEGER PRIMARY KEY,
     prefix       TEXT NOT NULL UNIQUE,
-    lease_count  INTEGER NOT NULL DEFAULT 0
-        CHECK (typeof(lease_count) = 'integer' AND lease_count >= 0)
-);
+    lease_count  INTEGER NOT NULL DEFAULT 0 CHECK (lease_count >= 0)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS snapshots (
     dump_id               INTEGER PRIMARY KEY REFERENCES dumps(id) ON DELETE RESTRICT,
     batch_index           INTEGER UNIQUE REFERENCES batches(batch_index) ON DELETE RESTRICT,
-    executed_input_count  INTEGER NOT NULL CHECK (
-        typeof(executed_input_count) = 'integer' AND executed_input_count >= 0
-    )
-);
+    l2_tx_count           INTEGER NOT NULL CHECK (l2_tx_count >= 0)
+) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_single_baseline
 ON snapshots ((1)) WHERE batch_index IS NULL;
 

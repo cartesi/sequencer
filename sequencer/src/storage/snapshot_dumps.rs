@@ -280,7 +280,7 @@ fn insert_snapshot_in(
     )?;
     let id = tx.last_insert_rowid();
     tx.execute(
-        "INSERT INTO snapshots (dump_id, batch_index, executed_input_count) VALUES (?1, ?2, ?3)",
+        "INSERT INTO snapshots (dump_id, batch_index, l2_tx_count) VALUES (?1, ?2, ?3)",
         params![id, batch_index.map(u64_to_i64), u64_to_i64(count.get())],
     )?;
     Ok(id)
@@ -317,7 +317,7 @@ fn latest_accepted_boundary_in(conn: &Connection) -> Result<Option<(u64, u64, u6
 
 fn snapshot_for_batch_in(conn: &Connection, batch_index: u64) -> Result<Snapshot> {
     conn.query_row(
-        "SELECT s.dump_id, d.prefix, s.executed_input_count FROM snapshots s \
+        "SELECT s.dump_id, d.prefix, s.l2_tx_count FROM snapshots s \
          LEFT JOIN dumps d ON d.id = s.dump_id WHERE s.batch_index = ?1",
         [u64_to_i64(batch_index)],
         row_to_snapshot,
@@ -326,7 +326,7 @@ fn snapshot_for_batch_in(conn: &Connection, batch_index: u64) -> Result<Snapshot
 
 fn baseline_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     conn.query_row(
-        "SELECT s.dump_id, d.prefix, s.executed_input_count FROM snapshots s \
+        "SELECT s.dump_id, d.prefix, s.l2_tx_count FROM snapshots s \
          LEFT JOIN dumps d ON d.id = s.dump_id WHERE s.batch_index IS NULL",
         [],
         row_to_snapshot,

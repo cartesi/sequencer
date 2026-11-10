@@ -19,6 +19,6 @@ map. This page keeps only what is not built yet.
   implements the header, and so whether the sequencer would link a foreign
   scheduler for the rebuild, is open
   ([questions for Bart](todo.md#questions-for-bart)).
-- **Names.** The HTTP API and two storage columns still call the L2 tx count
-  `executed_input_count`; they change with the
+- **Names.** The storage columns call the L2 tx count `l2_tx_count`; the HTTP
+  API still calls it `executed_input_count`, which changes with the
   [egress redesign](todo.md#redesign-the-egress-api).

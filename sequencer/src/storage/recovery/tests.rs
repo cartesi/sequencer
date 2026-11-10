@@ -15,7 +15,7 @@ use sequencer_core::protocol::ProtocolTiming;
 fn generation_cuts(storage: &Storage) -> Vec<(i64, i64)> {
     storage
         .conn
-        .prepare("SELECT recovery_generation, preserved_input_count FROM history_generation_cuts ORDER BY recovery_generation")
+        .prepare("SELECT recovery_generation, preserved_l2_tx_count FROM history_generation_cuts ORDER BY recovery_generation")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -1036,7 +1036,7 @@ mod tip_staleness {
         );
         let mappings: Vec<i64> = storage
             .conn
-            .prepare("SELECT offset FROM application_inputs ORDER BY offset")
+            .prepare("SELECT l2_tx_count FROM application_inputs ORDER BY l2_tx_count")
             .expect("prepare mapping query")
             .query_map([], |row| row.get(0))
             .expect("query mappings")

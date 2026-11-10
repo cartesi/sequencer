@@ -554,7 +554,7 @@ fn an_interior_history_hole_fails_loud() {
         .conn
         .execute_batch(
             "DROP TRIGGER trg_protect_valid_application_input_delete;\n\
-         DELETE FROM application_inputs WHERE offset = 1;",
+         DELETE FROM application_inputs WHERE l2_tx_count = 1;",
         )
         .unwrap();
     let bounds = storage.history_bounds().unwrap();

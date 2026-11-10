@@ -261,7 +261,7 @@ impl Storage {
             LEFT JOIN safe_inputs d
               ON d.safe_input_index = s.safe_input_index
             WHERE s.batch_index = ?1
-            ORDER BY s.offset ASC
+            ORDER BY s.l2_tx_count ASC
         ";
         let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![u64_to_i64(batch_index)], decode_l2_tx_row)?;

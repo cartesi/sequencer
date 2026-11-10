@@ -192,7 +192,7 @@ fn persist_direct_executions(
     executions: &[DirectInputExecution],
 ) -> Result<()> {
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO application_inputs (offset, batch_index, frame_in_batch, safe_input_index)
+        "INSERT INTO application_inputs (l2_tx_count, batch_index, frame_in_batch, safe_input_index)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for execution in executions {

@@ -420,7 +420,8 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   postmortems, the `terminal_faults` table records the cause of every
   command that returned through its bracket with a terminal verdict
   (best-effort, append-only, traveling with the data directory —
-  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; each `run` boot
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`, with a `sqlite3`
+  CLI of 3.37 or later, since the tables are STRICT; each `run` boot
   logs the latest row at WARN, with its age). Any death that did not return
   through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
   a controller panic — leaves only the process logs.

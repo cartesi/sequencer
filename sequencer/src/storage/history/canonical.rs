@@ -155,7 +155,7 @@ const REBUILT_PAGE_SQL: &str = "
 
 const LIVE_PAGE_SQL: &str = "
     SELECT
-        s.offset,
+        s.l2_tx_count,
         CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN 0 ELSE 1 END,
         CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.sender ELSE d.sender END,
         CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.data ELSE NULL END,
@@ -177,8 +177,8 @@ const LIVE_PAGE_SQL: &str = "
       ON f.batch_index = s.batch_index AND f.frame_in_batch = s.frame_in_batch
     LEFT JOIN safe_inputs d ON d.safe_input_index = s.safe_input_index
     LEFT JOIN batches b ON b.batch_index = s.batch_index
-    WHERE s.offset >= ?1
-    ORDER BY s.offset
+    WHERE s.l2_tx_count >= ?1
+    ORDER BY s.l2_tx_count
     LIMIT ?2
 ";
 

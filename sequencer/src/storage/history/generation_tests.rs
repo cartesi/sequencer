@@ -7,7 +7,7 @@ use crate::test_support::temp_db;
 fn ledger(storage: &Storage) -> Vec<(i64, i64)> {
     storage
         .conn
-        .prepare("SELECT recovery_generation, preserved_input_count FROM history_generation_cuts ORDER BY recovery_generation")
+        .prepare("SELECT recovery_generation, preserved_l2_tx_count FROM history_generation_cuts ORDER BY recovery_generation")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -23,7 +23,7 @@ fn seed_cuts(storage: &mut Storage, cuts: &[u64]) {
             for (index, cut) in cuts.iter().enumerate() {
                 let generation = i64::try_from(index + 1).unwrap();
                 tx.execute(
-                    "INSERT INTO history_generation_cuts (recovery_generation,preserved_input_count) VALUES (?1,?2)",
+                    "INSERT INTO history_generation_cuts (recovery_generation,preserved_l2_tx_count) VALUES (?1,?2)",
                     params![generation, u64_to_i64(*cut)],
                 )?;
                 tx.execute(
@@ -65,7 +65,7 @@ fn generation_and_cut_are_atomic_and_immutable() {
     storage.write(advance_recovery_generation_in).unwrap();
     assert_eq!(ledger(&storage), [(1, 0)]);
     for sql in [
-        "UPDATE history_generation_cuts SET preserved_input_count=1",
+        "UPDATE history_generation_cuts SET preserved_l2_tx_count=1",
         "UPDATE history_generation_cuts SET recovery_generation=2",
         "DELETE FROM history_generation_cuts",
         "INSERT INTO history_generation_cuts VALUES (1,1)",

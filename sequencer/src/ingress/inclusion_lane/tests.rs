@@ -1120,7 +1120,7 @@ fn catch_up_rejects_history_gap_before_execution() {
     seed_replay_fixture(&db.path);
     let mut storage = Storage::open(&db.path).unwrap();
     let conn = Storage::open_connection(&db.path).unwrap();
-    conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE offset=1;").unwrap();
+    conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE l2_tx_count=1;").unwrap();
     let mut app = StubApp::default();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2);
