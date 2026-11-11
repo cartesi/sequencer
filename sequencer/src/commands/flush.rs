@@ -9,7 +9,7 @@
 use super::load_setup_identity;
 use crate::commands::config::FlushConfig;
 use crate::commands::error::CommandError;
-use crate::recovery::MempoolFlusher;
+use crate::l1::flusher::MempoolFlusher;
 use crate::storage::{self, LifecycleCommand};
 
 pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {

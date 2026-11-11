@@ -144,8 +144,8 @@ Paths below are relative to `sequencer/src/`:
 - `runtime/` — exclusive process ownership and runtime scope/shutdown.
 - `ingress/` — public HTTP handlers and the single inclusion lane.
 - `egress/` — internal HTTP/WS API and DB-backed application-input feed.
-- `l1/` — safe-input reader, batch submitter, fee oracle, shared EIP-1559 estimation, and provider access.
-- `recovery/` — automatic startup repair, danger detector, and mempool flusher.
+- `l1/` — safe-input reader, batch submitter, mempool flusher, fee oracle, shared EIP-1559 estimation, and provider access.
+- `recovery/` — automatic startup repair and danger detector.
 - `storage/` — each writer role's persistence operations, shared queries, and schema.
 - `http.rs` and `clock.rs` — shared HTTP errors/server setup and the crate-wide wall clock. `L1Config` lives in `l1/`.
 

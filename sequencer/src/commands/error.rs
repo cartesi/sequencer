@@ -394,7 +394,7 @@ pub enum BootstrapError {
     DataDirLocked { path: String },
     /// The `flush-mempool` subcommand's flush failed (provider/transport).
     #[error("mempool flush failed: {0}")]
-    Flush(#[from] crate::recovery::FlushError),
+    Flush(#[from] crate::l1::flusher::FlushError),
     /// `setup` could not read the batch-submitter wallet nonce for its escape
     /// check. The sync before it proved L1 reachable, so this is a hiccup; but
     /// the data directory already holds the sync, so the operator discards it
@@ -732,8 +732,8 @@ impl From<IdentityError> for CommandError {
     }
 }
 
-impl From<crate::recovery::FlushError> for CommandError {
-    fn from(e: crate::recovery::FlushError) -> Self {
+impl From<crate::l1::flusher::FlushError> for CommandError {
+    fn from(e: crate::l1::flusher::FlushError) -> Self {
         CommandError::Bootstrap(BootstrapError::Flush(e))
     }
 }
@@ -776,11 +776,12 @@ impl From<FeeOracleError> for CommandError {
 mod tests {
     use super::*;
     use crate::l1::fee_oracle::worker::FeeOracleError;
+    use crate::l1::flusher::FlushError;
     use crate::l1::provider::VerifiedSignerProviderError;
     use crate::l1::submitter::BatchPosterError;
     use crate::l1::watermark::WalletNonceWatermarkError;
     use crate::recovery::{
-        FlushError, RecoveryError, RecoveryFailure, RecoveryRefusalReason, RecoveryRetryReason,
+        RecoveryError, RecoveryFailure, RecoveryRefusalReason, RecoveryRetryReason,
     };
     use crate::storage::DeploymentIdentity;
     use sequencer_core::protocol::ProtocolTimingError;

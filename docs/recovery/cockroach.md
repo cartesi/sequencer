@@ -377,5 +377,5 @@ it exist only on L1.
 | The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshots.rs`](../../sequencer/src/storage/snapshots.rs). |
 | The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |
 | Adoption | `HistoryInfo::adopt_claim` in [`history_api.rs`](../../sequencer-core/src/history_api.rs); `adopt_current_era` in [`sdk/rust-client`](../../sdk/rust-client/src/history.rs). |
-| The flush | [`recovery/flusher.rs`](../../sequencer/src/recovery/flusher.rs) `flush_to_safe`. |
+| The flush | [`l1/flusher.rs`](../../sequencer/src/l1/flusher.rs) `flush_to_safe`. |
 | End to end on the devnet | [`tests/e2e/src/recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs): the round trips from genesis and from a stored machine, and setup's refusal of a set-up directory, each for the Rust and C hosts ([drills](../watchdog/incident-runbook.md#drills)). |

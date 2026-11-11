@@ -7,17 +7,16 @@
 //! preparation; only the final check authorizes worker launch.
 
 mod detector;
-mod flusher;
 
 use thiserror::Error;
 
 use crate::l1::L1Config;
+use crate::l1::flusher::{FlushError, MempoolFlusher};
 use crate::l1::reader::{InputReader, InputReaderError};
 use crate::storage::{
     self, BatchId, DangerStatus, RecoveryInspection, RecoveryMutationError, StorageOpenError,
 };
 pub use detector::{DangerDetector, DangerDetectorError, DetectorExit};
-pub use flusher::{FlushError, MempoolFlusher};
 use sequencer_core::protocol::ProtocolTiming;
 
 /// A startup recovery failure is already classified when it leaves the

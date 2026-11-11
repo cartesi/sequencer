@@ -27,8 +27,8 @@ use crate::commands::config::{FeeOracleMode, SetupConfig};
 use crate::commands::error::{
     BootstrapError, CommandError, IdentityError, SetupError, SetupRefuse,
 };
+use crate::l1::flusher::MempoolFlusher;
 use crate::l1::reader::{InputReader, InputReaderConfig, InputReaderError, sample_safe_block};
-use crate::recovery::MempoolFlusher;
 use crate::runtime::process_lock::ProcessLock;
 use crate::storage::{DeploymentIdentity, FeeOracleIdentity, LifecycleCommand, NewEra, Storage};
 use base::{Base, ReadMachineExport};
