@@ -49,10 +49,10 @@ don't.
 
 ### Writer roles
 
-One writer role per fact. Reads over batch data go through the `valid_*`
-views (`valid_batches`, `valid_closed_batches`, `valid_open_batch`), which encapsulate the "exclude invalidated rows"
-filter; writers target the base tables. The batch lifecycle columns partition
-by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
+One writer role per fact. The batch lifecycle columns partition by writer and
+are write-once (`trg_batch_lifecycle`, `0001_schema.sql`). The sealed batches
+are the `closed_batches` view and the one unsealed batch is `open_batch`;
+writers target the base tables.
 
 | Writer | Writes |
 |---|---|
@@ -137,15 +137,25 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   recovery as the remedy.
 - **Breaks:** the sequencer keeps confirming user ops that can never land.
 
-### I5. Invalidation removes exactly the invalidated application suffix
+### I5. Batches and application history only append
 
-- **Holds:** invalidating a batch deletes its `application_inputs` through the
-  schema trigger. Original source records and immutable snapshots remain;
-  snapshot selection excludes invalidated batches and GC retires their
-  unleased artifacts. `trg_batch_lifecycle` refuses invalidating an accepted
-  batch. No operation invalidates a batch.
-- **Enforced by:** application-input constraints, valid views.
-- **Breaks:** loading invalidated state or leaving a hole in current history.
+- **Holds:** a batch is created once, sealed once with its hash, accepted
+  once, and never deleted or replaced; a frame, a user op and an application
+  input are written once and never deleted. Inside an era the history
+  therefore only grows, what the feed served stays served, and a sealed batch
+  always re-encodes to the bytes its hash was taken from.
+- **Enforced by:** `trg_batch_lifecycle` (a batch row changes only by sealing
+  once or by being accepted once); the triggers that refuse every delete on
+  `batches`, `frames`, `user_ops` and `application_inputs`, and every update
+  on `frames` and `user_ops`; and `PRAGMA recursive_triggers = ON` on every
+  connection, without which an `INSERT OR REPLACE` deletes a conflicting row
+  past those triggers.
+- **Depended on by:** a client resuming at any count it saved in this era;
+  the void history (I4), which judges a batch nothing replaces; the content
+  identity check (I9) and the nonce rule (I16), which need one batch per
+  nonce.
+- **Breaks:** a client's saved state stops matching the feed it resumes from,
+  or a nonce names two batches.
 
 ### I6. The frame clock accounts for a complete L1 interval
 
@@ -191,22 +201,21 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 - **Depended on by:** unconditional snapshot restore and catch-up.
 - **Breaks:** startup fails loud instead of inventing state.
 
-### I9. Acceptance identity: "accepted nonce N" means "our valid batch N"
+### I9. Acceptance identity: "accepted nonce N" means "our batch N"
 
 - **Holds:** by nonce **and content** — the **content-identity check**: every
   landing strictly after baseline block `C` that the off-chain
-  `scheduler_accepts` simulation accepts is compared against the local valid
-  closed batch at that nonce — `keccak256(landed bytes)` vs the hash stamped at
+  `scheduler_accepts` simulation accepts is compared against the local closed
+  batch at that nonce — `keccak256(landed bytes)` vs the hash stamped at
   seal by the same encode path the submitter broadcasts. The exhaustive local
-  outcomes are `Match`, `Foreign` (no local valid closed batch), and `Mismatch`
+  outcomes are `Match`, `Foreign` (no local closed batch), and `Mismatch`
   (different bytes); the last two record divergence. A `Match` is recorded on
   the batch itself, as `batches.accepted_input`: the input reader's one
-  write-once update, which the schema admits only on a sealed valid batch
+  write-once update, which the schema admits only on a sealed batch
   (`trg_batch_lifecycle`) whose nonce follows the greatest accepted batch's
   (the anchor before any), at a later input
   (`trg_batch_acceptance_extends_the_prefix`). A batch is inserted unaccepted
-  (`trg_batch_insert`). The accepted batches are a prefix of the valid path
-  and are never invalidated.
+  (`trg_batch_insert`). The accepted batches are a prefix of the list.
 - **Why content, not identity, suffices:** batches deliberately carry no
   identifier because content-equal copies are *effect-equal* — an accepted
   batch's application effects depend on its inclusion block only through the
@@ -370,7 +379,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
 - **Baseline-aware frontier:** accepted-batch scanning starts strictly after
   the era's stop block `C`, seeded with anchor nonce `N'`; the prefix through
   `C` is opaque
-  ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
+  ([I9](#i9-acceptance-identity-accepted-nonce-n-means-our-batch-n)).
   Later scans resume after the last acceptance. Storage maintains the
   accepted frontier exactly when the era row exists, reading the batch
   submitter from the pinned deployment identity: before the era (every setup
@@ -379,34 +388,32 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   The first append after `publish_era`, `run`'s first sync, judges every
   submitter input past `C`, whichever sync ingested it.
 
-### I16. Valid batches carry contiguous, unique nonces from the era's anchor
+### I16. Batches carry contiguous, unique nonces from the era's anchor
 
-- **Holds:** the valid batches, in `batch_index` order, carry the nonces
+- **Holds:** the batches, in `batch_index` order, carry the nonces
   `N'`, `N' + 1`, … where `N'` is the era's `anchor_batch_nonce` — the
   scheduler's next batch nonce at the end of the era's stop block, which
   setup's rebuild ends with and publishes in the era row. A new batch carries
-  the last valid nonce + 1, or the anchor when no batch is valid: the era's
-  first batch (setup leaves its creation to `run`'s start; there is no
-  sentinel batch). No operation invalidates a batch, so no nonce is reused
-  inside an era. At most one
-  valid batch carries each nonce; invalidated batches keep theirs. No batch
-  exists before the era does.
+  the last nonce + 1, or the anchor when there is no batch: the era's first
+  batch (setup leaves its creation to `run`'s start; there is no sentinel
+  batch). Each nonce names one batch, so no nonce is reused inside an era. No
+  batch exists before the era does.
 - **Enforced by:** `trg_batch_insert`, a BEFORE INSERT check that
-  `nonce IS COALESCE(last valid nonce + 1, era anchor)` (with neither, it
+  `nonce IS COALESCE(last nonce + 1, era anchor)` (with neither, it
   compares against NULL and aborts); `compute_next_nonce` computes the same
-  rule and fails when the era is absent; the partial unique index
-  `ux_valid_batch_nonce`; `trg_batch_lifecycle`, which keeps a nonce fixed
+  rule and fails when the era is absent; the uniqueness of `batches.nonce`;
+  `trg_batch_lifecycle`, which keeps a nonce fixed
   once inserted; and the era row's immutability (`trg_era_immutable`, `trg_era_not_deletable`,
   `trg_era_single_insert`), so a live deployment is never re-anchored.
 - **Depended on by:** the submitter resuming at the right nonce — `run` submits
-  `valid_closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
+  `closed_batches` with `nonce >= frontier_nonce`, where `frontier_nonce`
   defaults to the anchor while no batch is accepted, so the
   submitter starts at the anchor; nonce lookups such as the content-identity
-  check (I9), which expect one valid batch per nonce.
-- **Breaks:** valid batches mis-anchored at the wrong nonce ⇒ `run`'s first
+  check (I9), which expect one batch per nonce.
+- **Breaks:** batches mis-anchored at the wrong nonce ⇒ `run`'s first
   batch carries a nonce the scheduler rejects ⇒ the sequencer is wedged (never
   submits), or — worse, if defenses were absent — a recovered deployment
-  silently diverging from canonical L1 state; two valid batches at one nonce ⇒
+  silently diverging from canonical L1 state; two batches at one nonce ⇒
   a nonce lookup picks an arbitrary one.
 
 ### I17. `WriteHead` is a coherent cache of the durable open Tip/frame
@@ -445,7 +452,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   baseline snapshot at `E` in one `IMMEDIATE` transaction (`publish_era`),
   with no batch in the database; the row's existence is setup's completion.
   The era row is absent before this boundary. Its fields remain immutable even
-  after baseline artifact GC or root invalidation. The recovery generation is
+  after baseline artifact GC. The recovery generation is
   not stored: it is the greatest key of `history_generation_cuts` (0 with
   none), and a cut cannot exist without an era. If the cut ledger is ever
   retired, a log of generations must remain, because the generation has no
@@ -526,8 +533,7 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   commit with the complete frame rotation, after checking all execution receipts.
   Startup creates leading direct rows before restoring the engine;
   successful catch-up is required before admitting that sequence.
-- **Invalidation:** source records remain, while invalidation deletes the
-  current suffix (I5). No operation invalidates a batch.
+- **Append-only:** no application input is ever deleted (I5).
 - **Snapshot/replay agreement:** a batch-close snapshot records storage-derived
   `H`; the restored engine must report the same count. Each replay row must
   match the engine's next count and executes with its persisted frame fee and
@@ -537,8 +543,8 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   uniqueness and contiguous-offset triggers, coherent canonical pages, and
   catch-up checks.
 - **Performance boundary:** head discovery uses the integer primary-key maximum;
-  replay seeks directly by offset and joins bounded source rows. Neither scans
-  invalidated history. Chunk insertion adds no durability transaction or actor.
+  replay seeks directly by offset and joins bounded source rows. Chunk
+  insertion adds no durability transaction or actor.
 
 ## Do-not-simplify (deliberate shapes that look like cleanup targets)
 

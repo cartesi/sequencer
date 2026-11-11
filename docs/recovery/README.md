@@ -25,7 +25,7 @@ batch** that still takes user ops.
 **Accepted** means the sequencer read a safe L1 input, applied the scheduler's
 acceptance rules to it, and matched the landed bytes to its own closed batch at
 that nonce. The match is recorded on the batch as `accepted_input`
-([I9](../invariants.md#i9-acceptance-identity-accepted-nonce-n-means-our-valid-batch-n)).
+([I9](../invariants.md#i9-acceptance-identity-accepted-nonce-n-means-our-batch-n)).
 It does not mean a canonical machine was seen executing it; the
 [watchdog](../watchdog/README.md) checks that. A foreign or different payload
 accepted at one of the sequencer's nonces records a **divergence**, which ends

@@ -60,8 +60,8 @@ impl DirectOperands {
 // must always match what's persisted in `batches` and `frames`.
 
 pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
-    // The Tip is the single row in `valid_open_batch` (enforced by
-    // `ux_single_valid_tip`). Returns None if there's no Tip (a fresh era,
+    // The Tip is the single row in `open_batch` (enforced by
+    // `ux_single_open_batch`). Returns None if there's no Tip (a fresh era,
     // before `run` opens its first batch).
     let latest_batch = match tx.query_row(
         "SELECT
@@ -69,7 +69,7 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
             b.nonce,
             b.created_at_ms,
             (SELECT COUNT(*) FROM user_ops u WHERE u.batch_index = b.batch_index) AS user_op_count
-         FROM valid_open_batch b",
+         FROM open_batch b",
         [],
         |row| {
             Ok((

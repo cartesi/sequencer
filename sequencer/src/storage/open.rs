@@ -89,6 +89,7 @@ impl Storage {
     /// schema answers before setup may create its database file.
     pub(crate) fn schema_only() -> Result<Self, StorageOpenError> {
         let mut conn = Connection::open_in_memory()?;
+        set_recursive_triggers(&conn)?;
         run_migrations(&mut conn, Some(LifecycleCommand::Setup))?;
         Ok(Self { conn })
     }
@@ -152,6 +153,7 @@ impl Storage {
 pub(super) fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    set_recursive_triggers(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", SYNCHRONOUS_PRAGMA)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -163,7 +165,16 @@ fn open_reader_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "query_only", "ON")?;
     conn.pragma_update(None, "busy_timeout", 50)?;
+    set_recursive_triggers(&conn)?;
     Ok(conn)
+}
+
+/// Without `recursive_triggers`, `INSERT OR REPLACE` deletes a conflicting row
+/// without firing its BEFORE DELETE trigger, which bypasses every "never
+/// deleted" trigger. No schema trigger writes a table (each only RAISEs), so
+/// nothing can recurse. Harmless on a read-only connection; set on every one.
+fn set_recursive_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "recursive_triggers", "ON")
 }
 
 /// Apply all migrations. Package-private — callers use [`Storage::open`]

@@ -4,7 +4,7 @@
 //! SQLite storage. [`Storage`] is the single entry point; each writer role's
 //! methods live in its own sibling file (writer table: `docs/invariants.md`),
 //! shared reads in `queries` and shared writes in `mutations`. The schema and
-//! `valid_*` views live in `migrations/0001_schema.sql`.
+//! its views live in `migrations/0001_schema.sql`.
 
 mod acceptance;
 mod convert;
@@ -164,10 +164,8 @@ pub struct FrameHeader {
     pub safe_block: u64,
 }
 
-/// A batch's local key, `batches.batch_index`. Invalidated batches keep their
-/// rows, so one key names one batch; a batch nonce does not, since a cascade's
-/// replacement reuses it. Opaque outside storage, with no arithmetic; it
-/// prints as the bare number.
+/// A batch's local key, `batches.batch_index`. Opaque outside storage, with no
+/// arithmetic; it prints as the bare number.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BatchId(u64);
 

@@ -522,7 +522,7 @@ paths:
       operationId: getLatestSnapshot
       summary: Download the newest restorable snapshot
       description: |
-        Streams a tar archive of the newest valid batch-close snapshot, or the
+        Streams a tar archive of the newest batch-close snapshot, or the
         era baseline: `info.toml` plus the application's opaque `state` file
         or directory. The snapshot may still be optimistic. Its headers supply
         the complete `/ws/subscribe` claim. The download holds a GC lease

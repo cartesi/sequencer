@@ -126,7 +126,7 @@ pub struct FinalizedLease {
 }
 
 impl Storage {
-    /// GC keeps the accepted rollback checkpoint, every valid snapshot beyond
+    /// GC keeps the accepted rollback checkpoint, every snapshot beyond
     /// it (an intermediate optimistic snapshot may become the next accepted
     /// head) and every leased snapshot. Returns the collected prefixes, whose
     /// directories the caller deletes after this commit (I13).
@@ -194,7 +194,7 @@ impl Storage {
         )
     }
 
-    /// Lease the newest valid snapshot; egress calls it on a read-only handle.
+    /// Lease the newest snapshot; egress calls it on a read-only handle.
     pub fn acquire_latest_snapshot_lease(
         &mut self,
         leases: &SnapshotLeases,
@@ -235,14 +235,14 @@ impl Storage {
 /// zero entries, and delete the remaining rows.
 fn collect_unleased_in(tx: &Transaction<'_>, registry: &mut LeaseCounters) -> Result<Vec<PathBuf>> {
     let anchor_id = rollback_snapshot_in(tx)?.map(|snapshot| snapshot.id);
-    // Collectible: not the rollback snapshot, and its batch is not a valid
-    // closed batch (the baseline included) or is accepted.
+    // Collectible: not the rollback snapshot, and either the baseline or an
+    // accepted batch's.
     let candidates = {
         let mut stmt = tx.prepare(
             "SELECT s.snapshot_id, s.prefix FROM snapshots s \
-             LEFT JOIN valid_closed_batches b ON b.batch_index = s.batch_index \
+             LEFT JOIN batches b ON b.batch_index = s.batch_index \
              WHERE (?1 IS NULL OR s.snapshot_id != ?1) \
-               AND (b.batch_index IS NULL OR b.accepted_input IS NOT NULL) \
+               AND (s.batch_index IS NULL OR b.accepted_input IS NOT NULL) \
              ORDER BY s.snapshot_id",
         )?;
         stmt.query_map(params![anchor_id], |row| {
@@ -287,7 +287,7 @@ pub(super) fn insert_batch_snapshot_in(
 ) -> Result<i64> {
     // Registration is composed with sealing, so the batch must already be closed.
     tx.query_row(
-        "SELECT batch_index FROM valid_closed_batches WHERE batch_index = ?1",
+        "SELECT batch_index FROM closed_batches WHERE batch_index = ?1",
         [u64_to_i64(batch_index)],
         |_| Ok(()),
     )?;
@@ -401,7 +401,7 @@ pub(super) fn finalized_dump_in(
 fn latest_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     let batch_index: Option<i64> = conn
         .query_row(
-            "SELECT batch_index FROM valid_closed_batches ORDER BY batch_index DESC LIMIT 1",
+            "SELECT batch_index FROM closed_batches ORDER BY batch_index DESC LIMIT 1",
             [],
             |r| r.get(0),
         )

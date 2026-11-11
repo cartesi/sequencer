@@ -77,15 +77,15 @@ impl Storage {
         })
     }
 
-    /// Load all valid closed batches with nonce >= `min_nonce`, in nonce order,
+    /// Load all closed batches with nonce >= `min_nonce`, in nonce order,
     /// each one fully assembled and SSZ-encoded with its authoritative nonce.
     ///
     /// Authoritative because the nonce stamped into the wire payload is the
-    /// one the DB persists on the batch row (the last valid nonce + 1 at
+    /// one the DB persists on the batch row (the last nonce + 1 at
     /// insert, I16). The caller never sees an unstamped batch —
     /// there is no way to accidentally encode with the wrong nonce.
     pub fn pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM valid_closed_batches \
+        const SQL: &str = "SELECT batch_index, nonce FROM closed_batches \
                            WHERE nonce >= ?1 ORDER BY nonce ASC";
         let pending_refs: Vec<(u64, u64)> = {
             let mut stmt = self.conn.prepare_cached(SQL)?;
@@ -112,8 +112,7 @@ impl Storage {
     }
 
     /// Load every frame (header + user ops) of `batch_index` in frame order.
-    /// Internal helper for [`Self::pending_batches`]; does NOT filter on
-    /// validity — callers only reach this after they know the batch is valid.
+    /// Internal helper for [`Self::pending_batches`].
     fn load_batch_frames(&mut self, batch_index: u64) -> Result<Vec<BatchFrame>> {
         load_batch_frames_in(&self.conn, batch_index)
     }
@@ -186,7 +185,7 @@ mod tests {
         // `Batch { nonce: 0, … }` placeholder, and callers had to remember to
         // stamp the real nonce via `encode_for_scheduler_with_nonce`. The new
         // `pending_batches` reads the DB-authoritative nonce from
-        // `valid_closed_batches` and bakes it straight into the SSZ bytes — so
+        // `closed_batches` and bakes it straight into the SSZ bytes — so
         // decoding the payload must round-trip back to that nonce, and the
         // frame body must match what storage persisted.
         let db = temp_db("pending-batches-nonce-baked-in");
@@ -266,7 +265,7 @@ mod tests {
     #[test]
     fn closed_batch_becomes_eligible_for_submission_with_assigned_nonce() {
         // : closing a batch transitions it from "open Tip" to "eligible
-        // for L1 submission" — it appears in `valid_closed_batches` with a
+        // for L1 submission" — it appears in `closed_batches` with a
         // nonce derived at insert. Pins the submitter's
         // contract: open batches are NOT pulled into the submission pipeline,
         // and closed batches ARE, at the schema-guaranteed nonce.
@@ -291,7 +290,7 @@ mod tests {
             .close_frame_and_batch(&mut head)
             .expect("close batch 0");
 
-        // After close: batch 0 is eligible with nonce 0 (genesis: no valid
+        // After close: batch 0 is eligible with nonce 0 (genesis: no earlier
         // batch, so it carries the era's anchor, 0).
         let pending_after = storage
             .pending_batches(0)
@@ -408,25 +407,24 @@ mod tests {
     }
 
     #[test]
-    fn pending_batches_skips_invalidated_and_respects_min_nonce() {
+    fn pending_batches_respects_min_nonce() {
         let db = temp_db("load-pending-batches-filter");
         let mut storage = set_up_storage(&db.path, SENDER_A);
         seed_closed_batches(&mut storage, 3);
-        storage.insert_invalid_batch(1).expect("invalidate batch 1");
 
-        // From nonce 0: batches 0 and 2 remain valid.
+        // From nonce 0: every closed batch, and not the open one.
         let from_zero = storage
             .pending_batches(0)
             .expect("load pending batches from 0");
         let nonces: Vec<u64> = from_zero.iter().map(|b| b.nonce).collect();
-        assert_eq!(nonces, vec![0, 2], "batch 1 must be filtered out");
+        assert_eq!(nonces, vec![0, 1, 2]);
 
-        // From nonce 1: only batch 2 remains (batch 0 is below min_nonce).
+        // From nonce 1: batch 0 is below min_nonce.
         let from_one = storage
             .pending_batches(1)
             .expect("load pending batches from 1");
         let nonces: Vec<u64> = from_one.iter().map(|b| b.nonce).collect();
-        assert_eq!(nonces, vec![2]);
+        assert_eq!(nonces, vec![1, 2]);
 
         // Past the suffix: empty.
         let from_three = storage

@@ -364,18 +364,16 @@ impl Storage {
         )
     }
 
-    /// Highest valid `batch_index` (the open batch included), or `None`.
+    /// Highest `batch_index` (the open batch included), or `None`.
     pub(crate) fn latest_batch_index(&mut self) -> rusqlite::Result<Option<u64>> {
         let value: Option<i64> =
             self.conn
-                .query_row("SELECT MAX(batch_index) FROM valid_batches", [], |row| {
-                    row.get(0)
-                })?;
+                .query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
         Ok(value.map(i64_to_u64))
     }
 
-    /// The sequenced L2 txs of one batch; `[]` for an invalidated batch.
-    /// Production replay pages the valid stream by offset, never per batch.
+    /// The sequenced L2 txs of one batch.
+    /// Production replay pages the stream by offset, never per batch.
     pub(crate) fn ordered_l2_txs_for_batch(
         &mut self,
         batch_index: u64,
@@ -412,17 +410,6 @@ impl Storage {
         let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![u64_to_i64(batch_index)], decode_l2_tx_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-    }
-
-    /// Mark one batch invalid; leaves an already-invalid row alone.
-    pub(crate) fn insert_invalid_batch(&mut self, batch_index: u64) -> rusqlite::Result<()> {
-        let now_ms = now_unix_ms();
-        self.conn.execute(
-            "UPDATE batches SET invalidated_at_ms = ?1 \
-             WHERE batch_index = ?2 AND invalidated_at_ms IS NULL",
-            params![now_ms, u64_to_i64(batch_index)],
-        )?;
-        Ok(())
     }
 
     pub(crate) fn insert_batch_snapshot(
@@ -571,10 +558,10 @@ pub(crate) fn temp_db_with_default_deployment_identity(name: &str) -> TestDb {
     db
 }
 
-/// Wire bytes of the local valid closed batch at `nonce` — the
+/// Wire bytes of the local closed batch at `nonce` — the
 /// production-faithful "our batch landed on L1" payload. Hash-matches the
 /// seal-time stamp, so the content-identity check accepts it.
-/// Panics if no valid closed local batch carries `nonce` (test bug: an
+/// Panics if no closed local batch carries `nonce` (test bug: an
 /// accepted landing without a matching local batch is, by design, a
 /// canonical divergence).
 pub(crate) fn local_batch_payload(storage: &mut Storage, nonce: u64) -> Vec<u8> {
@@ -583,7 +570,7 @@ pub(crate) fn local_batch_payload(storage: &mut Storage, nonce: u64) -> Vec<u8> 
         .expect("load local closed batches")
         .into_iter()
         .find(|b| b.nonce == nonce)
-        .unwrap_or_else(|| panic!("no valid closed local batch at nonce {nonce}"))
+        .unwrap_or_else(|| panic!("no closed local batch at nonce {nonce}"))
         .encoded
 }
 
@@ -592,7 +579,7 @@ pub(crate) fn local_batch_payload(storage: &mut Storage, nonce: u64) -> Vec<u8> 
 /// batch-submitter address passed to `append_safe_inputs`, so the recorded
 /// acceptances follow this sender.
 ///
-/// Nonces with a valid closed local batch land with that batch's real wire
+/// Nonces with a closed local batch land with that batch's real wire
 /// bytes (the landing will be *accepted* — the content-identity check
 /// requires byte equality with the seal-time hash). Nonces without one get
 /// a synthetic empty-batch payload — sound **only** for landings the
@@ -644,7 +631,7 @@ pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
     }
 }
 
-/// Pull every valid sequenced L2 tx out of storage, dropping the offset.
+/// Pull every sequenced L2 tx out of storage, dropping the offset.
 /// Test-only convenience around `canonical_history_page`.
 pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<L2Tx> {
     let bounds = storage.history_bounds().expect("history bounds");

@@ -3,7 +3,7 @@
 
 //! `run`'s startup, under the process lock with no worker running: check the
 //! terminal facts on the database as it is, sync L1, and open a batch if none
-//! is open. Nothing else is repaired, flushed, invalidated or replaced, and
+//! is open. Nothing else is repaired, flushed or replaced, and
 //! nothing can change between these steps and the launch.
 
 use crate::commands::error::{BootstrapError, CommandError};

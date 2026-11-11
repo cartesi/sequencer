@@ -67,8 +67,9 @@ can rebind a saved state to the current version: the compatibility query
 below, within an era, and the [adopt rule](#adopting-a-new-era), across eras.
 WS itself requires exact identity.
 
-No operation invalidates a batch or advances the generation, and a restart
-changes neither; a history the scheduler can no longer accept ends the era
+A batch is never replaced and no operation advances the generation, so a
+restart changes nothing; a history the scheduler can no longer accept ends
+the era
 ([the void history](../recovery/README.md#the-void-history)).
 
 ### Checkpoint compatibility across generations
@@ -198,7 +199,7 @@ The adopt rule compares counts, not rows. Two faults pass it:
 | Application projection | Restore its own checkpoint at a count the era serves, then follow the feed ([the client's playbook](../recovery/cockroach.md#the-clients-playbook)). The feed starts at the base count; the rows below it exist only on L1. |
 
 A batch-close snapshot is identified by its local batch identity, not just its
-count or nonce. Recovery can reuse a nonce and empty batches can repeat a count.
+count. Empty batches can repeat a count.
 Acceptance derives the comparison point without modifying the artifact.
 Selection must first choose the required accepted batch and then require its
 snapshot; a missing one cannot justify falling back to an older comparison.

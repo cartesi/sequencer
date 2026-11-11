@@ -92,14 +92,13 @@ pub struct ManagedSequencerConfig {
 pub struct BatchCounts {
     pub total: u64,
     pub sealed: u64,
-    pub invalidated: u64,
 }
 
 /// Highest batch nonce sealed locally and highest accepted on safe L1.
 /// Returned by [`ManagedSequencer::batch_nonce_frontier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchNonceFrontier {
-    /// Highest nonce among valid sealed batches.
+    /// Highest nonce among sealed batches.
     pub sealed: Option<u64>,
     /// Highest accepted batch nonce (`batches.accepted_input` set).
     pub safe_accepted: Option<u64>,
@@ -554,7 +553,7 @@ impl ManagedSequencer {
         let (frame_safe_block, persisted_safe_head): (i64, i64) = conn
             .query_row(
                 "SELECT f.safe_block, h.block_number \
-                 FROM valid_open_batch b \
+                 FROM open_batch b \
                  JOIN frames f ON f.batch_index = b.batch_index \
                  JOIN l1_safe_head h ON h.singleton_id = 0 \
                  ORDER BY f.frame_in_batch DESC LIMIT 1",
@@ -587,7 +586,7 @@ impl ManagedSequencer {
                         (SELECT f.safe_block FROM frames f \
                           WHERE f.batch_index = b.batch_index \
                           ORDER BY f.frame_in_batch LIMIT 1) \
-                 FROM valid_batches b \
+                 FROM batches b \
                  WHERE b.accepted_input IS NULL \
                  ORDER BY b.nonce LIMIT 1",
                 [],
@@ -665,12 +664,9 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
         let sealed: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(nonce) FROM batches \
-                 WHERE sealed_at_ms IS NOT NULL AND invalidated_at_ms IS NULL",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT MAX(nonce) FROM closed_batches", [], |row| {
+                row.get(0)
+            })
             .map_err(|err| io_other(format!("max sealed batch nonce: {err}")))?;
         let safe_accepted: Option<i64> = conn
             .query_row(
@@ -687,7 +683,7 @@ impl ManagedSequencer {
 
     /// The era's anchor nonce (`anchor_batch_nonce`), read from the run DB
     /// read-only: the resume nonce of a rebuilt deployment, `0` for a genesis
-    /// one. The valid nonces are contiguous from it (I16). Fails when the era
+    /// one. The batch nonces are contiguous from it (I16). Fails when the era
     /// is absent.
     pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
         let db_path = self.data_dir_path.join("sequencer.db");
@@ -789,7 +785,7 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("read canonical_divergence: {err}")).into())
     }
 
-    /// Snapshot of the `batches` table: `(total, sealed, invalidated)`.
+    /// Snapshot of the `batches` table: `(total, sealed)`.
     /// Reads the DB file read-only; safe to call while the sequencer is
     /// running. Useful for asserting that batch closure happened during a
     /// test segment (e.g., the sequencer kept processing through an outage).
@@ -811,18 +807,9 @@ impl ManagedSequencer {
                 |row| row.get(0),
             )
             .map_err(|err| io_other(format!("count sealed batches: {err}")))?;
-        let invalidated: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("count invalidated batches: {err}")))?;
-
         Ok(BatchCounts {
             total: total as u64,
             sealed: sealed as u64,
-            invalidated: invalidated as u64,
         })
     }
 
@@ -832,11 +819,11 @@ impl ManagedSequencer {
     /// writers).
     ///
     /// Invariants checked:
-    ///   1. At most one `valid_open_batch` row (partial unique index
-    ///      `ux_single_valid_tip` should guarantee this structurally —
+    ///   1. At most one `open_batch` row (partial unique index
+    ///      `ux_single_open_batch` should guarantee this structurally —
     ///      we verify it in case the index ever regressed).
-    ///   2. The valid batches' nonces are unique and contiguous from the
-    ///      era's anchor (I16).
+    ///   2. In `batch_index` order, each batch's nonce is the era's anchor
+    ///      plus its position (I16): unique and contiguous.
     ///
     /// Panics with a specific violation message if any invariant fails.
     /// Harness-only check (no sequencer changes) that catches regressions
@@ -849,44 +836,35 @@ impl ManagedSequencer {
         )
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
-        // The era's anchor: the first valid nonce (0 for a genesis deployment,
-        // N' for a cockroach-recovered one). Mirrors
+        // The era's anchor: the first batch's nonce (0 for a genesis
+        // deployment, N' for a cockroach-recovered one). Mirrors
         // `trg_batch_insert`. Reuses the `batch_tree_anchor()`
         // accessor (its own short-lived read-only handle) rather than
         // re-issuing the query against `conn`.
         let anchor = self.batch_tree_anchor()? as i64;
 
-        // 1. At most one valid open batch.
+        // 1. At most one open batch.
         let open_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
-                row.get(0)
-            })
-            .map_err(|err| io_other(format!("count valid_open_batch: {err}")))?;
+            .query_row("SELECT COUNT(*) FROM open_batch", [], |row| row.get(0))
+            .map_err(|err| io_other(format!("count open_batch: {err}")))?;
         if open_count > 1 {
-            panic!("schema invariant: more than one valid Tip ({open_count} rows)");
+            panic!("schema invariant: more than one open batch ({open_count} rows)");
         }
 
-        // 2. Valid nonce uniqueness and contiguity from the anchor.
+        // 2. The nonces follow the batches from the anchor.
         let mut stmt = conn
-            .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")
-            .map_err(|err| io_other(format!("prepare valid-nonces: {err}")))?;
-        let valid_nonces: Vec<i64> = stmt
+            .prepare("SELECT nonce FROM batches ORDER BY batch_index ASC")
+            .map_err(|err| io_other(format!("prepare batch nonces: {err}")))?;
+        let nonces: Vec<i64> = stmt
             .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|err| io_other(format!("query valid-nonces: {err}")))?
+            .map_err(|err| io_other(format!("query batch nonces: {err}")))?
             .collect::<rusqlite::Result<_>>()
-            .map_err(|err| io_other(format!("collect valid-nonces: {err}")))?;
-        for pair in valid_nonces.windows(2) {
-            if pair[0] == pair[1] {
-                panic!(
-                    "schema invariant: duplicate valid nonce {} in {valid_nonces:?}",
-                    pair[0]
-                );
-            }
-        }
-        for (i, &n) in valid_nonces.iter().enumerate() {
+            .map_err(|err| io_other(format!("collect batch nonces: {err}")))?;
+        for (i, &n) in nonces.iter().enumerate() {
             if n != anchor + i as i64 {
                 panic!(
-                    "schema invariant: valid nonces not contiguous from anchor {anchor}: {valid_nonces:?}"
+                    "schema invariant: batch nonces are not the anchor {anchor} plus their \
+                     position: {nonces:?}"
                 );
             }
         }

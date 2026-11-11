@@ -448,7 +448,7 @@ they are served only on the internal listener, behind network controls.
   (`application/octet-stream`), with `X-Inclusion-Block`,
   `X-Executed-Input-Count`, and `ETag: "block-<n>"` (`If-None-Match` supports `304`).
   The watchdog downloads it only as divergence evidence.
-- `GET /latest_snapshot` — streams a restorable tar archive of the newest valid
+- `GET /latest_snapshot` — streams a restorable tar archive of the newest
   batch-close snapshot, or the era baseline. Includes immutable `info.toml`
   and the application's opaque `state` file or directory.
 - `GET /finalized_snapshot` — streams the accepted snapshot as a tar archive,

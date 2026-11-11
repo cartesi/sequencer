@@ -1433,8 +1433,8 @@ async fn mine_until_accepted_through(runtime: &ManagedSequencer, nonce: u64) -> 
     Err(format!("timed out waiting for L1 to accept batch nonce {nonce}").into())
 }
 
-/// The accepted batches are the nonces from zero, accepted in nonce order,
-/// and nothing was invalidated.
+/// The accepted batches are the nonces from zero, accepted in nonce order: a
+/// batch lands under the nonce it was sealed with.
 fn assert_accepted_in_order(runtime: &ManagedSequencer) -> ScenarioResult<()> {
     let accepted = runtime.accepted_batches()?;
     for (position, (nonce, _)) in (0_u64..).zip(&accepted) {
@@ -1449,11 +1449,6 @@ fn assert_accepted_in_order(runtime: &ManagedSequencer) -> ScenarioResult<()> {
             "batches are accepted in nonce order: {accepted:?}"
         );
     }
-    assert_eq!(
-        runtime.count_batches()?.invalidated,
-        0,
-        "no batch is invalidated"
-    );
     Ok(())
 }
 

@@ -42,8 +42,8 @@ This spec makes that requirement measurable and repeatable.
 1. `logical_db_bytes`: `(page_count - freelist_count) * page_size`, read over a read-only connection at run end. It counts pages still in the WAL and excludes free pages.
 2. `db_bytes` and `wal_bytes`: on-disk footprint of the SQLite file and its WAL at run end.
 3. `growth_bytes_per_1k_accepted`: growth of `logical_db_bytes` over the measured steps, normalized by accepted tx volume.
-4. `batches_pending`: valid sealed batches not yet accepted (`batches.accepted_input` is NULL) when the drain starts. The drain starts when the last measured step returns: every load worker is past its deadline, and in round-trip mode the WS matcher has finished, bounded by `--max-ws-wait-ms`.
-5. `drain_secs`: time from the drain start until the highest valid sealed batch nonce read at the start is accepted. The open batch is excluded, so this is the submission backlog, not the batch-open window.
+4. `batches_pending`: sealed batches not yet accepted (`batches.accepted_input` is NULL) when the drain starts. The drain starts when the last measured step returns: every load worker is past its deadline, and in round-trip mode the WS matcher has finished, bounded by `--max-ws-wait-ms`.
+5. `drain_secs`: time from the drain start until the highest sealed batch nonce read at the start is accepted. The open batch is excluded, so this is the submission backlog, not the batch-open window.
 
 ## 3. Measurement Method
 

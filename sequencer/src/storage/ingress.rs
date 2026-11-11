@@ -51,15 +51,14 @@ pub struct FeeQuote {
     pub recommended_fee: u16,
 }
 
-const LAST_VALID_USER_NONCE_SQL: &str = "SELECT u.nonce FROM user_ops u
-     WHERE u.sender = ?1
-       AND EXISTS (SELECT 1 FROM valid_batches b WHERE b.batch_index = u.batch_index)
-     ORDER BY u.nonce DESC
+const LAST_USER_NONCE_SQL: &str = "SELECT nonce FROM user_ops
+     WHERE sender = ?1
+     ORDER BY nonce DESC
      LIMIT 1";
 
 impl Storage {
-    /// First L1 input beyond the latest surviving frame's accounted block, or
-    /// the era's first queued input while no frame of the era survives.
+    /// First L1 input beyond the latest frame's accounted block, or the era's
+    /// first queued input while the era has no frame.
     pub fn next_undrained_safe_input_index(&mut self) -> Result<u64> {
         self.read(next_undrained_safe_input_index_in)
     }
@@ -75,14 +74,12 @@ impl Storage {
     pub fn current_fee_quote(&mut self) -> Result<Option<FeeQuote>> {
         self.read(|tx| {
             let tip: Option<i64> = tx
-                .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
-                    row.get(0)
-                })
+                .query_row("SELECT batch_index FROM open_batch", [], |row| row.get(0))
                 .optional()?;
             let Some(tip) = tip else {
                 return Ok(None);
             };
-            // Every valid batch has a frame; a missing one fails loud.
+            // Every batch has a frame; a missing one fails loud.
             let frame_fee: i64 = tx.query_row(
                 "SELECT fee FROM frames WHERE batch_index = ?1 \
                  ORDER BY frame_in_batch DESC LIMIT 1",
@@ -96,18 +93,15 @@ impl Storage {
         })
     }
 
-    /// The nonce `sender` must sign next: one past its latest user op in a
-    /// valid batch, or 0 without one. Exact under the application contract's
-    /// nonce rule, except for a sender whose last op predates the era's live
-    /// rows (in its rebuilt history or below its base): that sender reads a
-    /// stale value, and the 422's `expected` nonce corrects the client.
-    ///
-    /// Invalidated batches keep their rows, and resubmission after a cascade
-    /// reuses their nonces, so the validity filter is load-bearing.
+    /// The nonce `sender` must sign next: one past its latest user op, or 0
+    /// without one. Exact under the application contract's nonce rule, except
+    /// for a sender whose last op predates the era's live rows (in its rebuilt
+    /// history or below its base): that sender reads a stale value, and the
+    /// 422's `expected` nonce corrects the client.
     pub fn next_user_nonce(&mut self, sender: Address) -> Result<u32> {
         self.read(|tx| {
             let last_nonce: Option<i64> = tx
-                .prepare_cached(LAST_VALID_USER_NONCE_SQL)?
+                .prepare_cached(LAST_USER_NONCE_SQL)?
                 .query_row(params![sender.as_slice()], |row| row.get(0))
                 .optional()?;
             Ok(last_nonce.map_or(0, |nonce| {
@@ -286,15 +280,15 @@ pub(super) fn insert_tip_rows(
     Ok(batch_index)
 }
 
-/// Extend the valid batch path with a fresh open Tip at the current safe head,
+/// Extend the batch list with a fresh open Tip at the current safe head,
 /// draining every undrained safe input into its first frame: each direct that
 /// executes gets its row there (lane catch-up
 /// executes them, I11).
 ///
 /// Its production caller is `run`'s startup, through the guarded
 /// `Storage::open_batch_if_none` (`storage/landing.rs`), which opens the era's
-/// first batch. The new Tip follows the last valid batch, at the era's anchor
-/// nonce when none is valid; `batch_index` is the explicit genesis `0` only
+/// first batch. The new Tip follows the last batch, at the era's anchor
+/// nonce when there is none; `batch_index` is the explicit genesis `0` only
 /// when the `batches` table is empty, otherwise the monotonic PK (so indices
 /// are never reused).
 pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
@@ -332,13 +326,13 @@ fn insert_draining_tip_with_executions(
 /// The era's baseline accounts for the inputs through the stop block except
 /// the directs still queued there, which the era's first frame drains: from
 /// the first queued input, past submitter and over-cap inputs that never
-/// execute. A cascade that tears every batch of the era drains from there too.
+/// execute.
 fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
     let era = era_in(tx)?;
     let latest_frame: Option<i64> = tx
         .query_row(
             "SELECT safe_block FROM frames
-         WHERE batch_index = (SELECT MAX(batch_index) FROM valid_batches)
+         WHERE batch_index = (SELECT MAX(batch_index) FROM batches)
          ORDER BY frame_in_batch DESC LIMIT 1",
             [],
             |row| row.get(0),
@@ -377,7 +371,7 @@ impl NextBatch {
 ///
 /// Shared with the test fixture `close_frame_and_batch` so the seal ordering
 /// lives in one place: seal first (which frees the old row from the
-/// `ux_single_valid_tip` partial index), then insert the successor as the new
+/// `ux_single_open_batch` partial index), then insert the successor as the new
 /// Tip.
 pub(super) fn seal_and_open_next_batch(
     tx: &Transaction<'_>,
@@ -645,10 +639,8 @@ mod tests {
         assert_eq!(
             storage
                 .conn
-                .query_row("SELECT COUNT(*) FROM valid_closed_batches", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
+                .query_row("SELECT COUNT(*) FROM closed_batches", [], |row| row
+                    .get::<_, i64>(0))
                 .unwrap(),
             0
         );
@@ -1499,7 +1491,7 @@ mod tests {
             .unwrap();
         storage.close_frame_and_batch(&mut head).unwrap();
         let err = storage.conn.execute("INSERT INTO application_inputs (l2_tx_count,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
-        assert!(err.to_string().contains("current valid Tip"));
+        assert!(err.to_string().contains("must target the open batch"));
         assert!(
             storage
                 .conn
@@ -1549,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn next_user_nonce_follows_the_latest_valid_op_across_invalidated_batches() {
+    fn next_user_nonce_follows_the_latest_op_across_batches() {
         let alice = Address::repeat_byte(0xa1);
         let bob = Address::repeat_byte(0xb0);
         let db = temp_db("next-user-nonce");
@@ -1581,36 +1573,6 @@ mod tests {
             .unwrap();
         assert_eq!(storage.next_user_nonce(alice).unwrap(), 4);
         assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
-
-        // Invalidating the batch rolls Alice back; her rows stay for audit.
-        storage
-            .insert_invalid_batch(head.batch_index().to_raw())
-            .unwrap();
-        assert_eq!(storage.next_user_nonce(alice).unwrap(), 2);
-        assert_eq!(storage.next_user_nonce(bob).unwrap(), 1);
-
-        // Resubmitting nonce 2 leaves a duplicate (sender, nonce) pair across
-        // the invalid and valid batches; only the valid one counts.
-        storage.append_safe_inputs(0, &[], SENDER_A).unwrap();
-        storage.ensure_open_tip().unwrap();
-        let mut head = storage.open_state().unwrap().unwrap();
-        let offset = storage.next_l2_tx_count().unwrap().get();
-        storage
-            .append_included_user_ops(&mut head, &[included_user_op_from(alice, 2, offset)])
-            .unwrap();
-        assert_eq!(storage.next_user_nonce(alice).unwrap(), 3);
-        let raw_max: i64 = storage
-            .conn
-            .query_row(
-                "SELECT MAX(nonce) FROM user_ops WHERE sender = ?1",
-                [alice.as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            raw_max, 3,
-            "an unfiltered MAX would still report the rolled-back op"
-        );
     }
 
     #[test]
@@ -1621,7 +1583,7 @@ mod tests {
             .conn
             .prepare(&format!(
                 "EXPLAIN QUERY PLAN {}",
-                super::LAST_VALID_USER_NONCE_SQL
+                super::LAST_USER_NONCE_SQL
             ))
             .unwrap()
             .query_map([Address::ZERO.as_slice()], |row| row.get(3))
@@ -1781,123 +1743,5 @@ mod tests {
             .collect();
         assert_eq!(indexes, vec![0, 3]);
         assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(2));
-    }
-
-    /// The `valid_*` filtering over batches marked invalid. Nothing in
-    /// production invalidates a batch; the fixture marks one directly.
-    mod invalid_batches {
-        use crate::storage::SafeInputRange;
-        use crate::storage::test_helpers::{
-            LandingFixture, all_ordered_l2_txs, open_temp_storage, seed_closed_batches,
-        };
-        use alloy_primitives::Address;
-        use sequencer_core::l2_tx::L2Tx;
-
-        // ── invalid_batches filtering ──────────────────────────────────────
-
-        #[test]
-        fn invalid_batches_excluded_from_latest_batch_index() {
-            let (_db, mut storage) = open_temp_storage("invalid-latest-batch");
-            seed_closed_batches(&mut storage, 3);
-            assert_eq!(
-                storage.latest_batch_index().expect("latest").unwrap(),
-                3,
-                "open batch should be 3"
-            );
-
-            storage.insert_invalid_batch(3).expect("mark invalid");
-            assert_eq!(storage.latest_batch_index().expect("latest").unwrap(), 2,);
-
-            storage.insert_invalid_batch(2).expect("mark invalid");
-            assert_eq!(storage.latest_batch_index().expect("latest").unwrap(), 1,);
-        }
-
-        #[test]
-        fn invalid_batches_excluded_from_ordered_l2_txs() {
-            let (_db, mut storage) = open_temp_storage("invalid-ordered-txs");
-
-            let mut head = storage
-                .initialize_open_state(0, SafeInputRange::empty_at(0))
-                .expect("initialize");
-            storage.land(10, &[(Address::ZERO, vec![0xaa])]);
-            storage
-                .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
-                .expect("close frame");
-            storage
-                .close_batch_at(&mut head, 10)
-                .expect("close batch 0");
-
-            storage.land(20, &[(Address::ZERO, vec![0xbb])]);
-            storage
-                .close_frame_only(&mut head, 20, SafeInputRange::new(1, 2))
-                .expect("close frame");
-
-            let all = all_ordered_l2_txs(&mut storage);
-            assert_eq!(all.len(), 2);
-
-            storage
-                .insert_invalid_batch(1)
-                .expect("invalidate the suffix");
-
-            let filtered = all_ordered_l2_txs(&mut storage);
-            assert_eq!(filtered.len(), 1);
-            match &filtered[0] {
-                L2Tx::Direct(d) => assert_eq!(d.payload.as_slice(), &[0xaa]),
-                _ => panic!("expected direct input"),
-            }
-        }
-
-        #[test]
-        fn invalid_batches_excluded_from_ordered_l2_txs_for_batch() {
-            let (_db, mut storage) = open_temp_storage("invalid-ordered-for-batch");
-
-            let mut head = storage
-                .initialize_open_state(0, SafeInputRange::empty_at(0))
-                .expect("initialize");
-            storage.land(10, &[(Address::ZERO, vec![0xaa])]);
-            storage
-                .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
-                .expect("close frame");
-            storage
-                .close_batch_at(&mut head, 10)
-                .expect("close batch 0");
-
-            let txs = storage.ordered_l2_txs_for_batch(0).expect("load batch 0");
-            assert_eq!(txs.len(), 1);
-
-            storage.insert_invalid_batch(0).expect("mark invalid");
-            let txs = storage
-                .ordered_l2_txs_for_batch(0)
-                .expect("load batch 0 after invalidation");
-            assert!(txs.is_empty(), "invalid batch should return no txs");
-        }
-
-        #[test]
-        fn invalid_batches_excluded_from_drained_direct_count() {
-            let (_db, mut storage) = open_temp_storage("invalid-drained-count");
-
-            let mut head = storage
-                .initialize_open_state(0, SafeInputRange::empty_at(0))
-                .expect("initialize");
-            storage.land(
-                10,
-                &[(Address::ZERO, vec![0xaa]), (Address::ZERO, vec![0xbb])],
-            );
-            storage
-                .close_frame_only(&mut head, 10, SafeInputRange::new(0, 2))
-                .expect("close frame");
-            assert_eq!(
-                storage.next_undrained_safe_input_index().expect("cursor"),
-                2
-            );
-
-            storage.insert_invalid_batch(0).expect("mark invalid");
-            assert_eq!(
-                storage
-                    .next_undrained_safe_input_index()
-                    .expect("cursor after invalidation"),
-                0
-            );
-        }
     }
 }

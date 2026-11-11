@@ -3,7 +3,7 @@
 
 //! Batch submitter worker: stateless, at-least-once submission. Each tick reads
 //! the accepted frontier from SQLite, advances past batch nonces already seen on
-//! L1 above the safe block, and submits every remaining valid closed batch, a
+//! L1 above the safe block, and submits every remaining closed batch, a
 //! void one included, until the process stops. A cancelled tick's sends are
 //! found by the next scan.
 

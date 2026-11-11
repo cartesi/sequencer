@@ -11,9 +11,8 @@ use super::history::{era_in, next_l2_tx_count_in};
 use super::queries::{DIRECT_EXECUTES_SQL, DirectOperands};
 use super::{DirectInputExecution, SafeInputRange};
 
-/// Insert a new batch after the last valid one. Its nonce is the last valid
-/// nonce + 1, or the era's anchor when no batch is valid (the era's first
-/// batch, or after a cascade that tore every valid batch).
+/// Insert a new batch after the last one. Its nonce is the last nonce + 1, or
+/// the era's anchor for the era's first batch.
 ///
 /// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
 /// The explicit form pins the very first genesis batch at `batch_index = 0`.
@@ -44,12 +43,11 @@ pub(super) fn insert_new_batch(
     Ok((batch_index, nonce))
 }
 
-/// The last valid nonce + 1, or the era's anchor when no batch is valid: the
-/// rule of `trg_batch_insert`. With neither, reading the era fails.
+/// The last nonce + 1, or the era's anchor when there is no batch: the rule of
+/// `trg_batch_insert`. With neither, reading the era fails.
 fn compute_next_nonce(tx: &Transaction<'_>) -> Result<u64> {
-    let last_valid: Option<i64> =
-        tx.query_row("SELECT MAX(nonce) FROM valid_batches", [], |row| row.get(0))?;
-    match last_valid {
+    let last: Option<i64> = tx.query_row("SELECT MAX(nonce) FROM batches", [], |row| row.get(0))?;
+    match last {
         Some(nonce) => Ok(i64_to_u64(nonce)
             .checked_add(1)
             .expect("batch nonce overflow: contract-impossible")),

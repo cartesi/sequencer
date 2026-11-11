@@ -280,18 +280,16 @@ fn seed_void_history(db_path: &str, limits: sequencer_core::application::Schedul
         .expect("the safe head that voids the batch");
 }
 
-/// The batches as `(batch_index, nonce, sealed, invalidated)`.
-fn batch_rows(db_path: &str) -> Vec<(i64, i64, bool, bool)> {
+/// The batches as `(batch_index, nonce, sealed)`.
+fn batch_rows(db_path: &str) -> Vec<(i64, i64, bool)> {
     Storage::open(db_path)
         .expect("open storage")
         .raw_read(|tx| {
             tx.prepare(
-                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL, \
-                 invalidated_at_ms IS NOT NULL FROM batches ORDER BY batch_index",
+                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL \
+                 FROM batches ORDER BY batch_index",
             )?
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect()
         })
         .expect("read batches")

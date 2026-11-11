@@ -139,6 +139,9 @@ fn dump_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::storage::Storage;
+    use crate::storage::test_helpers::{
+        SENDER_A, seed_safe_inputs_with_batch_nonces, set_up_storage,
+    };
     use crate::test_support::create_structured_dump;
     use crate::test_support::temp_db;
 
@@ -475,17 +478,22 @@ mod tests {
     #[test]
     fn snapshot_gc_at_startup_removes_unreferenced_rows() {
         let db = temp_db("gc-startup");
-        let mut storage = Storage::open(db.path.as_str()).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let dumps_dir = tempfile::tempdir().unwrap();
         let orphan = dumps_dir.path().join("orphan");
         create_structured_dump(&orphan);
-        // An invalidated batch's snapshot is collectible.
-        let (_, batch_index) = storage.insert_closed_batch_snapshot(&orphan).unwrap();
-        storage.insert_invalid_batch(batch_index).unwrap();
+        let rollback = dumps_dir.path().join("rollback");
+        create_structured_dump(&rollback);
+        storage.insert_closed_batch_snapshot(&orphan).unwrap();
+        storage.insert_closed_batch_snapshot(&rollback).unwrap();
+        // With both batches accepted, the second's snapshot is the rollback
+        // checkpoint; the baseline and the first batch's are collectible.
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0, 1]);
         let removed =
             snapshot_gc_at_startup(&mut storage, &crate::storage::SnapshotLeases::default())
                 .unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert!(!orphan.exists());
+        assert!(rollback.join("info.toml").is_file());
     }
 }

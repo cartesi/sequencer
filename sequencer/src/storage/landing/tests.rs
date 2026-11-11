@@ -16,17 +16,15 @@ fn void_at(storage: &mut Storage, safe_block: u64) -> Option<TerminalFact> {
     storage.terminal_fact().expect("terminal fact")
 }
 
-/// The batches as `(batch_index, nonce, sealed, invalidated)`.
-fn batch_rows(storage: &mut Storage) -> Vec<(i64, i64, bool, bool)> {
+/// The batches as `(batch_index, nonce, sealed)`.
+fn batch_rows(storage: &mut Storage) -> Vec<(i64, i64, bool)> {
     storage
         .read(|tx| {
             tx.prepare(
-                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL, \
-                 invalidated_at_ms IS NOT NULL FROM batches ORDER BY batch_index",
+                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL \
+                 FROM batches ORDER BY batch_index",
             )?
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect()
         })
         .expect("read batches")
@@ -249,7 +247,10 @@ mod void_history {
         storage.advance_safe_head(10);
         storage
             .conn
-            .execute("DELETE FROM frames WHERE batch_index = 0", [])
+            .execute_batch(
+                "DROP TRIGGER trg_frames_not_deletable; \
+                 DELETE FROM frames WHERE batch_index = 0;",
+            )
             .expect("inject missing-frame corruption");
         let err = storage
             .landing_lag()
@@ -270,7 +271,7 @@ mod open_batch_if_none {
         assert_eq!(head.batch_index(), BatchId::new(0));
         assert_eq!(head.safe_block(), 42);
         let opened = batch_rows(&mut storage);
-        assert_eq!(opened, vec![(0, 0, false, false)]);
+        assert_eq!(opened, vec![(0, 0, false)]);
 
         assert!(!storage.open_batch_if_none().expect("no-op"));
         assert_eq!(batch_rows(&mut storage), opened);
@@ -318,16 +319,16 @@ mod open_batch_if_none {
         let (db, mut storage) = open_temp_storage("open-batch-postcondition");
         storage.advance_safe_head(42);
         drop(storage);
-        // Fault injection: invalidate the new batch the moment its first
-        // frame lands, so `open_fresh_tip_in_tx` returns `Ok` having left no
-        // valid open batch. (`open.rs` documents failure triggers as the
-        // sanctioned way past the typed API in tests.)
+        // Fault injection: seal the new batch the moment its first frame
+        // lands, so `open_fresh_tip_in_tx` returns `Ok` having left no open
+        // batch. (`open.rs` documents failure triggers as the sanctioned way
+        // past the typed API in tests.)
         Storage::open_connection(db.path.as_str())
             .expect("raw connection")
             .execute_batch(
-                "CREATE TRIGGER test_invalidate_new_tip AFTER INSERT ON frames \
+                "CREATE TRIGGER test_seal_new_tip AFTER INSERT ON frames \
                  BEGIN \
-                   UPDATE batches SET invalidated_at_ms = 1 \
+                   UPDATE batches SET sealed_at_ms = 1, payload_hash = zeroblob(32) \
                    WHERE batch_index = NEW.batch_index; \
                  END",
             )

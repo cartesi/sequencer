@@ -202,32 +202,6 @@ fn leases_keep_artifact_count_and_version_together_after_acceptance() {
 }
 
 #[test]
-fn invalidated_snapshot_is_not_selected_and_its_lease_blocks_collection() {
-    let (_db, mut storage, _, mut head) = baseline_and_tip("invalidated-snapshot");
-    let leases = SnapshotLeases::default();
-    close(&mut storage, &mut head);
-    let lease = storage
-        .acquire_latest_snapshot_lease(&leases)
-        .unwrap()
-        .unwrap();
-    assert_eq!(lease.prefix, prefix(1));
-    storage
-        .conn
-        .execute(
-            "UPDATE batches SET invalidated_at_ms=1 WHERE batch_index=0",
-            [],
-        )
-        .unwrap();
-    assert_eq!(
-        storage.latest_snapshot().unwrap().unwrap().prefix,
-        prefix(0)
-    );
-    assert!(storage.collect_snapshots(&leases).unwrap().is_empty());
-    drop(lease);
-    assert_eq!(storage.collect_snapshots(&leases).unwrap(), vec![prefix(1)]);
-}
-
-#[test]
 fn a_lease_taken_before_gc_keeps_its_row_until_the_guard_drops() {
     let (_db, mut storage, baseline, mut head) = baseline_and_tip("lease-before-gc");
     let leases = SnapshotLeases::default();

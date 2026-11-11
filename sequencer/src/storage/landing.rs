@@ -78,9 +78,9 @@ pub(crate) enum OpenBatchError {
     Storage(#[from] rusqlite::Error),
     #[error(transparent)]
     Terminal(TerminalFact),
-    /// The open transaction left no valid open batch: a broken postcondition,
+    /// The open transaction left no open batch: a broken postcondition,
     /// rolled back.
-    #[error("opening a batch left no valid open batch in its own transaction")]
+    #[error("opening a batch left no open batch in its own transaction")]
     OpenBatchMissing,
 }
 
@@ -115,13 +115,13 @@ impl Storage {
         if let Some(fact) = terminal_fact_in(&tx)? {
             return Err(OpenBatchError::Terminal(fact));
         }
-        if has_valid_open_batch(&tx)? {
+        if open_batch(&tx)?.is_some() {
             return Ok(false);
         }
         open_fresh_tip_in_tx(&tx)?;
         // A broken postcondition must roll back this transaction and refuse
         // startup, including in release builds.
-        if !has_valid_open_batch(&tx)? {
+        if open_batch(&tx)?.is_none() {
             return Err(OpenBatchError::OpenBatchMissing);
         }
         tx.commit()?;
@@ -154,8 +154,8 @@ pub(super) fn terminal_fact_in(conn: &Connection) -> Result<Option<TerminalFact>
 }
 
 /// The batch at the accepted frontier's next nonce: the first unaccepted
-/// valid closed batch, else the open batch. First-frame safe blocks do not
-/// decrease along the valid batches (I3), so it is the oldest unaccepted one.
+/// closed batch, else the open batch. First-frame safe blocks do not
+/// decrease along the batches (I3), so it is the oldest unaccepted one.
 fn landing_lag_in(conn: &Connection) -> Result<Option<LandingLag>> {
     let Some(safe_block) = current_safe_block(conn)? else {
         return Ok(None);
@@ -174,7 +174,7 @@ fn landing_lag_in(conn: &Connection) -> Result<Option<LandingLag>> {
     }))
 }
 
-/// First valid closed batch with `nonce >= frontier_nonce`, the next nonce
+/// First closed batch with `nonce >= frontier_nonce`, the next nonce
 /// the scheduler is expected to accept. `>=`, not `>`: the batch at the
 /// frontier carries `nonce == frontier_nonce`. The nonce seek, not
 /// `accepted_input IS NULL`, keeps this off the accepted prefix: the landing
@@ -184,7 +184,7 @@ fn first_unaccepted_closed_batch(conn: &Connection) -> Result<Option<u64>> {
     let frontier = frontier_nonce(conn)?;
     let batch_index: Option<i64> = conn
         .query_row(
-            "SELECT batch_index FROM valid_closed_batches \
+            "SELECT batch_index FROM closed_batches \
              WHERE nonce >= ?1 ORDER BY nonce ASC LIMIT 1",
             params![u64_to_i64(frontier)],
             |row| row.get(0),
@@ -195,9 +195,7 @@ fn first_unaccepted_closed_batch(conn: &Connection) -> Result<Option<u64>> {
 
 fn open_batch(conn: &Connection) -> Result<Option<u64>> {
     let batch_index: Option<i64> = conn
-        .query_row("SELECT batch_index FROM valid_open_batch", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT batch_index FROM open_batch", [], |row| row.get(0))
         .optional()?;
     Ok(batch_index.map(i64_to_u64))
 }
@@ -212,10 +210,6 @@ fn first_frame_safe_block_of(conn: &Connection, batch_index: u64) -> Result<u64>
         params![u64_to_i64(batch_index)],
         |row| row.get::<_, i64>(0).map(i64_to_u64),
     )
-}
-
-fn has_valid_open_batch(conn: &Connection) -> Result<bool> {
-    Ok(open_batch(conn)?.is_some())
 }
 
 #[cfg(test)]

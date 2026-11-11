@@ -328,9 +328,9 @@ pub enum BootstrapError {
     /// [`InputReaderError::is_retryable_at_startup`].
     #[error("startup L1 sync: {0}")]
     StartupSync(InputReaderError),
-    /// Opening the start batch left no valid open batch: a broken
-    /// postcondition, rolled back.
-    #[error("opening the start batch left no valid open batch")]
+    /// Opening the start batch left no open batch: a broken postcondition,
+    /// rolled back.
+    #[error("opening the start batch left no open batch")]
     StartBatchNotOpened,
     /// An input-reader failure in setup's L1 discovery (the chain-id check's
     /// client, the safe-head sample, the reader) or initial sync, classified by

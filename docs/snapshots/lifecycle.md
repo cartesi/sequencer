@@ -36,7 +36,7 @@ SQLite holds one row per artifact and the boundary it holds:
 
 The application count is the next canonical input position, never a physical
 SQLite cursor. The batch identity disambiguates empty batches, which can share
-an application count, and replacement branches, which can reuse a nonce.
+an application count.
 
 ## Creation and restart
 
@@ -57,12 +57,11 @@ the era's rebuilt history, from its base count to the baseline, have no
 snapshots: they live in `rebuilt_history`, which the feed serves and restart
 never replays.
 
-Restart requires the newest valid closed batch's snapshot, or the baseline
-when no valid closed batch exists. A missing required snapshot fails loud.
+Restart requires the newest closed batch's snapshot, or the baseline when no
+batch is closed. A missing required snapshot fails loud.
 The selected artifact and stored application count come from one row.
 Catch-up checks the restored engine's count and replays
-application inputs from that count. Invalidated branches are excluded by the
-same valid-batch relation used elsewhere.
+application inputs from that count.
 
 ## Acceptance and comparison
 
@@ -139,7 +138,7 @@ Garbage collection retains:
    batch may become the next accepted head before its successors do.
 3. Every artifact with an active reader lease.
 
-Older accepted artifacts and invalidated branch artifacts are collectible.
+Older accepted artifacts are collectible.
 The baseline artifact can be retired after an accepted checkpoint replaces it
 as the comparison checkpoint; the era's immutable baseline metadata and its rebuilt history
 remain in SQLite.

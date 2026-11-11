@@ -428,7 +428,7 @@ fn an_interior_history_hole_fails_loud() {
     storage
         .conn
         .execute_batch(
-            "DROP TRIGGER trg_protect_valid_application_input_delete;\n\
+            "DROP TRIGGER trg_application_inputs_not_deletable;\n\
          DELETE FROM application_inputs WHERE l2_tx_count = 1;",
         )
         .unwrap();

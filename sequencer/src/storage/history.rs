@@ -28,7 +28,7 @@ pub struct Era {
     /// The oldest direct still queued at the stop block, or the input count
     /// through it when none is: where the era's first frame drains from.
     pub first_queued_input: u64,
-    /// The nonce a new batch carries when no batch is valid (I16): the
+    /// The nonce the era's first batch carries (I16): the
     /// scheduler's next batch nonce at the stop block.
     pub anchor_batch_nonce: u64,
 }

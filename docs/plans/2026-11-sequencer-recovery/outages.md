@@ -1,6 +1,6 @@
 # One recovery: when batches stop landing
 
-**Status:** steps 1 and 2 of five are code. The sequencer has one recovery,
+**Status:** steps 1 to 3 of five are code. The sequencer has one recovery,
 [cockroach recovery](../../recovery/cockroach.md), and repairs nothing by
 itself. This page keeps what remains.
 
@@ -23,6 +23,9 @@ the operator's playbook, and why there is no automatic repair.
    startup, the cascade and the open-batch repair are gone, with exit code 10,
    `--preemptive-margin-blocks` and `--l1-read-stale-after-blocks`. The two
    TLA+ models of that mechanism are [archived](../../recovery/history/README.md).
+3. **The batches are an append-only list.** No batch, frame, user op or
+   application input is ever replaced or deleted, and the schema carries no
+   invalidation ([I5](../../invariants.md#i5-batches-and-application-history-only-append)).
 
 ## What remains
 
@@ -30,12 +33,6 @@ Each step is its own commit, compiles and passes on its own, and carries its
 docs. A step that touches a guest crate moves the template hash, so the images
 are rebuilt before the machine and devnet suites run.
 
-3. **The batches become an append-only list.** No operation invalidates a
-   batch, so the schema and storage lose invalidation:
-   `batches.invalidated_at_ms`, every "valid" filter and view, and the
-   triggers that guard an invalidated row. One unique index on the nonce
-   replaces the partial one, the nonce is the era's anchor plus the batch's
-   position, and no batch can be deleted.
 4. **A history's identity is its era.** No operation advances the recovery
    generation, so it leaves every client interface and the database:
    `RecoveryGeneration`, `STALE_GENERATION`, `from_generation` and

@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Batch acceptance: `batches.accepted_input`, the prefix of our valid batches
+//! Batch acceptance: `batches.accepted_input`, the prefix of our batches
 //! the on-chain scheduler accepted, simulated with `protocol::scheduler_accepts`
 //! under the pinned window.
 //! Its only writer is [`record_accepted_batches`], inside the input reader's
@@ -26,7 +26,7 @@ fn latest_accepted_input(conn: &Connection) -> Result<Option<i64>> {
 ///
 /// The greatest accepted batch's nonce + 1, else the era's anchor
 /// (`anchor_batch_nonce`, its next batch nonce at the stop block). By the
-/// contiguity of valid nonces this is the nonce of the first unaccepted valid
+/// contiguity of batch nonces this is the nonce of the first unaccepted
 /// closed batch, the one the void history judges, when one exists (I16).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     let latest: Option<i64> = conn
@@ -68,11 +68,10 @@ pub(super) fn record_accepted_batches(conn: &Connection) -> Result<()> {
                               WHERE sender = ?1 AND safe_input_index > ?2 \
                                 AND block_number > ?3 \
                               ORDER BY safe_input_index ASC LIMIT ?4";
-    // The content-identity check found this valid closed batch; the schema
+    // The content-identity check found this closed batch; the schema
     // refuses an acceptance that does not extend the accepted prefix.
     const ACCEPT_SQL: &str = "UPDATE batches SET accepted_input = ?1 \
-                              WHERE nonce = ?2 AND sealed_at_ms IS NOT NULL \
-                                AND invalidated_at_ms IS NULL";
+                              WHERE nonce = ?2 AND sealed_at_ms IS NOT NULL";
 
     // A persisted divergence marker freezes the acceptance frontier (I15).
     if canonical_divergence_in(conn)?.is_some() {
@@ -178,11 +177,11 @@ pub(super) fn record_accepted_batches(conn: &Connection) -> Result<()> {
 /// How an accepted landing failed the content-identity check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DivergenceKind {
-    /// No valid closed local batch exists at the accepted nonce — we never
-    /// (validly) submitted one, so the landing is a zombie or foreign batch
-    /// from our key.
+    /// No closed local batch exists at the accepted nonce — we never
+    /// submitted one, so the landing is a zombie or foreign batch from our
+    /// key.
     Foreign,
-    /// A valid closed local batch exists, but the landed wire bytes hash
+    /// A closed local batch exists, but the landed wire bytes hash
     /// differently from the bytes we sealed.
     Mismatch,
 }
@@ -197,7 +196,7 @@ impl DivergenceKind {
 }
 
 /// Content-identity check proper: compare a fully-accepted landing against
-/// our valid closed batch at the same nonce. `None` = identical (the normal
+/// our closed batch at the same nonce. `None` = identical (the normal
 /// case); a mismatch also returns our payload hash.
 ///
 /// Why content (not identity) suffices: accepted content-equal copies are
@@ -211,7 +210,7 @@ fn content_identity_violation(
 ) -> Result<Option<(DivergenceKind, Option<Vec<u8>>)>> {
     let ours: Option<Option<Vec<u8>>> = conn
         .query_row(
-            "SELECT payload_hash FROM valid_closed_batches WHERE nonce = ?1",
+            "SELECT payload_hash FROM closed_batches WHERE nonce = ?1",
             params![u64_to_i64(accepted.nonce)],
             |row| row.get(0),
         )
@@ -227,7 +226,7 @@ fn content_identity_violation(
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
                 Some(format!(
-                    "valid closed batch at nonce {} has no payload_hash",
+                    "closed batch at nonce {} has no payload_hash",
                     accepted.nonce
                 )),
             ))
@@ -737,7 +736,7 @@ mod tests {
         let submitter = SENDER_A;
 
         // The era is anchored at N' = 7: build + seal one local batch — with
-        // no valid batch before it, it carries nonce 7 (the anchor).
+        // no batch before it, it carries nonce 7 (the anchor).
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");

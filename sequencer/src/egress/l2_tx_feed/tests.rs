@@ -384,8 +384,10 @@ async fn corrupt_feed_page_trips_terminal_storage_fault() {
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
     // A missing frame makes the page's LEFT JOIN read NULL frame columns (fee,
     // safe block), which the decoder refuses as a wrongly typed stored value.
-    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM frames;")
-        .expect("drop the frames under stored rows");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF; DROP TRIGGER trg_frames_not_deletable; DELETE FROM frames;",
+    )
+    .expect("drop the frames under stored rows");
     drop(conn);
 
     let shutdown = RuntimeScope::default();
