@@ -798,6 +798,7 @@ mod tests {
             app_deployment_block: 0,
             batch_submitter_address: Address::repeat_byte(0x33),
             max_direct_payload_bytes: 1024,
+            max_wait_blocks: 1200,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
@@ -1157,8 +1158,8 @@ mod tests {
             (
                 CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(
                     ProtocolTimingError::MarginNotLessThanMaxWait {
-                        margin: sequencer_core::MAX_WAIT_BLOCKS,
-                        max_wait: sequencer_core::MAX_WAIT_BLOCKS,
+                        margin: 1200,
+                        max_wait: 1200,
                     },
                 )),
                 "invalid protocol timing",

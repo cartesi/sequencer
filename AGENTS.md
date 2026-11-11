@@ -26,7 +26,7 @@ In order of importance:
 
 - **Dispute compatibility** — the design already accounts for rollup dispute resolution. Preserve it.
 - **Wallet-compatible signing** — users sign with standard wallets via EIP-712. Never introduce custom signing schemes.
-- **Deposit availability < 10 minutes** — happy path. The censorship-resistance backstop (`MAX_WAIT_BLOCKS`, ~4h) is the worst case.
+- **Deposit availability < 10 minutes** — happy path. The censorship-resistance backstop (the application's `max_wait_blocks`, ~4h for the wallet) is the worst case.
 
 ## Design Principles
 
@@ -80,11 +80,11 @@ Two mechanical facts the agreement rests on:
 
 ## Batch Staleness and Recovery
 
-A batch is **stale** when `inclusion_block - first_frame.safe_block >= MAX_WAIT_BLOCKS`
-(1200 blocks, ~4h): the sequencer went offline, or kept submitting while
+A batch is **stale** when `inclusion_block - first_frame.safe_block >= max_wait_blocks`,
+the application's staleness window (1200 blocks, ~4h, for the wallet): the sequencer went offline, or kept submitting while
 freezing `safe_block` to hold back directs. The scheduler skips a stale batch
 without consuming its nonce, and overdue directs are force-drained anyway, which
-bounds censorship at ~4h. Every later batch then arrives at an unexpected nonce,
+bounds censorship at the window. Every later batch then arrives at an unexpected nonce,
 so invalidation cascades through the suffix, open batch included
 ([scheduler semantics](docs/protocol/scheduler-semantics.md)).
 

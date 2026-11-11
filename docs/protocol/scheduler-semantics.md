@@ -22,7 +22,7 @@ An **L2 transaction** is a direct input or a user op. The scheduler builds the
 sequence one L1 input at a time:
 
 1. **Every input first runs the backstop.** Directs queued for at least
-   `MAX_WAIT_BLOCKS` execute, oldest first, even when the input is a batch the
+   `max_wait_blocks` execute, oldest first, even when the input is a batch the
    gates then reject.
 2. **A direct input** joins the *fridge*, the queue of directs not yet
    executed, unless its payload is over the cap. A full fridge first drains
@@ -156,7 +156,7 @@ builds carry `v ∈ {27, 28}`, but keep a user's `s` as signed.
 ## Processing an input
 
 1. **The backstop.** Pop and execute directs from the front of the fridge
-   while `input.inclusion_block − front.inclusion_block ≥ MAX_WAIT_BLOCKS`,
+   while `input.inclusion_block − front.inclusion_block ≥ max_wait_blocks`,
    raising the clock to each one's block. This bounds how long a sequencer
    that stops submitting, or freezes `safe_block`, can hold a direct back.
 2. **A direct** joins the fridge, unless its payload is over the cap, and once
@@ -174,7 +174,7 @@ The first gate that applies decides the outcome:
 | b | `batch.nonce != next_batch_nonce` | Rejected | Kept |
 | c | `frames` is empty. | Accepted; executes nothing | +1 |
 | d | The frame structure is invalid (below). | Rejected | Kept |
-| e | `inclusion_block − frames[0].safe_block ≥ MAX_WAIT_BLOCKS` | Skipped as stale | Kept |
+| e | `inclusion_block − frames[0].safe_block ≥ max_wait_blocks` | Skipped as stale | Kept |
 | f | `frames[0].safe_block < clock` | Rejected | Kept |
 | g | Otherwise: execute every frame. | Accepted | +1 |
 
@@ -340,7 +340,7 @@ is consensus-critical: a bug there gets batches rejected.
   answers it. An overflow also moves which input executes the drained directs,
   which the watchdog's comparison at that block can see.
 
-Both constants belong to the application's template
+Both constants belong to the application's template, with the window
 ([`Application::scheduler_limits`](../../sequencer-core/src/application/mod.rs)).
 Their values for the wallet are provisional, and the values and the largest
 drain the guest can afford are **Open**
@@ -427,14 +427,16 @@ application reports.
 
 | Constant | Value | Home |
 |---|---|---|
-| `MAX_WAIT_BLOCKS` | 1200 L1 blocks, about 4 h | [`lib.rs`](../../sequencer-core/src/lib.rs) |
+| `max_wait_blocks` | 1200 L1 blocks, about 4 h, for the wallet | the application's template |
 | `MAX_EXPONENT` | 17101 | [`fee.rs`](../../sequencer-core/src/fee.rs) (`build.rs` generates it) |
 | `fridge_bound` | 16384 entries for the wallet, provisional | the application's template |
 | `max_direct_payload_bytes` | 1024 bytes for the wallet, provisional | the application's template |
 | `sequencer_address` | per deployment | compiled into the canonical machine |
 
 [`SchedulerConfig`](../../sequencer-core/src/scheduler/mod.rs) carries all but
-`MAX_EXPONENT`, built for an application by `SchedulerConfig::for_application`.
+`MAX_EXPONENT`, built for an application by `SchedulerConfig::for_application`
+from the submitter and the application's
+[`scheduler_limits`](application-contract.md#3-admission--policy-never-consensus).
 The window `max_wait_blocks` is at least one block, which the reference
 asserts: with zero, the backstop could drain the arriving input's own block and
 leave a direct from that block queued at the clock.

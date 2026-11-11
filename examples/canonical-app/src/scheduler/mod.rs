@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn a_rejected_batch_reports_after_its_backstop_outputs() {
         let alice = address_of(&key(3));
-        let overdue = 1 + sequencer_core::MAX_WAIT_BLOCKS;
+        let overdue = 1 + WALLET_SCHEDULER_LIMITS.max_wait_blocks;
         let emitted = run_wallet(
             Script::default()
                 .deposit(1, alice, 250)

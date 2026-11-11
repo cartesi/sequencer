@@ -61,20 +61,25 @@ fn run_config(data_dir: &str, eth_rpc_url: &str, key: &str) -> sequencer::RunCon
     }
 }
 
-/// The direct-payload cap of the binary these tests run.
-fn wallet_cap() -> u64 {
-    app_core::application::WalletApp::scheduler_limits().max_direct_payload_bytes
+/// The scheduler limits of the binary these tests run.
+fn wallet_limits() -> sequencer_core::application::SchedulerLimits {
+    app_core::application::WalletApp::scheduler_limits()
 }
 
 /// Seed a pinned deployment identity (chain id `chain_id`, submitter
-/// `submitter`, direct-payload cap `cap`), finalized-snapshot fact, and
+/// `submitter`, scheduler limits `limits`), finalized-snapshot fact, and
 /// completed setup lifecycle — the minimal local state needed to reach `run`'s
 /// initial L1 sync without doing `setup`'s on-chain discovery. Uses the same
 /// typed controller path `setup`
 /// itself records through (admission → facts → completion), so this seed
 /// cannot drift from the lifecycle schema or encode a state the controller
 /// would never write.
-fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address, cap: u64) {
+fn seed_setup_complete(
+    db_path: &str,
+    chain_id: u64,
+    submitter: Address,
+    limits: sequencer_core::application::SchedulerLimits,
+) {
     use sequencer::storage::LifecycleCommand;
 
     let mut storage = Storage::initialize_for_command(db_path, LifecycleCommand::Setup)
@@ -86,7 +91,8 @@ fn seed_setup_complete(db_path: &str, chain_id: u64, submitter: Address, cap: u6
             input_box_address: TEST_INPUT_BOX,
             app_deployment_block: 100,
             batch_submitter_address: submitter,
-            max_direct_payload_bytes: cap,
+            max_direct_payload_bytes: limits.max_direct_payload_bytes,
+            max_wait_blocks: limits.max_wait_blocks,
             fee_oracle: sequencer::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("seed deployment identity");
@@ -128,7 +134,7 @@ async fn run_refuses_on_submitter_key_mismatch() {
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let db_path = format!("{data_dir}/sequencer.db");
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_limits());
 
     let config = run_config(data_dir, "http://127.0.0.1:1", OTHER_KEY);
     let result = tokio::time::timeout(
@@ -148,29 +154,50 @@ async fn run_refuses_on_submitter_key_mismatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_refuses_a_cap_other_than_the_pinned_one() {
+async fn run_refuses_scheduler_limits_other_than_the_pinned_ones() {
     // Setup pinned a cap one byte larger than the binary's: storage would
-    // classify directs the lane's application does not execute, so `run`
-    // must fail loud before any L1 contact.
-    let dir = TempDir::new().expect("tempdir");
-    let data_dir = dir.path().to_str().unwrap();
-    let db_path = format!("{data_dir}/sequencer.db");
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap() + 1);
+    // classify directs the lane's application does not execute. Or it pinned
+    // a window one block longer: acceptance would be judged by another rule
+    // than the template's. Either way `run` must fail loud before any L1
+    // contact.
+    let binary = wallet_limits();
+    let cases = [
+        (
+            sequencer_core::application::SchedulerLimits {
+                max_direct_payload_bytes: binary.max_direct_payload_bytes + 1,
+                ..binary
+            },
+            "max_direct_payload_bytes",
+        ),
+        (
+            sequencer_core::application::SchedulerLimits {
+                max_wait_blocks: binary.max_wait_blocks + 1,
+                ..binary
+            },
+            "max_wait_blocks",
+        ),
+    ];
+    for (pinned, field) in cases {
+        let dir = TempDir::new().expect("tempdir");
+        let data_dir = dir.path().to_str().unwrap();
+        let db_path = format!("{data_dir}/sequencer.db");
+        seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, pinned);
 
-    let config = run_config(data_dir, "http://127.0.0.1:1", ANVIL_KEY);
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        sequencer::run::<app_core::application::WalletApp>(config),
-    )
-    .await
-    .expect("run() must return quickly on a cap mismatch");
+        let config = run_config(data_dir, "http://127.0.0.1:1", ANVIL_KEY);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            sequencer::run::<app_core::application::WalletApp>(config),
+        )
+        .await
+        .expect("run() must return quickly on a limits mismatch");
 
-    match result {
-        Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
-            fields,
-            ..
-        }))) => assert_eq!(fields, "max_direct_payload_bytes"),
-        other => panic!("expected max_direct_payload_bytes mismatch, got: {other:?}"),
+        match result {
+            Err(CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
+                fields,
+                ..
+            }))) => assert_eq!(fields, field),
+            other => panic!("expected {field} mismatch, got: {other:?}"),
+        }
     }
 }
 
@@ -185,7 +212,7 @@ async fn run_refuses_on_wrong_chain_rpc() {
     let db_path = format!("{data_dir}/sequencer.db");
     // Submitter = anvil key address so the key check passes and we reach the
     // chain-id check.
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_limits());
 
     let config = run_config(data_dir, &anvil.endpoint(), ANVIL_KEY);
     let result = tokio::time::timeout(
@@ -223,7 +250,7 @@ async fn run_accepts_matching_chain_rpc() {
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().to_str().unwrap();
     let db_path = format!("{data_dir}/sequencer.db");
-    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_cap());
+    seed_setup_complete(&db_path, 31_337, ANVIL_ADDR, wallet_limits());
 
     let config = run_config(data_dir, &anvil.endpoint(), ANVIL_KEY);
     let result = tokio::time::timeout(

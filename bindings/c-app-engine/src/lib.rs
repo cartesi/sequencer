@@ -282,11 +282,13 @@ impl Application for EngineApp {
     fn scheduler_limits() -> SchedulerLimits {
         assert_abi_version();
         let mut limits = sys::ApplicationEngineSchedulerLimits {
+            max_wait_blocks: 0,
             fridge_bound: 0,
             max_direct_payload_bytes: 0,
         };
         unsafe { sys::application_engine_scheduler_limits(&mut limits) };
         SchedulerLimits {
+            max_wait_blocks: limits.max_wait_blocks,
             fridge_bound: limits.fridge_bound,
             max_direct_payload_bytes: limits.max_direct_payload_bytes,
         }

@@ -55,7 +55,7 @@ const FRAME_CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 // ── Zone-math constants for the outage-matrix and recovery tests ─────────
 //
-// These derive from `MAX_WAIT_BLOCKS` (sequencer-core) and the timing the
+// These derive from the wallet's staleness window and the timing the
 // harness passes to the sequencer (`DEVNET_PREEMPTIVE_MARGIN_BLOCKS`,
 // `DEVNET_SECONDS_PER_BLOCK`), so a change to either flows through here. The
 // compile-time asserts below catch drift that would break the zone framing
@@ -65,9 +65,9 @@ const FRAME_CLOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 // The picks (PRE / DANGER / PAST_STALE) are deliberately well inside their
 // zones to give tests slack against scheduling jitter and timing drift.
 
-/// Source of truth: shared between sequencer + scheduler via
-/// `sequencer_core::MAX_WAIT_BLOCKS`.
-const MAX_WAIT_BLOCKS: u64 = sequencer_core::MAX_WAIT_BLOCKS;
+/// Source of truth: the wallet's scheduler limits, which its guest image and
+/// its sequencer binary both read.
+const MAX_WAIT_BLOCKS: u64 = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
 
 /// Derived: the preemptive-recovery danger threshold. Below this we're safe;
 /// above it (but below `MAX_WAIT_BLOCKS`) is the danger zone where the

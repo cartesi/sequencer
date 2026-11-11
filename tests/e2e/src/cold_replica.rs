@@ -180,7 +180,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     runtime.stop().await?;
     runtime
         .advance_wall_and_mine(Duration::from_secs(
-            (sequencer_core::MAX_WAIT_BLOCKS + 50) * 12,
+            (app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks + 50) * 12,
         ))
         .await?;
     runtime.respawn().await?;

@@ -48,13 +48,13 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
-    /// The production configuration: the protocol's staleness window and the
-    /// limits the application's template compiles in.
+    /// The production configuration: the submitter, and the constants the
+    /// application's template compiles in.
     pub fn for_application<A: Application>(sequencer_address: Address) -> Self {
         let limits = A::scheduler_limits();
         Self {
             sequencer_address,
-            max_wait_blocks: crate::MAX_WAIT_BLOCKS,
+            max_wait_blocks: limits.max_wait_blocks,
             fridge_bound: limits.fridge_bound,
             max_direct_payload_bytes: limits.max_direct_payload_bytes,
         }

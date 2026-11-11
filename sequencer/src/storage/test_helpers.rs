@@ -120,12 +120,13 @@ pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::NewEra
     }
 }
 
-/// Default protocol timing for tests that don't care about specific tuning.
-/// Sender-independent (timing carries no address); pair with a submitter
-/// address as needed at the call site.
+/// Default protocol timing for tests that don't care about specific tuning:
+/// the wallet's window, which the stub application shares. Sender-independent
+/// (timing carries no address); pair with a submitter address as needed at
+/// the call site.
 pub(crate) fn default_protocol_timing() -> ProtocolTiming {
-    ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12)
-        .expect("valid test timing")
+    let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
+    ProtocolTiming::try_new(window, 75, 900, 12).expect("valid test timing")
 }
 
 /// Every field of a [`WriteHead`], for the few tests that build one by hand:

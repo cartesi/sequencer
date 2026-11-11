@@ -43,7 +43,7 @@ An **L2 transaction** is a direct input or a user op. The scheduler builds the
 sequence one L1 input at a time:
 
 1. **Every input first runs the backstop.** Directs queued for at least
-   `MAX_WAIT_BLOCKS` execute, oldest first, even when the input is a batch the
+   `max_wait_blocks` execute, oldest first, even when the input is a batch the
    gates then reject.
 2. **A direct input**, from any sender but the sequencer, joins the fridge,
    the queue of directs not yet executed. **New:** one whose payload is over
@@ -190,7 +190,7 @@ This acceptance set is alloy's. Narrowing it to `v ∈ {27, 28}` and low `s` is
 ## Processing an input
 
 1. **The backstop.** Pop and execute directs from the front of the fridge
-   while `input.inclusion_block − front.inclusion_block ≥ MAX_WAIT_BLOCKS`,
+   while `input.inclusion_block − front.inclusion_block ≥ max_wait_blocks`,
    raising the clock to each one's block (**New**). This bounds how long a
    sequencer that stops submitting, or freezes `safe_block`, can hold a direct
    back.
@@ -209,7 +209,7 @@ The first gate that applies decides the outcome:
 | b | `batch.nonce != next_batch_nonce` | Rejected | Kept |
 | c | `frames` is empty | Accepted; executes nothing | +1 |
 | d | The frame structure is invalid (below) | Rejected | Kept |
-| e | `inclusion_block − frames[0].safe_block ≥ MAX_WAIT_BLOCKS` | Skipped as stale | Kept |
+| e | `inclusion_block − frames[0].safe_block ≥ max_wait_blocks` | Skipped as stale | Kept |
 | f | **New.** `frames[0].safe_block < clock` | Rejected | Kept |
 | g | Otherwise: execute every frame | Accepted | +1 |
 
@@ -462,13 +462,13 @@ interface.
 
 | Constant | Value | Home |
 |---|---|---|
-| `MAX_WAIT_BLOCKS` | 1200 L1 blocks, about 4 h | [`lib.rs`](../../../sequencer-core/src/lib.rs) |
+| `max_wait_blocks` | 1200 L1 blocks, about 4 h, for the wallet | the application's template |
 | `MAX_EXPONENT` | 17101 | [`fee.rs`](../../../sequencer-core/src/fee.rs) (`build.rs` generates it) |
 | `FRIDGE_BOUND` | **New**, value **Open** | the template |
 | `MAX_DIRECT_PAYLOAD_BYTES` | **New**, value **Open** | the template |
 | `sequencer_address` | per deployment | compiled into the canonical machine |
 
-The window `MAX_WAIT_BLOCKS` is at least one block. With zero, the backstop
+The window `max_wait_blocks` is at least one block. With zero, the backstop
 could drain the arriving input's own block and leave a direct from that block
 queued at the clock.
 

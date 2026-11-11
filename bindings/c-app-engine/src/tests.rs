@@ -32,6 +32,7 @@ unsafe extern "C" fn application_engine_scheduler_limits(
     // SAFETY: EngineApp supplies a writable record.
     unsafe {
         *out_limits = sys::ApplicationEngineSchedulerLimits {
+            max_wait_blocks: u64::MAX - 1,
             fridge_bound: 3,
             max_direct_payload_bytes: u64::MAX,
         }
@@ -48,6 +49,7 @@ fn scheduler_limits_come_from_the_engine_at_full_width() {
     assert_eq!(
         EngineApp::scheduler_limits(),
         SchedulerLimits {
+            max_wait_blocks: u64::MAX - 1,
             fridge_bound: 3,
             max_direct_payload_bytes: u64::MAX,
         }

@@ -579,7 +579,7 @@ pub fn scheduler_rejected_batch_reports_after_its_backstop_outputs() -> TestResu
     let token = WalletConfig::devnet().supported_erc20_token;
     let depositor = address!("0x7777777777777777777777777777777777777777");
     let amount = U256::from(250_u64);
-    let overdue = 1 + sequencer_core::MAX_WAIT_BLOCKS;
+    let overdue = 1 + WALLET_SCHEDULER_LIMITS.max_wait_blocks;
     let overdue_block = usize::try_from(overdue).expect("the block fits usize");
 
     machine.advance_state(portal_input(1, token, depositor, amount))?;

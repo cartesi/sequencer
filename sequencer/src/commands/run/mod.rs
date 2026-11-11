@@ -15,7 +15,7 @@ use crate::commands::config::RunConfig;
 use crate::commands::error::CommandError;
 use crate::commands::{
     INPUT_READER_POLL_INTERVAL, load_setup_identity, preflight_lifecycle_command,
-    record_terminal_fault_best_effort, require_pinned_direct_payload_cap, verify_submitter_key,
+    record_terminal_fault_best_effort, require_pinned_scheduler_limits, verify_submitter_key,
     warn_on_previous_terminal_fault,
 };
 use crate::l1::L1Config;
@@ -43,7 +43,7 @@ where
     // settlement; runtime-owned tasks separately retain clones until they stop.
     let process_lock = process_lock::ProcessLock::acquire(&config.data_dir)?;
     let db_path = config.db_path();
-    let timing = config.protocol_timing()?;
+    let timing = config.protocol_timing(A::scheduler_limits().max_wait_blocks)?;
 
     // Local absorbing facts are inspected before identity/key checks and any
     // RPC: canonical divergence and the two-sided setup-completion rule.
@@ -51,8 +51,9 @@ where
     warn_on_previous_terminal_fault(&db_path);
     preflight_lifecycle_command(&config.data_dir, LifecycleCommand::Run)?;
     let identity = load_setup_identity(&config.data_dir)?;
-    // Storage classifies directs by the pinned cap; the binary must agree.
-    require_pinned_direct_payload_cap(&identity, A::scheduler_limits().max_direct_payload_bytes)?;
+    // Storage classifies directs by the pinned cap, and acceptance is judged
+    // by the pinned window; the binary must agree with both.
+    require_pinned_scheduler_limits(&identity, A::scheduler_limits())?;
 
     // `run` holds the signing key (it submits). The key's address must match
     // the pinned submitter address — running with the wrong key against a DB

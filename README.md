@@ -38,7 +38,7 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 - **Go offline** — stop providing soft confirmations.
 - **Diverge** — if batches fail to land on L1 in time, soft confirmations that were issued become invalid.
 
-**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it. A direct whose payload is over the application's cap
+**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to the application's `max_wait_blocks`, ~4h for the wallet), but cannot prevent it. A direct whose payload is over the application's cap
 never executes, on L1 or in the sequencer.
 
 During normal operation the sequencer advances logical frame time after five
@@ -107,7 +107,7 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 The sequencer runs in two phases. **`setup`** creates a data directory: it
 pins the deployment identity (including the reviewed fee-oracle source and
-the application's direct-payload cap),
+the application's staleness window and direct-payload cap),
 flushes the submitter's wallet to pin a stop block, syncs L1 through it,
 rebuilds the history from a base through it, and publishes the era's baseline.
 The base is genesis, or a stored canonical machine with `--base <MACHINE_DIR>`
@@ -117,7 +117,7 @@ exit 30, and never touches it. `--dry-run` prints what setup would rebuild,
 takes no key, and never touches the data directory. **`run`** boots the
 sequencer from the set-up DB, reading identity from it (so chain id / app
 address are not `run` arguments); it refuses, with exit 30, a binary whose
-direct-payload cap differs from the pinned one. Both take the signing key:
+staleness window or direct-payload cap differs from the pinned one. Both take the signing key:
 setup's flush and `run`'s submitter sign for the batch-submitter address.
 
 ```bash

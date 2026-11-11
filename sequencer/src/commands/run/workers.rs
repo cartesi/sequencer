@@ -825,7 +825,8 @@ mod tests {
         };
         let run_config = *run_config;
         let db_path = run_config.db_path();
-        let timing = run_config.protocol_timing().expect("valid timing");
+        let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
+        let timing = run_config.protocol_timing(window).expect("valid timing");
         let submitter_address =
             crate::commands::batch_submitter_address_from_private_key(KEY).expect("key address");
         let dumps_dir = dir.path().join("dumps");
@@ -861,6 +862,7 @@ mod tests {
             app_deployment_block: 0,
             batch_submitter_address: submitter_address,
             max_direct_payload_bytes: crate::storage::test_helpers::TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            max_wait_blocks: window,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         };
         let input_reader = InputReader::from_parts(

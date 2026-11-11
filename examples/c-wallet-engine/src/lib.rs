@@ -42,6 +42,7 @@ pub unsafe extern "C" fn application_engine_scheduler_limits(
     let limits = WalletApp::scheduler_limits();
     unsafe {
         *out_limits = sys::ApplicationEngineSchedulerLimits {
+            max_wait_blocks: limits.max_wait_blocks,
             fridge_bound: limits.fridge_bound,
             max_direct_payload_bytes: limits.max_direct_payload_bytes,
         }

@@ -114,7 +114,8 @@ empty but for the lock file, so retrying in the same directory is safe.
    genesis, it builds the binary's genesis application, which must start at
    count zero.
 2. **Flushes and pins the stop block.** From here setup writes: it pins the
-   deployment identity (the application's direct-payload cap with it) and the
+   deployment identity (the application's staleness window and direct-payload
+   cap with it) and the
    first fee quote, then replaces whatever the provider's pool holds for the
    submitter account and waits until that is safe
    ([the flush and the stop block](#the-flush-and-the-stop-block)). The stop

@@ -514,7 +514,8 @@ by writer and are write-once (`trg_batch_lifecycle`, `0001_schema.sql`).
   no row; one SQL predicate (`DIRECT_EXECUTES_SQL`, `storage/queries.rs`)
   selects the directs to execute in every query, and it reads both its
   operands, the submitter and the cap, from the pinned `deployment_identity`
-  row. Setup pins the cap; `run` refuses a binary whose cap differs. A
+  row. Setup pins the cap, and the staleness window with it; `run` refuses a
+  binary whose cap or window differs. A
   direct's source reference, owning batch/frame, and payload tables
   reconstruct replay.
   There are no entries for batch envelopes, and none below the rebuilt

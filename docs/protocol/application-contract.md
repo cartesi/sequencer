@@ -146,11 +146,14 @@ its answer never changes what an included op does
 |---|---|
 | `admit_user_op(sender, op, fee) -> Result<Admission, AppError>` | Say, without changing state and without checking the nonce, whether the operator wants the op at this fee exponent. |
 | `max_method_payload_bytes() -> usize` | Return the engine's stable method payload bound without constructing an instance. |
-| `scheduler_limits() -> SchedulerLimits` | Return the fridge bound and direct payload cap the application's template compiles in. |
+| `scheduler_limits() -> SchedulerLimits` | Return the staleness window, the fridge bound and the direct payload cap the application's template compiles in, without constructing an instance. |
 
-Setup pins the direct payload cap with the deployment identity, and storage
-selects the directs to execute by the pinned value; `run` refuses a binary
-whose cap differs from it.
+Setup pins the window and the direct payload cap with the deployment identity.
+Storage selects the directs to execute by the pinned cap, and `run` refuses a
+binary whose window or cap differs from the pinned one. The pin ties a binary
+to its data directory, not to the deployed template: a machine's scheduler
+export carries no constants, so building the sequencer and the template from
+the same application is the operator's to keep.
 
 The lane checks a live op with
 [`check_live_user_op`](../../sequencer-core/src/application/mod.rs), in the

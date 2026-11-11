@@ -58,7 +58,9 @@ where
     A: Application + 'static,
     F: FnOnce() -> Result<A, AppError>,
 {
-    config.timing.protocol_timing()?;
+    config
+        .timing
+        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
     if config.dry_run {
         return dry_run(&config, genesis_app, read_export).await;
     }
@@ -100,7 +102,9 @@ where
     F: FnOnce() -> Result<A, AppError>,
 {
     let db_path = config.db_path();
-    let timing = config.timing.protocol_timing()?;
+    let timing = config
+        .timing
+        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
 
     // ── Before anything is written: every L1 check that can fail retryably.
     let mut input_reader = discover(config, &db_path, timing, process_lock.clone()).await?;
@@ -112,6 +116,7 @@ where
         app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
         max_direct_payload_bytes: A::scheduler_limits().max_direct_payload_bytes,
+        max_wait_blocks: A::scheduler_limits().max_wait_blocks,
         fee_oracle: fee_oracle.identity(),
     };
     // The flush settles the pinned account, so the key must sign for it.
@@ -332,7 +337,9 @@ where
     A: Application + 'static,
     F: FnOnce() -> Result<A, AppError>,
 {
-    let timing = config.timing.protocol_timing()?;
+    let timing = config
+        .timing
+        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
     let scratch = ScratchDir::create(&std::env::temp_dir())?;
     let scratch_dir = scratch.path().to_string_lossy().into_owned();
     let process_lock = ProcessLock::acquire(&scratch_dir)?;
@@ -347,6 +354,7 @@ where
         app_deployment_block: input_reader.app_deployment_block(),
         batch_submitter_address: config.batch_submitter_address,
         max_direct_payload_bytes: A::scheduler_limits().max_direct_payload_bytes,
+        max_wait_blocks: A::scheduler_limits().max_wait_blocks,
         fee_oracle: fee_oracle_identity(&fee_oracle),
     };
     let submitter = identity.batch_submitter_address;

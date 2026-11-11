@@ -79,7 +79,8 @@ APPLICATION_ENGINE_HEADER=/absolute/path/application-engine.h \
 The linked engine reports its ABI version through
 `application_engine_abi_version()`, its stable payload bound through
 `application_engine_max_method_payload_bytes()`, where zero permits only empty
-method payloads, and its scheduler constants through
+method payloads, and its scheduler constants (the staleness window, the fridge
+bound and the direct payload cap) through
 `application_engine_scheduler_limits()`. Bindgen generates the Rust records
 from the header, so a build needs libclang. The engine also supplies its own genesis tool; configuration does not
 cross this ABI. With no external archive configured, the generic binary reports

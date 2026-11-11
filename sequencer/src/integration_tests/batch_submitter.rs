@@ -113,8 +113,8 @@ impl BatchPoster for TestMock {
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.
 fn seed_observed_safe_head(storage: &mut Storage) {
-    let timing =
-        ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12).expect("test timing");
+    let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
+    let timing = ProtocolTiming::try_new(window, 75, 900, 12).expect("test timing");
     storage
         .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO, &timing)
         .expect("seed observed safe head");

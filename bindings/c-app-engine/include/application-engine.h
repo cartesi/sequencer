@@ -111,8 +111,9 @@
 
 /// @brief The version of this header, which the engine reports back to the host.
 /// @details Raised whenever a record's layout or a function's meaning changes. Version 2
-/// replaced validation with admission and made user-op execution total.
-#define APPLICATION_ENGINE_ABI_VERSION 2
+/// replaced validation with admission and made user-op execution total. Version 3 added the
+/// staleness window to the scheduler limits.
+#define APPLICATION_ENGINE_ABI_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,10 +132,13 @@ APPLICATION_ENGINE_API uint32_t application_engine_abi_version(void) APPLICATION
 APPLICATION_ENGINE_API uint64_t application_engine_max_method_payload_bytes(void) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief The scheduler constants a template compiles in for this application.
-/// @details They belong to the application because they bound what its directs may cost the
-/// canonical machine. Both are consensus values: a template's scheduler and every host must read
-/// the same ones.
+/// @details They belong to the application: the window is how long it lets a sequencer hold a
+/// direct back, and the other two bound what its directs may cost the canonical machine. All
+/// three are consensus values: a template's scheduler and every host must read the same ones.
 typedef struct ApplicationEngineSchedulerLimits {
+    /// The staleness window in L1 blocks, at least 1: a direct queued this long is executed, and
+    /// a batch whose first frame is this old is skipped.
+    uint64_t max_wait_blocks;
     uint64_t fridge_bound;             ///< How many admitted directs the fridge may hold.
     uint64_t max_direct_payload_bytes; ///< A direct with a longer payload never executes.
 } ApplicationEngineSchedulerLimits;

@@ -1292,9 +1292,9 @@ impl ManagedSequencer {
     /// The restart-loop convergence story: an aged Tip in the danger zone
     /// (not yet past-stale) auto-closes on respawn, and the resulting closed
     /// batch is in the danger zone, so the detector exits with `DangerDetected`.
-    /// Startup recovery's cascade fires at `MAX_WAIT_BLOCKS`, not at the
+    /// Startup recovery's cascade fires at the staleness window, not at the
     /// danger threshold — so the loop only converges once enough *additional*
-    /// L1 blocks have aged the batch past `MAX_WAIT_BLOCKS`. In production
+    /// L1 blocks have aged the batch past the window. In production
     /// the orchestrator restart itself takes seconds, during which real L1
     /// blocks are produced; `advance_per_retry` simulates that drift. Tests
     /// that expect a short hiccup to self-heal (no danger involved) should

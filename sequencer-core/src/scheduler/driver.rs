@@ -237,6 +237,7 @@ mod tests {
 
         fn scheduler_limits() -> SchedulerLimits {
             SchedulerLimits {
+                max_wait_blocks: 5,
                 fridge_bound: 7,
                 max_direct_payload_bytes: 9,
             }
@@ -303,12 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn for_application_takes_the_protocol_window_and_the_template_limits() {
+    fn for_application_takes_every_constant_from_the_application() {
         assert_eq!(
             SchedulerConfig::for_application::<RecordingApp>(SEQUENCER),
             SchedulerConfig {
                 sequencer_address: SEQUENCER,
-                max_wait_blocks: crate::MAX_WAIT_BLOCKS,
+                max_wait_blocks: 5,
                 fridge_bound: 7,
                 max_direct_payload_bytes: 9,
             }

@@ -31,9 +31,13 @@ pub enum AppOutput {
 pub type AppOutputs = Vec<AppOutput>;
 
 /// The scheduler constants a template compiles in for its application. They
-/// belong to the application because they bound what its directs may cost.
+/// belong to the application: the window is how long it lets a sequencer hold
+/// a direct back, and the other two bound what its directs may cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerLimits {
+    /// The staleness window, at least 1: a direct queued this many L1 blocks
+    /// is executed, and a batch whose first frame is this old is skipped.
+    pub max_wait_blocks: u64,
     /// How many admitted directs the fridge may hold.
     pub fridge_bound: u64,
     /// A direct with a longer payload never joins the fridge.
@@ -410,6 +414,7 @@ mod tests {
 
         fn scheduler_limits() -> SchedulerLimits {
             SchedulerLimits {
+                max_wait_blocks: 1,
                 fridge_bound: 0,
                 max_direct_payload_bytes: 0,
             }

@@ -295,7 +295,7 @@ mod tests {
         let protocol = default_protocol_timing();
         let landed = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
         // Observed check: batch 1's first_frame_safe_block = 100, current
-        // safe = 1200. age = 1100 < danger_threshold (MAX_WAIT_BLOCKS 1200 -
+        // safe = 1200. age = 1100 < danger_threshold (the window, 1200, less
         // margin 75 = 1125), so observed
         // closed-batch danger would NOT fire.
         //

@@ -24,7 +24,8 @@ application supplies through `Application::scheduler_limits`; the wallet's
 values, 16384 entries and 1024 bytes
 ([`wallet.rs`](../../examples/app-core/src/application/wallet.rs)), are
 provisional, and changing the cap means a new setup: `run` refuses a data
-directory whose pinned cap differs. The
+directory whose pinned cap differs. The staleness window comes from the same
+method and is pinned the same way. The
 [scheduler contract](../protocol/scheduler-semantics.md) owns the rules: an
 overflow drains whole blocks of the oldest entries, which live prediction
 cannot mirror, so an overflow is a deliberate divergence that the watchdog's

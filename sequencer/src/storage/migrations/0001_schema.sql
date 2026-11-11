@@ -536,6 +536,9 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
     -- The longest direct payload the application executes; with the batch
     -- submitter address it decides which safe inputs execute as directs.
     max_direct_payload_bytes  INTEGER NOT NULL CHECK (max_direct_payload_bytes >= 0),
+    -- The application's staleness window in L1 blocks: a batch whose first
+    -- frame is this old when it lands is skipped, so acceptance is judged by it.
+    max_wait_blocks           INTEGER NOT NULL CHECK (max_wait_blocks >= 1),
     -- Immutable setup-pinned fee source. Fixed has only fixed_log_gas_price;
     -- Uniswap has the complete reviewed token/pool tuple.
     fee_oracle_mode           TEXT    NOT NULL CHECK (fee_oracle_mode IN ('fixed', 'uniswap')),

@@ -267,18 +267,20 @@ pub(crate) fn verify_submitter_key(
     Ok(key)
 }
 
-/// `run`'s check that the binary's direct-payload cap is the one `setup`
-/// pinned: storage classifies directs by the pinned cap, and the lane's
-/// application executes under the binary's. A different cap is an identity
-/// mismatch, so a new cap needs a new `setup`.
-pub(crate) fn require_pinned_direct_payload_cap(
+/// `run`'s check that the binary's scheduler limits are the ones `setup`
+/// pinned. Storage classifies directs by the pinned cap while the lane's
+/// application executes under the binary's, and acceptance is judged by the
+/// staleness window. A different value is an identity mismatch, so a new
+/// limit needs a new `setup`.
+pub(crate) fn require_pinned_scheduler_limits(
     identity: &DeploymentIdentity,
-    binary_cap: u64,
+    binary: sequencer_core::application::SchedulerLimits,
 ) -> Result<(), CommandError> {
     require_deployment_identity_match(
         *identity,
         DeploymentIdentity {
-            max_direct_payload_bytes: binary_cap,
+            max_direct_payload_bytes: binary.max_direct_payload_bytes,
+            max_wait_blocks: binary.max_wait_blocks,
             ..*identity
         },
     )
@@ -307,6 +309,9 @@ fn deployment_identity_mismatch_fields(
     if stored.max_direct_payload_bytes != expected.max_direct_payload_bytes {
         fields.push("max_direct_payload_bytes");
     }
+    if stored.max_wait_blocks != expected.max_wait_blocks {
+        fields.push("max_wait_blocks");
+    }
     if stored.fee_oracle != expected.fee_oracle {
         fields.push("fee_oracle");
     }
@@ -318,7 +323,7 @@ mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
         deployment_identity_mismatch_fields, preflight_lifecycle_command, require_data_dir,
-        require_deployment_identity_match, require_pinned_direct_payload_cap,
+        require_deployment_identity_match, require_pinned_scheduler_limits,
     };
     use crate::recovery::{RecoveryError, RecoveryRetryReason};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
@@ -395,8 +400,8 @@ mod tests {
     #[test]
     fn invalid_protocol_config_propagates_through_run_error() {
         let err: CommandError = ProtocolTimingError::MarginNotLessThanMaxWait {
-            margin: sequencer_core::MAX_WAIT_BLOCKS,
-            max_wait: sequencer_core::MAX_WAIT_BLOCKS,
+            margin: 1200,
+            max_wait: 1200,
         }
         .into();
         assert!(matches!(
@@ -422,22 +427,47 @@ mod tests {
             app_deployment_block: 42,
             batch_submitter_address: Address::repeat_byte(0x33),
             max_direct_payload_bytes: 1024,
+            max_wait_blocks: 1200,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
 
     #[test]
-    fn run_refuses_a_cap_other_than_the_pinned_one() {
+    fn run_refuses_scheduler_limits_other_than_the_pinned_ones() {
+        use sequencer_core::application::SchedulerLimits;
         let pinned = identity();
-        require_pinned_direct_payload_cap(&pinned, 1024).expect("the pinned cap matches");
-        let err = require_pinned_direct_payload_cap(&pinned, 2048)
-            .expect_err("a different cap refuses startup");
-        assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
-        assert!(matches!(
-            err,
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
-                if fields == "max_direct_payload_bytes"
-        ));
+        // The fridge bound is not pinned: only setup's rebuild reads it.
+        let binary = SchedulerLimits {
+            max_wait_blocks: 1200,
+            fridge_bound: 7,
+            max_direct_payload_bytes: 1024,
+        };
+        require_pinned_scheduler_limits(&pinned, binary).expect("the pinned limits match");
+        for (changed, field) in [
+            (
+                SchedulerLimits {
+                    max_direct_payload_bytes: 2048,
+                    ..binary
+                },
+                "max_direct_payload_bytes",
+            ),
+            (
+                SchedulerLimits {
+                    max_wait_blocks: 7200,
+                    ..binary
+                },
+                "max_wait_blocks",
+            ),
+        ] {
+            let err = require_pinned_scheduler_limits(&pinned, changed)
+                .expect_err("a different limit refuses startup");
+            assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
+            assert!(matches!(
+                err,
+                CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
+                    if fields == field
+            ));
+        }
     }
 
     #[test]

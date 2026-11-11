@@ -107,11 +107,13 @@ Canonical staleness and local danger use different reference blocks and threshol
 
 ```text
 scheduler rejects a batch with at least one frame when:
-    inclusion_block - first_frame.safe_block >= MAX_WAIT_BLOCKS
+    inclusion_block - first_frame.safe_block >= max_wait_blocks
 
 sequencer observes danger when:
     current_safe_block - first_frame.safe_block >= danger_threshold
-    danger_threshold = MAX_WAIT_BLOCKS - preemptive_margin_blocks
+    danger_threshold = max_wait_blocks - preemptive_margin_blocks
+
+max_wait_blocks is the application's staleness window (scheduler_limits).
 ```
 
 An old batch can already have landed while fresh. Its inclusion block decides
@@ -129,8 +131,8 @@ accepted while the flush is running.
 
 The margin provides headroom before canonical expiry; it is not a grace period
 after detection. Startup can repair immediately. Defaults and validation live
-in [`TimingArgs`](../../sequencer/src/commands/config.rs): with `MAX_WAIT_BLOCKS`
-1200 and margin 300, observed danger starts at age 900 blocks. Neither that
+in [`TimingArgs`](../../sequencer/src/commands/config.rs): with the wallet's
+`max_wait_blocks` of 1200 and margin 300, observed danger starts at age 900 blocks. Neither that
 margin nor the fee policy bounds the time required to finish recovery.
 
 A Tip ages from its first frame, so `run` also refuses a
@@ -224,7 +226,7 @@ Tip and opens a fresh one. It does not invalidate closed batches or fall back to
 repairing a changed decision.
 
 The threshold is a policy choice: retaining an aging Tip would make the
-runtime detector stop service again. Waiting for `MAX_WAIT_BLOCKS` would keep
+runtime detector stop service again. Waiting for `max_wait_blocks` would keep
 the same suspected prediction alive without solving that cycle.
 
 `EnsureOpenTip` is a separate action. Its transaction requires `Safe`, no Tip,
@@ -329,7 +331,7 @@ Several details must not be read as literal production behavior:
 | A Gold genesis sentinel at nonce zero | Production opens the first batch at its stored anchor, without a submitted sentinel. Anchor cases are tested in Rust. |
 | `SubmitBatch` assigns the pending suffix with `max(walletNonce, nextL1Slot)` | The poster derives the suffix and Latest account nonce, and raises the durable watermark before sending. The model expression is not a Rust nonce-allocation recipe. |
 | Tip advancement and submission can interleave with recovery; dead batches can race after model invalidation | Production stops workers and settles covered slots before the closed cascade. These additional modeled interleavings do not establish coverage of different production actions. |
-| `Resolve` handles a stale Silver frontier or a Tip at `MAX_WAIT_BLOCKS` | Production also invalidates a killed/unsubmitted closed suffix after flush and repairs a Tip at the earlier danger threshold. Those actions need the arguments above and Rust tests. |
+| `Resolve` handles a stale Silver frontier or a Tip at `max_wait_blocks` | Production also invalidates a killed/unsubmitted closed suffix after flush and repairs a Tip at the earlier danger threshold. Those actions need the arguments above and Rust tests. |
 
 The model's `Gold`, `Silver`, `Bronze`, `Pending`, and `Tip` colors describe
 stages of inclusion and acceptance. `Gold* Silver* Bronze* Pending* Tip` is

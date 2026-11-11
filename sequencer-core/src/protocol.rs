@@ -25,7 +25,7 @@ pub enum ProtocolTimingError {
     /// `preemptive_margin_blocks >= max_wait_blocks` — the danger threshold
     /// would be 0, making preemptive recovery indistinguishable from hard
     /// staleness. The margin is supposed to be operator runway *before*
-    /// hitting `MAX_WAIT_BLOCKS`, so this is always an operator misconfig.
+    /// hitting the window, so this is always an operator misconfig.
     #[error(
         "preemptive_margin_blocks ({margin}) must be strictly less than \
          max_wait_blocks ({max_wait})"
@@ -86,7 +86,7 @@ pub struct WallClockRegression {
 /// afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolTiming {
-    /// `MAX_WAIT_BLOCKS` — after this many L1 blocks, the scheduler skips a
+    /// The staleness window: after this many L1 blocks, the scheduler skips a
     /// submitted batch as stale.
     max_wait_blocks: u64,
     /// How many blocks before `max_wait_blocks` the sequencer triggers
@@ -158,7 +158,7 @@ impl ProtocolTiming {
         })
     }
 
-    /// The scheduler staleness window ([`crate::MAX_WAIT_BLOCKS`] in
+    /// The scheduler staleness window (the application's `max_wait_blocks` in
     /// production).
     pub const fn max_wait_blocks(&self) -> u64 {
         self.max_wait_blocks
@@ -389,7 +389,7 @@ mod tests {
 
     const SUBMITTER: Address = Address::repeat_byte(0xAA);
     const OTHER: Address = Address::repeat_byte(0xBB);
-    const MAX_WAIT: u64 = crate::MAX_WAIT_BLOCKS;
+    const MAX_WAIT: u64 = 1200;
 
     fn timing() -> ProtocolTiming {
         ProtocolTiming::try_new(MAX_WAIT, 75, 900, 12).expect("valid test timing")

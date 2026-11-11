@@ -214,6 +214,9 @@ pub struct DeploymentIdentity {
     /// The application's `scheduler_limits().max_direct_payload_bytes`: with
     /// the batch submitter, it decides which safe inputs execute as directs.
     pub max_direct_payload_bytes: u64,
+    /// The application's `scheduler_limits().max_wait_blocks`: the staleness
+    /// window that decides whether a landed batch was accepted.
+    pub max_wait_blocks: u64,
     pub fee_oracle: FeeOracleIdentity,
 }
 

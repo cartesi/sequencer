@@ -98,7 +98,7 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
-    /// The protocol's staleness window and the application's limits.
+    /// The submitter and the application's limits.
     pub fn for_application<A: Application>(sequencer_address: Address) -> Self;
 }
 
@@ -402,6 +402,8 @@ pub enum Admission {
 }
 
 pub struct SchedulerLimits {
+    /// The staleness window, at least 1.
+    pub max_wait_blocks: u64,
     pub fridge_bound: u64,
     pub max_direct_payload_bytes: u64,
 }
@@ -429,7 +431,8 @@ pub enum PolicyRefusal {
 [Application](application.md#the-application-trait) states each method's
 obligation and what changes from today.
 
-`application-engine.h` (ABI version 2) matches it:
+`application-engine.h` matches it. Its ABI is version 3: version 2 made the
+changes below, and version 3 added the staleness window to the limits.
 
 | Version 1 | Version 2 |
 |---|---|

@@ -55,9 +55,9 @@ pub struct L1RpcArgs {
 /// fails fast at setup, not just at run).
 #[derive(Debug, Clone, Args)]
 pub struct TimingArgs {
-    /// Blocks before MAX_WAIT_BLOCKS to trigger preemptive recovery.
-    /// The danger threshold is MAX_WAIT_BLOCKS minus this margin.
-    /// Must be less than MAX_WAIT_BLOCKS (validated at startup).
+    /// Blocks before the application's staleness window to trigger
+    /// preemptive recovery. The danger threshold is the window minus this
+    /// margin. Must be less than the window (validated at startup).
     ///
     /// Default 300 gives ~1h of headroom before canonical expiry at 12s/block.
     /// Detection starts recovery immediately; this is neither an operator
@@ -85,11 +85,15 @@ pub struct TimingArgs {
 
 impl TimingArgs {
     /// Build a validated [`ProtocolTiming`]. Pure derivation — no I/O.
-    /// `max_wait_blocks` is the shared scheduler constant; the rest are the
-    /// operator-tunable CLI args.
-    pub fn protocol_timing(&self) -> Result<ProtocolTiming, ProtocolTimingError> {
+    /// `max_wait_blocks` is the application's staleness window
+    /// (`Application::scheduler_limits`); the rest are the operator-tunable
+    /// CLI args.
+    pub fn protocol_timing(
+        &self,
+        max_wait_blocks: u64,
+    ) -> Result<ProtocolTiming, ProtocolTimingError> {
         ProtocolTiming::try_new(
-            sequencer_core::MAX_WAIT_BLOCKS,
+            max_wait_blocks,
             self.preemptive_margin_blocks,
             self.l1_read_stale_after_blocks,
             self.seconds_per_block,
@@ -453,8 +457,8 @@ impl RunConfig {
     /// Build a validated [`ProtocolTiming`] and refuse a batch-open window that
     /// would carry a low-volume Tip into danger before it can be sealed,
     /// submitted and safe-accepted.
-    pub fn protocol_timing(&self) -> Result<ProtocolTiming, BootstrapError> {
-        let timing = self.timing.protocol_timing()?;
+    pub fn protocol_timing(&self, max_wait_blocks: u64) -> Result<ProtocolTiming, BootstrapError> {
+        let timing = self.timing.protocol_timing(max_wait_blocks)?;
         // Rounding up counts a partial block against the operator.
         let open_blocks = self
             .max_batch_open_seconds
@@ -870,24 +874,22 @@ mod tests {
         assert_eq!(run_config_from(&[]).timing.l1_read_stale_after_blocks, 600);
     }
 
-    const _: () = assert!(
-        sequencer_core::MAX_WAIT_BLOCKS == 1200,
-        "batch-open window fixtures below assume the 1200-block window"
-    );
+    /// The staleness window the fixtures below assume.
+    const WINDOW: u64 = 1200;
 
     #[test]
     fn run_bounds_batch_open_window_by_danger_threshold_less_submission_margin() {
-        // Defaults: danger_threshold MAX_WAIT_BLOCKS (1200) - 300 = 900; budget 800 blocks =
+        // Defaults: danger_threshold: the window (1200) - 300 = 900; budget 800 blocks =
         // 9600 s at 12 s.
         run_config_from(&[])
-            .protocol_timing()
+            .protocol_timing(WINDOW)
             .expect("default window fits");
         run_config_from(&["--max-batch-open-seconds", "9600"])
-            .protocol_timing()
+            .protocol_timing(WINDOW)
             .expect("boundary window fits");
         // 9601 s is 800.08 blocks; rounding up must refuse it.
         let err = run_config_from(&["--max-batch-open-seconds", "9601"])
-            .protocol_timing()
+            .protocol_timing(WINDOW)
             .expect_err("one second past the budget must be refused");
         assert!(
             matches!(
@@ -908,7 +910,7 @@ mod tests {
             "--seconds-per-block",
             "1",
         ])
-        .protocol_timing()
+        .protocol_timing(WINDOW)
         .expect_err("an unbounded window must be refused without overflow");
         assert!(
             matches!(err, BootstrapError::BatchOpenPastDanger { .. }),
@@ -918,7 +920,7 @@ mod tests {
 
     #[test]
     fn run_refuses_every_batch_open_window_when_danger_threshold_is_below_the_margin() {
-        // danger_threshold MAX_WAIT_BLOCKS (1200) - 1150 = 50 < 100: no window can land before
+        // danger_threshold: the window (1200) - 1150 = 50 < 100: no window can land before
         // danger.
         let err = run_config_from(&[
             "--preemptive-margin-blocks",
@@ -928,7 +930,7 @@ mod tests {
             "--max-batch-open-seconds",
             "1",
         ])
-        .protocol_timing()
+        .protocol_timing(WINDOW)
         .expect_err("no budget remains");
         assert!(
             matches!(
@@ -949,7 +951,9 @@ mod tests {
         use crate::storage::{DangerStatus, SafeInputRange, Storage};
 
         let config = run_config_from(&["--max-batch-open-seconds", "9600"]);
-        let timing = config.protocol_timing().expect("boundary window fits");
+        let timing = config
+            .protocol_timing(WINDOW)
+            .expect("boundary window fits");
         let open_blocks = config
             .max_batch_open_seconds
             .div_ceil(timing.seconds_per_block());

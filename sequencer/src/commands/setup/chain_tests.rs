@@ -502,6 +502,7 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
                 app_deployment_block: chain.app_deployment_block,
                 batch_submitter_address: chain.submitter,
                 max_direct_payload_bytes: WalletApp::scheduler_limits().max_direct_payload_bytes,
+                max_wait_blocks: WalletApp::scheduler_limits().max_wait_blocks,
                 fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
             })
             .unwrap();
@@ -752,6 +753,7 @@ async fn the_escape_check_refuses_activity_past_the_stop_block() {
             app_deployment_block: chain.app_deployment_block,
             batch_submitter_address: chain.submitter,
             max_direct_payload_bytes: WalletApp::scheduler_limits().max_direct_payload_bytes,
+            max_wait_blocks: WalletApp::scheduler_limits().max_wait_blocks,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .unwrap();

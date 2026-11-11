@@ -313,9 +313,9 @@ impl Storage {
                 "INSERT INTO deployment_identity \
                     (singleton_id, chain_id, app_address, input_box_address, \
                      app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
-                     fee_oracle_mode, fixed_log_gas_price, fee_oracle_weth, \
+                     max_wait_blocks, fee_oracle_mode, fixed_log_gas_price, fee_oracle_weth, \
                      fee_oracle_fee_token, fee_oracle_pool, fee_oracle_twap_window_secs) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     external_u64_to_i64(identity.chain_id, "deployment chain ID")?,
                     identity.app_address.as_slice(),
@@ -329,6 +329,7 @@ impl Storage {
                         identity.max_direct_payload_bytes,
                         "maximum direct payload bytes"
                     )?,
+                    external_u64_to_i64(identity.max_wait_blocks, "staleness window")?,
                     mode,
                     fixed,
                     weth,
@@ -359,7 +360,8 @@ pub(super) fn query_deployment_identity(
         "SELECT chain_id, app_address, input_box_address, \
                 app_deployment_block, batch_submitter_address, fee_oracle_mode, \
                 fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
-                fee_oracle_pool, fee_oracle_twap_window_secs, max_direct_payload_bytes \
+                fee_oracle_pool, fee_oracle_twap_window_secs, max_direct_payload_bytes, \
+                max_wait_blocks \
          FROM deployment_identity WHERE singleton_id = 0",
         [],
         |row| {
@@ -383,6 +385,7 @@ pub(super) fn query_deployment_identity(
                 app_deployment_block: i64_to_u64(row.get::<_, i64>(3)?),
                 batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
                 max_direct_payload_bytes: i64_to_u64(row.get::<_, i64>(11)?),
+                max_wait_blocks: i64_to_u64(row.get::<_, i64>(12)?),
                 fee_oracle,
             })
         },
@@ -444,6 +447,7 @@ mod tests {
             app_deployment_block: 42,
             batch_submitter_address: SENDER_A,
             max_direct_payload_bytes: 4096,
+            max_wait_blocks: 1200,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }

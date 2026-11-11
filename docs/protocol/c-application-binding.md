@@ -55,7 +55,9 @@ and [admission](application-contract.md#3-admission--policy-never-consensus):
   keep their numbers, and the adapter treats them, or an unknown one, as fatal.
 - `application_engine_scheduler_limits` and
   `application_engine_max_method_payload_bytes` take no instance and return
-  stable values for the linked engine. Zero is a valid payload bound.
+  stable values for the linked engine. The limits are the staleness window,
+  which is at least one block, the fridge bound and the direct payload cap.
+  Zero is a valid payload bound.
 - `application_engine_from_canonical_state` opens an engine over a canonical
   machine's comparison bytes at that machine's count
   ([canonical recovery](application-contract.md#7-canonical-recovery-integration)).
