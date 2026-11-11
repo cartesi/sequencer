@@ -617,7 +617,7 @@ paths:
                 status: ok
                 inclusion_lane: ok
                 landing_lag_blocks: 40
-                max_wait_blocks: 1200
+                max_wait_blocks: 7200
                 safe_head_age_seconds: 780
         "503":
           description: Degraded.
@@ -629,7 +629,7 @@ paths:
                 status: degraded
                 inclusion_lane: stopped
                 landing_lag_blocks: 40
-                max_wait_blocks: 1200
+                max_wait_blocks: 7200
                 safe_head_age_seconds: 780
 
 components:

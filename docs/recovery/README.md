@@ -156,8 +156,9 @@ which answers `null` for them until the worker's first reading, and in a
 
 From the moment batches stop landing, the operators have the window, less the
 age of the oldest unaccepted batch at that moment, less the safe head's lag of
-about 64 blocks. A stopped sequencer spends the same budget: its open batch
-ages while it is down.
+about 64 blocks. With the wallet's 24-hour window and the default two-hour
+batch, that is between about 21.5 and 23.5 hours. A stopped sequencer spends
+the same budget: its open batch ages while it is down.
 
 A running sequencer with no traffic stays inside it. The lane seals the open
 batch after `max_batch_open_seconds`, whatever it holds, and the poster posts

@@ -906,16 +906,21 @@ mod tests {
 
     /// At the boundary window a low-volume batch, sealed by time, still has
     /// the submission margin less the frame lag to land before its history
-    /// turns void.
+    /// turns void. The database pins the wallet's window, so the boundary is
+    /// derived from it.
     #[test]
     fn boundary_batch_open_window_seals_a_low_volume_batch_inside_the_window() {
         use crate::storage::test_helpers::{SENDER_A, temp_db_with_default_deployment_identity};
         use crate::storage::{SafeInputRange, Storage};
         use sequencer_core::protocol::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS;
 
-        let config = run_config_from(&["--max-batch-open-seconds", "13200"]);
+        let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
+        let boundary_seconds = ((window - BATCH_SUBMISSION_MARGIN_BLOCKS)
+            * run_config_from(&[]).timing.seconds_per_block)
+            .to_string();
+        let config = run_config_from(&["--max-batch-open-seconds", &boundary_seconds]);
         config
-            .check_batch_open_window(WINDOW)
+            .check_batch_open_window(window)
             .expect("boundary window fits");
         let open_blocks = config
             .max_batch_open_seconds
@@ -946,9 +951,12 @@ mod tests {
 
         // The sealed batch keeps the margin, less the frame lag, to be accepted:
         // the last safe head at which a later block can still accept it is
-        // `first_frame + WINDOW - 2`.
-        let last_live = first_frame + WINDOW - 2;
-        assert_eq!(last_live - seal_safe_block, 100 - frame_lag - 2);
+        // `first_frame + window - 2`.
+        let last_live = first_frame + window - 2;
+        assert_eq!(
+            last_live - seal_safe_block,
+            BATCH_SUBMISSION_MARGIN_BLOCKS - frame_lag - 2
+        );
         assert!(!void_at(&mut storage, last_live));
         assert!(void_at(&mut storage, last_live + 1));
     }

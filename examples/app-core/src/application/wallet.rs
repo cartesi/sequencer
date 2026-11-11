@@ -23,11 +23,11 @@ use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
 /// The wallet template's scheduler constants. Provisional: the window is
-/// about 4 h of L1 blocks; a deposit's payload is 72 bytes plus its exec-layer
+/// about 24 h of L1 blocks; a deposit's payload is 72 bytes plus its exec-layer
 /// data, so 1 KiB leaves that data room, and a full fridge then holds at most
 /// 16 MiB of payloads.
 pub const WALLET_SCHEDULER_LIMITS: SchedulerLimits = SchedulerLimits {
-    max_wait_blocks: 1200,
+    max_wait_blocks: 7200,
     fridge_bound: 16_384,
     max_direct_payload_bytes: 1024,
 };

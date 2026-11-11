@@ -536,43 +536,49 @@ mod tests {
         let db = temp_db("safe-accepted-frontier-skip-stale");
         let mut storage = set_up_storage(&db.path, SENDER_A);
 
-        // Local batch 0 (first frame safe_block=1900) and batch 1 (first frame
-        // safe_block=1900). Their landings carry the real wire bytes so the
-        // content-identity check accepts them.
+        // Local batch 0 and batch 1, both with first frame at `first_frame`.
+        // Their landings carry the real wire bytes so the content-identity
+        // check accepts them. Every block derives from the window, so the
+        // stale copy is stale and the real landings fresh whatever it is.
+        let first_frame = WINDOW + 700;
+        let landing = first_frame + 100;
+        let stale_safe_block = 100;
+        assert!(landing - stale_safe_block >= WINDOW);
         let mut head = storage
-            .initialize_open_state(1900, SafeInputRange::empty_at(0))
+            .initialize_open_state(first_frame, SafeInputRange::empty_at(0))
             .expect("initialize");
         storage.close_frame_and_batch(&mut head).expect("close 0");
         storage.close_frame_and_batch(&mut head).expect("close 1");
 
-        // Non-stale landing of batch 0 (block 1950 - safe_block 1900 < 1200).
+        // Fresh landing of batch 0, 50 blocks after its first frame.
         let non_stale_payload = local_batch_payload(&mut storage, 0);
-        // Stale copy at nonce 1 (safe_block=100, block 2000 → age >= 1200):
-        // a scheduler no-op, so its content is never compared — synthetic
-        // bytes are deliberate here.
-        let stale_payload = super::super::test_helpers::make_stale_batch_payload(1, 100);
-        // Non-stale landing of batch 1 (block 2000 - safe_block 1900 < 1200).
+        // Stale copy at nonce 1 (its first frame a window or more before its
+        // landing): a scheduler no-op, so its content is never compared —
+        // synthetic bytes are deliberate here.
+        let stale_payload =
+            super::super::test_helpers::make_stale_batch_payload(1, stale_safe_block);
+        // Fresh landing of batch 1, 100 blocks after its first frame.
         let non_stale_payload_2 = local_batch_payload(&mut storage, 1);
 
         let inputs = vec![
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: non_stale_payload,
-                block_number: 1950,
+                block_number: first_frame + 50,
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: stale_payload,
-                block_number: 2000,
+                block_number: landing,
             },
             StoredSafeInput {
                 sender: SENDER_A,
                 payload: non_stale_payload_2,
-                block_number: 2000,
+                block_number: landing,
             },
         ];
         storage
-            .append_safe_inputs(2000, inputs.as_slice(), SENDER_A)
+            .append_safe_inputs(landing, inputs.as_slice(), SENDER_A)
             .expect("append");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");

@@ -420,7 +420,7 @@
     "about": "Scenarios replayed from genesis on the devnet template, whose scheduler configuration is config. Each step is the next InputBox input: its sender (a name in senders), block, timestamp and payload (a name in payloads). Then what the scheduler made of it: outcome, and for a rejected batch reject, whose reason is a diagnostic. Then txs, the transactions it handed out in order: a direct by its input index, a user op whole, each with the batch nonce it was handed out under, and for a user op whether the executor ran it or skipped it for its nonce. Then outputs, by name in outputs, and scheduler, the machine's scheduler report after the input. A scenario ends with the machine's state report, or its keccak256 when it is long.",
     "chain_id": 31337,
     "app_contract": "0x0000000000000000000000000000000000000000",
-    "config": {"sequencer_address": "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720", "max_wait_blocks": 1200, "fridge_bound": 16384, "max_direct_payload_bytes": 1024},
+    "config": {"sequencer_address": "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720", "max_wait_blocks": 7200, "fridge_bound": 16384, "max_direct_payload_bytes": 1024},
     "senders": {
       "portal": "0x3332DE61a8BB9aC84893b2f552Fe81C9a6dC5419",
       "sequencer": "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720",
@@ -438,7 +438,7 @@
       "deposit_carol": "0x95d0c8a7d11342299807a2fc19ac44c2321ccc683325a78425f17a7e487eb5666b2bfd93abb06c7000000000000000000000000000000000000000000000000000000000000001f4",
       "deposit_carol_late": "0x95d0c8a7d11342299807a2fc19ac44c2321ccc683325a78425f17a7e487eb5666b2bfd93abb06c700000000000000000000000000000000000000000000000000000000000000007",
       "deposit_dave": "0x95d0c8a7d11342299807a2fc19ac44c2321ccc68c48b812bb43401392c037381aca934f4069c0517000000000000000000000000000000000000000000000000000000000000012c",
-      "drain_1212_batch": "0x00000000000000000c000000040000000e000000bc040000000000000000",
+      "drain_7212_batch": "0x00000000000000000c000000040000000e0000002c1c0000000000000000",
       "drain_at_11_batch": "0x00000000000000000c000000040000000e0000000b000000000000000000",
       "drain_at_11_batch_1": "0x01000000000000000c000000040000000e0000000b000000000000000000",
       "drain_at_14_batch": "0x00000000000000000c000000040000000e0000000e000000000000000000",
@@ -1705,8 +1705,8 @@
           },
           {
             "from": "sequencer",
-            "block": 1210,
-            "timestamp": 1700014520,
+            "block": 7210,
+            "timestamp": 1700086520,
             "payload": "stale_transfer_batch",
             "outcome": "batch_stale",
             "txs": [{"direct": 0, "batch_nonce": 0}],
@@ -1715,8 +1715,8 @@
           },
           {
             "from": "sequencer",
-            "block": 1211,
-            "timestamp": 1700014532,
+            "block": 7211,
+            "timestamp": 1700086532,
             "payload": "oldest_fresh_transfer_batch",
             "outcome": "batch_accepted",
             "txs": [
@@ -1855,8 +1855,8 @@
           },
           {
             "from": "sequencer",
-            "block": 1211,
-            "timestamp": 1700014532,
+            "block": 7211,
+            "timestamp": 1700086532,
             "payload": "undecodable_batch",
             "outcome": "batch_rejected",
             "reject": {"reason": "decode_failed"},
@@ -1866,8 +1866,8 @@
           },
           {
             "from": "stranger",
-            "block": 1212,
-            "timestamp": 1700014544,
+            "block": 7212,
+            "timestamp": 1700086544,
             "payload": "stranger_direct",
             "outcome": "direct_queued",
             "txs": [{"direct": 2, "batch_nonce": 0}],
@@ -1876,13 +1876,13 @@
           },
           {
             "from": "sequencer",
-            "block": 1213,
-            "timestamp": 1700014556,
-            "payload": "drain_1212_batch",
+            "block": 7213,
+            "timestamp": 1700086556,
+            "payload": "drain_7212_batch",
             "outcome": "batch_accepted",
             "txs": [{"direct": 4, "batch_nonce": 0}],
             "outputs": [],
-            "scheduler": {"l1_input_count": 6, "l2_tx_count": 4, "next_batch_nonce": 1, "clock": 1212, "first_queued_input": 6, "fridge_len": 0}
+            "scheduler": {"l1_input_count": 6, "l2_tx_count": 4, "next_batch_nonce": 1, "clock": 7212, "first_queued_input": 6, "fridge_len": 0}
           }
         ],
         "state": "0x3332de61a8bb9ac84893b2f552fe81c9a6dc541995d0c8a7d11342299807a2fc19ac44c2321ccc68a0ee7a142d267c1f36714e4a8f75612f20a797204c000000b400000004000000000000001a642f0e3c3af545e7acbd38b07251b3990914f100000000000000000000000000000000000000000000000000000000000003e83325a78425f17a7e487eb5666b2bfd93abb06c7000000000000000000000000000000000000000000000000000000000000001f4"
@@ -2206,8 +2206,8 @@
           },
           {
             "from": "sequencer",
-            "block": 5000,
-            "timestamp": 1700060000,
+            "block": 11000,
+            "timestamp": 1700132000,
             "payload": "empty_batch_0",
             "outcome": "batch_accepted",
             "txs": [{"direct": 0, "batch_nonce": 0}],
@@ -2216,8 +2216,8 @@
           },
           {
             "from": "sequencer",
-            "block": 5001,
-            "timestamp": 1700060012,
+            "block": 11001,
+            "timestamp": 1700132012,
             "payload": "empty_batch_0",
             "outcome": "batch_rejected",
             "reject": {"reason": "wrong_nonce", "expected": 1, "got": 0},
@@ -2302,8 +2302,8 @@
           },
           {
             "from": "portal",
-            "block": 1210,
-            "timestamp": 1700014520,
+            "block": 7210,
+            "timestamp": 1700086520,
             "payload": "deposit_alice_over_cap",
             "outcome": "direct_dropped",
             "txs": [{"direct": 0, "batch_nonce": 0}],
@@ -2312,8 +2312,8 @@
           },
           {
             "from": "stranger",
-            "block": 1212,
-            "timestamp": 1700014544,
+            "block": 7212,
+            "timestamp": 1700086544,
             "payload": "stranger_direct",
             "outcome": "direct_queued",
             "txs": [],
@@ -2322,13 +2322,13 @@
           },
           {
             "from": "sequencer",
-            "block": 1215,
-            "timestamp": 1700014580,
-            "payload": "drain_1212_batch",
+            "block": 7215,
+            "timestamp": 1700086580,
+            "payload": "drain_7212_batch",
             "outcome": "batch_accepted",
             "txs": [{"direct": 1, "batch_nonce": 0}, {"direct": 3, "batch_nonce": 0}],
             "outputs": [],
-            "scheduler": {"l1_input_count": 5, "l2_tx_count": 3, "next_batch_nonce": 1, "clock": 1212, "first_queued_input": 5, "fridge_len": 0}
+            "scheduler": {"l1_input_count": 5, "l2_tx_count": 3, "next_batch_nonce": 1, "clock": 7212, "first_queued_input": 5, "fridge_len": 0}
           }
         ],
         "state": "0x3332de61a8bb9ac84893b2f552fe81c9a6dc541995d0c8a7d11342299807a2fc19ac44c2321ccc68a0ee7a142d267c1f36714e4a8f75612f20a797204c0000008000000003000000000000001a642f0e3c3af545e7acbd38b07251b3990914f100000000000000000000000000000000000000000000000000000000000003e8"

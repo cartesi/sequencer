@@ -517,7 +517,7 @@ mod tests {
         );
     }
 
-    /// The worked boundary, with the 1200-block wait bound. A malformed batch
+    /// The worked boundary over the wallet's window `W`. A malformed batch
     /// from the submitter consumes no batch nonce, yet the backstop runs
     /// before decoding and executes the overdue directs; the last frame
     /// drains the direct at its own safe block, so nothing stays queued.
@@ -529,16 +529,12 @@ mod tests {
     /// | 2 | 20 | batch 0, safe block 10, `U0` | `D0`, `U0` |
     /// | 3 | 20 | `D2`, after the batch | queued |
     /// | 4 | 24 | `D3` | queued |
-    /// | 5 | 1230 | malformed batch | the backstop: `D1`, `D2`, `D3` |
-    /// | 6 | 1231 | `D4` | queued |
-    /// | 7 | 1232 | batch 1, safe block 1231, `U1` | `D4`, `U1` |
-    ///
-    /// At stop block 1240 the era has 7 transactions, next batch nonce 2 and
-    /// first queued input 8, the input count through the stop block.
-    #[test]
-    fn the_worked_boundary_rebuilds_seven_transactions_and_queues_nothing() {
-        const STOP: u64 = 1240;
-        let inputs = vec![
+    /// | 5 | `W + 30` | malformed batch | the backstop: `D1`, `D2`, `D3` |
+    /// | 6 | `W + 31` | `D4` | queued |
+    /// | 7 | `W + 32` | batch 1, safe block `W + 31`, `U1` | `D4`, `U1` |
+    fn worked_boundary() -> Vec<IngestedSafeInput> {
+        let window = config().max_wait_blocks;
+        vec![
             direct(5, vec![1]),
             direct(12, vec![2]),
             batch(0, 20, 10, 0),
@@ -546,18 +542,17 @@ mod tests {
             direct(24, vec![4]),
             IngestedSafeInput {
                 sender: SUBMITTER,
-                ..direct(1230, vec![0])
+                ..direct(window + 30, vec![0])
             },
-            direct(1231, vec![5]),
-            batch(1, 1232, 1231, 1),
-        ];
-        let (_db, mut storage) = synced("rebuild-worked-boundary", &inputs, STOP);
-        let data_dir = tempfile::tempdir().unwrap();
-        let summary = finish(&mut storage, STOP, STOP, (3, 3), data_dir.path()).unwrap();
+            direct(window + 31, vec![5]),
+            batch(1, window + 32, window + 31, 1),
+        ]
+    }
 
-        // Each row: its L2 tx index, and the direct's input index (`None`
-        // for a user op). Every transaction of this trace executes.
-        let rows: Vec<(u64, Option<u64>)> = stored(&mut storage)
+    /// Each stored row: its L2 tx index, and the direct's input index (`None`
+    /// for a user op).
+    fn stored_rows(storage: &mut Storage) -> Vec<(u64, Option<u64>)> {
+        stored(storage)
             .into_iter()
             .map(|(count, scheduled)| {
                 let direct = match scheduled.tx {
@@ -566,9 +561,23 @@ mod tests {
                 };
                 (count.get(), direct)
             })
-            .collect();
+            .collect()
+    }
+
+    /// The [worked boundary](worked_boundary) through stop block `W + 40`:
+    /// the era has 7 transactions, next batch nonce 2 and first queued input
+    /// 8, the input count through the stop block.
+    #[test]
+    fn the_worked_boundary_rebuilds_seven_transactions_and_queues_nothing() {
+        let stop = config().max_wait_blocks + 40;
+        let inputs = worked_boundary();
+        let (_db, mut storage) = synced("rebuild-worked-boundary", &inputs, stop);
+        let data_dir = tempfile::tempdir().unwrap();
+        let summary = finish(&mut storage, stop, stop, (3, 3), data_dir.path()).unwrap();
+
+        // Every transaction of this trace executes.
         assert_eq!(
-            rows,
+            stored_rows(&mut storage),
             vec![
                 (0, Some(0)),
                 (1, None),
@@ -585,7 +594,7 @@ mod tests {
             Some(crate::storage::NewEra {
                 base: L2TxCount::ZERO,
                 rebuilt_end: L2TxCount::new(7),
-                stop_block: STOP,
+                stop_block: stop,
                 first_queued_input: 8,
                 anchor_batch_nonce: 2,
             })
@@ -598,6 +607,46 @@ mod tests {
         let expected = expected(&mut runner, &inputs, 0, 8);
         assert!(expected.skipped.is_empty());
         assert_stored(&mut storage, &expected);
+    }
+
+    /// The [worked boundary](worked_boundary) stopped right after the
+    /// malformed batch, at `W + 30`: only the backstop can have executed
+    /// `D1`, `D2` and `D3`, since no later frame drains them. Without it they
+    /// would still be queued.
+    #[test]
+    fn the_worked_boundary_backstop_drains_at_the_malformed_batch() {
+        let stop = config().max_wait_blocks + 30;
+        let inputs = &worked_boundary()[..6];
+        let (_db, mut storage) = synced("rebuild-worked-boundary-backstop", inputs, stop);
+        let data_dir = tempfile::tempdir().unwrap();
+        let summary = finish(&mut storage, stop, stop, (3, 3), data_dir.path()).unwrap();
+
+        // `D0`, `U0`, then the backstop's `D1`, `D2`, `D3`.
+        assert_eq!(
+            stored_rows(&mut storage),
+            vec![
+                (0, Some(0)),
+                (1, None),
+                (2, Some(1)),
+                (3, Some(3)),
+                (4, Some(4)),
+            ]
+        );
+        assert_eq!(summary.inputs_to_replay, 6);
+        assert_eq!(
+            summary.era,
+            Some(crate::storage::NewEra {
+                base: L2TxCount::ZERO,
+                rebuilt_end: L2TxCount::new(5),
+                stop_block: stop,
+                first_queued_input: 6,
+                anchor_batch_nonce: 1,
+            })
+        );
+        assert_eq!(storage.next_undrained_safe_input_index().unwrap(), 6);
+
+        let mut runner = reference(inputs, 0);
+        assert_stored(&mut storage, &expected(&mut runner, inputs, 0, 6));
     }
 
     /// A base in the middle with two directs queued: the rebuild resumes with

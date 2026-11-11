@@ -462,7 +462,7 @@ interface.
 
 | Constant | Value | Home |
 |---|---|---|
-| `max_wait_blocks` | 1200 L1 blocks, about 4 h, for the wallet | the application's template |
+| `max_wait_blocks` | 7200 L1 blocks, about 24 h, for the wallet | the application's template |
 | `MAX_EXPONENT` | 17101 | [`fee.rs`](../../../sequencer-core/src/fee.rs) (`build.rs` generates it) |
 | `FRIDGE_BOUND` | **New**, value **Open** | the template |
 | `MAX_DIRECT_PAYLOAD_BYTES` | **New**, value **Open** | the template |

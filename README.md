@@ -37,7 +37,7 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 - **Go offline** — stop providing soft confirmations.
 - **Diverge** — if batches fail to land on L1 in time, soft confirmations that were issued become invalid.
 
-**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to the application's `max_wait_blocks`, ~4h for the wallet), but cannot prevent it. A direct whose payload is over the application's cap
+**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to the application's `max_wait_blocks`, ~24h for the wallet), but cannot prevent it. A direct whose payload is over the application's cap
 never executes, on L1 or in the sequencer.
 
 During normal operation the sequencer advances logical frame time after five
@@ -459,7 +459,7 @@ lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.m
 - `GET /readyz` returns `200` while the inclusion-lane receiver is open and
   shutdown has not been requested; otherwise `503`. Its body is empty.
 - `GET /healthz` uses the same status as `/readyz` and returns JSON:
-  `{ "status": "ok", "inclusion_lane": "ok", "landing_lag_blocks": 40, "max_wait_blocks": 1200, "safe_head_age_seconds": 780 }`.
+  `{ "status": "ok", "inclusion_lane": "ok", "landing_lag_blocks": 40, "max_wait_blocks": 7200, "safe_head_age_seconds": 780 }`.
   `status` becomes `"degraded"`
   for either failure condition; `inclusion_lane` becomes `"stopped"` once its
   receiver is closed. The lane closes it soon after shutdown is requested, so it
