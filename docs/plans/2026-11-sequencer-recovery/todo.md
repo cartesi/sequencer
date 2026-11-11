@@ -10,6 +10,14 @@ era, the rebuilt history and the adopt rule. The
 [register](../../review/register.md#sequencer-recovery-follow-ups) holds the
 limits this work accepts and the paths it left unverified.
 
+## One recovery
+
+[outages.md](outages.md) plans deleting the standard recovery: what the
+sequencer does when batches stop landing, the playbooks, what goes, the order
+of work and what is [still to decide](outages.md#still-to-decide). It also
+takes the recovery generation off every client interface, which the
+[egress redesign](#redesign-the-egress-api) below then need not do.
+
 ## Promote to real docs
 
 - **[scheduler.md](scheduler.md)**: [scheduler semantics](../../protocol/scheduler-semantics.md)
