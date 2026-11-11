@@ -37,6 +37,10 @@ To settle with Bart:
   is bounded too, and portals accept zero-value deposits with arbitrary extra
   data, up to the 64 KiB input cap; the cap is the longest payload the
   application accepts.
+- A filter on a direct's sender and shape. Dropping a direct the application
+  would ignore before it joins keeps garbage out of the fridge. It must be a
+  function of the input alone: the scheduler reads no application state, the
+  lane mirrors the fridge, and a resume re-admits from the raw inputs.
 - The count. Above what L1 can include within the backstop window, roughly
   2 million zero-value deposits at mainnet's 60M gas limit today (30-40k gas
   each when a contract batches them; measure it on the pinned contracts),
@@ -277,14 +281,12 @@ unverified paths.
   answered queries and a missing directory; the measurement above also saw a
   `state` report over 2 MiB halt the guest and `read_machine_export` refuse
   the base.
-- **The scheduler header's direction.** [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h)
-  and its reference export exist; whether a C or C++ guest links that export
-  or its port implements the header, and so whether the sequencer would link
-  a foreign scheduler for the rebuild, is the port author's call
-  ([questions](../plans/2026-11-sequencer-recovery/todo.md#questions-for-bart)).
-  Until then setup and the sequencer call the Rust `Scheduler` directly, with
-  no adapter and no `Scheduler` trait: nothing foreign runs on that path yet,
-  so a seam would have no second implementation to test it.
+- **A foreign scheduler in the rebuild.** An application's author may bring
+  their own scheduler, behind [`scheduler.h`](../../bindings/c-scheduler/include/scheduler.h),
+  for setup to run in the rebuild. Setup and the sequencer call the Rust
+  `Scheduler` directly: no `Scheduler` trait and no adapter over the header
+  exist, so no foreign scheduler can be linked yet
+  ([build](../plans/2026-11-sequencer-recovery/todo.md#build)).
 - **Unverified on GitHub Actions:** the release workflow's native arm64
   runner (`ubuntu-24.04-arm`) and the amd64 release link, since the
   sequencer links the emulator. That workflow runs only on a tag or by hand,
@@ -366,8 +368,9 @@ force.
     deployment's workload, including checkpoint creation and complete
     L1-reconciliation turns.
 - **Not planned without a consumer need:** resumable snapshot transfer (when
-  artifact size makes an interrupted download costly), session fencing (if
-  several local writers become supported), and submitter key rotation.
+  artifact size makes an interrupted download costly) and session fencing (if
+  several local writers become supported). Rotating the submitter's key has a
+  [note](../plans/2026-11-sequencer-recovery/todo.md#later).
 - [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign):
   external engine/scheduler agreement, application-specific recovery export, independent
   fee-conversion vectors, and consumer-driven ABI/checkpoint decisions.

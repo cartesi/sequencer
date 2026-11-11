@@ -14,11 +14,11 @@ map. This page keeps only what is not built yet.
   A larger state needs another state source, such as a labeled memory range,
   or a guest that splits its answer
   ([the loader's limits](../../cartesi-machine.md#reading-a-stored-machines-export)).
-- **Which side links the scheduler.** `bindings/c-scheduler` exports the Rust
-  scheduler through `scheduler.h`; whether a C guest links it or a C port
-  implements the header, and so whether the sequencer would link a foreign
-  scheduler for the rebuild, is open
-  ([questions for Bart](todo.md#questions-for-bart)).
+- **A foreign scheduler.** `bindings/c-scheduler` exports the Rust scheduler
+  through `scheduler.h`, and an application's author may implement that header
+  with their own. Setup still calls the Rust scheduler directly: the trait and
+  the adapter that would link a foreign one are not built
+  ([todo](todo.md#build)).
 - **Names.** The storage columns call the L2 tx count `l2_tx_count`; the HTTP
   API still calls it `executed_input_count`, which changes with the
   [egress redesign](todo.md#redesign-the-egress-api).

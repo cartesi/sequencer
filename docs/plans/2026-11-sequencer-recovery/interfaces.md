@@ -1,9 +1,9 @@
 # The interfaces
 
 **Status:** the Rust side, `application-engine.h` and `scheduler.h` with its
-reference export are code in this tree; whether a guest links that export or
-a port implements the header is to settle with Bart
-([todo](todo.md#build)). The signatures of the two
+reference export are code in this tree. An application's author may implement
+`scheduler.h` with their own scheduler; the Rust adapter that would link it
+is not built ([todo](todo.md#build)). The signatures of the two
 components, in Rust and in C. The [scheduler](scheduler.md) owns the rules
 they carry out, and [application](application.md) owns the trait's
 obligations and the machine's export. Where this page and the code differ,
@@ -27,7 +27,7 @@ There are four interfaces, each component in Rust and in C:
 | Interface | Implemented by | Called by |
 |---|---|---|
 | `Scheduler`, a Rust struct in `sequencer-core` | The reference scheduler | The guest harness, through `CanonicalRunner`, and setup |
-| `scheduler.h` | The reference scheduler's C export, or a port | A C or C++ guest; no Rust adapter exists yet |
+| `scheduler.h` | The reference scheduler's C export, or an author's own scheduler | A C or C++ guest; no Rust adapter exists yet |
 | `Application`, a Rust trait | An application, and the adapter over `application-engine.h` | The executor, the lane and setup |
 | `application-engine.h` | A native engine | The Rust adapter |
 

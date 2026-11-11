@@ -454,9 +454,9 @@ application: it feeds the scheduler one input, then executes each
 transaction the scheduler hands out for it. The scheduler never reads the
 application. That needs a free-standing scheduler with an interface of its
 own, as the application has its trait and its C binding.
-[Interfaces](interfaces.md#the-scheduler) proposes it, in Rust and in C, to
-settle with Bart. This page fixes the scheduler's behavior whatever the
-interface.
+[Interfaces](interfaces.md#the-scheduler) outlines it, in Rust and in C; an
+application's author may implement the C header with their own scheduler.
+This page fixes the scheduler's behavior whatever the implementation.
 
 ## Constants
 

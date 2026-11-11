@@ -8,11 +8,11 @@ for its own tests). The transaction records are
 C or C++ guest hands what the scheduler gives straight to its engine;
 [`c/feed_loop.c`](c/feed_loop.c) is that loop without an engine.
 
-The header is a proposal to settle with the C port's author: whether a guest
-links this export or a port implements the header is still open
-([todo](../../docs/plans/2026-11-sequencer-recovery/todo.md#questions-for-bart)).
-No Rust adapter over a foreign scheduler exists yet; the sequencer and setup
-call the Rust `Scheduler` directly.
+An application's author may implement the header with their own scheduler,
+to compile into their guest and for setup to run natively in a rebuild. No
+Rust adapter over a foreign scheduler exists yet: the sequencer and setup
+call the Rust `Scheduler` directly
+([todo](../../docs/plans/2026-11-sequencer-recovery/todo.md#build)).
 
 The reference panics on impossible states; the export turns each into a
 negative status and a dead handle, so no panic unwinds into C. That needs the

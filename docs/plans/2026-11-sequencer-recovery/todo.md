@@ -21,19 +21,24 @@ limits this work accepts and the paths it left unverified.
   export and the projection; this page shrinks to the guest's open duties and
   the questions below.
 - **[interfaces.md](interfaces.md)** is code, except the outline of the
-  scheduler's C header, which stays until its direction is settled
-  ([build](#build)).
+  scheduler's C header, which stays until a foreign scheduler links through
+  it ([build](#build)).
 
 ## Build
 
-- **The scheduler header's direction.** [`scheduler.h`](../../../bindings/c-scheduler/include/scheduler.h)
-  and its reference export are code, tested against the Rust `Scheduler`.
-  Settle with Bart whether his guest links that export or his port implements
-  the header ([questions](#questions-for-bart)); only the second needs a Rust
-  adapter over a foreign scheduler, and a `Scheduler` trait for it. A port is
+- **A foreign scheduler in the rebuild.** An application's author may bring
+  their own scheduler: one library, compiled into their guest, and natively
+  behind [`scheduler.h`](../../../bindings/c-scheduler/include/scheduler.h)
+  for setup's rebuild, as libdex will. The reference scheduler is then the
+  specification's implementation and the wallet's scheduler, and its export
+  is the header's reference. Setup calls the Rust `Scheduler` directly today
+  ([`rebuild.rs`](../../../sequencer/src/commands/setup/rebuild.rs)); it needs
+  a `Scheduler` trait and an adapter over the header, linked as an engine's
+  archive is ([C engine](../../../bindings/c-app-engine/README.md)). The lane
+  still predicts the canonical scheduler in Rust, so a foreign scheduler is
   held to the [conformance vectors](../../protocol/scheduler-semantics.md#conformance)
   through `c-scheduler`'s `tests/conformance.rs`, which today links only the
-  reference export; package it so a port links its own implementation in one
+  reference export; package it so an author links their own archive in one
   command.
 - **A base machine's state through the range source.** Setup reads only the
   `state` inspect report, which must fit 2 MiB; add the labeled-range read the
@@ -71,6 +76,13 @@ Later, in light of this plan:
   logs and `/healthz`. Design one on the internal listener, beside the other
   internal routes, starting from the two numbers `/healthz` reports
   ([what the sequencer does](../../recovery/README.md#what-the-sequencer-does)).
+- **A batch proxy, to rotate the submitter's key.** The canonical machine
+  compiles in the address that posts batches, so the key behind that address
+  can never change. A proxy contract would stand at it: the proxy forwards a
+  batch to the InputBox from one configured hot wallet, the sequencer's, and a
+  cold multisig can replace that wallet. The machine then pins the proxy,
+  which never changes. A rotation may still need a cockroach recovery; that is
+  to work out.
 
 ## Machine sourcing
 
@@ -87,33 +99,59 @@ operator's job.
 
 ## Questions for Bart
 
-- Can your guest answer the `scheduler` query and keep each queued direct's
-  input index? Which encoding will libdex's `state` export use, and how large
-  can it grow?
-- Does libdex's drive hold the L2 tx count? The projection is given the
-  machine's either way. Does the drive hold only the flat buffer, or a padding
-  tail too?
-- Which of a direct's index, timestamp and prevRandao does libdex read? Does it
-  read a transaction's block as time?
-- What is the longest direct payload libdex accepts? It sets the payload cap.
-  What bound and largest drain can the guest afford?
-- How should libdex's apply handle an underfunded op? We recommend charging
-  what the sender has.
-- Can libdex report a nonce for an address it has never seen, and store one
-  after that address's first op? A bounded account table cannot, and the nonce
-  getter would then need a "no such sender" answer that skips the op.
-- Would your guest link the reference scheduler through `scheduler.h`, or
-  would your port implement `scheduler.h`, so that the sequencer links it for
-  the rebuild?
-- Is your guest's compiled sequencer address the pinned submitter? Can its
-  harness answer an input with `RX_REJECTED`?
-- Does your scheduler reproduce the conformance vectors, and reject an
-  out-of-range `fee_price` at gate d, as ours does since PR #56?
-- Can your client restore a state at a count it trusts, by the two backup
-  rules or its own? Which SQLite version does it link? Will it compare its rows
-  from the base count before it adopts the new era?
-- What are libdex's per-op cycles and state size? Who fixes libdex during an
-  incident?
+The guest's duties are stated in [application](application.md#the-canonical-machine),
+and what an op pays is the application's choice, with charging what the sender
+has as the recommendation; neither is a question.
+
+To confirm:
+
+- Price pushes are the only large op: about 165 bytes with three markets,
+  sent every few minutes by wallets the operator runs, against about 32 bytes
+  for the rest. How many bytes does a market add, and how many markets are
+  planned?
+- Official pushers should pay nothing, and a redundant push should not be
+  included at all. `application_engine_execute_user_op` decides what an op
+  pays, and `application_engine_admit_user_op` can refuse one with
+  `APPLICATION_ENGINE_REFUSED_BY_POLICY`, which costs its sender no nonce and
+  no fee. Does that cover it? Is pushing open to anyone, or to a list?
+- Which revision of the sequencer, and which version of
+  `application-engine.h`, is libdex built against?
+
+Your scheduler in a recovery, which the sequencer runs natively through
+`scheduler.h`, apart from your engine:
+
+- Can your scheduler library implement
+  [`scheduler.h`](../../../bindings/c-scheduler/include/scheduler.h) as
+  written? What would you change?
+- Does your scheduler read anything from the engine's state?
+- Can it resume from five numbers and the L1 inputs still queued: the inputs
+  consumed, the next batch nonce, the clock, the index of the oldest queued
+  direct, and how many are queued? Does it keep any other state?
+- Have you ported `fee_to_linear` bit for bit? Would a checked-in table of
+  exact values be easier to match?
+
+libdex:
+
+- Which L1 inputs does libdex act on, by sender and by payload shape, and how
+  long is the longest valid one? The scheduler could drop every other direct
+  before it queues it.
+- How does an account come to exist: by a deposit only, or by a first user op
+  too? What happens to each when the account table is full?
+- What does libdex read as time: a direct's block or timestamp, a user op's
+  frame block, or the price pusher's own timestamp?
+- The state: its encoding, its size now and at full scale, whether the drive
+  holds only the flat buffer or a padding tail too, and whether the L2 tx
+  count is inside it.
+- How many machine cycles do a small op, a price push and a deposit take?
+
+Your client:
+
+- Which endpoints and headers does your indexer call, and what is missing or
+  awkward?
+- After a recovery the history can differ from what the indexer saw, from
+  some count on. Can it go back to an earlier count from its own backups
+  ([client backups](client-backups.md)), or does it rebuild from zero, and how
+  long does that take? Which SQLite version does it link?
 
 ## Measure
 
