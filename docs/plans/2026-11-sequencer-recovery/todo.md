@@ -73,6 +73,13 @@ Later, in light of this plan:
   `l2_tx_count`);
 - the WS headers.
 
+## Later
+
+- **A metrics endpoint.** The sequencer exports no metrics: an operator reads
+  logs and `/healthz`. Design one on the internal listener, beside the other
+  internal routes, starting from the two numbers the
+  [outage plan](outages.md#what-the-sequencer-does) adds.
+
 ## Machine sourcing
 
 A separate task. Setup only takes a machine; finding a trusted one is the

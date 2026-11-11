@@ -150,9 +150,10 @@ sequencer:
 - the **safe head's age** in seconds, because the lag freezes while the
   provider is down.
 
-The sequencer has no metrics exporter, only logs and `/healthz`. The plan
-logs both numbers and adds them to `/healthz`
-([still to decide](#still-to-decide)).
+The sequencer has no metrics exporter, only logs and `/healthz`, so both
+numbers go to the logs and into `/healthz`. A metrics endpoint on the internal
+listener, beside the other internal routes, is
+[later work](todo.md#later).
 
 **What it does not do:**
 
@@ -185,18 +186,17 @@ No document tells an operator this today.
 
 `run` exits with the terminal code and refuses every later start. The remedy
 is [cockroach recovery](../../recovery/cockroach.md#the-operators-playbook),
-with one step this plan adds in front of it:
+unchanged.
 
-- **When the old data directory survives, settle its wallet first**, with
-  `flush-mempool` on that directory, before `setup` runs in the new one. The
-  old directory holds the wallet-nonce watermark, which covers every slot the
-  old instance ever broadcast at. Setup's own flush starts from an empty
-  database and covers only what the provider's pool still remembers
-  ([the flush and the stop block](../../recovery/cockroach.md#the-flush-and-the-stop-block)).
-  An outage that ends here is the case most likely to leave batches in flight,
-  and a late one that lands in the new era reads as a foreign batch and costs
-  another recovery. After `setup`, the old directory is never signed for
-  again, as today.
+Setup's flush stays best effort. It runs in a new directory, without the old
+instance's record of the wallet slots it broadcast at, so it replaces only
+what the provider's pool still shows
+([the flush and the stop block](../../recovery/cockroach.md#the-flush-and-the-stop-block)).
+An outage that ends here is the case most likely to leave batches in flight,
+and a late one that lands in the new era reads as a foreign batch and costs
+another recovery. Setup does not read the old directory to close that gap:
+cockroach recovery is the procedure for when that directory is lost or cannot
+be trusted, so it must not depend on it.
 
 What is lost is what any cockroach recovery loses: everything served that had
 not landed by the stop block. Those user ops are revoked, not cancelled.
@@ -211,9 +211,10 @@ There is no generation, no cut to detect and no compatibility query.
 
 ## The window belongs to the application
 
-`MAX_WAIT_BLOCKS` is a constant of `sequencer-core` today, 1200 blocks. It
-moves beside the template's other two scheduler constants, which the
-application already returns from a static method:
+The window was a constant of `sequencer-core`, `MAX_WAIT_BLOCKS`. It now sits
+beside the template's other two scheduler constants, which the application
+returns from a static method (step 1 of [the order of work](#order-of-work),
+done):
 
 ```rust
 pub struct SchedulerLimits {
@@ -229,16 +230,19 @@ pub trait Application {
 }
 ```
 
-- **Nothing in the scheduler changes.** `SchedulerConfig`, in Rust and in
-  `scheduler.h`, already takes the window as a field; only
-  `SchedulerConfig::for_application` reads the crate constant.
-- **The C engine's limits record gains the field**, so libdex supplies its own
+- **Nothing in the scheduler changed.** `SchedulerConfig`, in Rust and in
+  `scheduler.h`, already took the window as a field; only
+  `SchedulerConfig::for_application` read the crate constant.
+- **The C engine's limits record has the field**, so libdex supplies its own
   window ([`application-engine.h`](../../../bindings/c-app-engine/include/application-engine.h)).
-- **Setup pins it with the deployment identity**, as it pins the payload cap,
-  and storage reads it from that row. A binary with another window would judge
-  acceptance and the void history by the wrong rule, so `run` refuses it.
-  The pin binds the binary to the data directory, not to the deployed
-  template: a machine's scheduler export carries no constants.
+  The engine ABI is version 3 for it, so an engine built against the older
+  header is refused instead of reporting a window of zero.
+- **Setup pins it with the deployment identity**, as it pins the payload cap.
+  A binary with another window would judge acceptance and the void history by
+  the wrong rule, so `run` refuses it. The pin binds the binary to the data
+  directory, not to the deployed template: a machine's scheduler export
+  carries no constants. Step 2 makes storage read the window from the pinned
+  row, as it reads the cap.
 - **The window is per application type, not per deployment.** The wallet's
   devnet and Sepolia builds are one type, so they share a value.
 
@@ -251,7 +255,7 @@ pub trait Application {
 | The client interfaces | `RecoveryGeneration`, `STALE_GENERATION`, `from_generation` and `compatibility` on `/history`, `X-Recovery-Generation`, the generation in the WS claim, the SDK's handling | 1,100 lines |
 | The workers | The lane's recovery test and the reader's progress stamp | 300 lines |
 | Devnet scenarios | 13 of 53 deleted, 9 rewritten | 116 of 512 s |
-| Models | `preemptive.tla`, `admission.tla`, the archived `optimistic.tla` | 3 models |
+| Models | `preemptive.tla` and `admission.tla` move to the archive | 2 models |
 
 Three simplifications follow from "no batch is ever replaced":
 
@@ -288,8 +292,8 @@ Each step is its own commit, compiles and passes on its own, and carries its
 docs. A step that touches a guest crate moves the template hash, so the images
 are rebuilt before the machine and devnet suites run.
 
-1. **The window moves to the application.** No behaviour changes: the wallet
-   keeps 1200. Setup pins it; the C engine's record gains it.
+1. **The window moves to the application.** Done. No behaviour changed: the
+   wallet keeps 1200. Setup pins it; the C engine's record has it.
 2. **The sequencer stops for good on a void history.** Startup, the watching
    worker and the two numbers; the repair, its flags and exit code 10 go. The
    devnet scenarios are deleted or rewritten here, and the new drills land.
@@ -300,7 +304,10 @@ are rebuilt before the machine and devnet suites run.
 5. **The docs and models that remain.** [Automatic recovery](../../recovery/README.md)
    becomes the page for batch landing, the void history and the outage
    playbook, at the same path. The invariant register, the threat model and
-   `AGENTS.md` follow. The three TLA+ models go.
+   `AGENTS.md` follow. The two TLA+ models move to the
+   [archive](../../recovery/history/README.md), beside the older one: inside an
+   era no nonce is reused, so the race they guard cannot occur there, and
+   neither model has eras.
 
 ## Tests and drills
 
@@ -322,26 +329,14 @@ takes milliseconds, so the wallet's window does not need to shrink for tests.
 
 ## Still to decide
 
-- **Where the two numbers are read.** Logs alone, or `/healthz` too. The plan
-  proposes both; `/healthz` is the only place a probe can read them without
-  parsing logs, and it is an interface change.
 - **The wallet's window.** At 1200 blocks with the default two-hour batch, a
   quiet wallet deployment has under two hours to land each batch, and a
-  posting stall past that now ends the era. Moving the wallet to 7200 means
+  posting stall past that now ends the era. Tests do not need the short
+  window: they mine it in one call. Moving the wallet to 7200 means
   regenerating the guest scenarios of the consensus vectors, which fix block
-  numbers around 1200. The plan proposes it as its own commit after step 1.
-- **The C engine ABI's version.** Version 2 exists only on this branch. A bump
-  to 3 costs a line and refuses an engine built against today's header, which
-  would otherwise report a window of zero.
-- **The TLA+ models.** Inside an era no nonce is reused, so the race they
-  guard cannot occur there, and neither model has eras. The plan proposes
-  deleting all three and keeping the old counterexample, in prose, as the
-  reason a nonce is never reused in place.
+  numbers around 1200; it would be its own commit, after a look at whether
+  each test tied to 1200 earns its keep.
 - **The batch's key.** A batch nonce now names one batch for the life of an
   era, so `BatchId` and the nonce are two names for one thing. Making the
-  nonce the key touches every table that points at a batch; decide after
-  step 3.
-- **Settling the old wallet before a rebuild.** The step
-  [above](#the-sequencer-stopped-for-good) reverses today's rule that the old
-  directory is never signed for again, for the time before `setup`. It needs a
-  drill before it enters the cockroach playbook.
+  nonce the key touches every table that points at a batch; it is decided
+  after step 3, on what the schema looks like then.
