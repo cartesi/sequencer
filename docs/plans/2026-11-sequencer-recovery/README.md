@@ -54,8 +54,8 @@ This directory keeps the design's reasons and what remains:
 [interfaces.md](interfaces.md) for the shared software;
 [operations.md](operations.md), [sequencer.md](sequencer.md) and
 [client-backups.md](client-backups.md) for the rest; [todo.md](todo.md) for
-the work left. [outages.md](outages.md) keeps what remains of making this
-the only recovery: the sequencer repairs nothing by itself
+the work left. This is the sequencer's only recovery: it repairs nothing by
+itself, and stops for good when its batches can no longer land
 ([batch landing and outages](../../recovery/README.md)).
 
 ## Names
