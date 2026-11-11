@@ -149,9 +149,9 @@ deployment assumes the application promptly digests the whole range
 only if production measurements disprove that).
 
 Authority remains role-local and auditable: a FULL-committed user-op chunk
-authorizes its acknowledgement; a valid sealed batch plus the durable
+authorizes its acknowledgement; a sealed batch plus the durable
 write-before-broadcast watermark authorizes an L1 submission; committed
-version-checked application-input rows authorize the feed output. Effects handed to the network before process termination may still
+era-checked application-input rows authorize the feed output. Effects handed to the network before process termination may still
 complete remotely.
 
 A global effect mutex or actor would duplicate these owners and put authority

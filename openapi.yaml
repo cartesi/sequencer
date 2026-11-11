@@ -643,7 +643,8 @@ components:
     XInclusionBlock:
       description: |
         L1 block whose end the accepted checkpoint represents: where its batch
-        was included, or `0` for the genesis checkpoint.
+        was included, or the era's stop block before the era's first accepted
+        batch.
       required: true
       schema:
         type: string

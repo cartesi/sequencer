@@ -105,7 +105,7 @@ writers target the base tables.
 
 ### I3. Frame `safe_block`s are non-decreasing along the spine
 
-- **Holds:** frame `safe_block`s never decrease along the valid spine; equal
+- **Holds:** frame `safe_block`s never decrease along the batches; equal
   adjacent clocks are valid. The [frame-clock policy](protocol/scheduler-semantics.md#sequencer-frame-clock-policy)
   says when the lane advances the clock, including the anchoring exception
   for bootstrap.
@@ -159,11 +159,11 @@ writers target the base tables.
 
 ### I6. The frame clock accounts for a complete L1 interval
 
-- **Holds:** the surviving latest frame clock, floored by the era's stop block
+- **Holds:** the latest frame clock, floored by the era's stop block
   `C`, identifies the completely accounted L1 prefix. Reconciliation executes all
   external directs within the payload cap in the newly safe interval before
   committing its next frame and application rows. Envelopes-only intervals advance the clock with no rows.
-  With no valid frame in the era, the next undrained input is the era's first
+  With no frame in the era, the next undrained input is the era's first
   queued input: the era's baseline accounts for every input through `C`
   except the directs still queued there, so the root frame drains from it
   (`next_undrained_safe_input_index_in`, `storage/ingress.rs`).
@@ -222,9 +222,9 @@ writers target the base tables.
   overdue force-drain, and for any fresh copy that force-executed prefix is
   a subset of the first frame's drain, in the same queue order. Which
   physical L1 transaction landed carries no semantic weight.
-- **Enforced by:** prevention — no batch nonce is reused inside an era, and
-  setup's flush settles every wallet-nonce slot of the old era before a
-  rebuild, anchored by the persisted watermark (I14);
+- **Enforced by:** prevention — no batch nonce is reused inside an era;
+  across eras setup's flush is best effort, and its escape check refuses what
+  it sees ([the flush and the stop block](recovery/cockroach.md#the-flush-and-the-stop-block));
   detection — the content-identity check in
   `record_accepted_batches`, which on violation persists the
   `canonical_divergence` marker and freezes the frontier (I15).
@@ -323,8 +323,8 @@ writers target the base tables.
   `MempoolFlusher::flush_and_wait` covers every no-op range it sends, and
   refuses to complete until `safe >= watermark + 1`. Pinned by a
   raise-before-send test on each side.
-- **Depended on by:** the flush's completeness: `flush-mempool`, and setup's
-  flush in a data directory that has a watermark
+- **Depended on by:** `flush-mempool`'s completeness. Setup's flush runs on a
+  new database, which has no watermark, so it does not rely on this
   ([the flush and the stop block](recovery/cockroach.md#the-flush-and-the-stop-block)).
 - **Breaks:** zombie txs evade the flush — a batch tx dropped locally but
   surviving in the network lands after the flush reports the wallet settled.
@@ -548,7 +548,7 @@ like a simplification and would break a registered invariant:
   precede their envelope and have no general one-to-one L1 mapping.
 - **Don't retain a numeric resume offset without its history identity** —
   a new era reuses counts (I18).
-- **Don't discard a valid snapshot beyond the accepted frontier** — that exact
+- **Don't discard a snapshot beyond the accepted frontier** — that exact
   batch can become the next comparison checkpoint (I7).
 - **Don't add internal retry loops to the flusher/submitter for provider
   errors** — the orchestrator respawn is the retry mechanism; internal

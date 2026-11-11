@@ -2,7 +2,7 @@
 
 **Status:** implemented. The reference
 [`Scheduler`](../../../sequencer-core/src/scheduler/mod.rs) runs these rules,
-and [scheduler semantics](../../protocol/scheduler-semantics.md) is now their
+and [scheduler semantics](../../protocol/scheduler-semantics.md) is their
 contract; read that page for the rules in force. This page stays until its
 **Open** items settle with the port's author
 ([register](../../review/register.md#canonical-rules-open-for-the-c-port)),
@@ -223,8 +223,8 @@ Gate d checks every frame before any frame executes; the backstop has already
 run. Ages saturate at zero. An empty batch is accepted at any age, since it has
 no first frame; rejecting empty batches is **Open**. A rejected batch and a
 stale one have the same effect: no state change, nonce kept. So every later
-batch fails gate b until one reuses that nonce, as a batch rebuilt after a
-recovery does. The reject reason the reference reports is diagnostic.
+batch fails gate b until one reuses that nonce, as only a new era's batches
+do. The reject reason the reference reports is diagnostic.
 
 ### Frame execution
 

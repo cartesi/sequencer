@@ -134,7 +134,7 @@ a sequencer artifact ([cockroach recovery](../recovery/cockroach.md)).
 Garbage collection retains:
 
 1. The newest accepted checkpoint, or the baseline before first acceptance.
-2. Every valid snapshot beyond the accepted frontier. An intermediate optimistic
+2. Every snapshot beyond the accepted frontier. An intermediate optimistic
    batch may become the next accepted head before its successors do.
 3. Every artifact with an active reader lease.
 

@@ -122,7 +122,8 @@ opens. Any other sync failure exits 20 or 30, by its class.
 
 **While running**, one worker reads the terminal facts every two seconds and
 stops the process on either. It does not write the database and does not call
-L1. The lane does not read them, so a user op confirmed in the seconds between
+L1. The lane does not check for a void history, and it sees a divergence only
+at its periodic frontier read, so a user op confirmed in the seconds between
 the safe head showing a fact and the stop is lost with the rest.
 
 **How it stops.** A start that finds a terminal fact exits 30 and names it. A
@@ -212,7 +213,9 @@ its first frame's safe block, the safe head and the window
 ([how it stops](#what-the-sequencer-does)). Restarting does not help, and
 nothing in the old data directory needs repair: follow
 [the operator's playbook](cockroach.md#the-operators-playbook) for a cockroach
-recovery.
+recovery. A void history is not a disagreement with the canonical machine, so
+the watchdog has not latched and that playbook's last step has no latch to
+clear.
 
 What is lost is what any cockroach recovery loses: everything served that had
 not landed by the stop block. Those user ops are revoked, not cancelled; anyone

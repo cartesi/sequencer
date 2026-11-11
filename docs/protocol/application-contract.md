@@ -122,7 +122,7 @@ sender's next nonce from the user ops it persisted, without asking the engine.
   nonce.
 
 Under this rule a sender's next nonce is one past its latest included op. The
-exception is a sender with no surviving live op. `GET /nonce` counts only the
+exception is a sender with no live op. `GET /nonce` counts only the
 era's live rows, and every setup, genesis base included, rebuilds the history
 up to its stop block first ([era baseline](application-history.md#era-baseline)),
 so a sender whose last op lies in the rebuilt history or below the base count
@@ -146,6 +146,15 @@ its answer never changes what an included op does
 | `admit_user_op(sender, op, fee) -> Result<Admission, AppError>` | Say, without changing state and without checking the nonce, whether the operator wants the op at this fee exponent. |
 | `max_method_payload_bytes() -> usize` | Return the engine's stable method payload bound without constructing an instance. |
 | `scheduler_limits() -> SchedulerLimits` | Return the staleness window, the fridge bound and the direct payload cap the application's template compiles in, without constructing an instance. |
+
+The staleness window, `max_wait_blocks`, is at least one block. It bounds how
+long a sequencer can hold a direct back, and it is all the time operators have
+to fix an outage before the era ends
+([the window](../recovery/README.md#the-window),
+[the budget](../recovery/README.md#the-budget)). `run` refuses a window too
+short for its batches: the batch-open deadline in blocks plus a 100-block
+submission margin must fit inside it. Changing the window is a new template
+and a new setup.
 
 Setup pins the window and the direct payload cap with the deployment identity.
 Storage selects the directs to execute by the pinned cap, and `run` refuses a

@@ -22,7 +22,7 @@ freely at this stage — no backward-compatibility constraints.
 2. Application integrators/operators validate the private engine, its `from_canonical_state` and the recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
-Full restore archives now support file and directory application prefixes.
+Full restore archives support file and directory application prefixes.
 Additional snapshot retention or transport mechanisms require a measured consumer need.
 
 ## Track 3 — Feed & replay protocol redesign
@@ -33,8 +33,8 @@ and the [API contract](../../README.md#api) own its behavior; the
 
 [Cockroach recovery](../recovery/cockroach.md) rebuilds the sequencer from a
 canonical machine's exported state, and each client realigns through the feed
-from its own count, so the sequencer no longer serves raw L1 inputs for a
-client to replay. A new client sync follows that design. Until then, what it
+from its own count, so the sequencer serves no raw L1 inputs for a client to
+replay. A new client sync follows that design. Until then, what it
 replaces gets bug fixes only, and its docs are not polished:
 
 - Reshaped or retired with the new sync: the WS wire format, the SDK
@@ -69,8 +69,8 @@ table with Bart and ship it with the other guest-image changes.
 The [Application contract](../protocol/application-contract.md) owns execution,
 engine progress, and checkpoint semantics. The [C binding guide](../protocol/c-application-binding.md)
 maps that contract to native engines. Its reference conformance suite and C-host
-process scenarios cover snapshot-to-live bootstrap, restart, standard
-recovery and the rebuild from genesis and from a stored machine.
+process scenarios cover snapshot-to-live bootstrap, restart, and the rebuild
+from genesis and from a stored machine.
 Reference bridge conformance cannot establish private-engine correctness.
 
 Remaining checks need the actual consumer:

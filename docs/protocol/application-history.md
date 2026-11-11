@@ -18,7 +18,7 @@ These facts answer different questions:
 | Fact | Meaning |
 |---|---|
 | `L2TxCount` | Number of L2 transactions already executed; at count `N`, entry `N` executes next. |
-| Latest surviving frame's `safe_block` | Complete L1 interval accounted for by local ordering, bounded below by the era baseline. |
+| Latest frame's `safe_block` | Complete L1 interval accounted for by local ordering, bounded below by the era baseline. |
 | `batches.accepted_input` | The safe L1 landing of a local sealed batch, accepted by the scheduler rules and matched to its bytes. |
 
 A frame can account for an empty interval or only batch envelopes, advancing
@@ -173,7 +173,7 @@ Acceptance derives the comparison point without modifying the artifact.
 Selection must first choose the required accepted batch and then require its
 snapshot; a missing one cannot justify falling back to an older comparison.
 The [snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)
-explains block-boundary comparison and rollback retention. The
+explains block-boundary comparison and which snapshots are retained. The
 [watchdog guide](../watchdog/README.md) explains independent verification.
 
 ## Replica bootstrap and resume
@@ -223,7 +223,7 @@ multiple local writers become supported.
 | Boundary | Code and tests |
 |---|---|
 | Coordinates and claim ordering | [`sequencer-core/src/history.rs`](../../sequencer-core/src/history.rs) — identity before position, inclusive head, checked counts. |
-| Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, the rebuilt/live seam, nonzero baselines, replacement offsets, concurrent recovery, gaps and SQL limits. |
+| Coherent application pages | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs) and its tests — source context, the rebuilt/live seam, nonzero baselines, gaps and SQL limits. |
 | Rebuilt history | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs) and its tests — contiguous counts, directs in input order, immutability, sealing at publication; [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs) — the export check, and the rebuild executing as it goes. |
 | Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |

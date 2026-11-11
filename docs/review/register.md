@@ -55,8 +55,8 @@ To settle with Bart:
   ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#c-draining-a-full-fridge-in-one-input));
   libdex's drain is its own to measure.
 
-Next: settle these values and measure libdex's headroom, then exercise delayed fresh
-batches, same-block overflow and outages on devnet. An overflow changes the
+Next: settle these values and measure libdex's headroom, then exercise a
+same-block overflow on devnet. An overflow changes the
 application state after a block's last accepted batch, so the watchdog's
 block-boundary comparison does not hold for that block
 ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
@@ -286,17 +286,38 @@ unverified paths.
   no adapter and no `Scheduler` trait: nothing foreign runs on that path yet,
   so a seam would have no second implementation to test it.
 - **Unverified on GitHub Actions:** the release workflow's native arm64
-  runner (`ubuntu-24.04-arm`) and the amd64 release link, now that the
+  runner (`ubuntu-24.04-arm`) and the amd64 release link, since the
   sequencer links the emulator. That workflow runs only on a tag or by hand,
   so no pull request exercises it. Evidence:
   [`release.yml`](../../.github/workflows/release.yml).
-- **Release notes owe three items.** `HistoryBaseline.rebuilt_history_end` is
-  a required field, so an older SDK build fails to decode `/history`; the
-  released binaries link the emulator statically, so they need the Ubuntu
-  24.04 or Debian 13 C++ runtime; and the new template hashes. Read them from
-  the released images (`just canonical-print-build-hashes`), not from an
-  earlier build: any source change in a guest crate moves them, a rename
-  included ([what moves the template hash](../cartesi-machine.md)).
+- **Release notes owe an upgrade path.** No deployment crosses this release
+  in place:
+  - **A new setup.** The baseline schema changed in place, so a data directory
+    from before needs a new `setup`, which starts a new era and realigns every
+    client. `run` does not refuse an older directory by name; it fails on the
+    first statement the old schema cannot serve.
+  - **No automatic recovery.** A sequencer whose batches do not land inside
+    the window stops for good ([batch landing and outages](../recovery/README.md)).
+    Exit code `10` is gone and stays unused.
+  - **Removed flags.** `--preemptive-margin-blocks` and
+    `--l1-read-stale-after-blocks` are gone. A command line that still passes
+    one fails argument parsing with exit `2`, which a supervisor recipe keyed
+    on `30` does not catch; their environment variables are ignored.
+  - **Client interfaces.** A history's identity is its era id: the recovery
+    generation, `STALE_GENERATION`, `from_generation`, `compatibility` and
+    `X-Recovery-Generation` are gone, and the subscribe query and `/history`
+    answer `400` to a field they do not know.
+    `HistoryBaseline.rebuilt_history_end` is a required field, and
+    `/historical-l1-inputs` is gone. An SDK build from before cannot talk to
+    this server.
+  - **Applications.** `SchedulerLimits` carries `max_wait_blocks`, and a C
+    engine is rebuilt against ABI version 3.
+  - **The runtime.** The released binaries link the emulator statically, so
+    they need the Ubuntu 24.04 or Debian 13 C++ runtime.
+  - **The template hashes.** Read them from the released images
+    (`just canonical-print-build-hashes`), not from an earlier build: any
+    source change in a guest crate moves them, a rename included
+    ([what moves the template hash](../cartesi-machine.md)).
 - **One unexplained memory reading in the rebuild.** Setup streams its passes
   in pages, and a test process rebuilding 10^6 inputs, sampled every 5 s,
   stayed between 26 and 55 MB resident. `/usr/bin/time -l` around one such
@@ -346,8 +367,7 @@ force.
     L1-reconciliation turns.
 - **Not planned without a consumer need:** resumable snapshot transfer (when
   artifact size makes an interrupted download costly), session fencing (if
-  history can change within an admitted process, or several local writers
-  become supported), and submitter key rotation.
+  several local writers become supported), and submitter key rotation.
 - [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign):
   external engine/scheduler agreement, application-specific recovery export, independent
   fee-conversion vectors, and consumer-driven ABI/checkpoint decisions.
