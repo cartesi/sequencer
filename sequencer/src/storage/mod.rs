@@ -14,12 +14,12 @@ mod history;
 mod ingress;
 mod l1_inputs;
 mod l1_submission;
+mod landing;
 mod lifecycle;
 mod mutations;
 mod open;
 mod queries;
 mod rebuilt_history;
-mod recovery;
 mod snapshots;
 
 #[cfg(test)]
@@ -32,6 +32,8 @@ pub(crate) use convert::is_persistent_storage_error;
 use std::time::SystemTime;
 use thiserror::Error;
 
+#[cfg(test)]
+pub(crate) use acceptance::Divergence;
 pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
 pub(crate) use history::ApplicationInputRow;
@@ -39,10 +41,10 @@ pub use history::{DirectInputExecution, NewEra};
 pub(crate) use history::{HistoryReadError, L2TxContext};
 pub(crate) use ingress::ExecutedUserOp;
 pub use ingress::FeeQuote;
+pub(crate) use landing::OpenBatchError;
+pub use landing::{LandingLag, TerminalFact};
 pub use lifecycle::{LifecycleCommand, LifecycleError};
 pub use open::Storage;
-pub use recovery::DangerStatus;
-pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
 pub use sequencer_core::history::L2TxCount;
 pub use snapshots::{
     FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot, SnapshotLeases,

@@ -147,6 +147,7 @@ impl TestServerBuilder {
                 },
                 leases: snapshot_leases.clone(),
             },
+            crate::landing::test_feed(1200),
         );
         TestServer {
             public_addr,

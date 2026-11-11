@@ -11,11 +11,11 @@ Rollup applications need fast transaction confirmations. Waiting for L1 finality
 The protocol objective is that, under supported honest operation, **the
 off-chain sequencer predicts the same execution order the rollup's on-chain
 scheduler later produces.** Soft confirmations are optimistic and may be
-invalidated by the recovery cases below; L1 remains canonical truth.
+revoked by the recovery described below; L1 remains canonical truth.
 
 ## Two Chains Synchronizing
 
-The sequencer maintains an optimistic list of batches; recovery replaces an invalid suffix. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
+The sequencer maintains an optimistic list of batches, which L1 accepts in order. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
 
 ```
 Sequencer (off-chain)              Scheduler (on-chain)
@@ -26,9 +26,8 @@ Sequencer (off-chain)              Scheduler (on-chain)
 ```
 
 When things go well, the sequencer's chain and the scheduler's view converge.
-When batches risk becoming stale on L1, the sequencer stops serving and startup
-determines the required repair. A lost or untrustworthy local state instead
-requires an operator rebuild. Both recovery modes are described below.
+When a batch can no longer land before it goes stale, or local state is lost or
+untrustworthy, an operator rebuilds the sequencer, as described below.
 
 ## Trust Model
 
@@ -57,19 +56,18 @@ its bounds are recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I1
 
 ## Recovery
 
-**[Standard recovery](docs/recovery/README.md)** runs automatically at startup
-using the existing database. It handles liveness failures such as outages and
-extended downtime: reconcile L1 outcomes, invalidate the affected optimistic
-suffix, and resume from retained state. Stale batches do not consume the
-scheduler's expected nonce, so their successors cannot be accepted until recovery
-supplies a replacement at that nonce.
-
-**[Cockroach recovery](docs/recovery/cockroach.md)** is an operator-triggered
-rebuild when the local database is lost or cannot be trusted, including after
-a sequencer bug that corrupted state or emitted malformed batches. The operator
+The sequencer has one recovery, **[cockroach recovery](docs/recovery/cockroach.md)**:
+an operator-triggered rebuild when the era has ended or the local database is
+lost or cannot be trusted, including after a sequencer bug that corrupted state
+or emitted malformed batches. The operator
 runs `setup --base <machine>` in a new data directory: setup rebuilds the
 history from a trusted canonical machine and L1 through a stop block and
 publishes a new era, and each client realigns at its own count.
+
+An era ends when its oldest unaccepted batch can no longer land before it goes
+stale, the **void history**: no later batch can then be accepted, so the
+sequencer stops and refuses every start
+([batch landing and outages](docs/recovery/README.md)).
 
 The [threat model](docs/threat-model/README.md#self-trust) explains the boundary
 between normal operation's self-trust and manual repair after a bug.
@@ -78,10 +76,10 @@ between normal operation's self-trust and manual repair after a bug.
 
 The sequencer is designed to handle:
 
-- **L1 provider outages** — each worker retries on its next tick; the RPC client resends a rate-limited or temporarily unavailable request at most twice, a second apart or after the server's requested wait when that is 5 s or less. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
-- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
-- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state is cockroach recovery, above.
-- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. Recovery waits until every covered wallet-nonce slot is consumed at safe depth, whether the original transaction or a flush no-op wins, so delayed "zombie" submissions cannot land later.
+- **L1 provider outages** — each worker retries on its next tick; the RPC client resends a rate-limited or temporarily unavailable request at most twice, a second apart or after the server's requested wait when that is 5 s or less. The inclusion lane and API continue operating locally. The sequencer acts only on what L1 shows: it reports the safe head's age for monitoring and makes no wall-clock estimate ([outages](docs/recovery/README.md#when-batches-are-not-landing)).
+- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart resumes: every boot syncs L1 and checks the terminal facts from SQLite and L1 safe state, never assuming the previous exit was clean ([what the sequencer does](docs/recovery/README.md#what-the-sequencer-does)). Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
+- **Extended downtime** — startup syncs to the current L1 safe head and resumes. A stop longer than the window ends the era, and every start refuses until cockroach recovery, above.
+- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. No batch nonce is reused inside an era, so a delayed "zombie" submission carries a batch the sequencer still holds; and setup's flush settles the submitter's wallet before a rebuild, so no submission of the old era can land in the new one.
 
 ## Interfaces
 
@@ -92,8 +90,8 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 ### Sequenced Transaction Feed
 
 Subscribers restore an HTTP snapshot, then use one WebSocket stream to replay
-application inputs and follow the optimistic tip. Recovery can replace that
-history; the snapshot's era, generation, and input count bind a resume request
+application inputs and follow the optimistic tip. A cockroach rebuild starts
+a new era; the snapshot's era, generation, and input count bind a resume request
 to the state the consumer actually holds. The endpoint serves a small number of
 infrastructure subscribers, which serve users directly. See the
 [bootstrap workflow](docs/protocol/application-history.md#replica-bootstrap-and-resume)
@@ -142,8 +140,8 @@ The sequencer links the Cartesi Machine emulator statically, to read a base mach
 
 A third subcommand, **`flush-mempool`**, settles the batch-submitter wallet
 nonce on demand (keyed operator tool). It is flush-only: it requires a
-completed setup and no canonical divergence, and it never performs
-Sync/Cascade or launches runtime workers.
+completed setup and no canonical divergence, and it launches no runtime
+workers.
 
 `setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`, and the signing key, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`, which must sign for that address (`--dry-run` takes no key). On chains other than Ethereum mainnet and Sepolia it also requires a fee-oracle source (listed below).
 The submitter address must equal the `sequencer_address` compiled into the canonical machine; nothing checks this at runtime ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
@@ -165,7 +163,6 @@ not just a runtime signing-key change.
 Optional variables, by name; each subcommand's `--help` shows their defaults and validation from [`commands/config.rs`](sequencer/src/commands/config.rs):
 
 - Every subcommand: `CARTESI_SEQUENCER_DATA_DIR` (the SQLite file is `sequencer.db` inside; `setup` creates it and refuses a directory that holds anything but `sequencer.lock`, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC` (below).
-- `setup` and `run`: `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`.
 - `setup`: the fee-oracle source it pins, either `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` or a Uniswap source (the overrides `CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`, `CARTESI_SEQUENCER_WETH_ADDRESS` and `CARTESI_SEQUENCER_UNISWAP_V3_POOL`, given together and required on other chains, and `CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`); and two flags with no variable, `--base <MACHINE_DIR>` (a stored canonical machine to rebuild from; genesis without it) and `--dry-run`.
 - `run`: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener), `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH` and `CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`.
 
@@ -181,7 +178,7 @@ environment:
   CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
 ```
 
-Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, setup on a non-empty data directory, identity mismatch, a base machine that disagrees with L1, canonical divergence, persistent storage/application invariant failure), `40` setup's escape check found the old instance's work past the stop block (do not restart; stop the old instance, discard the data directory, run setup again), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics and an undecodable batch landed by the submitter key, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
+Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, setup on a non-empty data directory, identity mismatch, a base machine that disagrees with L1, canonical divergence, a void history, persistent storage/application invariant failure), `40` setup's escape check found the old instance's work past the stop block (do not restart; stop the old instance, discard the data directory, run setup again), and `1` for an unclassified operational failure; `10` is not used. Diagnosed terminal runtime faults, including worker panics, an undecodable batch landed by the submitter key, and a divergence or void history seen by a running process, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
 
 The [EIP-712 domain](docs/protocol/scheduler-semantics.md#user-op-signatures) is fixed except `chainId` and `verifyingContract`, which come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`.
 
@@ -280,7 +277,7 @@ Notes:
 - `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
 - Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
-- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, which names the expected nonce (`bad nonce: expected N, got M`), query again rather than incrementing.
+- The value is a hint, not a reservation; the application is authoritative. It does not go down within an era; a new era starts its own count (below). After a `422` bad-nonce rejection, which names the expected nonce (`bad nonce: expected N, got M`), query again rather than incrementing.
 - It is read from the era's live ops only. After a setup, a sender whose last op lies in the [rebuilt history](docs/protocol/application-history.md#the-rebuilt-history) or below the base count reads 0 until its first live op; sign the nonce the `422` names.
 - Successful responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
 
@@ -326,8 +323,8 @@ After each successfully applied input at offset `X`, persist the claim with
 - The era's history starts at its base count: the rows setup rebuilt from L1
   up to `baseline.rebuilt_history_end`, then the live rows, in one offset
   sequence with the same message shapes.
-- Recovery stops the process and disconnects subscribers. A reconnect must
-  present its saved claim; offsets alone cannot distinguish a replaced suffix.
+- A stopped process disconnects subscribers. A reconnect must present its
+  saved claim; offsets alone cannot distinguish another era's history.
 - Shutdown or a feed read/send failure may disconnect without a WebSocket
   Close frame. Resume from the saved claim after an unexpected disconnect;
   a clean close is not required for safe replay.
@@ -403,8 +400,8 @@ Example immediately after a setup from a machine stopped at the stop block:
   and does not certify a client projection. A known divergence returns `503`.
 - `compatibility` is `null` unless `from_generation=<u64>` is supplied together
   with `era_id`. It then contains `from_generation` and `preserved_input_count`:
-  the prefix that survived every standard recovery since that generation,
-  bounded by the current head. A future generation or missing era returns
+  the prefix preserved since that generation, bounded by the current head. No
+  operation advances the generation, so within an era this is the current head. A future generation or missing era returns
   `400 BAD_REQUEST`; an era mismatch takes precedence over the generation bound.
 
 For example, `GET /history?era_id=<uuid>&from_generation=0` can return
@@ -412,14 +409,11 @@ For example, `GET /history?era_id=<uuid>&from_generation=0` can return
 A saved checkpoint from that era/generation is reusable when its count `X`
 satisfies `K <= X <= 3`. The boundary is inclusive: the checkpoint has executed
 entries before `X`, and resumes at entry `X`. Each checkpoint must be checked
-using its own saved generation. With no intervening recovery, the bound is the
-current head. The [history contract](docs/protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)
+using its own saved generation. Within an era the bound is the current head. The [history contract](docs/protocol/application-history.md#checkpoint-compatibility-across-generations)
 defines the calculation and trust boundary.
 
 Restore an eligible checkpoint, persist the response's current history version
-with it, and subscribe using that version and its actual count. A recovery
-between lookup and subscription still returns `STALE_GENERATION`; repeat the
-lookup using the version associated with the restored state. Compatibility does
+with it, and subscribe using that version and its actual count. Compatibility does
 not certify the client's application or projection implementation, and cannot
 cross a cockroach recovery's new era.
 
@@ -480,13 +474,22 @@ lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.m
 - `GET /readyz` returns `200` while the inclusion-lane receiver is open and
   shutdown has not been requested; otherwise `503`. Its body is empty.
 - `GET /healthz` uses the same status as `/readyz` and returns JSON:
-  `{ "status": "ok", "inclusion_lane": "ok" }`. `status` becomes `"degraded"`
+  `{ "status": "ok", "inclusion_lane": "ok", "landing_lag_blocks": 40, "max_wait_blocks": 1200, "safe_head_age_seconds": 780 }`.
+  `status` becomes `"degraded"`
   for either failure condition; `inclusion_lane` becomes `"stopped"` once its
   receiver is closed. The lane closes it soon after shutdown is requested, so it
   can still read `"ok"` early in a shutdown.
+- `landing_lag_blocks`, `max_wait_blocks` and `safe_head_age_seconds` are the
+  [landing lag](docs/recovery/README.md#what-the-sequencer-does), the
+  application's window, and the safe block's age by the wall clock.
+  The history is void when `landing_lag_blocks` reaches `max_wait_blocks`.
+  `landing_lag_blocks` and `safe_head_age_seconds` are `null` until the first
+  reading after start, about two seconds. They do not change the status code.
 
-These probes cover process reachability, the lane channel, and shutdown state.
-They do not certify L1 freshness, submitter balance, or canonical agreement.
+These probes cover process reachability, the lane channel, and shutdown state,
+and report the landing lag and the safe head's age for monitoring to alert on;
+they set no threshold of their own. They do not certify submitter balance or
+canonical agreement.
 
 ## Storage Model
 
@@ -497,7 +500,7 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
 - `safe_inputs`: every raw InputBox observation, including batch envelopes
 - `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
-- `history_generation_cuts`: one immutable cut per standard-recovery transition; the greatest is the recovery generation
+- `history_generation_cuts`: one immutable cut per generation transition; the greatest is the recovery generation, and no operation advances it
 - `rebuilt_history`: the transactions setup executed from the base through the stop block, each with its count; the feed serves them before the live rows
 - `snapshots`: one immutable row per batch-close or baseline artifact (its directory and count); accepted status is read from `batches.accepted_input`, and download leases live in the serving process
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.
@@ -521,7 +524,7 @@ image names and how to run it.
 
 ## Prototype Limits
 
-- The `Application` trait defines dump/load behavior ([format](docs/snapshots/format.md)). Every batch close registers a durable snapshot atomically with the seal. Restart restores the latest valid snapshot and replays application inputs from its count. Acceptance determines the recovery checkpoint and garbage-collection frontier without mutating artifact metadata. [Snapshot lifecycle](docs/snapshots/lifecycle.md) documents leases and crash ordering.
+- The `Application` trait defines dump/load behavior ([format](docs/snapshots/format.md)). Every batch close registers a durable snapshot atomically with the seal. Restart restores the latest valid snapshot and replays application inputs from its count. Acceptance determines the comparison checkpoint and garbage-collection frontier without mutating artifact metadata. [Snapshot lifecycle](docs/snapshots/lifecycle.md) documents leases and crash ordering.
 - Schema and migrations are still in prototype mode and may change.
 
 ## Development

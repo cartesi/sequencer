@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Storage-domain test fixtures: seeding, the recovery fixture trait and
+//! Storage-domain test fixtures: seeding, the landing fixture trait and
 //! divergence markers. Crate-wide fixtures live in `crate::test_support`.
 
 use std::path::Path;
@@ -10,7 +10,6 @@ use alloy_primitives::{Address, B256};
 use app_core::application::WALLET_SCHEDULER_LIMITS;
 use rusqlite::params;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
-use sequencer_core::protocol::ProtocolTiming;
 
 use super::convert::{i64_to_u16, i64_to_u32, i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::next_l2_tx_count_in;
@@ -19,7 +18,6 @@ use super::ingress::{
 };
 use super::mutations::persist_frame_direct_sequence_derived;
 use super::queries::{load_current_write_head, query_batch_policy};
-use super::recovery::{recover_aging_tip_inner, recover_post_flush_inner};
 use super::snapshots::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
     BatchId, BatchPolicy, IngestedSafeInput, L2TxCount, LifecycleCommand, NewEra, SafeInputRange,
@@ -84,9 +82,27 @@ impl WriteHead {
 /// baseline yet opens through `Storage::open_with_era` instead; one that
 /// needs no era, through `Storage::initialize_for_command`.
 pub(crate) fn set_up_storage(path: &str, batch_submitter: Address) -> Storage {
+    set_up_storage_with_window(
+        path,
+        batch_submitter,
+        WALLET_SCHEDULER_LIMITS.max_wait_blocks,
+    )
+}
+
+/// [`set_up_storage`] with the identity pinning `max_wait_blocks` instead of
+/// the wallet's window.
+pub(crate) fn set_up_storage_with_window(
+    path: &str,
+    batch_submitter: Address,
+    max_wait_blocks: u64,
+) -> Storage {
     let mut storage =
         Storage::initialize_for_command(path, LifecycleCommand::Setup).expect("create schema");
-    pin_test_deployment_identity(&mut storage, batch_submitter);
+    crate::test_support::pin_test_deployment_identity_with_window(
+        &mut storage,
+        batch_submitter,
+        max_wait_blocks,
+    );
     storage
         .publish_era(
             &Path::new(path).with_file_name("baseline"),
@@ -94,11 +110,6 @@ pub(crate) fn set_up_storage(path: &str, batch_submitter: Address) -> Storage {
         )
         .expect("publish the genesis era");
     storage
-}
-
-/// Batch ids from raw indices, to compare against a cascade's invalidated list.
-pub(crate) fn batch_ids(raw: &[u64]) -> Vec<BatchId> {
-    raw.iter().copied().map(BatchId::from_raw).collect()
 }
 
 pub(crate) const SENDER_A: Address = Address::repeat_byte(0xAA);
@@ -118,15 +129,6 @@ pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::NewEra
         first_queued_input: 0,
         anchor_batch_nonce: 0,
     }
-}
-
-/// Default protocol timing for tests that don't care about specific tuning:
-/// the wallet's window, which the stub application shares. Sender-independent
-/// (timing carries no address); pair with a submitter address as needed at
-/// the call site.
-pub(crate) fn default_protocol_timing() -> ProtocolTiming {
-    let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
-    ProtocolTiming::try_new(window, 75, 900, 12).expect("valid test timing")
 }
 
 /// Every field of a [`WriteHead`], for the few tests that build one by hand:
@@ -189,7 +191,7 @@ impl WriteHeadParts {
 }
 
 /// Lane fixtures. Production opens the Tip through
-/// `ensure_open_tip_for_recovery` and closes frames and batches with
+/// `open_batch_if_none` and closes frames and batches with
 /// attributed executions and a snapshot (I7).
 impl Storage {
     /// Open the genesis Tip with an explicit leading range; asserts none exists.
@@ -210,7 +212,7 @@ impl Storage {
     }
 
     /// Open the genesis Tip at the observed safe head unless one exists; the
-    /// unguarded twin of `ensure_open_tip_for_recovery`.
+    /// unguarded twin of `open_batch_if_none`.
     pub(crate) fn ensure_open_tip(&mut self) -> rusqlite::Result<()> {
         self.write(|tx| {
             if load_current_write_head(tx)?.is_some() {
@@ -257,8 +259,7 @@ impl Storage {
     }
 }
 
-/// Reads only tests make. The danger check reads the safe-head columns
-/// through the `queries` functions inside its own transaction.
+/// Reads only tests make.
 impl Storage {
     /// Unix-ms of the last successful `log_gas_price` write. `0` means never
     /// written (migration default); completed setup guarantees a nonzero value.
@@ -268,18 +269,6 @@ impl Storage {
             [],
             |row| Ok(i64_to_u64(row.get::<_, i64>(0)?)),
         )
-    }
-
-    /// L1 timestamp (Unix seconds) of the observed safe block, or `None`
-    /// before the first safe-head observation.
-    pub(crate) fn current_safe_block_timestamp(&mut self) -> rusqlite::Result<Option<u64>> {
-        super::queries::current_safe_block_timestamp(&self.conn)
-    }
-
-    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
-    /// or `None` before the first safe-head observation.
-    pub(crate) fn last_safe_progress_ms(&self) -> rusqlite::Result<Option<u64>> {
-        super::queries::last_safe_progress_ms(&self.conn)
     }
 }
 
@@ -331,21 +320,20 @@ impl Storage {
         super::open::open_writer_connection(path)
     }
 
-    /// Append safe inputs at the current wall clock, with zero provenance.
-    /// See [`Storage::append_safe_inputs_with_timestamp`] for `batch_submitter`.
+    /// Append safe inputs with the wall clock as the safe block's L1
+    /// timestamp, with zero provenance. See
+    /// [`Storage::append_safe_inputs_with_timestamp`] for `batch_submitter`.
     pub(crate) fn append_safe_inputs(
         &mut self,
         safe_block: u64,
         inputs: &[StoredSafeInput],
         batch_submitter: Address,
-        timing: &ProtocolTiming,
     ) -> rusqlite::Result<()> {
         self.append_safe_inputs_with_timestamp(
             safe_block,
             i64_to_u64(now_unix_ms()) / 1000,
             inputs,
             batch_submitter,
-            timing,
         )
     }
 
@@ -360,28 +348,6 @@ impl Storage {
         safe_block_timestamp: u64,
         inputs: &[StoredSafeInput],
         batch_submitter: Address,
-        timing: &ProtocolTiming,
-    ) -> rusqlite::Result<()> {
-        self.append_safe_inputs_observed_at(
-            safe_block,
-            safe_block_timestamp,
-            crate::clock::unix_now_ms(),
-            inputs,
-            batch_submitter,
-            timing,
-        )
-    }
-
-    /// [`Storage::append_safe_inputs_with_timestamp`] synced at `now_ms`, the
-    /// reader's wall-clock reading that becomes `l1_safe_head.synced_at_ms`.
-    pub(crate) fn append_safe_inputs_observed_at(
-        &mut self,
-        safe_block: u64,
-        safe_block_timestamp: u64,
-        now_ms: u64,
-        inputs: &[StoredSafeInput],
-        batch_submitter: Address,
-        timing: &ProtocolTiming,
     ) -> rusqlite::Result<()> {
         match self.deployment_identity()? {
             Some(identity) => assert_eq!(
@@ -395,8 +361,6 @@ impl Storage {
             safe_block,
             safe_block_timestamp,
             rows.as_slice(),
-            timing,
-            now_ms,
         )
     }
 
@@ -459,22 +423,6 @@ impl Storage {
             params![now_ms, u64_to_i64(batch_index)],
         )?;
         Ok(())
-    }
-
-    /// The unguarded twin of `recover_post_flush_for_recovery`.
-    pub(crate) fn recover_post_flush(
-        &mut self,
-        danger_threshold: u64,
-    ) -> rusqlite::Result<Vec<BatchId>> {
-        self.write(|tx| recover_post_flush_inner(tx, danger_threshold))
-    }
-
-    /// The unguarded twin of `recover_aging_tip_for_recovery`.
-    pub(crate) fn recover_aging_tip(
-        &mut self,
-        danger_threshold: u64,
-    ) -> rusqlite::Result<Vec<BatchId>> {
-        self.write(|tx| recover_aging_tip_inner(tx, danger_threshold))
     }
 
     pub(crate) fn insert_batch_snapshot(
@@ -680,12 +628,7 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
         })
         .collect();
     storage
-        .append_safe_inputs(
-            safe_block,
-            inputs.as_slice(),
-            sender,
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(safe_block, inputs.as_slice(), sender)
         .expect("append safe inputs");
 }
 
@@ -757,10 +700,10 @@ pub(crate) fn record_canonical_divergence(
         .expect("record canonical divergence");
 }
 
-/// Recovery-test plumbing over [`Storage`]. `land` and `advance_safe_head`
-/// append through the production path with [`SENDER_A`] as the submitter and
-/// default timing; every input lands at `safe_block`.
-pub(crate) trait RecoveryFixture {
+/// Landing-test plumbing over [`Storage`]. `land` and `advance_safe_head`
+/// append through the production path with [`SENDER_A`] as the submitter;
+/// every input lands at `safe_block`.
+pub(crate) trait LandingFixture {
     /// Exercise the same frame-advance-before-close sequence as the live lane.
     fn close_batch_at(
         &mut self,
@@ -770,7 +713,7 @@ pub(crate) trait RecoveryFixture {
     fn land(&mut self, safe_block: u64, inputs: &[(Address, Vec<u8>)]);
     fn advance_safe_head(&mut self, safe_block: u64);
 }
-impl RecoveryFixture for Storage {
+impl LandingFixture for Storage {
     fn close_batch_at(
         &mut self,
         head: &mut crate::storage::WriteHead,
@@ -804,7 +747,7 @@ impl RecoveryFixture for Storage {
                 block_number: safe_block,
             })
             .collect();
-        self.append_safe_inputs(safe_block, &inputs, SENDER_A, &default_protocol_timing())
+        self.append_safe_inputs(safe_block, &inputs, SENDER_A)
             .expect("append safe inputs");
     }
 

@@ -76,7 +76,7 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
 
 fn make_dump_dir(dumps_dir: &Path, nonce: u64) -> PathBuf {
     // Unique per call within a process: nonce + nanos + atomic counter.
-    // Nonces can be reused across recovery cascades, so they alone
+    // Several dumps can carry one nonce, so it alone
     // don't guarantee uniqueness; the nanos+counter pair does. The name
     // is opaque — checkpoint metadata lives in the dir's `info.toml`,
     // never in the path.

@@ -12,11 +12,12 @@ limits this work accepts and the paths it left unverified.
 
 ## One recovery
 
-[outages.md](outages.md) plans deleting the standard recovery: what the
-sequencer does when batches stop landing, the playbooks, what goes, the order
-of work and what is [still to decide](outages.md#still-to-decide). It also
-takes the recovery generation off every client interface, which the
-[egress redesign](#redesign-the-egress-api) below then need not do.
+The sequencer repairs nothing by itself and stops for good on a void history
+([batch landing and outages](../../recovery/README.md)). [outages.md](outages.md)
+keeps what remains: the batches as an append-only list, the recovery
+generation off every client interface, which the
+[egress redesign](#redesign-the-egress-api) below then need not do, and what is
+[still to decide](outages.md#still-to-decide).
 
 ## Promote to real docs
 
@@ -77,8 +78,8 @@ Later, in light of this plan:
 
 - **A metrics endpoint.** The sequencer exports no metrics: an operator reads
   logs and `/healthz`. Design one on the internal listener, beside the other
-  internal routes, starting from the two numbers the
-  [outage plan](outages.md#what-the-sequencer-does) adds.
+  internal routes, starting from the two numbers `/healthz` reports
+  ([what the sequencer does](../../recovery/README.md#what-the-sequencer-does)).
 
 ## Machine sourcing
 

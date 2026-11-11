@@ -61,8 +61,8 @@ impl DirectOperands {
 
 pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
     // The Tip is the single row in `valid_open_batch` (enforced by
-    // `ux_single_valid_tip`). Returns None if there's no Tip (fresh DB,
-    // or torn state between cascade and recovery-batch open).
+    // `ux_single_valid_tip`). Returns None if there's no Tip (a fresh era,
+    // before `run` opens its first batch).
     let latest_batch = match tx.query_row(
         "SELECT
             b.batch_index,
@@ -159,9 +159,9 @@ pub(super) fn current_safe_block(conn: &Connection) -> Result<Option<u64>> {
 }
 
 /// Current safe block, or `QueryReturnedNoRows` if no observation has been
-/// recorded yet. Use from code paths that only run after preemptive recovery
-/// has produced a safe-head observation (submitter, lane, post-recovery
-/// open-batch helpers); callers that legitimately handle the "never synced"
+/// recorded yet. Use from code paths that only run once setup's sync has
+/// recorded a safe head (submitter, lane, the start batch's opening);
+/// callers that legitimately handle the "never synced"
 /// case should use [`current_safe_block`] instead.
 pub(super) fn current_safe_block_required(conn: &Connection) -> Result<u64> {
     current_safe_block(conn)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
@@ -173,19 +173,6 @@ pub(super) fn current_safe_block_timestamp(conn: &Connection) -> Result<Option<u
     let value: Option<i64> = conn
         .query_row(
             "SELECT block_timestamp FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(value.map(i64_to_u64))
-}
-
-/// Wall-clock timestamp (Unix ms) of the last observed safe-head advance, or
-/// `None` if no real safe-head observation has occurred yet.
-pub(super) fn last_safe_progress_ms(conn: &Connection) -> Result<Option<u64>> {
-    let value: Option<i64> = conn
-        .query_row(
-            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
             [],
             |row| row.get(0),
         )

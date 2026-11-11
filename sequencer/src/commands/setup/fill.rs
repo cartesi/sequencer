@@ -70,7 +70,6 @@ mod tests {
     use super::*;
     use crate::ingress::inclusion_lane::{InclusionLane, InclusionLaneConfig};
     use crate::runtime::shutdown::RuntimeScope;
-    use crate::storage::test_helpers::default_protocol_timing;
     use crate::storage::{LifecycleCommand, StoredSafeInput};
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use crate::test_support::{shutdown_lane, wait_until};
@@ -183,7 +182,6 @@ mod tests {
                     },
                 ],
                 SUBMITTER,
-                &default_protocol_timing(),
             )
             .unwrap();
         (db, storage)
@@ -265,10 +263,9 @@ mod tests {
         assert_eq!(storage.era().unwrap(), history);
     }
 
-    /// Run's root frame drains from the era's first queued input, and so does
-    /// a replacement after a cascade tears the root; the baseline survives.
+    /// Run's root frame drains from the era's first queued input.
     #[test]
-    fn the_root_and_its_replacement_drain_from_the_first_queued_input() {
+    fn the_root_drains_from_the_first_queued_input() {
         let (_db, mut storage) = synced_setup("root-drains-queued", 1400, 1500);
         let dumps = tempfile::tempdir().unwrap();
         publish(
@@ -280,10 +277,7 @@ mod tests {
             queued_at_stop(3),
         )
         .unwrap();
-        let generation = storage.history_version().unwrap().recovery_generation;
-        storage
-            .ensure_open_tip_for_recovery(&default_protocol_timing(), crate::clock::unix_now_ms())
-            .unwrap();
+        assert!(storage.open_batch_if_none().unwrap(), "run opens the root");
         assert_eq!(storage.open_state().unwrap().unwrap().safe_block(), 1500);
 
         let drained = |storage: &mut Storage| {
@@ -308,34 +302,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(drained(&mut storage), vec![(41, 1)]);
-
-        // The root ages past the threshold and is torn.
-        storage
-            .append_safe_inputs(2800, &[], SUBMITTER, &default_protocol_timing())
-            .unwrap();
-        assert_eq!(
-            storage.recover_aging_tip(1200).unwrap(),
-            crate::storage::test_helpers::batch_ids(&[0])
-        );
-        assert_eq!(
-            storage.history_version().unwrap().recovery_generation.get(),
-            generation.get() + 1
-        );
-        let current = storage.era().unwrap();
-        assert_eq!(current.stop_block, 100);
-        assert_eq!(current.rebuilt_end, L2TxCount::new(41));
-        assert_eq!(drained(&mut storage), vec![(41, 1)]);
-        assert!(
-            storage.latest_snapshot().unwrap().is_some(),
-            "the baseline survives"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_after_setup_credits_a_queued_deposit_exactly_once() {
         let db = temp_db("setup-then-lane-credits-once");
         let dumps_dir = tempfile::tempdir().expect("dumps dir");
-        let timing = default_protocol_timing();
 
         // The real `WalletApp`: only it exposes a queryable balance. Its config
         // round-trips through the SSZ dump, so the lane reloads it.
@@ -381,7 +353,7 @@ mod tests {
                 Storage::initialize_for_command(db.path.as_str(), LifecycleCommand::Setup).unwrap();
             pin_test_deployment_identity(&mut storage, Address::repeat_byte(0x99));
             storage
-                .append_safe_inputs(150, &inputs, Address::repeat_byte(0x99), &timing)
+                .append_safe_inputs(150, &inputs, Address::repeat_byte(0x99))
                 .unwrap();
             publish(
                 &mut base,
@@ -402,9 +374,7 @@ mod tests {
             let at_stop = WalletApp::from_dump(&dump_info::app_prefix(&baseline.prefix)).unwrap();
             assert_eq!(at_stop.current_user_balance(recipient), U256::ZERO);
             // Run's startup opens the root frame at its own safe head.
-            storage
-                .ensure_open_tip_for_recovery(&timing, crate::clock::unix_now_ms())
-                .unwrap();
+            assert!(storage.open_batch_if_none().unwrap());
         }
 
         let storage = Storage::open(db.path.as_str()).expect("reopen for lane");

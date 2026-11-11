@@ -47,21 +47,25 @@ pub(crate) fn timestamped_log_path(logs_dir: &Path, prefix: &str) -> PathBuf {
     logs_dir.join(format!("{prefix}-{ts}.log"))
 }
 
+/// How a child's wait for its HTTP listener ended.
+pub(crate) enum Readiness {
+    Ready,
+    /// The child exited first, with this status.
+    Exited(std::process::ExitStatus),
+}
+
 pub(crate) async fn wait_for_http_readiness(
     endpoint: &str,
     child: &mut Child,
     timeout: Duration,
-) -> HarnessResult<()> {
+) -> HarnessResult<Readiness> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Err(io_other(format!(
-                "sequencer exited before readiness: status={status}"
-            ))
-            .into());
+            return Ok(Readiness::Exited(status));
         }
         if http_endpoint_is_ready(endpoint).await {
-            return Ok(());
+            return Ok(Readiness::Ready);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(io_other(format!(

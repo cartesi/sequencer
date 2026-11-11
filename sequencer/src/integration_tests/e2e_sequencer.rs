@@ -1199,8 +1199,8 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
     let config = WalletConfig::default();
     pin_test_deployment_identity(&mut storage, TEST_BATCH_SUBMITTER);
 
-    // Always record a safe-head observation: production callers are gated by
-    // the startup recovery procedure, so storage paths like `safe_input_frontier`
+    // Always record a safe-head observation: in production setup's sync
+    // leaves one before `run` starts, so storage paths like `safe_input_frontier`
     // assume a row exists. With no deposits we still write an empty advance
     // so the lane can start without `current_safe_block_required` failing.
     let safe_inputs: Vec<StoredSafeInput> = deposits
@@ -1218,12 +1218,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
         })
         .collect();
     storage
-        .append_safe_inputs(
-            1,
-            &safe_inputs,
-            TEST_BATCH_SUBMITTER,
-            &crate::storage::test_helpers::default_protocol_timing(),
-        )
+        .append_safe_inputs(1, &safe_inputs, TEST_BATCH_SUBMITTER)
         .expect("seed safe head (and any deposits)");
 }
 
@@ -1260,7 +1255,6 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 block_number: safe_block,
             }],
             TEST_BATCH_SUBMITTER,
-            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append safe direct input");
 }

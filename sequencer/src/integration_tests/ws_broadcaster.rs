@@ -374,7 +374,6 @@ fn seed_ordered_txs(db_path: &str) {
                 block_number: 10,
             }],
             Address::repeat_byte(0x7f),
-            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append direct input");
     storage
@@ -405,7 +404,6 @@ fn append_drained_direct_input(db_path: &str, payload: Vec<u8>) {
                 block_number: safe_block,
             }],
             Address::repeat_byte(0x7f),
-            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append direct input");
     storage
@@ -475,6 +473,7 @@ async fn start_test_server_with_limits(
             state_file_in_dump: snapshot_state_file,
             leases: crate::storage::SnapshotLeases::default(),
         },
+        crate::landing::test_feed(1200),
     );
 
     WsServerRuntime {

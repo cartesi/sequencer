@@ -4,6 +4,5 @@
 mod batch_submitter;
 mod chain_id_validation;
 mod e2e_sequencer;
-mod recovery_compatibility;
 mod snapshot_endpoints;
 mod ws_broadcaster;

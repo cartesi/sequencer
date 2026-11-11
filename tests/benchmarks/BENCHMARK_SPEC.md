@@ -87,7 +87,6 @@ This spec makes that requirement measurable and repeatable.
 3. During the drain the harness mines one L1 block per second at Anvil's own clock and stops after 120 s; `drain_secs` is then reported as not reached.
 4. `drain_secs` is shaped by the environment: the submitter's idle poll (5 s by default), Anvil's safe-head lag (`--slots-in-an-epoch 1`) and the 1 s poll. It does not measure submitter throughput.
 5. Neither metric has a threshold in this phase.
-6. A recovery cascade during the run reuses batch nonces, which makes `drain_secs` meaningless.
 
 ## 4. Benchmark Scenarios
 

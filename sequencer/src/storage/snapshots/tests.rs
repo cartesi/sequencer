@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
-use crate::storage::history::advance_recovery_generation_in;
 use crate::storage::test_helpers::{SENDER_A, era, seed_safe_inputs_with_batch_nonces};
 use crate::storage::{LifecycleCommand, SafeInputRange, WriteHead};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
@@ -157,7 +156,7 @@ fn snapshot_prefix_is_immutable() {
 }
 
 #[test]
-fn leases_keep_artifact_count_and_version_together_after_acceptance_and_generation_change() {
+fn leases_keep_artifact_count_and_version_together_after_acceptance() {
     let (_db, mut storage, baseline, mut head) = baseline_and_tip("snapshot-version");
     let leases = SnapshotLeases::default();
     let old = storage
@@ -189,14 +188,13 @@ fn leases_keep_artifact_count_and_version_together_after_acceptance_and_generati
         .unwrap();
     close(&mut storage, &mut head);
     seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0]);
-    storage.write(advance_recovery_generation_in).unwrap();
     let new = storage.acquire_finalized_lease(&leases).unwrap().unwrap();
     assert_eq!(old.prefix, prefix(0));
     assert_eq!(old.l2_tx_count, L2TxCount::ZERO);
     assert_eq!(old.history_version, old_version);
     assert_eq!(new.dump.l2_tx_count.get(), 1);
     assert_eq!(new.dump.next_batch_nonce, 1);
-    assert_ne!(new.dump.history_version, old_version);
+    assert_eq!(new.dump.history_version, old_version);
     assert!(storage.collect_snapshots(&leases).unwrap().is_empty());
     assert_eq!(leases.count(baseline), Some(1));
     drop(old);

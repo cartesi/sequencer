@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Batch acceptance: `batches.accepted_input`, the prefix of our valid batches
-//! the on-chain scheduler accepted, simulated with `ProtocolTiming::scheduler_accepts`.
+//! the on-chain scheduler accepted, simulated with `protocol::scheduler_accepts`
+//! under the pinned window.
 //! Its only writer is [`record_accepted_batches`], inside the input reader's
 //! append transaction; a divergence marker freezes it (I9, I15).
 
@@ -11,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Result, params};
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 use super::history::{era_in, find_era_in};
 use super::l1_inputs::query_deployment_identity;
-use sequencer_core::protocol::{AcceptedBatch, ProtocolTiming, SafeInputView};
+use sequencer_core::protocol::{AcceptedBatch, SafeInputView, scheduler_accepts};
 
 /// The safe input of the greatest acceptance, or `None` before any.
 fn latest_accepted_input(conn: &Connection) -> Result<Option<i64>> {
@@ -26,7 +27,7 @@ fn latest_accepted_input(conn: &Connection) -> Result<Option<i64>> {
 /// The greatest accepted batch's nonce + 1, else the era's anchor
 /// (`anchor_batch_nonce`, its next batch nonce at the stop block). By the
 /// contiguity of valid nonces this is the nonce of the first unaccepted valid
-/// closed batch (the cascade pivot), when one exists (I16).
+/// closed batch, the one the void history judges, when one exists (I16).
 pub(super) fn frontier_nonce(conn: &Connection) -> Result<u64> {
     let latest: Option<i64> = conn
         .query_row(
@@ -55,12 +56,12 @@ fn next_expected_nonce(nonce: u64) -> u64 {
 /// Mirror scheduler acceptance over new batch-submitter inputs onto
 /// `batches.accepted_input`; an accepted landing that is foreign or
 /// byte-different records `canonical_divergence` instead (I9, I15). The only
-/// persistent cursor is the greatest accepted input: recovery can reuse a
-/// nonce after rejected rows, so those are rescanned until a later acceptance.
-/// The expected-nonce advance stays inline because it interleaves with the
-/// content-identity check and the divergence freeze. Runs exactly when the
-/// era exists; the submitter is the pinned deployment identity's.
-pub(super) fn record_accepted_batches(conn: &Connection, timing: &ProtocolTiming) -> Result<()> {
+/// persistent cursor is the greatest accepted input: rows rejected at the
+/// expected nonce are rescanned until a later acceptance. The expected-nonce
+/// advance stays inline because it interleaves with the content-identity
+/// check and the divergence freeze. Runs exactly when the era exists; the
+/// submitter and the staleness window are the pinned deployment identity's.
+pub(super) fn record_accepted_batches(conn: &Connection) -> Result<()> {
     const PAGE_SIZE: i64 = 256;
     const SELECT_SQL: &str = "SELECT safe_input_index, payload, block_number, transaction_hash \
                               FROM safe_inputs \
@@ -88,9 +89,9 @@ pub(super) fn record_accepted_batches(conn: &Connection, timing: &ProtocolTiming
         return Ok(());
     };
     let stop_block = u64_to_i64(era.stop_block);
-    let batch_submitter = query_deployment_identity(conn)?
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)?
-        .batch_submitter_address;
+    let identity = query_deployment_identity(conn)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let batch_submitter = identity.batch_submitter_address;
+    let max_wait_blocks = identity.max_wait_blocks;
     let mut cursor = latest_accepted_input(conn)?.unwrap_or(-1);
     let mut expected = frontier_nonce(conn)?;
 
@@ -122,7 +123,9 @@ pub(super) fn record_accepted_batches(conn: &Connection, timing: &ProtocolTiming
                 payload: payload.as_slice(),
                 inclusion_block: i64_to_u64(*block_number),
             };
-            let Some(accepted) = timing.scheduler_accepts(batch_submitter, input, expected) else {
+            let Some(accepted) =
+                scheduler_accepts(batch_submitter, max_wait_blocks, input, expected)
+            else {
                 continue;
             };
 
@@ -148,7 +151,7 @@ pub(super) fn record_accepted_batches(conn: &Connection, timing: &ProtocolTiming
                 );
                 // Stop scanning; the marker (committed with this sync)
                 // freezes the frontier and routes every subsequent boot and
-                // detector tick to refusal, and the lane's next time-gated
+                // landing-watch tick to the terminal stop, and the lane's next time-gated
                 // frontier read (`Storage::safe_frontier_state`) returns
                 // `CanonicalDivergence` instead of an open frontier (I15).
                 return Ok(());
@@ -290,10 +293,11 @@ fn record_canonical_divergence_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::unix_now_ms;
+
+    /// The window the test identity pins (the wallet's).
+    const WINDOW: u64 = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
     use crate::storage::test_helpers::{
-        SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-        seed_safe_inputs_with_batch_nonces, set_up_storage,
+        SENDER_A, SENDER_B, local_batch_payload, seed_safe_inputs_with_batch_nonces, set_up_storage,
     };
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
     use crate::test_support::temp_db;
@@ -301,7 +305,7 @@ mod tests {
 
     #[test]
     fn recovered_prefix_does_not_reinterpret_a_rejected_future_nonce() {
-        use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
+        use crate::storage::test_helpers::local_batch_payload;
         use crate::storage::{LifecycleCommand, StoredSafeInput};
         use crate::test_support::pin_test_deployment_identity;
         use sequencer_core::{batch::Batch, history::L2TxCount};
@@ -314,7 +318,6 @@ mod tests {
             let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
                 .expect("initialize setup");
             let submitter = Address::repeat_byte(0x99);
-            let timing = default_protocol_timing();
             pin_test_deployment_identity(&mut storage, submitter);
             let old_future = Batch {
                 nonce: 1,
@@ -327,32 +330,32 @@ mod tests {
             }
             .as_ssz_bytes();
             assert!(
-                timing
-                    .scheduler_accepts(
-                        submitter,
-                        SafeInputView {
-                            safe_input_index: 0,
-                            sender: submitter,
-                            payload: &old_future,
-                            inclusion_block: old_future_block,
-                        },
-                        0
-                    )
-                    .is_none()
+                scheduler_accepts(
+                    submitter,
+                    WINDOW,
+                    SafeInputView {
+                        safe_input_index: 0,
+                        sender: submitter,
+                        payload: &old_future,
+                        inclusion_block: old_future_block,
+                    },
+                    0
+                )
+                .is_none()
             );
             assert!(
-                timing
-                    .scheduler_accepts(
-                        submitter,
-                        SafeInputView {
-                            safe_input_index: 1,
-                            sender: submitter,
-                            payload: &old_accepted,
-                            inclusion_block: 30,
-                        },
-                        0
-                    )
-                    .is_some()
+                scheduler_accepts(
+                    submitter,
+                    WINDOW,
+                    SafeInputView {
+                        safe_input_index: 1,
+                        sender: submitter,
+                        payload: &old_accepted,
+                        inclusion_block: 30,
+                    },
+                    0
+                )
+                .is_some()
             );
             storage
                 .append_safe_inputs_with_timestamp(
@@ -371,7 +374,6 @@ mod tests {
                         },
                     ],
                     submitter,
-                    &timing,
                 )
                 .expect("ingest opaque prefix");
             storage
@@ -403,7 +405,6 @@ mod tests {
                         block_number: 31,
                     }],
                     submitter,
-                    &timing,
                 )
                 .expect("accept post-baseline batch");
             assert!(
@@ -435,7 +436,6 @@ mod tests {
     fn record_accepted_batches_resumes_from_latest_row() {
         let db = temp_db("safe-accepted-frontier-resume");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -470,7 +470,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(11, second_wave.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(11, second_wave.as_slice(), SENDER_A)
             .expect("append second wave");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -488,11 +488,54 @@ mod tests {
         assert_eq!(accepted_count, 4);
     }
 
+    /// Acceptance judges staleness by the pinned window, not the wallet's:
+    /// under a pinned window of 50, a batch landing `s + 49` is accepted and
+    /// one landing `s + 50` is not.
+    #[test]
+    fn acceptance_uses_the_pinned_window() {
+        let db = temp_db("accepted-pinned-window");
+        let mut storage =
+            crate::storage::test_helpers::set_up_storage_with_window(&db.path, SENDER_A, 50);
+        let mut head = storage
+            .initialize_open_state(100, SafeInputRange::empty_at(0))
+            .expect("initialize");
+        storage.close_frame_and_batch(&mut head).expect("close 0");
+        storage.close_frame_and_batch(&mut head).expect("close 1");
+        let first = local_batch_payload(&mut storage, 0);
+        let second = local_batch_payload(&mut storage, 1);
+        storage
+            .append_safe_inputs(
+                150,
+                &[
+                    StoredSafeInput {
+                        sender: SENDER_A,
+                        payload: first,
+                        block_number: 149,
+                    },
+                    StoredSafeInput {
+                        sender: SENDER_A,
+                        payload: second,
+                        block_number: 150,
+                    },
+                ],
+                SENDER_A,
+            )
+            .expect("append");
+        assert_eq!(
+            storage
+                .submitter_frontier()
+                .expect("frontier")
+                .accepted_next_nonce,
+            1,
+            "batch 0 at s + 49 is accepted; batch 1 at s + 50 is stale"
+        );
+        assert_eq!(storage.canonical_divergence().expect("marker"), None);
+    }
+
     #[test]
     fn accepted_frontier_skips_stale_payloads() {
         let db = temp_db("safe-accepted-frontier-skip-stale");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         // Local batch 0 (first frame safe_block=1900) and batch 1 (first frame
         // safe_block=1900). Their landings carry the real wire bytes so the
@@ -530,7 +573,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(2000, inputs.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(2000, inputs.as_slice(), SENDER_A)
             .expect("append");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -575,7 +618,6 @@ mod tests {
         // frontier; later syncs stay frozen.
         let db = temp_db("mismatch-divergence");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
             .expect("initialize");
@@ -595,7 +637,6 @@ mod tests {
                     block_number: 20,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect("sync commits; the marker rides the same transaction");
 
@@ -623,7 +664,6 @@ mod tests {
                     block_number: 21,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect("append after marker");
         let frontier = storage.submitter_frontier().expect("frontier");
@@ -640,8 +680,8 @@ mod tests {
         // expected nonce would be sim-accepted and silently desync the
         // frontier forever. With the check, it fails the local-batch lookup
         // (kind = foreign), the poison marker persists atomically with the
-        // sync, the frontier freezes, and `check_danger` reports
-        // `CanonicalDivergence` ahead of every other arm.
+        // sync, the frontier freezes, and `terminal_fact` reports the
+        // divergence.
         let db = temp_db("frontier-future-safe-block");
         let mut storage = set_up_storage(&db.path, Address::repeat_byte(0xCC));
 
@@ -655,14 +695,13 @@ mod tests {
         });
 
         let batch_submitter = Address::repeat_byte(0xCC);
-        let protocol = ProtocolTiming::try_new(u64::MAX, 75, 900, 12).expect("valid timing");
         let inputs = vec![StoredSafeInput {
             sender: batch_submitter,
             payload: future_safe_block_payload,
             block_number: 100,
         }];
         storage
-            .append_safe_inputs(200, inputs.as_slice(), batch_submitter, &protocol)
+            .append_safe_inputs(200, inputs.as_slice(), batch_submitter)
             .expect("append commits; the marker rides the same transaction");
 
         let frontier = storage.submitter_frontier().expect("submitter frontier");
@@ -670,13 +709,13 @@ mod tests {
             frontier.accepted_next_nonce, 0,
             "the frontier must freeze before the diverged landing"
         );
-        let status = storage
-            .check_danger(&protocol, unix_now_ms())
-            .expect("check_danger");
         assert_eq!(
-            status,
-            crate::storage::DangerStatus::CanonicalDivergence(0),
-            "the marker outranks every other danger arm"
+            storage.terminal_fact().expect("terminal fact"),
+            Some(crate::storage::TerminalFact::Divergence(Divergence {
+                nonce: 0,
+                safe_input_index: 0,
+            })),
+            "the marker is the era's terminal fact"
         );
     }
 
@@ -695,7 +734,6 @@ mod tests {
                 ..crate::storage::NewEra::EMPTY_GENESIS
             },
         );
-        let protocol = default_protocol_timing();
         let submitter = SENDER_A;
 
         // The era is anchored at N' = 7: build + seal one local batch — with
@@ -729,7 +767,6 @@ mod tests {
                     block_number: 20,
                 }],
                 submitter,
-                &protocol,
             )
             .expect("sync the N' landing");
 
@@ -769,7 +806,6 @@ mod tests {
                 ..crate::storage::NewEra::EMPTY_GENESIS
             },
         );
-        let protocol = default_protocol_timing();
         let submitter = SENDER_A;
 
         // Old-generation batches at nonces 0, 1, 2 (< anchor) land from the submitter.
@@ -791,7 +827,7 @@ mod tests {
             })
             .collect();
         storage
-            .append_safe_inputs(30, &landings, submitter, &protocol)
+            .append_safe_inputs(30, &landings, submitter)
             .expect("sync below-anchor landings");
 
         let divergence: i64 = storage
@@ -818,7 +854,6 @@ mod tests {
     fn record_accepted_batches_skips_duplicate_nonces() {
         let db = temp_db("populate-dup-nonces");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -842,7 +877,6 @@ mod tests {
                     },
                 ],
                 SENDER_A,
-                &protocol,
             )
             .expect("append");
 
@@ -857,7 +891,6 @@ mod tests {
     fn record_accepted_batches_handles_large_nonce_gap() {
         let db = temp_db("populate-nonce-gap");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -873,7 +906,6 @@ mod tests {
                     block_number: 20,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect("append");
 
@@ -885,7 +917,6 @@ mod tests {
     fn record_accepted_batches_out_of_order_arrivals_stalls_frontier() {
         let db = temp_db("populate-out-of-order");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         let mut head = storage
             .initialize_open_state(10, SafeInputRange::empty_at(0))
@@ -902,7 +933,6 @@ mod tests {
                     block_number: 20,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect("append");
 
@@ -922,7 +952,6 @@ mod tests {
                     block_number: 21,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect("append nonce 0");
 
@@ -960,21 +989,20 @@ mod tests {
         let db = temp_db("accepted-before-era");
         let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
             .expect("initialize setup");
-        let timing = default_protocol_timing();
         // Judged against the empty tree, this landing would read as Foreign.
         assert!(
-            timing
-                .scheduler_accepts(
-                    SENDER_A,
-                    SafeInputView {
-                        safe_input_index: 0,
-                        sender: SENDER_A,
-                        payload: &empty_batch(0),
-                        inclusion_block: 10,
-                    },
-                    0
-                )
-                .is_some()
+            scheduler_accepts(
+                SENDER_A,
+                WINDOW,
+                SafeInputView {
+                    safe_input_index: 0,
+                    sender: SENDER_A,
+                    payload: &empty_batch(0),
+                    inclusion_block: 10,
+                },
+                0
+            )
+            .is_some()
         );
         storage
             .append_safe_inputs(
@@ -992,7 +1020,6 @@ mod tests {
                     },
                 ],
                 SENDER_A,
-                &timing,
             )
             .expect("setup's sync appends");
 
@@ -1020,8 +1047,6 @@ mod tests {
                     block_timestamp: 180,
                     transaction_hash: alloy_primitives::B256::repeat_byte(0x01),
                 }],
-                &default_protocol_timing(),
-                crate::clock::unix_now_ms(),
             )
             .expect_err("the era's frontier needs the pinned submitter");
         assert!(
@@ -1039,7 +1064,6 @@ mod tests {
         let db = temp_db("accepted-first-after-era");
         let mut storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup)
             .expect("initialize setup");
-        let timing = default_protocol_timing();
         // Setup's sync ingests past the stop block 30: a submitter landing at
         // the anchor nonce 1 inside the baseline (opaque) and one after it.
         storage
@@ -1058,7 +1082,6 @@ mod tests {
                     },
                 ],
                 SENDER_A,
-                &timing,
             )
             .expect("setup's sync appends");
         assert_eq!(accepted_count(&storage), 0);
@@ -1077,7 +1100,7 @@ mod tests {
         // the stop block that setup's sync ingested: no local batch carries
         // nonce 1, so it is Foreign.
         storage
-            .append_safe_inputs(41, &[], SENDER_A, &timing)
+            .append_safe_inputs(41, &[], SENDER_A)
             .expect("run's first sync");
         assert_eq!(
             storage.canonical_divergence().expect("marker"),

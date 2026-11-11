@@ -248,10 +248,12 @@ pub(crate) fn start_on_listeners(
     tx_feed: L2TxFeed,
     config: ApiConfig,
     snapshot_state: SnapshotState,
+    landing: crate::landing::LandingFeed,
 ) -> ApiServerTask {
     let health_state = Arc::new(crate::egress::api::HealthState {
         tx_sender: tx_sender.clone(),
         shutdown: shutdown.clone(),
+        landing,
     });
     // Serve exactly the domain `/tx` verifies against. Production builds it
     // with `build_input_domain`, which always sets all four fields.

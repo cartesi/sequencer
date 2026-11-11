@@ -154,23 +154,6 @@ pub(super) fn next_l2_tx_count_of(conn: &Connection, era: &Era) -> Result<L2TxCo
     }))
 }
 
-/// Record the next recovery generation's cut. Called after suffix deletion
-/// and before the replacement Tip attributes directs; the cut is the new
-/// generation, since the generation is the greatest cut.
-pub(super) fn advance_recovery_generation_in(tx: &Transaction<'_>) -> Result<RecoveryGeneration> {
-    let current = history_version_in(tx)?.recovery_generation.get();
-    let next = current
-        .checked_add(1)
-        .expect("recovery generation exhausted");
-    let preserved = next_l2_tx_count_in(tx)?;
-    tx.execute(
-        "INSERT INTO history_generation_cuts (recovery_generation, preserved_l2_tx_count) \
-         VALUES (?1, ?2)",
-        params![u64_to_i64(next), u64_to_i64(preserved.get())],
-    )?;
-    Ok(RecoveryGeneration::new(next))
-}
-
 pub(super) fn preserved_input_count_in(
     conn: &Connection,
     from: RecoveryGeneration,
@@ -204,7 +187,7 @@ pub(super) fn preserved_input_count_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::{SENDER_A, era, set_up_storage};
+    use crate::storage::test_helpers::era;
     use crate::storage::{LifecycleCommand, Storage};
     use crate::test_support::temp_db;
 
@@ -313,40 +296,6 @@ mod tests {
         let mut reopened = Storage::open(&db.path).unwrap();
         assert_eq!(reopened.era().unwrap(), published);
         assert_eq!(reopened.next_l2_tx_count().unwrap().get(), 41);
-    }
-
-    #[test]
-    fn the_generation_is_the_greatest_cut_and_advances_one_at_a_time() {
-        let db = temp_db("history-generation");
-        let mut storage = set_up_storage(&db.path, SENDER_A);
-        let original = storage.history_version().unwrap();
-        assert_eq!(original.recovery_generation.get(), 0);
-        let result: Result<()> = storage.write(|tx| {
-            advance_recovery_generation_in(tx)?;
-            Err(rusqlite::Error::InvalidQuery)
-        });
-        assert!(result.is_err());
-        assert_eq!(storage.history_version().unwrap(), original);
-        for expected in [1, 2] {
-            assert_eq!(
-                storage.write(advance_recovery_generation_in).unwrap(),
-                RecoveryGeneration::new(expected)
-            );
-            let version = storage.history_version().unwrap();
-            assert_eq!(version.era_id, original.era_id);
-            assert_eq!(version.recovery_generation.get(), expected);
-        }
-        for sql in [
-            "INSERT INTO history_generation_cuts VALUES (4, 0)",
-            "INSERT INTO history_generation_cuts VALUES (2, 0)",
-        ] {
-            let error = storage.conn.execute(sql, []).expect_err(sql);
-            assert_eq!(
-                error.to_string(),
-                "a cut advances the recovery generation by exactly one, within an era",
-                "{sql}"
-            );
-        }
     }
 
     #[test]

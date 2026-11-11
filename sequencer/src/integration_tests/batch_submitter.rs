@@ -14,7 +14,6 @@ use sequencer::l1::watermark::WalletNonceWatermarkSink;
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
-use sequencer_core::protocol::ProtocolTiming;
 
 use crate::test_support::{TestDb, temp_db};
 
@@ -108,15 +107,13 @@ impl BatchPoster for TestMock {
     }
 }
 
-/// Mirrors what the startup recovery procedure establishes in production: persist a real
+/// Mirrors what setup's sync establishes in production: persist a real
 /// safe-head observation so `submitter_frontier` has a row to read. Without
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.
 fn seed_observed_safe_head(storage: &mut Storage) {
-    let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
-    let timing = ProtocolTiming::try_new(window, 75, 900, 12).expect("test timing");
     storage
-        .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO, &timing)
+        .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO)
         .expect("seed observed safe head");
 }
 

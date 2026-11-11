@@ -3,9 +3,10 @@
 Cockroach recovery starts a new sequencer when the old one is gone or cannot be
 trusted: it had a bug, it served transactions that never landed, its SQLite is
 corrupt, or its disk failed. The watchdog reports most of these as a divergence
-([incident runbook](../watchdog/incident-runbook.md)).
-[Standard recovery](README.md) is a different procedure: the sequencer runs it
-by itself after a liveness failure, over a database it still trusts.
+([incident runbook](../watchdog/incident-runbook.md)). It is the sequencer's
+only recovery: a void history and a recorded divergence both stop the
+sequencer for good and send the operator here
+([batch landing and outages](README.md)).
 
 The operator starts a recovery and one command does the work: `setup`, the
 same command that starts a new deployment. Every setup starts from a **base**
@@ -182,12 +183,11 @@ in the input table for `run`.
 
 ## After setup
 
-- **`run` opens the root frame** at its own safe head, through startup
-  recovery's `EnsureOpenTip`. That frame first drains the directs still queued
-  at the stop block, from the first queued input on, as the canonical
-  scheduler's first frame does; submitter and over-cap inputs never execute.
-  A standard-recovery cascade that tears every batch of the era drains from
-  there again.
+- **`run` opens the era's first batch** at its own safe head: its start opens
+  a batch when none is open ([what the sequencer does](README.md#what-the-sequencer-does)).
+  That batch's root frame first drains the directs still queued at the stop
+  block, from the first queued input on, as the canonical scheduler's first
+  frame does; submitter and over-cap inputs never execute.
 - **The watchdog compares the baseline.** The application's state at the end
   of the stop block is the canonical machine's state there, so until a batch of
   the era is accepted the sequencer serves the baseline as its comparison
@@ -206,8 +206,8 @@ in the input table for `run`.
   A wallet that signs at the nonce its own state holds is unaffected, and a
   `422` bad-nonce rejection names the expected nonce.
 - **The rebuilt history is permanent.** Its rows come from safe blocks, so they
-  never change: no standard recovery cuts below the stop block, and storage
-  triggers refuse an update or a deletion.
+  never change: nothing removes rows inside an era, and storage triggers
+  refuse an update or a deletion.
 
 ## How long a recovery takes
 

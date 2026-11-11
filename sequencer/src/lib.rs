@@ -12,8 +12,8 @@ pub mod harness;
 pub mod http;
 pub mod ingress;
 pub mod l1;
+pub(crate) mod landing;
 pub mod machine;
-pub mod recovery;
 pub mod runtime;
 pub(crate) mod storage;
 

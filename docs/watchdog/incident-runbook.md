@@ -186,7 +186,8 @@ it confirms that has not landed when `foreclose()` executes never will. On
 Kubernetes, scale the Deployment to zero, because Deployments restart regardless
 of exit code ([restart policy](operator-deployment.md#sequencer-restart-policy)).
 Never restart the sequencer for a foreclosed application: batch posts fail at
-gas estimation, and every recovery cycle sends a few no-op flush transactions.
+gas estimation on every attempt, and the open batch ages until the history is
+void.
 
 ## Drills
 
@@ -195,9 +196,7 @@ Every drill with a test runs in CI: the watchdog's Lua unit tests
 `just test-rollups-e2e` and `just test-watchdog-e2e` in the `rollups-e2e` job
 ([`ci.yml`](../../.github/workflows/ci.yml)). The devnet scenarios are in
 [`test_cases.rs`](../../tests/e2e/src/test_cases.rs), the recovery ones in
-[`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs). The
-recovery scenarios have passed on a local devnet but not yet in a GitHub
-Actions run ([register](../review/register.md#sequencer-recovery-follow-ups)).
+[`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs).
 
 | Scenario | Drill | Practices |
 |---|---|---|

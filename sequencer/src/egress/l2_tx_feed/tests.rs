@@ -459,8 +459,6 @@ fn seed_ordered_txs(db_path: &str) {
                 block_timestamp: 1_700_000_000,
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
-            &crate::storage::test_helpers::default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .expect("append direct input");
     storage

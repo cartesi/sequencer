@@ -88,25 +88,13 @@ counts, then correct the estimate and check the separately configured
   useful can happen meanwhile. Revisit on a partial failure where block polling
   stalls while the endpoint otherwise serves; the fix is an outer timeout around
   the watch. Evidence: [`submitter/poster.rs`](../../sequencer/src/l1/submitter/poster.rs).
-- **Intermittent C-host recovery WebSocket reset.** At `dc4dd78` on
-  2026-09-19, `c_host_recovery_after_stale_batches_test` failed an expected
-  message receive with `Connection reset without closing handshake` in the
-  [push run](https://github.com/cartesi/sequencer/actions/runs/35456024614/job/105931662252).
-  The [PR run](https://github.com/cartesi/sequencer/actions/runs/35456514750/job/105934071941)
-  passed all 49 scenarios on the same source tree. The failed run retained no
-  child-process log artifact, so the reset's cause is unclassified. CI now
-  uploads `tests/e2e/results/*.log` on failure. On recurrence, use those logs
-  to identify the server's last events and the failing receive before changing
-  timeouts, teardown, or retry behavior. Evidence: the
-  [recovery scenario](../../tests/e2e/src/test_cases.rs) and
-  [WS receive helper](../../tests/harness/src/ws.rs).
 - **Transient SQLite contention stops the submitter and the input reader**
   (input-reader half checked 2026-10-13 at `1a9615d`).
   Submitter read handles use a 50 ms busy timeout; the input reader opens
   writer handles (5 s busy timeout) for its cursor read and its append. In
   both, a storage/open failure escapes the worker loop. BUSY/LOCKED are
-  nonterminal but project to unclassified exit 1, causing respawn/recovery
-  under a restarting supervisor. Frequency and benefit of local retry are
+  nonterminal but project to unclassified exit 1, causing a respawn under a
+  restarting supervisor. Frequency and benefit of local retry are
   unmeasured. Check contention for both workers before choosing a bounded
   retry or timeout change; preserve other errors. Evidence:
   [`storage/open.rs`](../../sequencer/src/storage/open.rs),
@@ -123,13 +111,6 @@ counts, then correct the estimate and check the separately configured
   oracle rewrites the stamp on every successful poll, unchanged price included,
   so a stale stamp means failing polls. That is one FULL-sync commit per
   successful poll, an estimated (unmeasured) cost under 0.1% of writer time.
-- **Recovery across external effects.** Model/storage tests do not replace
-  process-level zombie re-injection or a restart between flush completion and
-  cascade commit. Before adding harness machinery, identify the missing
-  observation: safe nonce consumption must exclude a later original landing,
-  and a restarted recovery must rederive facts without reusing the previous
-  attempt's flush witness. Use the [recovery model](../recovery/README.md) to
-  bound a scenario and assess whether existing component tests suffice.
 - **OpenAPI drift.** [`openapi.yaml`](../../openapi.yaml) is hand-maintained
   beside the [API contract](../../README.md#api). CI lints its structure, but
   nothing checks it against the routes or serde wire types; only the
@@ -151,17 +132,14 @@ at `6b2a233`.
   [2026-09-25 measurement](2026-09-25-sender-index-commit-cost.md) it raised
   the mean 64-op commit from 0.27 to 1.0 ms and p99 from 1.1 to 9 ms. It stays:
   any sender-keyed durable structure pays about the same once the sender
-  population is large, and a derived index needs no recovery maintenance. If
+  population is large, and a derived index needs no maintenance. If
   lane persistence becomes the throughput limit, the alternatives are a
   lane-written sender-to-next-nonce table, cheaper only while the sender
-  population fits in a few pages and needing a rewind on invalidation, and
+  population fits in a few pages, and
   moving checkpoints off the lane (next entry). Such a table is also where
   rebuilt-baseline nonces could be seeded; see
   [Track 6](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign).
-  On the read side, the lookup walks the sender's invalidated entries above its
-  current nonce: about 0.11 µs each, 16 ms at 100,000, bounded by that sender's
-  own rolled-back volume. A covering `(sender, nonce, batch_index)` index would
-  skip the table fetch per entry. Revisit with a measurement on production-like
+  Revisit with a measurement on production-like
   Linux storage, or when lane throughput is the limit. Evidence:
   [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql),
   [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs).
@@ -185,8 +163,8 @@ at `6b2a233`.
   `Application::create_dump` and the sequencer's fsyncs. Closes fire on the fee
   policy's byte target or the batch-open deadline, not on L1 posting, so under
   load several land per L1 block and the stall grows with throughput over target
-  size. Exact per-batch snapshots stay: restart, acceptance comparison, and
-  recovery select the exact batch's snapshot
+  size. Exact per-batch snapshots stay: restart and acceptance comparison
+  select the exact batch's snapshot
   ([lifecycle](../snapshots/lifecycle.md#creation-and-restart)). For a
   large-state native engine, the mitigation is a `create_dump` that clones files
   on a copy-on-write filesystem (XFS with `reflink=1`, btrfs, APFS); see the
@@ -201,8 +179,9 @@ at `6b2a233`.
   `1a9615d`). A reader tick fetches `[cursor, safe]` whole, holds every event in
   memory (decoded event plus raw log, roughly twice the input bytes;
   unmeasured) and commits once; one failed single-block `get_logs` restarts the
-  span. In `run` the span stays under `l1_read_stale_after_blocks`. Setup and
-  startup syncs after downtime have no bound: a fresh
+  span. In `run` the span covers the blocks since the last successful tick,
+  which a provider outage lengthens without bound, and setup and startup syncs
+  after downtime have no bound either: a fresh
   database scans every input since the app's deployment, our batches included
   (the InputBox caps an encoded input at 64 KiB). Current histories are
   megabytes, and rerunning on a larger host is the fallback. The known
@@ -210,8 +189,8 @@ at `6b2a233`.
   indices are contiguous from the stored count and the last one sits at block
   `b`, the stored and received inputs in blocks before `b` are complete,
   because InputBox indices follow L1 order. Commit those at head `b - 1`, with
-  that block's header timestamp and without refreshing `synced_at_ms` (I12),
-  and hold the inputs at `b` for the next window; an empty window commits
+  that block's header timestamp (I12), and hold the inputs at `b` for the
+  next window; an empty window commits
   nothing; the window that reaches the sampled safe head keeps today's count
   check; reject logs outside the requested window; a later failure still
   returns an error. A window end is never committed on contiguity alone: the
@@ -240,9 +219,6 @@ at the smallest useful boundary when working on that behavior.
 
 | Boundary | Existing evidence and remaining check |
 |---|---|
-| Elapsed-time danger | Storage/procedure coverage exists. Add a process scenario isolating `EstimatedBatchInDanger` from stale-view refusal: retry at exit 20 without a speculative cascade. Start in [recovery](../../sequencer/src/recovery/mod.rs) and the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
-| Canonical divergence | Storage freeze and startup refusal are covered separately. Compose accepted divergent input, runtime stop, and refusal after respawn in a process test; frontier must remain frozen. See [I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen). |
-| Rebuilt anchor | Setup writes the anchor from its rebuild. Storage tests accept a first batch at a nonzero anchor and tear every batch of a nonzero-anchor era, which drains again from the first queued input ([`fill.rs`](../../sequencer/src/commands/setup/fill.rs)). The devnet round trips land a recovered era's first batch at the anchor nonce ([`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs)), but no process scenario submits after a full-tear cascade of a recovered era and checks the nonce it resumes at; those round trips are the natural place. See [I16](../invariants.md#i16-valid-batches-carry-contiguous-unique-nonces-from-the-eras-anchor). |
 | Same-block directs | `multi_deposit_reconciliation_test` accumulates directs in separate blocks. Queue portal sends, mine once, assert equal receipt blocks, and verify canonical/WS order and attribution in the [E2E scenarios](../../tests/e2e/src/test_cases.rs). |
 | Boot failure exits | Exit 20 has a process assertion, and exit 30 for setup on a set-up directory. Exit 40 is setup's escape check, covered only by unit and chain tests (`escape_check_*`, `the_escape_check_refuses_activity_past_the_stop_block`); exits 40 and 1 still need exact assertions in process scenarios, so the supervisor receives the intended hint. Start in the [E2E scenarios](../../tests/e2e/src/test_cases.rs) and [exit contract](../../sequencer/src/commands/error.rs). |
 | SDK HTTPS | A test pins that `https://` endpoints open with a TLS ClientHello. Certificate rejection is untested; it relies on reqwest's rustls platform verifier, with no override in the SDK. Add a rejection test if the SDK gains custom roots. See the [client](../../sdk/rust-client/src/lib.rs). |

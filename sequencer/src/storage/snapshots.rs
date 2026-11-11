@@ -316,7 +316,8 @@ fn insert_snapshot_in(
     Ok(tx.last_insert_rowid())
 }
 
-/// Required by recovery/admission inside their existing transaction.
+/// Whether a rollback-safe snapshot exists, read inside the caller's
+/// transaction (the history metadata reads it).
 pub(super) fn has_rollback_safe_snapshot_in(conn: &Connection) -> Result<bool> {
     Ok(rollback_snapshot_in(conn)?.is_some())
 }

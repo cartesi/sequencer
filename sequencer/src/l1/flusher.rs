@@ -176,8 +176,8 @@ impl MempoolFlusher {
     ///    have been dropped or underpriced).
     ///
     /// Returns the L1 **safe block number** at which resolution was observed:
-    /// the caller must not cascade until its own re-synced view reaches at
-    /// least this block.
+    /// the caller must not act on its own re-synced view until it reaches at
+    /// least this block (setup pins it as the stop block).
     pub async fn flush_and_wait(
         &self,
         watermark: Option<u64>,

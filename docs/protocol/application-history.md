@@ -55,8 +55,8 @@ shared executor.
 A `HistoryClaim` combines:
 
 - **Era**: a UUIDv4 created by setup, identifying one local history.
-- **Recovery generation**: a revision within that era, advanced atomically
-  whenever automatic recovery invalidates at least one valid batch.
+- **Recovery generation**: a revision within that era. No operation advances
+  it.
 - **Next input**: the application's actual L2 tx count.
 
 If the era's base count is `K` and the current head is `H`, available entries
@@ -67,24 +67,16 @@ can rebind a saved state to the current version: the compatibility query
 below, within an era, and the [adopt rule](#adopting-a-new-era), across eras.
 WS itself requires exact identity.
 
-Automatic recovery invalidates a batch suffix, removes its live application
-rows, advances the generation, and opens the replacement Tip in one transaction.
-It never reaches the rebuilt history, which comes from safe blocks.
-Replacement inputs reuse suffix offsets under the new generation. Original L1,
-batch, frame, and user-op source records remain; the invalidated flattened
-sequence is not separately retained. A repair that invalidates nothing leaves
-the generation unchanged. The [recovery guide](../recovery/README.md) owns
-repair selection and guards.
+No operation invalidates a batch or advances the generation, and a restart
+changes neither; a history the scheduler can no longer accept ends the era
+([the void history](../recovery/README.md#the-void-history)).
 
-### Checkpoint compatibility after standard recovery
+### Checkpoint compatibility across generations
 
-Each generation transition records the surviving application count after the
-invalidated rows are removed and before the replacement Tip adds any directs.
-This cut commits atomically with invalidation and reopening, and it is the
-generation advance: the current generation is the greatest cut's (0 before
-any). An invalidated empty batch still creates a transition with the old
-head as its cut; a repair that invalidates nothing creates neither. The cuts are
-immutable and retained for the era's lifetime.
+A cut is a generation advance: it records the application count that survives
+it, and the current generation is the greatest cut's (0 before any). The cut
+ledger and the formula below are on the wire, but no operation writes a cut,
+so `G = g` and `P = H` for every checkpoint of an era.
 
 For a checkpoint saved in generation `g`, `/history` returns the current version
 at generation `G`, head `H`, and preserved count:
@@ -93,8 +85,8 @@ at generation `G`, head `H`, and preserved count:
 P = min(H, cut[g+1], ..., cut[G])
 ```
 
-For `g = G`, `P = H`. Every cut is at or past the rebuilt history end, since
-recovery removes only live rows. A checkpoint at count `X` is eligible to
+For `g = G`, `P = H`. Every cut is at or past the rebuilt history end. A
+checkpoint at count `X` is eligible to
 resume under the returned version exactly when `K <= X <= P`. Check each saved checkpoint using
 its own era and generation, then choose the newest eligible one. For cuts
 `0 -> 1: 3` and `1 -> 2: 5`, a generation-0 checkpoint at 4 is invalid, while a
@@ -105,10 +97,9 @@ the minimum over an incomplete ledger.
 
 The client owns checkpoint consistency: application state, projection, and claim
 must describe the same executed prefix. Once compatibility is established,
-persist the new version with the restored checkpoint before continuing. If
-another recovery wins the race with subscription, query again using that saved
-version. A stale response cannot weaken WS admission. The query proves prefix
-preservation under standard recovery's trusted local bookkeeping; it does not
+persist the new version with the restored checkpoint before continuing. A
+stale response cannot weaken WS admission. The query proves prefix
+preservation under the sequencer's trusted local bookkeeping; it does not
 inspect client state or establish trust after a software bug. A new era is
 crossed by the [adopt rule](#adopting-a-new-era) instead.
 
@@ -139,9 +130,8 @@ as the comparison checkpoint: inclusion block `C`, count `E`, next nonce `N'`.
 
 Setup opens no batch. `run`'s first frame drains the directs still queued at
 `C`, from the first queued input on, as the canonical scheduler's next frame
-does; a cascade that tears every batch of the era drains from there again.
-Accepted-batch scanning begins after `C`. The era row survives root
-invalidation and baseline artifact GC.
+does. Accepted-batch scanning begins after `C`. The era row survives baseline
+artifact GC.
 
 ### The rebuilt history
 
@@ -272,7 +262,7 @@ writers become supported.
 | Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
-| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) and recovery tests — immutable cuts, complete lineage, and transaction rollback; [`recovery_compatibility.rs`](../../sequencer/src/integration_tests/recovery_compatibility.rs) — saved projections across missed recoveries and HTTP lookup/WS admission races. |
+| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) — the cut ledger's read and the preserved count. |
 
 The [integration validation record](../review/2026-09-16-track3-validation.md)
 records wallet replica and canonical-machine evidence. Remaining consumer and

@@ -188,8 +188,8 @@ Gate d checks every frame before any frame executes; the backstop has already
 run. Ages saturate at zero. An empty batch is accepted at any age, since it has
 no first frame; rejecting empty batches is **Open**. A rejected batch and a
 stale one have the same effect: no state change, nonce kept. So every later
-batch fails gate b until one reuses that nonce, as a batch rebuilt after a
-recovery does. The reject reason the reference reports is diagnostic.
+batch fails gate b until one reuses that nonce, as only a new era's batches
+do. The reject reason the reference reports is diagnostic.
 
 ### Frame execution
 
@@ -367,7 +367,7 @@ The L2 tx count advances by one for each executed direct and each
 executed user op, and for nothing else ([what counts](#what-counts)). The
 [application contract](application-contract.md#4-the-l2-tx-count-l2_tx_count)
 owns the count; the [history contract](application-history.md) owns how
-catch-up, recovery and the API use it.
+catch-up, setup's rebuild and the API use it.
 
 ## Fatal conditions
 
@@ -510,15 +510,15 @@ The rest of this page is for sequencer developers.
 
 Gate d constrains frame clocks only within a batch: non-decreasing and no later
 than its inclusion block. The scheduler does not require a frame for every L1
-block. During an admitted live run, the sequencer advances logical frame time
+block. During a live run, the sequencer advances logical frame time
 when the latest persisted safe head `H` is at least five blocks beyond the open
 frame clock `S`. It then opens exactly one frame at `H`, drains the complete
 newly-covered direct range, and uses `H` for subsequent user ops. An observation
 jump from 100 to 132 therefore creates one frame at 132, not synthetic frames at
 each missed five-block boundary. Intermediate empty frames would execute
-nothing, so their omission is scheduler-equivalent. Bootstrap and recovery are
-anchoring transitions rather than live clock ticks: they may open a fresh Tip
-at their proven checkpoint/current safe head without applying the five-block
+nothing, so their omission is scheduler-equivalent. Opening a batch at
+`run`'s start is an anchoring transition rather than a live clock tick: it
+opens the batch at the current safe head without applying the five-block
 delta.
 
 Direct-input presence is not another rotation condition: the five-block tick

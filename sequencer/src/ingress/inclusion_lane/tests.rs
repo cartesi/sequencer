@@ -10,8 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, WriteHeadParts, default_protocol_timing, record_canonical_divergence,
-    set_one_op_batch_target,
+    SENDER_A, WriteHeadParts, record_canonical_divergence, set_one_op_batch_target,
 };
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, L2TxContext, SafeInputRange, Storage, StoredSafeInput,
@@ -20,7 +19,7 @@ use crate::storage::{
 use crate::test_support::{pin_test_deployment_identity, temp_db};
 use alloy_primitives::B256;
 use sequencer_core::application::{
-    Admission, AppError, AppOutputs, Application, Executed, SchedulerLimits, SkipReason, execute,
+    Admission, AppError, AppOutputs, Application, SchedulerLimits, SkipReason,
 };
 use sequencer_core::history::L2TxCount;
 use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
@@ -28,7 +27,7 @@ use sequencer_core::user_op::{SignedUserOp, UserOp};
 
 use crate::test_support::{ReplayEvent, StubApp, shutdown_lane, wait_until};
 
-use super::catch_up::{catch_up_application_paged, catch_up_snapshot};
+use super::catch_up::catch_up_application_paged;
 use super::dequeue_and_execute_user_op_chunk;
 use super::error::CatchUpError;
 use super::{
@@ -91,12 +90,7 @@ async fn start_lane(
     let mut storage = Storage::open(db_path).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
@@ -153,7 +147,7 @@ fn fast_turn_processes_at_most_one_rejected_chunk() {
     let db = temp_db("one-rejected-chunk-per-fast-turn");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -199,7 +193,7 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
     let db = temp_db("reject-flood-does-not-starve-frontier");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     storage.ensure_open_tip().expect("establish open tip");
 
@@ -287,12 +281,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
     let config = default_test_config();
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -310,7 +299,6 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
             JUMP_TARGET_BLOCK,
             backlog.as_slice(),
             Address::repeat_byte(0xff),
-            &default_protocol_timing(),
         )
         .expect("seed the outage backlog at the jump target");
 
@@ -353,12 +341,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     let config = default_test_config();
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -383,7 +366,6 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
                 block_number: 4,
             }],
             Address::repeat_byte(0xff),
-            &default_protocol_timing(),
         )
         .expect("append below-threshold direct");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -392,12 +374,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     assert_eq!(lane.storage.next_undrained_safe_input_index().unwrap(), 0);
 
     lane.storage
-        .append_safe_inputs(
-            5,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(5, &[], Address::repeat_byte(0xff))
         .expect("advance to first clock tick");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("rotate at block 5");
@@ -431,36 +408,21 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     ));
 
     lane.storage
-        .append_safe_inputs(
-            32,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(32, &[], Address::repeat_byte(0xff))
         .expect("jump safe head");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("collapse jump to one frame");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 32]);
 
     lane.storage
-        .append_safe_inputs(
-            36,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(36, &[], Address::repeat_byte(0xff))
         .expect("advance below reset threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("observe block 36");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 32]);
 
     lane.storage
-        .append_safe_inputs(
-            37,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(37, &[], Address::repeat_byte(0xff))
         .expect("advance to reset threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("rotate at block 37");
@@ -473,7 +435,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     let db = temp_db("batch-frame-does-not-reset-clock");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -490,7 +452,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     let mut safe_inputs = Vec::new();
 
     lane.storage
-        .append_safe_inputs(4, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(4, &[], SENDER_A)
         .expect("advance below threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("observe block 4");
@@ -500,7 +462,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 0]);
 
     lane.storage
-        .append_safe_inputs(5, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(5, &[], SENDER_A)
         .expect("reach original five-block threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("clock tick after structural frame");
@@ -512,7 +474,7 @@ fn poisoned_frontier_outranks_frame_clock_and_closes_intake() {
     let db = temp_db("poisoned-frontier-outranks-clock");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -579,7 +541,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 10,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append first direct input");
     storage
@@ -607,7 +568,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 20,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append second direct input");
     storage
@@ -631,7 +591,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 30,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append third direct input");
     storage
@@ -756,7 +715,6 @@ async fn direct_inputs_close_frame_and_persist_drain() {
                 block_number: 10,
             }],
             Address::repeat_byte(0xff),
-            &default_protocol_timing(),
         )
         .expect("append safe direct input");
 
@@ -778,7 +736,7 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, batch_submitter_address);
     storage
-        .append_safe_inputs(0, &[], batch_submitter_address, &default_protocol_timing())
+        .append_safe_inputs(0, &[], batch_submitter_address)
         .expect("seed observed safe head");
     let config = default_test_config();
     {
@@ -813,7 +771,6 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
                 block_number: 10,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append safe batch-submitter input");
 
@@ -856,12 +813,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
         });
     }
     feeder_storage
-        .append_safe_inputs(
-            10,
-            directs.as_slice(),
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(10, directs.as_slice(), Address::repeat_byte(0xff))
         .expect("append safe direct inputs");
 
     let drained = wait_until(Duration::from_secs(2), || {
@@ -890,7 +842,6 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
                 block_number: 10,
             }],
             Address::repeat_byte(0xff),
-            &default_protocol_timing(),
         )
         .expect("append safe direct input");
 
@@ -1161,245 +1112,6 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
 }
 
 #[test]
-fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
-    let db = temp_db("standard-recovery-history-boundary");
-    let dumps_dir = tempfile::tempdir().expect("create dump directory");
-    let batch_submitter = Address::from([0xff; 20]);
-    let direct_sender = Address::repeat_byte(0x44);
-    let protocol = default_protocol_timing();
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, batch_submitter);
-    storage
-        .append_safe_inputs(0, &[], batch_submitter, &protocol)
-        .expect("seed genesis safe head");
-    storage.ensure_open_tip().expect("open genesis Tip");
-    let mut head = storage.open_state().unwrap().unwrap();
-    let initial_history = storage.history_version().expect("initial history");
-    let mut live_app = StubApp::default();
-
-    // Batch 0 is the surviving prefix. Its pending snapshot reflects exactly
-    // input 0 and becomes the recovery checkpoint once the batch lands.
-    let (prefix_op, _response) = make_pending_user_op(0x51);
-    let mut included = Vec::new();
-    super::execute_user_op(
-        &mut live_app,
-        prefix_op,
-        head.frame_fee(),
-        head.safe_block(),
-        &mut included,
-    )
-    .expect("execute prefix user op");
-    assert_eq!(included[0].l2_tx_index, L2TxCount::ZERO);
-    storage
-        .append_included_user_ops(&mut head, &included)
-        .expect("persist prefix user op");
-    super::snapshot::close_batch_with_snapshot(
-        &mut live_app,
-        &mut storage,
-        &mut head,
-        dumps_dir.path(),
-    )
-    .expect("close prefix batch with snapshot");
-
-    let prefix_landing = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
-    let direct = Direct {
-        input_index: 1,
-        sender: direct_sender,
-        block: 10,
-        timestamp: 0,
-        payload: vec![0xd1],
-    };
-    storage
-        .append_safe_inputs(
-            10,
-            &[
-                StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: prefix_landing,
-                    block_number: 10,
-                },
-                StoredSafeInput {
-                    sender: direct.sender,
-                    payload: direct.payload.clone(),
-                    block_number: direct.block,
-                },
-            ],
-            batch_submitter,
-            &protocol,
-        )
-        .expect("observe prefix landing and direct input");
-    let Executed::Done {
-        index: direct_index,
-        ..
-    } = execute(&mut live_app, &L2Tx::Direct(direct))
-        .expect("execute direct input in doomed suffix")
-    else {
-        panic!("the executor never skips a direct");
-    };
-    assert_eq!(direct_index, L2TxCount::new(1));
-    storage
-        .close_frame_only_with_executions(
-            &mut head,
-            10,
-            SafeInputRange::new(0, 2),
-            &[DirectInputExecution {
-                safe_input_index: 1,
-                l2_tx_index: direct_index,
-            }],
-        )
-        .expect("drain direct and promote prefix snapshot");
-    let finalized_before = storage
-        .finalized_dump()
-        .expect("read finalized prefix")
-        .expect("prefix snapshot promoted");
-    assert_eq!(finalized_before.snapshot.l2_tx_count, L2TxCount::new(1));
-
-    // The direct and this user op are both beyond the finalized checkpoint.
-    // Closing batch 1 makes it the first non-gold recovery pivot.
-    let (doomed_op, _response) = make_pending_user_op(0x52);
-    included.clear();
-    super::execute_user_op(
-        &mut live_app,
-        doomed_op,
-        head.frame_fee(),
-        head.safe_block(),
-        &mut included,
-    )
-    .expect("execute doomed user op");
-    assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
-    storage
-        .append_included_user_ops(&mut head, &included)
-        .expect("persist doomed user op");
-    super::snapshot::close_batch_with_snapshot(
-        &mut live_app,
-        &mut storage,
-        &mut head,
-        dumps_dir.path(),
-    )
-    .expect("close doomed batch with snapshot");
-    assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(3));
-
-    let before_recovery = history_rows(&mut storage, 32);
-    assert_eq!(
-        before_recovery
-            .iter()
-            .map(|row| row.offset.get())
-            .collect::<Vec<_>>(),
-        vec![0, 1, 2]
-    );
-    let invalidated = storage
-        .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
-        .expect("standard recovery cascade");
-    assert_eq!(
-        invalidated,
-        crate::storage::test_helpers::batch_ids(&[1, 2])
-    );
-    let recovered_history = storage.history_version().expect("recovered history");
-    assert_eq!(
-        recovered_history.era_id, initial_history.era_id,
-        "standard recovery must stay in the same era"
-    );
-    assert_eq!(recovered_history.recovery_generation.get(), 1);
-    assert_eq!(
-        storage.next_l2_tx_count().unwrap(),
-        L2TxCount::new(2),
-        "H rolls back the doomed user op while the direct is re-drained"
-    );
-    assert_eq!(
-        storage.finalized_dump().unwrap().unwrap(),
-        finalized_before,
-        "the accepted prefix checkpoint must survive the cascade"
-    );
-    assert_eq!(
-        storage.latest_snapshot().unwrap().unwrap(),
-        finalized_before.snapshot
-    );
-    let after_recovery = history_rows(&mut storage, 32);
-    assert_eq!(after_recovery.len(), 2);
-    assert!(matches!(
-        &after_recovery[1].context,
-        L2TxContext::Direct {
-            tx: Direct { input_index: 1, .. },
-            ..
-        }
-    ));
-    assert_eq!(after_recovery[1].offset, L2TxCount::new(1));
-
-    let checkpoint = catch_up_snapshot(&mut storage).expect("select surviving checkpoint");
-    assert_eq!(
-        checkpoint.l2_tx_count,
-        finalized_before.snapshot.l2_tx_count
-    );
-    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.prefix))
-        .expect("load surviving application checkpoint");
-    assert_eq!(restarted.l2_tx_count(), L2TxCount::new(1));
-    catch_up_application_paged(&mut restarted, &mut storage, checkpoint.l2_tx_count, 2)
-        .expect("catch up through recovery re-drain");
-    assert_eq!(restarted.l2_tx_count(), L2TxCount::new(2));
-
-    // The replacement suffix reuses offset 2, rolling H forward without
-    // retaining the invalidated op that previously occupied that coordinate.
-    let mut recovery_head = storage.open_state().unwrap().unwrap();
-    let replacement_safe_block = recovery_head.safe_block();
-    let (replacement_op, _response) = make_pending_user_op(0x53);
-    included.clear();
-    super::execute_user_op(
-        &mut restarted,
-        replacement_op,
-        recovery_head.frame_fee(),
-        recovery_head.safe_block(),
-        &mut included,
-    )
-    .expect("execute replacement user op");
-    assert_eq!(included[0].l2_tx_index, L2TxCount::new(2));
-    storage
-        .append_included_user_ops(&mut recovery_head, &included)
-        .expect("persist replacement suffix");
-    assert_eq!(storage.next_l2_tx_count().unwrap(), L2TxCount::new(3));
-
-    let valid = history_rows(&mut storage, 32);
-    let mappings: Vec<_> = valid.iter().map(|row| row.offset.get()).collect();
-    assert_eq!(mappings, vec![0, 1, 2]);
-    let user_ops: Vec<_> = valid
-        .iter()
-        .filter_map(|row| match &row.context {
-            L2TxContext::UserOp { tx, .. } => Some((tx.data[0], tx.block)),
-            L2TxContext::Direct { .. } => None,
-        })
-        .collect();
-    // The replacement op carries its frame's safe block, which replay hands
-    // the application in place of an application-held clock.
-    assert_eq!(user_ops, vec![(0x51, 0), (0x53, replacement_safe_block)]);
-
-    let mut restarted_again = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.prefix))
-        .expect("reload surviving checkpoint");
-    catch_up_application_paged(
-        &mut restarted_again,
-        &mut storage,
-        checkpoint.l2_tx_count,
-        2,
-    )
-    .expect("catch up through replacement suffix");
-    assert_eq!(restarted_again.l2_tx_count(), L2TxCount::new(3));
-    assert_eq!(
-        restarted_again.replayed,
-        vec![
-            ReplayEvent::DirectInput {
-                input_index: 1,
-                sender: direct_sender,
-                block_number: 10,
-                timestamp: 0,
-                payload: vec![0xd1],
-            },
-            ReplayEvent::UserOp {
-                sender: Address::from_slice(&[0x53; 20]),
-                data: vec![0x53; 4],
-            },
-        ]
-    );
-}
-
-#[test]
 fn catch_up_load_error_reports_offset() {
     let db = temp_db("catch-up-load-error");
     let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
@@ -1418,12 +1130,7 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
 
     let mut app = StubApp::with_progress(1);
@@ -1475,7 +1182,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         // Batch size target < one user op, so every op closes its batch.
         set_one_op_batch_target(&mut storage);
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .append_safe_inputs(0, &[], SENDER_A)
             .expect("seed observed safe head");
     }
 
@@ -1669,12 +1376,7 @@ fn lane_with_closed_queue_and_due_direct(
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     storage.ensure_open_tip().expect("establish open tip");
     storage
@@ -1686,7 +1388,6 @@ fn lane_with_closed_queue_and_due_direct(
                 block_number: 5,
             }],
             Address::repeat_byte(0xff),
-            &default_protocol_timing(),
         )
         .expect("append a direct at the first clock tick");
 
@@ -1939,12 +1640,7 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -1969,8 +1665,6 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
                 ingested_direct(4, 1_004, vec![0xee; cap + 1]),
                 ingested_direct(5, 1_005, vec![0xa3]),
             ],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .expect("append directs around the payload cap");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -2006,8 +1700,6 @@ fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
             10,
             1_010,
             &[ingested_direct(10, 1_010, vec![0xb1])],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .expect("append a later direct");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -2076,13 +1768,7 @@ async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
     };
     Storage::open(&db.path)
         .expect("open feeder storage")
-        .append_ingested_safe_inputs_with_timestamp(
-            test_era::STOP_BLOCK + 6,
-            1_016,
-            &[later],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
-        )
+        .append_ingested_safe_inputs_with_timestamp(test_era::STOP_BLOCK + 6, 1_016, &[later])
         .expect("land a direct after the root frame");
     let head = |db_path: &str| {
         Storage::open_read_only(db_path)

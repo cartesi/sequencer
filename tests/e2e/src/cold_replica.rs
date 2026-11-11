@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! A cold consumer restores an HTTP archive and follows its claim through replay,
-//! live writes, and a process-boundary recovery. Its reference starts at genesis.
+//! live writes, and a clean restart of the sequencer. Its reference starts at
+//! genesis.
 
 use std::time::Duration;
 
@@ -12,10 +13,7 @@ use rollups_harness::replay::apply_ws_message;
 use rollups_harness::{ManagedSequencer, ReplayWalletApp, TestSigner, WsClient};
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::application::Application;
-use sequencer_core::fee::fee_to_linear;
-use sequencer_rust_client::{
-    HistoryClaim, HistoryPolicyError, SequencerClient, SnapshotResponse, SubscribeError,
-};
+use sequencer_rust_client::{HistoryClaim, SequencerClient, SnapshotResponse};
 
 use crate::ScenarioResult;
 use crate::test_cases::advance_live_frame_until_covers;
@@ -54,7 +52,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
     record(&mut reference_ws, &mut reference, &mut history).await?;
 
     // Size closure supplies a nonempty immutable snapshot while leaving a suffix
-    // in the next batch. Only the first batch is submitted before the outage.
+    // in the next batch.
     for _ in 0..150 {
         alice_l2.transfer(alice_address, U256::from(1)).await?;
         record(&mut reference_ws, &mut reference, &mut history).await?;
@@ -171,95 +169,7 @@ async fn run_scenario<A: Application>(runtime: &mut ManagedSequencer) -> Scenari
         U256::from(21_000)
     );
 
-    let stale_claim = HistoryClaim {
-        next_input: replica.l2_tx_count(),
-        ..downloaded_claim
-    };
-    drop(replica_ws);
-    drop(reference_ws);
-    runtime.stop().await?;
-    runtime
-        .advance_wall_and_mine(Duration::from_secs(
-            (app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks + 50) * 12,
-        ))
-        .await?;
-    runtime.respawn().await?;
-
-    // Respawn chooses a fresh listener. The claim comes exclusively from the
-    // downloaded snapshot and consumed inputs, never the harness's DB helpers.
-    let client = SequencerClient::new(runtime.internal_endpoint())?;
-    assert!(matches!(
-        client.subscribe(stale_claim).await,
-        Err(SubscribeError::History(
-            HistoryPolicyError::StaleGeneration { .. }
-        ))
-    ));
-    let (mut recovered, fresh_claim) = restore::<A>(client.latest_snapshot().await?).await?;
-    assert_eq!(fresh_claim.version.era_id, original_claim.version.era_id);
-    assert_eq!(
-        fresh_claim.version.recovery_generation.get(),
-        original_claim.version.recovery_generation.get() + 1,
-    );
-    assert_eq!(fresh_claim.next_input.get(), snapshot_count);
-
-    // Reconstruct the expected replacement branch independently: the accepted
-    // prefix survives, optimistic user ops disappear, and L1 directs replay.
-    let mut recovered_reference = replay_prefix(&history, snapshot_count)?;
-    assert_same_state(&mut recovered, &recovered_reference)?;
-    for message in &history[snapshot_count as usize..] {
-        if let WsTxMessage::DirectInput { .. } = message {
-            let mut direct = message.clone();
-            if let WsTxMessage::DirectInput { offset, .. } = &mut direct {
-                *offset = recovered_reference.l2_tx_count();
-            }
-            recovered_reference.apply(direct)?;
-        }
-    }
-    let mut recovered_ws = WsClient::connect(&client, fresh_claim).await?;
-    consume_until(
-        &mut recovered_ws,
-        &mut recovered,
-        recovered_reference.l2_tx_count(),
-    )
-    .await?;
-    assert_same_state(&mut recovered, &recovered_reference)?;
-    assert_eq!(
-        recovered_reference.current_user_balance(bob_address),
-        U256::ZERO
-    );
-    assert!(recovered.l2_tx_count().get() < replica.l2_tx_count().get());
-
-    let mut alice_l2 = runtime.wallet_l2(TestSigner::from_default(1)?)?;
-    let expected_nonce = recovered_reference.current_user_nonce(alice_address);
-    let balance_before = recovered_reference.current_user_balance(alice_address);
-    // The fixed oracle keeps this quote valid across frame rotations. Derive the
-    // expected debit before receiving the event so wrong feed fees cannot agree by replay.
-    let quote = SequencerClient::new(runtime.endpoint())?.get_fee().await?;
-    assert_eq!(quote.fee, quote.recommended_fee);
-    let amount = U256::from(6_000);
-    let expected_balance = balance_before - amount - fee_to_linear(quote.fee);
-    assert_eq!(alice_l2.served_next_nonce().await?, expected_nonce);
-    alice_l2.set_next_nonce(expected_nonce);
-    alice_l2.transfer(bob_address, amount).await?;
-    let resumed = recovered_ws.expect_user_op_from(alice_address).await?;
-    assert!(matches!(resumed, WsTxMessage::UserOp { fee, nonce, .. }
-        if fee == quote.fee && nonce == expected_nonce));
-    apply_ws_message(&mut recovered, resumed.clone())?;
-    recovered_reference.apply(resumed)?;
-    assert_same_state(&mut recovered, &recovered_reference)?;
-    assert_eq!(
-        recovered_reference.current_user_nonce(alice_address),
-        expected_nonce + 1
-    );
-    assert_eq!(
-        recovered_reference.current_user_balance(alice_address),
-        expected_balance
-    );
-    assert_eq!(
-        recovered_reference.current_user_balance(bob_address),
-        U256::from(6_000)
-    );
-    recovered_ws
+    replica_ws
         .expect_no_message_for(Duration::from_millis(100))
         .await?;
     Ok(())

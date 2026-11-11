@@ -1,364 +1,87 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Protocol timing: the scheduler's staleness rule and its off-chain acceptance
-//! predicate, which must agree with the canonical scheduler (I1), plus sequencer-only
-//! knobs for when the sequencer stops issuing soft confirmations against stale
-//! or unknowable L1 state.
+//! The scheduler's staleness rule and its off-chain acceptance predicate,
+//! which must agree with the canonical scheduler (I1), plus the frame clock.
 
 use crate::batch::Batch;
 use alloy_primitives::Address;
-use thiserror::Error;
 
-/// Error surfaced by [`ProtocolTiming::try_new`] when timing fields would
-/// produce an unusable danger threshold.
+/// Advance logical frame time after this many newly-safe L1 blocks.
 ///
-/// Returning a typed error lets the runtime surface the misconfiguration at
-/// config-parse time through the structured `RunError` taxonomy.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ProtocolTimingError {
-    /// `preemptive_margin_blocks == 0` — zero-width preemptive zone defeats
-    /// the entire margin design (recovery only ever fires at the absolute max,
-    /// with no operator runway). Always an operator misconfig.
-    #[error("preemptive_margin_blocks must be greater than zero")]
-    MarginZero,
-    /// `preemptive_margin_blocks >= max_wait_blocks` — the danger threshold
-    /// would be 0, making preemptive recovery indistinguishable from hard
-    /// staleness. The margin is supposed to be operator runway *before*
-    /// hitting the window, so this is always an operator misconfig.
-    #[error(
-        "preemptive_margin_blocks ({margin}) must be strictly less than \
-         max_wait_blocks ({max_wait})"
-    )]
-    MarginNotLessThanMaxWait { margin: u64, max_wait: u64 },
-    /// `l1_read_stale_after_blocks == 0` would make the L1 view unusable
-    /// immediately, so the sequencer could never start.
-    #[error("l1_read_stale_after_blocks must be greater than zero")]
-    ReadStaleAfterZero,
-    /// The read-staleness threshold must fire strictly before the write danger
-    /// threshold. Equality would have both refusal arms (L1ViewStale and
-    /// EstimatedBatchInDanger) trip at the same point, defeating the
-    /// "stale fires first" design property.
-    #[error(
-        "l1_read_stale_after_blocks ({read_stale_after}) must be strictly \
-         less than danger_threshold ({danger_threshold})"
-    )]
-    ReadStaleAfterPastDanger {
-        read_stale_after: u64,
-        danger_threshold: u64,
-    },
-    /// A zero block-time estimate makes the wall-clock fallback undefined.
-    #[error("seconds_per_block must be greater than zero")]
-    SecondsPerBlockZero,
-    /// The configured read-staleness horizon must fit in the `u64` Unix-time
-    /// arithmetic used by the detector.
-    #[error(
-        "l1_read_stale_after_blocks ({read_stale_after}) * seconds_per_block \
-         ({seconds_per_block}) exceeds u64::MAX seconds"
-    )]
-    ReadStaleWindowOverflow {
-        read_stale_after: u64,
-        seconds_per_block: u64,
-    },
-}
+/// Protocol-visible, deliberately not configurable: user ops validate at
+/// their frame's safe block, so this value is the application-clock
+/// granularity (about a minute on mainnet), a product semantics decision
+/// — not a lane implementation detail (prose owner:
+/// `docs/protocol/scheduler-semantics.md`, frame-clock policy). The
+/// observed tip is used directly, so delayed or epoch-sized observations
+/// create one frame and never synthesize missed intermediate ticks.
+pub const FRAME_CLOCK_INTERVAL_SAFE_BLOCKS: u64 = 5;
 
-/// The local wall clock predates the persisted safe-head progress baseline.
+/// Off-chain simulation of the scheduler's batch-acceptance predicate, under
+/// the application's staleness window `max_wait_blocks`.
 ///
-/// This is an unusable timing environment, not a storage invariant violation:
-/// callers must stop issuing soft confirmations until the clock catches up or
-/// a new safe-head advance establishes a usable baseline.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[error(
-    "current wall clock ({now_ms} ms) predates last safe-head progress \
-     ({last_safe_progress_ms} ms)"
-)]
-pub struct WallClockRegression {
-    pub now_ms: u64,
-    pub last_safe_progress_ms: u64,
-}
-
-/// Time-based protocol parameters: scheduler-mirroring `max_wait_blocks`
-/// plus sequencer-side preemptive-recovery tuning. No identity (the
-/// batch-submitter address is passed separately to predicates that need it).
+/// Returns `Some(AcceptedBatch)` iff the scheduler would accept the input
+/// at the given `expected_nonce`. The caller threads `expected_nonce`
+/// across a stream of inputs, advancing by one on each `Some`.
 ///
-/// Construct via [`ProtocolTiming::try_new`]: it checks the margin/stale
-/// relationships once, and the private fields keep every value valid
-/// afterwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProtocolTiming {
-    /// The staleness window: after this many L1 blocks, the scheduler skips a
-    /// submitted batch as stale.
+/// Rejection paths (wrong sender, SSZ decode failure, stale by inclusion,
+/// nonce mismatch) return `None` without advancing — matching what the
+/// scheduler does on-chain.
+///
+/// **Deliberately omitted rejects: a self-trust.** The canonical scheduler
+/// also rejects a batch with a frame whose `safe_block` is not strictly
+/// below the inclusion block (`SafeBlockNotBelowInclusionBlock`), with
+/// safe blocks that decrease across frames (`NonMonotonicSafeBlocks`), or
+/// with a fee above `MAX_EXPONENT` (`FeePriceOutOfRange`): gate d. Gate f
+/// rejects one whose first frame lies below the scheduler clock
+/// (`FirstFrameBelowClock`). This predicate re-checks none of them. A
+/// correct submitter never trips them: it opens frames in order, only at
+/// safe heads it has already seen, so its batch lands in a later block.
+/// Gate f belongs to the same omission for a further reason: the clock
+/// rises with every executed direct, backstop and overflow drains
+/// included, so the predicate could know it only by replaying the
+/// directs. An overflow drain can still make gate f reject a sealed batch;
+/// the watchdog's divergence latch reports that, and a manual recovery
+/// answers it. The I1 duality test pins every omission as a *documented*
+/// asymmetry; mirror them here if the submitter stops being trusted.
+pub fn scheduler_accepts(
+    batch_submitter: Address,
     max_wait_blocks: u64,
-    /// How many blocks before `max_wait_blocks` the sequencer triggers
-    /// preemptive recovery. Sequencer-local; must be strictly less than
-    /// `max_wait_blocks` (enforced by [`ProtocolTiming::try_new`]).
-    preemptive_margin_blocks: u64,
-    /// How long the L1 safe block itself may be stale, measured in assumed L1
-    /// blocks. Sequencer-local; startup refuses once the safe block timestamp
-    /// is older than this threshold.
-    l1_read_stale_after_blocks: u64,
-    /// Wall-clock estimate of L1 block time, used as a fallback when the L1
-    /// safe head appears frozen. Sequencer-local.
-    seconds_per_block: u64,
-}
-
-impl ProtocolTiming {
-    /// Advance logical frame time after this many newly-safe L1 blocks.
-    ///
-    /// Protocol-visible, deliberately not configurable: user ops validate at
-    /// their frame's safe block, so this value is the application-clock
-    /// granularity (about a minute on mainnet), a product semantics decision
-    /// — not a lane implementation detail (prose owner:
-    /// `docs/protocol/scheduler-semantics.md`, frame-clock policy). The
-    /// observed tip is used directly, so delayed or epoch-sized observations
-    /// create one frame and never synthesize missed intermediate ticks.
-    pub const FRAME_CLOCK_INTERVAL_SAFE_BLOCKS: u64 = 5;
-
-    /// Validated constructor. Rejects timing configurations that would
-    /// produce an unusable danger threshold or a degenerate margin.
-    pub fn try_new(
-        max_wait_blocks: u64,
-        preemptive_margin_blocks: u64,
-        l1_read_stale_after_blocks: u64,
-        seconds_per_block: u64,
-    ) -> Result<Self, ProtocolTimingError> {
-        if preemptive_margin_blocks == 0 {
-            return Err(ProtocolTimingError::MarginZero);
-        }
-        if preemptive_margin_blocks >= max_wait_blocks {
-            return Err(ProtocolTimingError::MarginNotLessThanMaxWait {
-                margin: preemptive_margin_blocks,
-                max_wait: max_wait_blocks,
-            });
-        }
-        if l1_read_stale_after_blocks == 0 {
-            return Err(ProtocolTimingError::ReadStaleAfterZero);
-        }
-        if seconds_per_block == 0 {
-            return Err(ProtocolTimingError::SecondsPerBlockZero);
-        }
-        let danger_threshold = max_wait_blocks - preemptive_margin_blocks;
-        if l1_read_stale_after_blocks >= danger_threshold {
-            return Err(ProtocolTimingError::ReadStaleAfterPastDanger {
-                read_stale_after: l1_read_stale_after_blocks,
-                danger_threshold,
-            });
-        }
-        l1_read_stale_after_blocks
-            .checked_mul(seconds_per_block)
-            .ok_or(ProtocolTimingError::ReadStaleWindowOverflow {
-                read_stale_after: l1_read_stale_after_blocks,
-                seconds_per_block,
-            })?;
-        Ok(Self {
+    input: SafeInputView<'_>,
+    expected_nonce: u64,
+) -> Option<AcceptedBatch> {
+    if input.sender != batch_submitter {
+        return None;
+    }
+    let batch = <Batch as ssz::Decode>::from_ssz_bytes(input.payload).ok()?;
+    let first_frame_safe_block = batch.frames.first().map(|f| f.safe_block).unwrap_or(0);
+    // Gate e: a batch that lands `max_wait_blocks` or more after its first
+    // frame's safe block is stale.
+    if !batch.frames.is_empty()
+        && age_exceeds(
+            input.inclusion_block,
+            first_frame_safe_block,
             max_wait_blocks,
-            preemptive_margin_blocks,
-            l1_read_stale_after_blocks,
-            seconds_per_block,
-        })
-    }
-
-    /// The scheduler staleness window (the application's `max_wait_blocks` in
-    /// production).
-    pub const fn max_wait_blocks(&self) -> u64 {
-        self.max_wait_blocks
-    }
-
-    /// Blocks before [`Self::max_wait_blocks`] at which preemptive recovery
-    /// triggers.
-    pub const fn preemptive_margin_blocks(&self) -> u64 {
-        self.preemptive_margin_blocks
-    }
-
-    /// How many assumed L1 blocks the safe block itself may be stale.
-    pub const fn l1_read_stale_after_blocks(&self) -> u64 {
-        self.l1_read_stale_after_blocks
-    }
-
-    /// Wall-clock estimate of L1 block time, in seconds.
-    pub const fn seconds_per_block(&self) -> u64 {
-        self.seconds_per_block
-    }
-
-    /// The block-age threshold at which preemptive recovery triggers.
-    pub fn danger_threshold(&self) -> u64 {
-        self.max_wait_blocks - self.preemptive_margin_blocks
-    }
-
-    /// Wall-clock age, in seconds, after which the L1 safe block is too old
-    /// for the sequencer to trust its L1 view.
-    pub fn l1_read_stale_after_secs(&self) -> u64 {
-        self.l1_read_stale_after_blocks
-            .checked_mul(self.seconds_per_block)
-            .expect("validated L1 read-staleness window must fit in u64 seconds")
-    }
-
-    /// Whether the safe block timestamp is too old to support recovery or
-    /// continued soft confirmations. `None` means the view is unknown and is
-    /// treated as unusable.
-    pub fn l1_view_is_stale(&self, safe_block_timestamp_secs: Option<u64>, now_ms: u64) -> bool {
-        let Some(timestamp_secs) = safe_block_timestamp_secs else {
-            return true;
-        };
-        let now_secs = now_ms / 1000;
-        let Some(age_secs) = now_secs.checked_sub(timestamp_secs) else {
-            // Ahead-of-clock is not staleness — the observation is the
-            // freshest possible. Whether the local *clock* is usable against
-            // it is a separate fault ([`Self::clock_cannot_age_l1_view`]),
-            // deliberately checked after the observed danger arms.
-            return false;
-        };
-        age_secs >= self.l1_read_stale_after_secs()
-    }
-
-    /// Whether the local clock is a full block-time or more behind the
-    /// persisted L1 safe-block timestamp — i.e. it cannot age the view at
-    /// all. Sub-block ahead-ness is ordinary NTP-scale skew against a
-    /// block-granular timestamp (usable, age 0) and is tolerated.
-    ///
-    /// This is a clock fault, not a view fault: `check_danger` evaluates it
-    /// only after the observed danger arms, which are pure block arithmetic
-    /// and must not be suppressed by a broken local clock.
-    pub fn clock_cannot_age_l1_view(
-        &self,
-        safe_block_timestamp_secs: Option<u64>,
-        now_ms: u64,
-    ) -> bool {
-        let Some(timestamp_secs) = safe_block_timestamp_secs else {
-            return false;
-        };
-        // Compare at millisecond precision: flooring `now_ms` to seconds
-        // would make the full-block refusal fire up to 999 ms early,
-        // contradicting the sub-block tolerance. Saturating multiplies are
-        // safe: a saturated ahead-side only widens toward refusal for
-        // timestamps that are absurd anyway.
-        let timestamp_ms = timestamp_secs.saturating_mul(1000);
-        match timestamp_ms.checked_sub(now_ms) {
-            Some(ahead_ms) => ahead_ms >= self.seconds_per_block.saturating_mul(1000),
-            None => false,
-        }
-    }
-
-    /// Wall-clock-adjusted danger threshold, used when the L1 safe head may be
-    /// stale.
-    ///
-    /// Translates "wall-clock time elapsed since the last L1 safe-head
-    /// observation" into "blocks the safe head is presumed to be behind", and
-    /// shaves that off the strict [`Self::danger_threshold`]. Returns `None`
-    /// when the wall-clock arm should be skipped:
-    ///
-    /// - `last_safe_progress_ms` is `None` — no baseline to extrapolate from.
-    /// - Less than one block-time has elapsed — adjustment would be 0, so the
-    ///   strict check covers this case directly.
-    ///
-    /// Returns `Ok(Some(adjusted))` where
-    /// `adjusted = danger_threshold − (elapsed_secs / seconds_per_block)`,
-    /// saturating at 0. A `now_ms` less than one block-time behind the
-    /// baseline is treated as elapsed 0 — the estimate quantizes elapsed time
-    /// into whole blocks, so a sub-block regression cannot change it and is
-    /// ordinary clock-step noise. Returns [`WallClockRegression`] only
-    /// for larger regressions, which genuinely invalidate the extrapolation;
-    /// callers must treat that environment as unusable rather than silently
-    /// reporting no elapsed time.
-    pub fn wall_clock_adjusted_danger_threshold(
-        &self,
-        last_safe_progress_ms: Option<u64>,
-        now_ms: u64,
-    ) -> Result<Option<u64>, WallClockRegression> {
-        let Some(last) = last_safe_progress_ms else {
-            return Ok(None);
-        };
-        let elapsed_ms = match now_ms.checked_sub(last) {
-            Some(elapsed) => elapsed,
-            None => {
-                let regression_secs = (last - now_ms) / 1000;
-                if regression_secs < self.seconds_per_block {
-                    return Ok(None);
-                }
-                return Err(WallClockRegression {
-                    now_ms,
-                    last_safe_progress_ms: last,
-                });
-            }
-        };
-        let elapsed_secs = elapsed_ms / 1000;
-        let missed = elapsed_secs / self.seconds_per_block;
-        if missed == 0 {
-            return Ok(None);
-        }
-        Ok(Some(self.danger_threshold().saturating_sub(missed)))
-    }
-
-    /// Scheduler's staleness predicate: a batch is stale when
-    /// `inclusion_block - first_frame_safe_block >= max_wait_blocks`.
-    /// Off-chain mirror of the scheduler's gate e (both call [`age_exceeds`]);
-    /// used by [`Self::scheduler_accepts`].
-    pub fn is_scheduler_stale(&self, inclusion_block: u64, first_frame_safe_block: u64) -> bool {
-        age_exceeds(
-            inclusion_block,
-            first_frame_safe_block,
-            self.max_wait_blocks,
         )
+    {
+        return None;
     }
-
-    /// Off-chain simulation of the scheduler's batch-acceptance predicate.
-    ///
-    /// Returns `Some(AcceptedBatch)` iff the scheduler would accept the input
-    /// at the given `expected_nonce`. The caller threads `expected_nonce`
-    /// across a stream of inputs, advancing by one on each `Some`.
-    ///
-    /// Rejection paths (wrong sender, SSZ decode failure, stale by inclusion,
-    /// nonce mismatch) return `None` without advancing — matching what the
-    /// scheduler does on-chain.
-    ///
-    /// **Deliberately omitted rejects: a self-trust.** The canonical scheduler
-    /// also rejects a batch with a frame whose `safe_block` is not strictly
-    /// below the inclusion block (`SafeBlockNotBelowInclusionBlock`), with
-    /// safe blocks that decrease across frames (`NonMonotonicSafeBlocks`), or
-    /// with a fee above `MAX_EXPONENT` (`FeePriceOutOfRange`): gate d. Gate f
-    /// rejects one whose first frame lies below the scheduler clock
-    /// (`FirstFrameBelowClock`). This predicate re-checks none of them. A
-    /// correct submitter never trips them: it opens frames in order, only at
-    /// safe heads it has already seen, so its batch lands in a later block.
-    /// Gate f belongs to the same omission for a further reason: the clock
-    /// rises with every executed direct, backstop and overflow drains
-    /// included, so the predicate could know it only by replaying the
-    /// directs. An overflow drain can still make gate f reject a sealed batch;
-    /// the watchdog's divergence latch reports that, and a manual recovery
-    /// answers it. The I1 duality test pins every omission as a *documented*
-    /// asymmetry; mirror them here if the submitter stops being trusted.
-    pub fn scheduler_accepts(
-        &self,
-        batch_submitter: Address,
-        input: SafeInputView<'_>,
-        expected_nonce: u64,
-    ) -> Option<AcceptedBatch> {
-        if input.sender != batch_submitter {
-            return None;
-        }
-        let batch = <Batch as ssz::Decode>::from_ssz_bytes(input.payload).ok()?;
-        let first_frame_safe_block = batch.frames.first().map(|f| f.safe_block).unwrap_or(0);
-        if !batch.frames.is_empty()
-            && self.is_scheduler_stale(input.inclusion_block, first_frame_safe_block)
-        {
-            return None;
-        }
-        if batch.nonce != expected_nonce {
-            return None;
-        }
-        Some(AcceptedBatch {
-            safe_input_index: input.safe_input_index,
-            nonce: batch.nonce,
-            first_frame_safe_block,
-            inclusion_block: input.inclusion_block,
-        })
+    if batch.nonce != expected_nonce {
+        return None;
     }
+    Some(AcceptedBatch {
+        safe_input_index: input.safe_input_index,
+        nonce: batch.nonce,
+        first_frame_safe_block,
+        inclusion_block: input.inclusion_block,
+    })
 }
 
 /// The one staleness formula, `now - start >= window`. Saturating keeps the
 /// consensus path total when `start` is ahead of `now`. Callers: the
 /// scheduler's gate e and overdue-direct backstop, the off-chain
-/// [`ProtocolTiming::is_scheduler_stale`], and the danger check.
+/// [`scheduler_accepts`], and the sequencer's void-history check.
 pub fn age_exceeds(now: u64, start: u64, window: u64) -> bool {
     now.saturating_sub(start) >= window
 }
@@ -391,8 +114,8 @@ mod tests {
     const OTHER: Address = Address::repeat_byte(0xBB);
     const MAX_WAIT: u64 = 1200;
 
-    fn timing() -> ProtocolTiming {
-        ProtocolTiming::try_new(MAX_WAIT, 75, 900, 12).expect("valid test timing")
+    fn accepts(input: SafeInputView<'_>, expected_nonce: u64) -> Option<AcceptedBatch> {
+        scheduler_accepts(SUBMITTER, MAX_WAIT, input, expected_nonce)
     }
 
     fn encode(batch: &Batch) -> Vec<u8> {
@@ -411,264 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn danger_threshold_is_max_wait_minus_margin() {
-        assert_eq!(timing().danger_threshold(), MAX_WAIT - 75);
-    }
-
-    #[test]
-    fn l1_read_stale_after_secs_uses_configured_block_time() {
-        assert_eq!(timing().l1_read_stale_after_secs(), 900 * 12);
-    }
-
-    #[test]
-    fn l1_view_is_stale_without_timestamp() {
-        assert!(timing().l1_view_is_stale(None, 1_000_000));
-    }
-
-    #[test]
-    fn l1_view_is_stale_at_threshold() {
-        let cfg = timing();
-        let timestamp_secs = 1_000;
-        let before = (timestamp_secs + cfg.l1_read_stale_after_secs() - 1) * 1000;
-        let at = (timestamp_secs + cfg.l1_read_stale_after_secs()) * 1000;
-        assert!(!cfg.l1_view_is_stale(Some(timestamp_secs), before));
-        assert!(cfg.l1_view_is_stale(Some(timestamp_secs), at));
-    }
-
-    #[test]
-    fn l1_view_is_stale_never_fires_on_a_future_timestamp() {
-        // Ahead-of-clock is not staleness — the observation is the freshest
-        // possible. Clock usability is `clock_cannot_age_l1_view`'s job.
-        assert!(!timing().l1_view_is_stale(Some(1_001), 1_000_000));
-        assert!(!timing().l1_view_is_stale(Some(1_012), 1_000_000));
-        assert!(
-            !timing().l1_view_is_stale(Some(1_001), 1_001_000),
-            "equality is a usable zero-age observation"
-        );
-    }
-
-    #[test]
-    fn clock_cannot_age_l1_view_tolerates_sub_block_skew() {
-        let cfg = timing();
-        // No view at all: nothing for the clock to age — not a clock fault.
-        assert!(!cfg.clock_cannot_age_l1_view(None, 1_000_000));
-        // Behind or equal: ordinary aging, never a clock fault.
-        assert!(!cfg.clock_cannot_age_l1_view(Some(900), 1_000_000));
-        assert!(!cfg.clock_cannot_age_l1_view(Some(1_000), 1_000_000));
-        // Sub-block ahead-ness is NTP-scale skew against a block-granular
-        // timestamp: usable, age 0.
-        assert!(!cfg.clock_cannot_age_l1_view(Some(1_011), 1_000_000));
-        // Millisecond precision at the boundary: 11.999 s and 11.001 s ahead
-        // are both sub-block; exactly 12.000 s refuses.
-        assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_001));
-        assert!(!cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_999));
-        assert!(cfg.clock_cannot_age_l1_view(Some(1_012), 1_000_000));
-    }
-
-    #[test]
-    fn wall_clock_adjusted_threshold_returns_none_without_baseline() {
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(None, 1_000_000),
-            Ok(None),
-        );
-    }
-
-    #[test]
-    fn wall_clock_adjusted_threshold_returns_none_below_one_block_time() {
-        // 11 seconds elapsed, seconds_per_block = 12 → missed = 0.
-        let last = 1_000_000;
-        let now = last + 11_000;
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), now),
-            Ok(None),
-        );
-    }
-
-    #[test]
-    fn wall_clock_adjusted_threshold_rejects_regression() {
-        let last = 1_000_000;
-        // Sub-block regressions are quantization noise: identical outcome to
-        // elapsed = 0 for a block-granular estimate (clock steps are
-        // legitimate).
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 1),
-            Ok(None),
-            "a sub-block clock step must not be a fault"
-        );
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 11_999),
-            Ok(None),
-            "just under one block-time of regression is still noise"
-        );
-        // A regression of one block-time or more genuinely invalidates the
-        // extrapolation.
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), last - 12_000),
-            Err(WallClockRegression {
-                now_ms: last - 12_000,
-                last_safe_progress_ms: last,
-            }),
-        );
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), last),
-            Ok(None),
-            "equality is a usable zero-elapsed baseline"
-        );
-    }
-
-    #[test]
-    fn wall_clock_adjusted_threshold_shaves_one_block_per_block_time() {
-        // 25 blocks of elapsed time (300s) → adjusted = danger_threshold - 25.
-        let last = 1_000_000;
-        let now = last + 300_000;
-        let cfg = timing();
-        assert_eq!(
-            cfg.wall_clock_adjusted_danger_threshold(Some(last), now),
-            Ok(Some(cfg.danger_threshold() - 25)),
-        );
-    }
-
-    #[test]
-    fn wall_clock_adjusted_threshold_saturates_at_zero() {
-        // Wildly long outage — adjustment shaves more blocks than the threshold.
-        let last = 0;
-        let now = u64::MAX / 2;
-        assert_eq!(
-            timing().wall_clock_adjusted_danger_threshold(Some(last), now),
-            Ok(Some(0)),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_margin_equal_to_max_wait() {
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, MAX_WAIT, 1, 12),
-            Err(ProtocolTimingError::MarginNotLessThanMaxWait {
-                margin: MAX_WAIT,
-                max_wait: MAX_WAIT,
-            }),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_margin_greater_than_max_wait() {
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, MAX_WAIT + 1, 1, 12),
-            Err(ProtocolTimingError::MarginNotLessThanMaxWait {
-                margin: MAX_WAIT + 1,
-                max_wait: MAX_WAIT,
-            }),
-        );
-    }
-
-    #[test]
-    fn try_new_accepts_max_margin_admitting_valid_stale() {
-        // margin = MAX_WAIT - 2 is the largest margin that still admits a
-        // valid stale value (stale must satisfy 0 < stale < danger, and
-        // danger = MAX_WAIT - margin, so danger >= 2 is required for stale = 1
-        // to be valid).
-        let cfg = ProtocolTiming::try_new(MAX_WAIT, MAX_WAIT - 2, 1, 12)
-            .expect("margin admitting stale = 1 must be accepted");
-        assert_eq!(cfg.danger_threshold(), 2);
-    }
-
-    #[test]
-    fn try_new_rejects_zero_margin() {
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, 0, 1, 12),
-            Err(ProtocolTimingError::MarginZero),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_zero_l1_read_stale_after() {
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, 75, 0, 12),
-            Err(ProtocolTimingError::ReadStaleAfterZero),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_zero_seconds_per_block() {
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, 75, 1, 0),
-            Err(ProtocolTimingError::SecondsPerBlockZero),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_overflowing_read_staleness_window() {
-        assert_eq!(
-            ProtocolTiming::try_new(u64::MAX, 1, u64::MAX - 2, 2),
-            Err(ProtocolTimingError::ReadStaleWindowOverflow {
-                read_stale_after: u64::MAX - 2,
-                seconds_per_block: 2,
-            }),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_l1_read_stale_after_past_danger() {
-        let danger_threshold = MAX_WAIT - 75;
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, 75, danger_threshold + 1, 12),
-            Err(ProtocolTimingError::ReadStaleAfterPastDanger {
-                read_stale_after: danger_threshold + 1,
-                danger_threshold,
-            }),
-        );
-    }
-
-    #[test]
-    fn try_new_rejects_l1_read_stale_after_equal_to_danger() {
-        // Strict less-than: equality means L1ViewStale and
-        // EstimatedBatchInDanger fire at the same point, defeating the
-        // "stale fires first" design property.
-        let danger_threshold = MAX_WAIT - 75;
-        assert_eq!(
-            ProtocolTiming::try_new(MAX_WAIT, 75, danger_threshold, 12),
-            Err(ProtocolTimingError::ReadStaleAfterPastDanger {
-                read_stale_after: danger_threshold,
-                danger_threshold,
-            }),
-        );
-    }
-
-    #[test]
     fn age_exceeds_saturates_on_underflow() {
         assert!(!age_exceeds(5, 10, 1));
         assert!(age_exceeds(1200, 0, 1200));
         assert!(!age_exceeds(1199, 0, 1200));
-    }
-
-    // ── ProtocolTiming::is_scheduler_stale direct boundary tests ──────────
-    //
-    // Indirectly covered by `scheduler_accepts_boundary_just_below_stale`, but
-    // the staleness predicate is load-bearing on its own (the scheduler skips
-    // submissions that trip it) and deserves direct tests that don't go through
-    // SSZ decoding.
-
-    #[test]
-    fn is_scheduler_stale_reports_false_below_threshold() {
-        // age = inclusion - first = MAX_WAIT - 1, strictly below.
-        assert!(!timing().is_scheduler_stale(MAX_WAIT, 1));
-        // age = 0 (safe head right at the first frame).
-        assert!(!timing().is_scheduler_stale(100, 100));
-    }
-
-    #[test]
-    fn is_scheduler_stale_reports_true_at_and_past_threshold() {
-        // age = MAX_WAIT exactly — `>=` comparison trips.
-        assert!(timing().is_scheduler_stale(MAX_WAIT, 0));
-        // age = MAX_WAIT + 1, clearly past.
-        assert!(timing().is_scheduler_stale(MAX_WAIT + 1, 0));
-    }
-
-    #[test]
-    fn is_scheduler_stale_saturates_when_first_frame_is_ahead() {
-        // Degenerate input: safe head is behind the first frame's safe_block.
-        // Saturating subtraction yields 0, strictly below threshold — never stale.
-        assert!(!timing().is_scheduler_stale(50, 100));
     }
 
     #[test]
@@ -680,9 +149,8 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: 500,
         };
-        let accepted = timing()
-            .scheduler_accepts(SUBMITTER, input, 3)
-            .expect("matching nonce + fresh inclusion should be accepted");
+        let accepted =
+            accepts(input, 3).expect("matching nonce + fresh inclusion should be accepted");
         assert_eq!(accepted.safe_input_index, 7);
         assert_eq!(accepted.nonce, 3);
         assert_eq!(accepted.first_frame_safe_block, 100);
@@ -698,7 +166,7 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: 0,
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_none());
+        assert!(accepts(input, 0).is_none());
     }
 
     #[test]
@@ -710,7 +178,7 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: MAX_WAIT,
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_none());
+        assert!(accepts(input, 0).is_none());
     }
 
     #[test]
@@ -722,7 +190,22 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: MAX_WAIT,
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_some());
+        assert!(accepts(input, 0).is_some());
+    }
+
+    #[test]
+    fn scheduler_accepts_a_first_frame_ahead_of_inclusion_as_fresh() {
+        // Degenerate input: the first frame is ahead of the inclusion block.
+        // Saturating subtraction yields age 0, never stale; gate d, which
+        // the predicate omits, is what rejects it on chain.
+        let payload = encode(&single_frame_batch(0, 100));
+        let input = SafeInputView {
+            safe_input_index: 0,
+            sender: SUBMITTER,
+            payload: payload.as_slice(),
+            inclusion_block: 50,
+        };
+        assert!(accepts(input, 0).is_some());
     }
 
     #[test]
@@ -734,8 +217,8 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: 200,
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 3).is_none());
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 1).is_none());
+        assert!(accepts(input, 3).is_none());
+        assert!(accepts(input, 1).is_none());
     }
 
     #[test]
@@ -746,7 +229,7 @@ mod tests {
             payload: &[0xFF, 0xEE, 0xDD],
             inclusion_block: 0,
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_none());
+        assert!(accepts(input, 0).is_none());
     }
 
     #[test]
@@ -761,6 +244,6 @@ mod tests {
             payload: payload.as_slice(),
             inclusion_block: MAX_WAIT.saturating_mul(10),
         };
-        assert!(timing().scheduler_accepts(SUBMITTER, input, 0).is_some());
+        assert!(accepts(input, 0).is_some());
     }
 }

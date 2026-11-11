@@ -126,8 +126,7 @@ exception is a sender with no surviving live op. `GET /nonce` counts only the
 era's live rows, and every setup, genesis base included, rebuilds the history
 up to its stop block first ([era baseline](application-history.md#era-baseline)),
 so a sender whose last op lies in the rebuilt history or below the base count
-reads 0 until its first live op, and again if a later recovery invalidates all
-of its live ops. The lane's refusal names the expected nonce, which corrects
+reads 0 until its first live op. The lane's refusal names the expected nonce, which corrects
 the client. An engine outside the rule (gapped or keyed nonces, a
 deposit that resets one) makes `GET /nonce` quote nonces the lane refuses.
 
@@ -178,9 +177,8 @@ skipped ops, refusals, queued or dropped directs, envelopes, and empty batches
 do not ([what counts](scheduler-semantics.md#what-counts)). Arithmetic is
 checked, never wrapping or saturating.
 
-The count belongs to the checkpoint's logical state. Standard recovery may
-roll it back to a retained prefix and then advance over replacement inputs; a
-recovery from a canonical machine starts at that machine's count
+The count belongs to the checkpoint's logical state. Within an era it only
+advances; a recovery from a canonical machine starts at that machine's count
 ([§7](#7-canonical-recovery-integration)). SQLite stores an independent expected snapshot count and per-input
 execution offsets, checked during catch-up.
 

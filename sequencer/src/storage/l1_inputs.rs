@@ -12,11 +12,10 @@ use super::Storage;
 use super::acceptance::record_accepted_batches;
 use super::convert::{external_u64_to_i64, i64_to_u64, saturating_query_bound, u64_to_i64};
 use super::queries::{
-    DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block,
+    DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block, current_safe_block_timestamp,
     query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
 use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange};
-use sequencer_core::protocol::ProtocolTiming;
 
 /// What a base's export is checked against: the admitted directs above its
 /// clock among the inputs it consumed.
@@ -52,6 +51,12 @@ impl Storage {
 
     pub fn current_safe_block(&mut self) -> Result<Option<u64>> {
         current_safe_block(&self.conn)
+    }
+
+    /// L1 timestamp (Unix seconds) of the persisted safe block, or `None`
+    /// before the first sync: the safe head's age.
+    pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
+        current_safe_block_timestamp(&self.conn)
     }
 
     /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
@@ -211,32 +216,28 @@ impl Storage {
     ///
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
     /// the current MAX+1) with their per-input L1 provenance, advance
-    /// `l1_safe_head.block_number` to `safe_block`, stamp `synced_at_ms` with
-    /// `now_ms`, and record `batches.accepted_input` via `timing` so the
-    /// scheduler-accepted frontier stays consistent with the safe head.
+    /// `l1_safe_head` to `safe_block` and its timestamp, and record
+    /// `batches.accepted_input` so the scheduler-accepted frontier stays
+    /// consistent with the safe head.
     ///
     /// Once the era exists, the accepted frontier is an invariant of this
     /// operation while no divergence exists: every safe input up to
     /// `safe_block` has been evaluated against the scheduler's acceptance
-    /// rules for the pinned batch submitter. Before the era (setup's syncs)
-    /// nothing is accepted; the first append after it judges
+    /// rules for the pinned batch submitter and window. Before the era
+    /// (setup's syncs) nothing is accepted; the first append after it judges
     /// every input past the stop block. A foreign/mismatched accepted landing
     /// instead commits the `canonical_divergence` fact with this head and
     /// freezes the projection; later head advances remain paired with that
-    /// terminal fact. Readers (submitter, recovery, danger checks) never
+    /// terminal fact. Readers (submitter, landing watch, startup) never
     /// populate separately.
     ///
-    /// `now_ms` is the caller's wall-clock reading taken just before this
-    /// call, so it is at most the commit time: the staleness arms can only
-    /// err toward "stale" (I12). Asserts `safe_block` is monotonic and that
-    /// it strictly advances when `inputs` is non-empty.
+    /// Asserts `safe_block` is monotonic and that it strictly advances when
+    /// `inputs` is non-empty.
     pub(crate) fn append_ingested_safe_inputs_with_timestamp(
         &mut self,
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[IngestedSafeInput],
-        timing: &ProtocolTiming,
-        now_ms: u64,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -254,24 +255,21 @@ impl Storage {
             insert_safe_inputs_batch(tx, next_index, inputs)?;
 
             let changed = tx.execute(
-                "INSERT INTO l1_safe_head \
-                    (singleton_id, block_number, block_timestamp, synced_at_ms) \
-                 VALUES (0, ?1, ?2, ?3) \
+                "INSERT INTO l1_safe_head (singleton_id, block_number, block_timestamp) \
+                 VALUES (0, ?1, ?2) \
                  ON CONFLICT(singleton_id) DO UPDATE SET \
                     block_number = excluded.block_number, \
-                    block_timestamp = excluded.block_timestamp, \
-                    synced_at_ms = excluded.synced_at_ms",
+                    block_timestamp = excluded.block_timestamp",
                 params![
                     external_u64_to_i64(safe_block, "L1 safe block")?,
                     external_u64_to_i64(safe_block_timestamp, "L1 safe block timestamp")?,
-                    external_u64_to_i64(now_ms, "safe-head sync time")?
                 ],
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
 
-            record_accepted_batches(tx, timing)
+            record_accepted_batches(tx)
         })
     }
 
@@ -431,10 +429,7 @@ mod tests {
     use crate::storage::{
         DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange, Storage,
         StoredSafeInput,
-        test_helpers::{
-            SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, default_protocol_timing,
-            set_up_storage,
-        },
+        test_helpers::{SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, set_up_storage},
     };
     use crate::test_support::{pin_test_deployment_identity, temp_db};
     use alloy_primitives::{Address, B256};
@@ -456,7 +451,6 @@ mod tests {
     fn safe_input_end_exclusive_counts_appended_inputs() {
         let db = temp_db("safe-input-api");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
 
@@ -473,7 +467,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, inserted.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(10, inserted.as_slice(), SENDER_A)
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
@@ -488,7 +482,6 @@ mod tests {
     fn first_batch_submitter_input_after_block_scans_strictly_past() {
         let db = temp_db("first-submitter-input-after");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         // index 0: submitter @5; index 1: non-submitter @12; index 2: submitter @18.
         // Payloads are junk (scheduler no-ops on decode) — detection scans the
@@ -512,7 +505,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(20, inputs.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(20, inputs.as_slice(), SENDER_A)
             .expect("seed safe inputs");
 
         // From genesis (0): the earliest submitter input is index 0 @5.
@@ -588,7 +581,6 @@ mod tests {
                     input(SENDER_B, vec![0x15], 15),
                 ],
                 SENDER_A,
-                &default_protocol_timing(),
             )
             .expect("seed safe inputs");
     }
@@ -751,13 +743,6 @@ mod tests {
             None,
             "fresh storage should not have a safe block timestamp"
         );
-        assert_eq!(
-            storage
-                .last_safe_progress_ms()
-                .expect("read sync timestamp"),
-            None,
-            "fresh storage should not have a safe-progress timestamp"
-        );
     }
 
     #[test]
@@ -765,7 +750,6 @@ mod tests {
         let db = temp_db("external-integer-range");
         // No identity yet: the test's refused pins must leave none.
         let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
-        let protocol = default_protocol_timing();
 
         let identity_err = storage
             .pin_deployment_identity(DeploymentIdentity {
@@ -800,14 +784,14 @@ mod tests {
         assert_eq!(storage.deployment_identity().expect("read identity"), None);
 
         let safe_head_err = storage
-            .append_safe_inputs_with_timestamp(u64::MAX, 1, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(u64::MAX, 1, &[], SENDER_A)
             .expect_err("unrepresentable provider safe block must be refused");
         assert!(matches!(
             safe_head_err,
             rusqlite::Error::ToSqlConversionFailure(_)
         ));
         let safe_timestamp_err = storage
-            .append_safe_inputs_with_timestamp(10, u64::MAX, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(10, u64::MAX, &[], SENDER_A)
             .expect_err("unrepresentable provider safe timestamp must be refused");
         assert!(matches!(
             safe_timestamp_err,
@@ -823,7 +807,6 @@ mod tests {
                     block_number: u64::MAX,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect_err("unrepresentable provider input block must be refused");
         assert!(matches!(
@@ -841,8 +824,6 @@ mod tests {
                     block_timestamp: u64::MAX,
                     transaction_hash: B256::ZERO,
                 }],
-                &protocol,
-                crate::clock::unix_now_ms(),
             )
             .expect_err("unrepresentable provider input timestamp must be refused");
         assert!(matches!(
@@ -904,20 +885,15 @@ mod tests {
     fn append_safe_inputs_creates_and_advances_safe_head() {
         let db = temp_db("append-safe-inputs-creates-safe-head");
         let mut storage = set_up_storage(&db.path, SENDER_A);
-        let protocol = default_protocol_timing();
 
         storage
-            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A)
             .expect("record first real safe-head observation");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
             Some(7),
             "append should create the safe-head row"
         );
-        let recorded_sync = storage
-            .last_safe_progress_ms()
-            .expect("read sync timestamp")
-            .expect("first observation should record wall-clock time");
         assert_eq!(
             storage
                 .current_safe_block_timestamp()
@@ -927,7 +903,7 @@ mod tests {
         );
 
         storage
-            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A, &protocol)
+            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A)
             .expect("advance safe head");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -940,14 +916,6 @@ mod tests {
                 .expect("read advanced block timestamp"),
             Some(5678),
             "append should record the observed L1 block timestamp"
-        );
-        assert!(
-            storage
-                .last_safe_progress_ms()
-                .expect("read sync timestamp")
-                .expect("advanced observation should record wall-clock time")
-                >= recorded_sync,
-            "safe-progress timestamp should stay monotonic across appends"
         );
     }
 }

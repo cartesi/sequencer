@@ -1,7 +1,7 @@
 # ADR: The Runtime Authority Boundary
 
 The architecture decision record for how authority — over speculative state,
-promises, process lifetime, and recovery admission — is owned in the
+promises, process lifetime, and admission to run — is owned in the
 sequencer. The mechanisms and their reasons below describe the current design;
 Git preserves the earlier proposals and review history.
 
@@ -15,8 +15,8 @@ The policy separates into three guarantees:
 
 1. **G1 — terminal stop:** a diagnosed terminal runtime fault aborts the
    process without worker drain or database settlement.
-2. **G2 — no silent fast-path:** every boot inspects durable facts and runs
-   recovery, regardless of the previous process's verdict.
+2. **G2 — no silent fast-path:** every boot inspects durable facts and syncs
+   L1, regardless of the previous process's verdict.
 3. **G3 — scoped divergence freeze:** a committed canonical-divergence fact
    freezes its persisted acceptance domain immediately. The mechanism, its
    runtime reaction, its race bound, and the watchdog boundary are stated
@@ -34,8 +34,8 @@ may still complete remotely; the zombie-transaction model accounts for them.
 Every command acquires the OS-held exclusive data-directory lock before
 inspection (`runtime/process_lock.rs`). For `run`, ownership transfers into a
 `RuntimeScope` containing the lock and a `ShutdownSignal`. Workers may hold
-the scope or the lock and signal separately. Operator shutdown, expected
-recovery, and transient exits signal all workers and drain them normally.
+the scope or the lock and signal separately. Operator shutdown and transient
+exits signal all workers and drain them normally.
 
 Terminal runtime errors call `abort_terminal`: emit a diagnostic and call
 `std::process::abort`. They do not signal a graceful drain, write a terminal
@@ -64,26 +64,25 @@ The reader can cancel a pending RPC read, but awaits any started SQLite
 append before joining, so the final clean-exit divergence check sees every
 committed sync.
 
-Runtime construction is prepare → admit → launch: fallible or awaited
-dependency preparation happens before workers launch; final admission checks one
-consistent fact set; launch spawns every worker in one infallible,
-non-yielding block, consuming the single-use `RuntimeAdmission` witness. A
-preparation failure cannot leave a partially launched runtime, and no
-refusal or retry can mint the witness. This boundary does not promise that
-worker initialization succeeds: application restore and catch-up run inside
-the launched lane.
+Runtime construction is prepare → launch: fallible or awaited dependency
+preparation happens before workers launch, and launch spawns every worker in
+one infallible, non-yielding block. A preparation failure cannot leave a
+partially launched runtime. Under the process lock, with no worker running,
+nothing changes the facts startup last checked before launch. This boundary
+does not promise that worker initialization succeeds: application restore and
+catch-up run inside the launched lane.
 
 ### 2. Fact-derived admission and the terminal-fault black box
 
-Admission is governed by three facts, each with one owner: the kernel
+Admission is governed by four facts, each with one owner: the kernel
 process lock (concurrent owners), the era's existence, two-sided (command
-ordering), and `canonical_divergence` (the one absorbing refusal — only a
-fresh-directory cockroach rebuild proceeds); baseline schema creation and
+ordering), and the two terminal facts, `canonical_divergence` and the void
+history, derived from the batches and the safe head (absorbing refusals —
+only a fresh-directory cockroach rebuild proceeds); baseline schema creation and
 the era's publication (which is setup's completion) are each one
 `synchronous=FULL` transaction.
 There is no lifecycle admission state machine or operator acknowledgement.
-Standard recovery is automatic, and restart policy after a terminal fault
-is the exit contract (30 or SIGABRT = do not restart, page), which the
+Restart policy after a terminal fault is the exit contract (30 or SIGABRT = do not restart, page), which the
 supervisor is expected to honor.
 
 `terminal_faults` stores append-only causes for terminal errors returned
@@ -94,28 +93,25 @@ reads the black box for decisions.
 A known-terminal fault refuses at re-detection rather than at a boot gate.
 Every fault whose evidence the boot path reads re-refuses before the first
 soft confirmation; the residual window is recorded in the threat model.
-The honesty backstops (rollbackable soft confirmations, the watchdog
+The honesty backstops (revocable soft confirmations, the watchdog
 byte-compare, and the divergence freeze) do not depend on a boot gate.
 A durable gate on the previous verdict would require operator acknowledgement
 without adding evidence about the current facts. A full integrity sweep would
 still miss semantic faults outside its read set. Revisit admission checks for
 a specific detectable fault, rather than treating a previous verdict as proof.
 
-### 3. Ordered startup recovery
+### 3. Ordered startup
 
-Normal `run` startup inspects local terminal facts, syncs L1, selects a repair
-from current facts, and checks the result. The flush branch orders flush →
-sync through the returned safe block → cascade explicitly. There is no
-phase driver or progress ledger; the flush witness is a local value. A restart
-must obtain fresh flush/sync evidence; persisting a phase would let it skip
-work based on an earlier attempt's observation.
-Setup/rebuild, maintenance flush, and normal-run recovery retain distinct
-typed controllers because they establish different facts; a universal
-controller would represent combinations none of those commands needs.
-The dispatch table, boot-local witnesses, and final
-admission check are owned by
-[`docs/recovery/README.md`](../recovery/README.md);
-[`admission.tla`](../recovery/admission.tla) verifies the controller ordering.
+Normal `run` startup checks the terminal facts on the database as it is,
+before any L1 call; syncs L1; checks them again; and opens a batch if none is
+open, in one guarded transaction. It repairs, flushes and replaces nothing,
+and keeps no phase driver or progress ledger: every start derives the same
+answer from the same facts.
+Setup/rebuild, maintenance flush, and `run`'s start retain distinct typed
+controllers because they establish different facts; a universal controller
+would represent combinations none of those commands needs.
+[What the sequencer does](../recovery/README.md#what-the-sequencer-does) owns
+the sequence and what each check refuses.
 
 ### 4. SQLite-centered runtime and the two-regime inclusion lane
 
@@ -175,12 +171,10 @@ HistoryPosition = (HistoryVersion, ExecutedInputCount)
 ```
 
 `EraId` (UUIDv4, minted write-once in the baseline transaction) identifies a
-setup/rebuild era; `RecoveryGeneration` increments exactly once in the
-standard-recovery transaction iff it invalidates at least one valid batch; a
-clean restart changes neither. The pair is an equality/discontinuity token,
+setup/rebuild era; no operation advances `RecoveryGeneration`, and a clean
+restart changes neither. The pair is an equality/discontinuity token,
 not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
-application row has its pre-execution count; recovery replaces only the current
-suffix. See the [history contract](../protocol/application-history.md) and
+application row has its pre-execution count. See the [history contract](../protocol/application-history.md) and
 [register](../review/register.md#integration-work-owned-elsewhere).
 
 ## Performance posture

@@ -8,8 +8,7 @@
 use rusqlite::params;
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-    open_temp_storage, set_up_storage,
+    LandingFixture, SENDER_A, SENDER_B, open_temp_storage, set_up_storage,
 };
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 
@@ -633,61 +632,6 @@ fn schema_rejects_application_input_into_non_tip() {
     );
 }
 
-#[test]
-fn nonce_reuse_after_partial_cascade() {
-    // After a cascade that invalidates only the suffix (keeping a prefix
-    // valid), the new Tip follows the last valid batch, so its nonce is that
-    // batch's `nonce + 1` — the same nonce the invalidated suffix's first
-    // batch had. Nonce reuse is automatic.
-    //
-    // Scenario: batch 0 is accepted (the accepted frontier advances past
-    // nonce 0). Batch 1 is stale and triggers cascade. Batches 1, 2, 3
-    // invalidated; batch 0 remains valid.
-    let (_db, mut storage) = open_temp_storage("nonce-reuse-partial-cascade");
-
-    let mut head = storage
-        .initialize_open_state(10, SafeInputRange::empty_at(0))
-        .expect("initialize at safe_block=10");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 0 (nonce 0)");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 1 (nonce 1)");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 2 (nonce 2)");
-    // Head is now batch 3 (nonce 3, first_frame_safe_block=100).
-
-    // Batch 0 lands on L1 (accepted): safe_input at block 20 with nonce 0.
-    let landed = local_batch_payload(&mut storage, 0);
-    storage.land(20, &[(SENDER_A, landed)]); // append batch 0 submission
-    // Advance safe head so batches 1, 2, 3 (first_frame=100) are stale.
-    // current_safe=1400 → 1400-100=1300 >= 1200.
-    storage.advance_safe_head(1400); // advance past threshold
-
-    let inv = storage.recover_post_flush(1200).expect("recover");
-    // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
-    assert_eq!(
-        inv,
-        crate::storage::test_helpers::batch_ids(&[1, 2, 3]),
-        "only the suffix cascades, got {inv:?}"
-    );
-
-    // The new Tip (batch 4) reuses the pivot's nonce 1: the last valid
-    // nonce (0) + 1.
-    let (tip_index, tip_nonce): (i64, i64) = storage
-        .conn
-        .query_row(
-            "SELECT batch_index, nonce FROM valid_open_batch",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query recovery tip");
-    assert_eq!(tip_index, 4, "the recovery Tip takes a fresh batch_index");
-    assert_eq!(tip_nonce, 1, "recovery Tip reuses nonce 1");
-}
-
 // ── CHECK-constraint regressions ──────────────────────────
 //
 // These differ from the trigger-based tests above: they exercise raw
@@ -933,13 +877,14 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
             .expect_err("pending-snapshot DELETE must be frozen"),
     );
 
-    // Reads stay usable on a frozen DB: the danger check must still
-    // classify the divergence (the boot-refusal path depends on it).
-    let protocol = default_protocol_timing();
-    let status = storage
-        .check_danger(&protocol, 1_000_000)
-        .expect("check danger on a frozen DB");
-    assert_eq!(status, crate::storage::DangerStatus::CanonicalDivergence(0));
+    // Reads stay usable on a frozen DB: the terminal-fact read must still
+    // report the divergence (the boot refusal depends on it).
+    assert!(matches!(
+        storage
+            .terminal_fact()
+            .expect("terminal fact on a frozen DB"),
+        Some(crate::storage::TerminalFact::Divergence(divergence)) if divergence.nonce == 0
+    ));
 }
 
 #[test]
@@ -1036,7 +981,7 @@ fn schema_rejects_safe_input_update_and_delete() {
         },
     ];
     storage
-        .append_safe_inputs(10, inputs.as_slice(), SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(10, inputs.as_slice(), SENDER_A)
         .expect("seed safe inputs");
 
     let update = storage

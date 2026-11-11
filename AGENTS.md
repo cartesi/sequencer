@@ -31,7 +31,7 @@ In order of importance:
 ## Design Principles
 
 - **App-specific sequencer.** The sequencer may link against the application, enabling validation and execution at ingress time. This is a deliberate design choice.
-- **Soft confirmations may be invalidated.** Under adversarial conditions (network, infrastructure, provider, or L1 outages), soft confirmations can be rolled back via recovery. This is by design, not a bug — it is what makes the sequencer sound in the face of liveness failures.
+- **Soft confirmations may be invalidated.** Under adversarial conditions (network, infrastructure, provider, or L1 outages), batches can fail to land inside the staleness window; the era then ends, and the cockroach rebuild that starts a new era revokes every soft confirmation that had not landed. This is by design, not a bug — it is what makes the sequencer sound in the face of liveness failures.
 - **App UX may depend on the sequencer.** Without the sequencer, user experience may degrade substantially. This is an acceptable tradeoff: the on-chain scheduler remains the canonical source of truth; the sequencer only accelerates the UX.
 - **SQLite-centered local coordination.** Components publish and consume durable local facts through their owned SQLite tables, and the on-chain scheduler remains canonical authority. HTTP ingress ↔ inclusion lane is the one deliberate in-memory exception, not a precedent for a component bus ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)).
 - **Append-oriented storage.** Avoid mutable status flags for open/closed entities; prefer write-once NULL→value transitions with one owner each, and derive cursors and heads from persisted facts rather than duplicating them as mutable fields.
@@ -54,7 +54,8 @@ batches. A frame's `safe_block` tells the scheduler how far to drain directs
 before the frame's user ops, and commits the sequencer to having accounted for
 every direct input up to that block. Under honest operation without outages,
 soft confirmations match the canonical order; if the sequencer goes offline or
-freezes `safe_block`, staleness forces recovery and invalidates them.
+freezes `safe_block` past the window, staleness ends the era and a cockroach
+rebuild revokes them.
 
 ### Where the duality lives in code (change one, check all)
 
@@ -66,7 +67,7 @@ This section is the map.
 Scheduler-acceptance semantics exist in exactly three implementations that must agree:
 
 1. the canonical scheduler — `Scheduler` ([`sequencer-core/src/scheduler/mod.rs`](sequencer-core/src/scheduler/mod.rs)), driven with the executor by `CanonicalRunner` ([`scheduler/driver.rs`](sequencer-core/src/scheduler/driver.rs)): the same source the on-chain machine compiles;
-2. the off-chain acceptance predicate — `ProtocolTiming::scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), whose results `record_accepted_batches` writes to `batches.accepted_input`;
+2. the off-chain acceptance predicate — `scheduler_accepts` ([`sequencer-core/src/protocol.rs`](sequencer-core/src/protocol.rs)), whose results `record_accepted_batches` writes to `batches.accepted_input`;
 3. the inclusion lane's live prediction (drain + execution order).
 
 [I1](docs/invariants.md#i1-scheduler-acceptance-semantics-agree-across-all-implementations)
@@ -84,15 +85,14 @@ A batch is **stale** when `inclusion_block - first_frame.safe_block >= max_wait_
 the application's staleness window (1200 blocks, ~4h, for the wallet): the sequencer went offline, or kept submitting while
 freezing `safe_block` to hold back directs. The scheduler skips a stale batch
 without consuming its nonce, and overdue directs are force-drained anyway, which
-bounds censorship at the window. Every later batch then arrives at an unexpected nonce,
-so invalidation cascades through the suffix, open batch included
+bounds censorship at the window. Every later batch then arrives at an unexpected nonce
 ([scheduler semantics](docs/protocol/scheduler-semantics.md)).
 
-- **Automatic recovery** repairs optimistic history after liveness failures: the
-  danger detector stops the process at a threshold before staleness, and startup
-  settles outstanding submissions and replaces the invalid suffix
-  ([automatic recovery](docs/recovery/README.md)).
-- **Cockroach recovery** rebuilds a new data directory from a trusted
+- **The era ends** when the oldest unaccepted batch can no longer be accepted
+  (the void history), or when a foreign batch lands at one of the sequencer's
+  nonces. The sequencer then stops and refuses every start; it repairs nothing
+  in place ([batch landing and outages](docs/recovery/README.md)).
+- **Cockroach recovery**, the only recovery, rebuilds a new data directory from a trusted
   canonical machine and L1 history, including after a sequencer bug:
   `setup --base <machine>` rebuilds the history through a stop block with the
   scheduler, executing each transaction as it is handed out, and publishes a
@@ -106,7 +106,7 @@ See [`docs/threat-model/README.md`](docs/threat-model/README.md) for the full mo
 - **Trusted:** InputBox contract, our own Ethereum node (fail-stop, not byzantine), operator config, batch-submitter key.
 - **Adversarial:** `POST /tx` callers, direct-input senders, the L1 mempool and block builders (zombie transactions are a first-class threat).
 - **RPC endpoint:** single (`CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`), trusted fail-stop, **must be one consistent node** — no fallback tier exists yet ([RPC endpoint](docs/threat-model/README.md#rpc-endpoint)).
-- **Self-trust:** normal operation assumes the sequencer's own code is correct; a bug needs a fix and, when state cannot be trusted, cockroach recovery. Automatic recovery does not repair software defects.
+- **Self-trust:** normal operation assumes the sequencer's own code is correct; a bug needs a fix and, when state cannot be trusted, cockroach recovery.
 - **In scope:** correctness bugs *and* exploitation. Under rollup semantics, a correctness bug that causes scheduler/sequencer state divergence is as severe as direct theft.
 
 ## Architecture Map
@@ -145,7 +145,7 @@ Paths below are relative to `sequencer/src/`:
 - `ingress/` — public HTTP handlers and the single inclusion lane.
 - `egress/` — internal HTTP/WS API and DB-backed application-input feed.
 - `l1/` — safe-input reader, batch submitter, mempool flusher, fee oracle, shared EIP-1559 estimation, and provider access.
-- `recovery/` — automatic startup repair and danger detector.
+- `landing.rs` — the worker that watches the terminal facts and reports the landing lag ([code map](docs/recovery/README.md#code-map)).
 - `storage/` — each writer role's persistence operations, shared queries, and schema.
 - `http.rs` and `clock.rs` — shared HTTP errors/server setup and the crate-wide wall clock. `L1Config` lives in `l1/`.
 
@@ -154,10 +154,10 @@ Paths below are relative to `sequencer/src/`:
 - **Chunk** — bounded list of user ops processed and persisted together to amortize SQLite cost.
 - **Frame** — ordering boundary; commits `safe_block` + user ops.
 - **Batch** — list of frames posted on-chain as one L1 transaction (SSZ-encoded).
-- **Tip** — the open batch at the end of the valid batches; recovery invalidates a suffix and opens a new Tip after the last valid batch ([automatic recovery](docs/recovery/README.md#the-state-being-repaired)).
+- **Tip** — the open batch: the one batch at the end of the history that still takes user ops; `run`'s start opens one if none is open ([batch landing and outages](docs/recovery/README.md#accepted-and-unaccepted-batches)).
 - **Inclusion lane** — the single ordering lane ([ADR mechanism 4](docs/plans/2026-08-authority-boundary-adr.md)); the only writer of open batch/frame state ([I17](docs/invariants.md)) and the system's execution bottleneck.
 - **Soft confirmation** — sequencer's predicted ordering, emitted before the batch lands on L1.
-- **Snapshot** — immutable artifact registered at every batch close; acceptance selects the comparison and recovery checkpoint ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
+- **Snapshot** — immutable artifact registered at every batch close; acceptance selects the comparison checkpoint ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 - **Era** — the history one setup publishes: it starts at its base's L2 tx count, holds the history setup rebuilt from L1 through the stop block (`rebuilt_history`), then the live rows; the baseline at the stop block is its first comparison checkpoint ([cockroach recovery](docs/recovery/cockroach.md)).
 
 ## Domain Truths
@@ -209,7 +209,7 @@ changing configuration.
 
 - Prefer small, composable functions at module boundaries (`ingress::api` → `ingress::inclusion_lane` → `storage::ingress`; `egress::l2_tx_feed` ← `storage::history`).
 - Keep application validation and execution deterministic for a given input/state. No `SystemTime::now()`, `HashMap` iteration order, or floating-point in consensus paths.
-- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a recovery boot, a retry, a setup refusal).
+- Surface user-facing errors via `ApiError` (in `http.rs`); keep internal failures descriptive but safe. An error that wraps a cause ends its Display with `: {source}`, because log sinks print Display only. A dependency error whose Display omits its cause (reqwest names only the request kind) is rendered with `l1::provider::error_chain` where it becomes text, in a `String` variant or a log field; it appends only causes the line does not already hold, so it is also safe on our own wrappers of such an error. A failure logs at its verdict's level: ERROR when the cause is a fault or unknown (terminal, unclassified), WARN when the verdict names a planned procedure (a retry, a setup refusal).
 - Avoid introducing heavy dependencies without strong reason.
 - **Impossible states fail loud; they are never handled or absorbed.** The [check policy](docs/invariants.md#the-check-policy-fail-loud) owns the decision test and its reasons; [Self-trust](docs/threat-model/README.md#self-trust) owns the trust boundary.
 
@@ -256,7 +256,7 @@ large, never `#[path]`. Cross-module in-process tests go in
 `sequencer/src/integration_tests/`; devnet, machine and binary tests go in the
 `tests/*` crates. Shared fixtures live in `crate::test_support`;
 `storage::test_helpers` keeps the storage-domain ones (the set-up database
-`set_up_storage`, seeding, the recovery fixture trait, divergence markers, and
+`set_up_storage`, seeding, the landing fixture trait, divergence markers, and
 the test-only `Storage` reads); cross-crate signing helpers live in
 `sequencer_core::test_support` behind its `test-support` feature.
 
@@ -301,8 +301,8 @@ See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
 - Preserve API error shape and status code mapping unless intentionally changing the API contract.
 - Add or update tests when logic changes.
 - Run at least `cargo check` before finishing.
-- Read the relevant recovery guide and both current TLA+ models before touching
-  recovery code, and the threat model before touching trust-boundary code.
+- Read the relevant recovery guide before touching recovery code, and the
+  threat model before touching trust-boundary code.
 - Check [`docs/invariants.md`](docs/invariants.md) before changing anything it lists as load-bearing (storage changes cross writer boundaries even when the SQL looks local), the owning design for its assumptions, and [`docs/review/register.md`](docs/review/register.md) for unresolved work in the code you're about to touch. Verify review claims against current code.
 
 ### Ask First
@@ -346,7 +346,7 @@ work reaches another boundary.
 | Scheduler acceptance, batch nonces, direct-input ordering, or frame clock | [Scheduler semantics](docs/protocol/scheduler-semantics.md) — canonical algorithm and the implementations that must agree. |
 | Inclusion lane, storage writes, or runtime concurrency | [Invariant register](docs/invariants.md) — enforcement and consumers; [authority-boundary ADR](docs/plans/2026-08-authority-boundary-adr.md) — ownership, acknowledgement, admission, and terminal stop. |
 | Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
-| Automatic recovery or danger detection | [Automatic recovery](docs/recovery/README.md), then [preemptive.tla](docs/recovery/preemptive.tla) and [admission.tla](docs/recovery/admission.tla) — repair ordering and the models' bounded guarantees. |
+| Batch landing, the void history, or outages | [Batch landing and outages](docs/recovery/README.md) — the rule that ends an era, what `run` does at start and while running, and the operator's playbook. |
 | Setup, or a manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — one setup from any base, the rebuild, the era it publishes, the playbooks, and a code map; [sequencer recovery plan](docs/plans/2026-11-sequencer-recovery/README.md) for what remains. |
 | API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, generation, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |

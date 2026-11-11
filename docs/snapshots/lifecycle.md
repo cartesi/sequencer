@@ -72,7 +72,7 @@ older snapshot. Before the era's first accepted batch, the baseline is the
 comparison checkpoint: the application's state at the end of the stop block is
 the canonical machine's state there, whatever the base, so it is served with
 the stop block as its inclusion block, the rebuilt history end as its count,
-and the anchor as its next batch nonce. After a recovery, this is the
+and the anchor as its next batch nonce. After a cockroach recovery, this is the
 watchdog's first comparison of the new era. Acceptance already includes
 scheduler validation and local content identity, so merely observing an
 own-sender L1 input is insufficient.
@@ -140,8 +140,8 @@ Garbage collection retains:
 3. Every artifact with an active reader lease.
 
 Older accepted artifacts and invalidated branch artifacts are collectible.
-The baseline artifact can be retired after an accepted checkpoint replaces its
-rollback role; the era's immutable baseline metadata and its rebuilt history
+The baseline artifact can be retired after an accepted checkpoint replaces it
+as the comparison checkpoint; the era's immutable baseline metadata and its rebuilt history
 remain in SQLite.
 
 Leases live in the serving process, in one registry of per-snapshot counters

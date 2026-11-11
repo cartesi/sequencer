@@ -5,7 +5,7 @@ use alloy_primitives::B256;
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 
 use super::*;
-use crate::storage::test_helpers::{SENDER_A, SENDER_B, default_protocol_timing, era};
+use crate::storage::test_helpers::{SENDER_A, SENDER_B, era};
 use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
@@ -57,8 +57,6 @@ fn setup_storage(name: &str) -> (TestDb, Storage) {
             9,
             109,
             &[input(SENDER_B, 5), input(SENDER_A, 6), input(SENDER_B, 9)],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .unwrap();
     (db, storage)

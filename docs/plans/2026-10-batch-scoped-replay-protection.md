@@ -75,14 +75,14 @@ The per-sender `(b, i)` entry rejects the second inclusion.
 
 ## Recovery and invalidation
 
-A stale batch does not consume its nonce, so a cascade rolls the open batch
-back and replacements reuse the nonces. An op from an invalidated batch never
-executed, but its signature stays executable while canonical `c <= b + 3`,
-including when its `b` is above the rolled-back open batch. That breaks
-re-signing, which today's nonce makes safe:
+A stale batch does not consume its nonce, so a cockroach rebuild whose stop
+block falls past it starts a new era whose batches reuse the nonces after it.
+An op from a batch the rebuild revoked never executed, but its signature stays
+executable while canonical `c <= b + 3`, including when its `b` is above the
+new era's open batch. That breaks re-signing, which today's nonce makes safe:
 
 ```
-user signs X with (15, 0); batches 10..15 are invalidated; open batch is 10
+user signs X with (15, 0); batches 10..15 never land; the new era opens batch 10
 user re-signs X' with (10, 0); it executes and stores (10, 0)
 canonical c reaches 15: X arrives with k=0, (15, 0) > (10, 0), accepted again
 ```

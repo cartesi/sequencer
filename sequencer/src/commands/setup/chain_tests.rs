@@ -487,7 +487,6 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
         let mut reader = discover(
             &chain.setup_config(data_dir.path(), &with_key(&[])),
             &scratch.path,
-            crate::storage::test_helpers::default_protocol_timing(),
             lock,
         )
         .await
@@ -539,8 +538,6 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
 
     // `run`'s startup: sync with the frontier on, then the root frame at its
     // own safe head.
-    let identity = crate::commands::load_setup_identity(data_dir.path().to_str().unwrap()).unwrap();
-    let timing = crate::storage::test_helpers::default_protocol_timing();
     let lock = ProcessLock::acquire(data_dir.path().to_str().unwrap()).unwrap();
     let mut reader = InputReader::new(
         db_path.clone(),
@@ -551,24 +548,13 @@ async fn setup_from_a_base_with_queued_directs_then_run_drains_them() {
             poll_interval: std::time::Duration::from_secs(1),
             expected_chain_id: CHAIN_ID,
         },
-        timing,
         lock,
     )
     .await
     .unwrap();
-    crate::recovery::run_startup_recovery(
-        &db_path,
-        &mut reader,
-        &crate::l1::L1Config {
-            identity,
-            eth_rpc_url: chain.url.clone(),
-            batch_submitter_private_key: crate::l1::SubmitterKey::new(SUBMITTER_KEY.to_owned()),
-            allow_insecure_rpc: false,
-        },
-        &timing,
-    )
-    .await
-    .unwrap();
+    crate::commands::run::start(&db_path, &mut reader)
+        .await
+        .unwrap();
 
     let mut storage = Storage::open(&db_path).unwrap();
     let root = storage.open_state().unwrap().expect("run opened the root");
@@ -738,7 +724,6 @@ async fn the_escape_check_refuses_activity_past_the_stop_block() {
     let mut reader = discover(
         &chain.setup_config(data_dir.path(), &with_key(&[])),
         &scratch.path,
-        crate::storage::test_helpers::default_protocol_timing(),
         ProcessLock::test(),
     )
     .await

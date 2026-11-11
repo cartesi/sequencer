@@ -47,14 +47,15 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. Startup recovery establishes the
-    /// open Tip, so the lane loads its resume state and never initializes a Tip.
+    /// Spawn the lane on a blocking thread. `run`'s startup opens the Tip if
+    /// none is open, so the lane loads its resume state and never initializes
+    /// a Tip.
     /// It fails loudly with
     /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
     ///
     /// Restore the newest surviving snapshot and replay from its exact
-    /// application count. Startup preserves a rollback-safe checkpoint before
-    /// admitting any runtime work.
+    /// application count. Setup leaves a rollback-safe checkpoint, the era's
+    /// baseline, before `run` launches any worker.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -96,11 +97,11 @@ impl<A: Application + 'static> InclusionLane<A> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
-        // Startup recovery established the Tip before runtime admission.
+        // `run`'s startup opened the Tip before launching the workers.
         // Read the open frame (fail-loud if absent) and the drain
         // cursor together from storage, so both come from the same place. Any
-        // leading range already sequenced into the Tip's frames (genesis or a
-        // recovery batch) was replayed into the app by `run_catch_up` above,
+        // leading range already sequenced into the Tip's frames (an era's
+        // first batch included) was replayed into the app by `run_catch_up` above,
         // so there is no cold-start drain here.
         let head = self
             .storage
@@ -219,7 +220,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             lane_state.head.safe_block(),
         );
         if frontier.safe_block - lane_state.head.safe_block()
-            < sequencer_core::protocol::ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS
+            < sequencer_core::protocol::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS
         {
             return Ok(());
         }
@@ -343,8 +344,10 @@ impl TurnOutcome {
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
     // A backwards clock step makes `duration_since` err; `unwrap_or_default`
     // then reads as age 0, silently stalling the time-based close trigger
-    // until the clock catches up. Acceptable: the size trigger
-    // is unaffected, and a wedge here is liveness-only, never correctness.
+    // until the clock catches up. The size trigger is unaffected, but a batch
+    // that is never sealed keeps aging toward the staleness window, and once
+    // it cannot land the history is void and the era ends. A backwards step
+    // longer than the window is therefore not only a liveness problem.
     let age = SystemTime::now()
         .duration_since(head.batch_created_at())
         .unwrap_or_default();

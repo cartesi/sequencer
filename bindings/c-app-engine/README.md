@@ -119,13 +119,11 @@ admission's reason mapping with a small ABI fixture.
 
 The `c_host_` scenarios in `rollups-e2e` launch the reference C host with generated
 devnet genesis, delete that source before startup, and exercise ordinary execution,
-clean restart, and stale-batch recovery. Independent `EngineApp` replicas restore
-HTTP archives, discard the downloaded sources, follow backlog and live WS inputs,
-and check history identity across recovery. Ordinary execution and stale-batch
-recovery also compare the host against the canonical machine.
-`c_host_recovery_from_genesis_round_trip_test` runs setup's rebuild through the
-engine; recovery from a stored canonical machine is `setup --base`, which no
-`c_host_` scenario runs yet. Run them with:
+clean restart, and setup's rebuild through the engine, from genesis and from a
+stored canonical machine. Independent `EngineApp` replicas restore HTTP
+archives, discard the downloaded sources, and follow backlog and live WS
+inputs, from a snapshot to the live feed. Ordinary execution also compares the
+host against the canonical machine. Run them with:
 
 ```sh
 just setup

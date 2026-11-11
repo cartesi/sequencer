@@ -18,7 +18,6 @@ use tokio::sync::oneshot;
 
 use crate::egress::l2_tx_feed::BroadcastTxMessage;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
-use crate::storage::test_helpers::default_protocol_timing;
 use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra, Storage};
 use crate::test_support::pin_test_deployment_identity;
 
@@ -78,8 +77,6 @@ pub(crate) fn publish_rebuilt_era(db_path: &str, baseline_prefix: &Path) -> Stor
             STOP_BLOCK,
             1_000 + STOP_BLOCK,
             &(0..4).map(safe_input).collect::<Vec<_>>(),
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .expect("sync through the stop block");
     let direct = |index: u64, batch_nonce| Scheduled {

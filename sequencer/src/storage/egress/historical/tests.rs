@@ -7,13 +7,9 @@ use alloy_primitives::{Address, B256};
 use sequencer_core::history::L2TxCount;
 
 use super::*;
-use crate::storage::history::{advance_recovery_generation_in, insert_era_in};
-use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, default_protocol_timing, era as era_record, local_batch_payload,
-};
-use crate::storage::{
-    DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
-};
+use crate::storage::history::insert_era_in;
+use crate::storage::test_helpers::{SENDER_A, SENDER_B, era as era_record, local_batch_payload};
+use crate::storage::{IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange};
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
 fn fixture(name: &str, stop: u64, count: u64, nonce: u64) -> (TestDb, Storage) {
@@ -43,13 +39,7 @@ fn input(block: u64, sender: Address, payload: Vec<u8>) -> IngestedSafeInput {
 
 fn append(storage: &mut Storage, safe_block: u64, inputs: &[IngestedSafeInput]) {
     storage
-        .append_ingested_safe_inputs_with_timestamp(
-            safe_block,
-            safe_block * 12,
-            inputs,
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
-        )
+        .append_ingested_safe_inputs_with_timestamp(safe_block, safe_block * 12, inputs)
         .unwrap();
 }
 
@@ -120,12 +110,10 @@ fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
     );
 
     append(&mut storage, 40, &[input(35, SENDER_B, vec![9])]);
-    storage.write(advance_recovery_generation_in).unwrap();
     let updated = storage
         .history_info(Some(info.history.version.era_id), None)
         .unwrap();
     assert_eq!(updated.baseline, info.baseline);
-    assert_eq!(updated.history.version.recovery_generation.get(), 1);
 }
 
 #[test]
@@ -168,8 +156,6 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
                 input(29, SENDER_A, payloads[0].clone()),
                 input(30, SENDER_A, payloads[1].clone()),
             ],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .unwrap();
     storage
@@ -256,68 +242,5 @@ fn compatibility_requires_an_era_and_rejects_future_generations_after_era_valida
             from_generation: RecoveryGeneration::new(0),
             preserved_input_count: L2TxCount::ZERO,
         })
-    );
-}
-
-#[test]
-fn full_recovery_preserves_nonzero_baseline_before_replacement_directs() {
-    let (_db, mut storage) = fixture("historical-generation-baseline", 100, 41, 7);
-    let mut head = storage
-        .initialize_open_state(100, SafeInputRange::empty_at(0))
-        .unwrap();
-    let now = crate::clock::unix_now_ms();
-    let protocol = default_protocol_timing();
-    storage
-        .append_ingested_safe_inputs_with_timestamp(
-            1400,
-            now / 1000,
-            &[input(110, SENDER_B, vec![1])],
-            &protocol,
-            now,
-        )
-        .unwrap();
-    storage
-        .close_frame_only_with_executions(
-            &mut head,
-            110,
-            SafeInputRange::new(0, 1),
-            &[DirectInputExecution {
-                safe_input_index: 0,
-                l2_tx_index: L2TxCount::new(41),
-            }],
-        )
-        .unwrap();
-    let current = era(&mut storage);
-    let before = storage
-        .history_info(Some(current), Some(RecoveryGeneration::new(0)))
-        .unwrap();
-    assert_eq!(before.history.head, L2TxCount::new(42));
-    assert_eq!(
-        before.compatibility.unwrap().preserved_input_count,
-        before.history.head
-    );
-    assert_eq!(
-        storage
-            .recover_aging_tip_for_recovery(head.batch_index(), &protocol, now,)
-            .unwrap(),
-        crate::storage::test_helpers::batch_ids(&[0])
-    );
-
-    let after = storage
-        .history_info(Some(current), Some(RecoveryGeneration::new(0)))
-        .unwrap();
-    assert_eq!(after.history.available_from, L2TxCount::new(41));
-    assert_eq!(after.history.head, L2TxCount::new(42));
-    assert_eq!(after.history.version.recovery_generation.get(), 1);
-    assert_eq!(
-        after.compatibility.unwrap().preserved_input_count,
-        L2TxCount::new(41)
-    );
-    let latest = storage
-        .history_info(Some(current), Some(RecoveryGeneration::new(1)))
-        .unwrap();
-    assert_eq!(
-        latest.compatibility.unwrap().preserved_input_count,
-        latest.history.head
     );
 }

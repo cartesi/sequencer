@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! The `run` command: refuse unless `setup` completed, read the pinned identity,
-//! run startup recovery (`crate::recovery`), then prepare, admit and launch the
-//! workers (`workers`). The `_admitted` suffix names the lifecycle gate, not the
-//! runtime admission witness, which is minted after preparation.
+//! then refuse on a terminal fact, sync L1 and open a batch if none is open
+//! (`startup`), then prepare and launch the workers (`workers`). The
+//! `_admitted` suffix names the lifecycle gate.
 
+mod startup;
 mod startup_hygiene;
 mod workers;
+
+#[cfg(test)]
+pub(crate) use startup::start;
 
 use std::time::Duration;
 
@@ -43,7 +47,6 @@ where
     // settlement; runtime-owned tasks separately retain clones until they stop.
     let process_lock = process_lock::ProcessLock::acquire(&config.data_dir)?;
     let db_path = config.db_path();
-    let timing = config.protocol_timing(A::scheduler_limits().max_wait_blocks)?;
 
     // Local absorbing facts are inspected before identity/key checks and any
     // RPC: canonical divergence and the two-sided setup-completion rule.
@@ -54,6 +57,7 @@ where
     // Storage classifies directs by the pinned cap, and acceptance is judged
     // by the pinned window; the binary must agree with both.
     require_pinned_scheduler_limits(&identity, A::scheduler_limits())?;
+    config.check_batch_open_window(identity.max_wait_blocks)?;
 
     // `run` holds the signing key (it submits). The key's address must match
     // the pinned submitter address — running with the wrong key against a DB
@@ -69,14 +73,13 @@ where
         allow_insecure_rpc: config.rpc.allow_insecure_rpc,
     };
 
-    let result = run_admitted::<A>(config, timing, l1_config, process_lock.clone()).await;
-    // The Ok-path divergence fact check (run's counterpart of the one
-    // `publish_era` keeps): divergence persisted during this run must
-    // exit terminal even through a clean drain — exit 0 is the one code
-    // that breaks the supervisor's rediscovery chain (restart → preflight
-    // refusal), and the detector's poll cadence leaves a window where a
-    // clean shutdown outruns re-detection.
-    let result = result.and_then(|()| refuse_divergence_on_clean_exit(&db_path));
+    let result = run_admitted::<A>(config, l1_config, process_lock.clone()).await;
+    // The Ok-path terminal-fact check: a divergence recorded or a history
+    // that became void during this run must exit terminal even through a
+    // clean drain. Exit 0 is the one code that breaks the supervisor's
+    // rediscovery chain (restart, then refusal), and the landing watch's poll
+    // cadence leaves a window where a clean shutdown outruns its detection.
+    let result = result.and_then(|()| startup::refuse_terminal_fact(&db_path));
     // Verdict-neutral black-box settlement: a terminal failure records
     // its cause best-effort — never changing the verdict — while a
     // panic/cancellation/SIGKILL writes nothing; the next boot proceeds and
@@ -85,20 +88,8 @@ where
     result
 }
 
-fn refuse_divergence_on_clean_exit(db_path: &str) -> Result<(), CommandError> {
-    let mut storage = storage::Storage::open_read_only(db_path)?;
-    if let Some(divergence) = storage.canonical_divergence()? {
-        return Err(storage::LifecycleError::CanonicalDivergence {
-            nonce: divergence.nonce,
-        }
-        .into());
-    }
-    Ok(())
-}
-
 async fn run_admitted<A>(
     config: RunConfig,
-    timing: sequencer_core::protocol::ProtocolTiming,
     l1_config: L1Config,
     process_lock: process_lock::ProcessLock,
 ) -> Result<(), CommandError>
@@ -120,10 +111,9 @@ where
         l1_config.identity.input_box_address,
         l1_config.identity.app_deployment_block,
         db_path.clone(),
-        timing,
-        // Bootstrap syncs use nested blocking SQLite jobs. The reader takes
-        // its retained lock clone at construction—not only after worker
-        // admission—so cancellation of this async command cannot release
+        // The startup sync uses nested blocking SQLite jobs. The reader takes
+        // its retained lock clone at construction—not only at worker
+        // launch—so cancellation of this async command cannot release
         // exclusivity beneath an orphaned DB write.
         process_lock.clone(),
     );
@@ -138,11 +128,8 @@ where
         chain_id = l1_config.identity.chain_id,
         app_address = %l1_config.identity.app_address,
         batch_submitter_address = %l1_config.identity.batch_submitter_address,
-        max_wait_blocks = timing.max_wait_blocks(),
-        preemptive_margin_blocks = timing.preemptive_margin_blocks(),
-        danger_threshold = timing.danger_threshold(),
-        l1_read_stale_after_blocks = timing.l1_read_stale_after_blocks(),
-        seconds_per_block = timing.seconds_per_block(),
+        max_wait_blocks = l1_config.identity.max_wait_blocks,
+        seconds_per_block = config.timing.seconds_per_block,
         max_batch_open_seconds = config.max_batch_open_seconds,
         batch_submitter_confirmation_depth = config.batch_submitter_confirmation_depth,
         batch_submitter_idle_poll_interval_ms = config.batch_submitter_idle_poll_interval_ms,
@@ -153,19 +140,21 @@ where
     // ── Schema ───────────────────────────────────────────────
     // The run's one migrating open. Only the black-box warning, the lifecycle
     // preflight and the identity load, which read setup's own facts, open the
-    // database before it; recovery, the lane's handle and the workers open
+    // database before it; the startup, the lane's handle and the workers open
     // without migrating.
     drop(storage::Storage::open(&db_path)?);
 
-    // ── Recovery ─────────────────────────────────────────────
-    // Local terminal facts are inspected before the first provider call.
-    crate::recovery::run_startup_recovery(&db_path, &mut input_reader, &l1_config, &timing).await?;
+    // ── Check, sync, open ────────────────────────────────────
+    // A divergence or a void history is read from the database as it is,
+    // before any L1 call, so an unreachable provider cannot hide it and no
+    // batch is opened over it.
+    startup::start(&db_path, &mut input_reader).await?;
 
     // Setup persisted a real first price, so run performs no synchronous
-    // fee-source I/O and fee availability never precedes recovery's local
-    // terminal-fact inspection. The exhaustive identity match is the worker
+    // fee-source I/O and fee availability never precedes the terminal-fact
+    // check. The exhaustive identity match is the worker
     // launch decision: fixed mode has no task; Uniswap's supervised worker
-    // performs the first runtime quote after admission.
+    // performs the first runtime quote after launch.
     let fee_oracle = match l1_config.identity.fee_oracle {
         storage::FeeOracleIdentity::Fixed { .. } => None,
         storage::FeeOracleIdentity::Uniswap {
@@ -200,22 +189,18 @@ where
         }
     };
 
-    // ── Prepare → admit → launch ─────────────────────────────
+    // ── Prepare → launch ─────────────────────────────────────
+    // Under the process lock with no worker running, nothing changes the
+    // facts checked above before the launch.
     let prepared = PreparedRuntime::<A>::prepare(WorkersConfig {
         run_config: config,
         l1_config,
-        timing,
         input_reader,
         fee_oracle,
         process_lock,
     })
     .await?;
-
-    // Preparation may take long enough for a clock/view refusal to arise.
-    // Recheck one consistent fact set; workers are
-    // never launched from an aged decision.
-    let admission = crate::recovery::admit_runtime(&db_path, &timing)?;
-    let mut workers = prepared.launch(admission);
+    let mut workers = prepared.launch();
 
     let first_exit = workers.select_first_exit().await;
     workers.finish(first_exit).await
@@ -239,7 +224,7 @@ mod tests {
         record_canonical_divergence(&mut storage, 7, 0);
         drop(storage);
 
-        let error = refuse_divergence_on_clean_exit(&db.path)
+        let error = startup::refuse_terminal_fact(&db.path)
             .expect_err("a clean drain over divergence must not exit 0");
         assert_eq!(
             error.exit_code(),
@@ -250,6 +235,6 @@ mod tests {
         let clean = temp_db("run-clean-exit-clean");
         storage::Storage::initialize_for_command(&clean.path, LifecycleCommand::Setup)
             .expect("initialize clean");
-        refuse_divergence_on_clean_exit(&clean.path).expect("no divergence passes clean");
+        startup::refuse_terminal_fact(&clean.path).expect("no terminal fact passes clean");
     }
 }

@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Runtime worker lifecycle: prepare -> admit -> launch -> stop. Each worker is one
+//! Runtime worker lifecycle: prepare -> launch -> stop. Each worker is one
 //! field, one spawn, one select arm and one cleanup entry. The `Workers` literal in
 //! `launch` and the `let Self { .. }` destructures in `select_first_exit` and
 //! `finish` stay exhaustive (no `..`), so a missed site fails the build.
@@ -31,16 +31,15 @@ use crate::l1::submitter::{
     BatchPosterConfig, BatchSubmitter, BatchSubmitterConfig, BatchSubmitterError,
     EthereumBatchPoster,
 };
-use crate::recovery::{DangerDetector, DangerDetectorError, DetectorExit};
+use crate::landing::{LandingWatch, LandingWatchError, LandingWatchExit};
 use crate::runtime::process_lock::ProcessLock;
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use sequencer_core::application::Application;
-use sequencer_core::protocol::ProtocolTiming;
 
 const QUEUE_CAPACITY: usize = 8192;
-/// Danger detector cadence. Cheap DB-only check; re-running quickly bounds the
-/// lag on entering the danger zone. The preemptive margin absorbs bounded lag.
-const DANGER_DETECTOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Landing watch cadence. Cheap DB-only check; re-running quickly bounds how
+/// long the process serves after a divergence or a void history is recorded.
+const LANDING_WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Which event ended the `select!` race in [`Workers::select_first_exit`].
 pub(super) enum FirstExit {
@@ -51,9 +50,8 @@ pub(super) enum FirstExit {
 /// Inputs to [`PreparedRuntime::prepare`]. Consumed entirely; the caller has
 /// nothing further to do with these after the call.
 ///
-/// Everything here is built by `run` because the recovery procedure consumes
-/// it or must run after it; anything the workers alone need is derived
-/// inside `prepare`.
+/// Everything here is built by `run` because its startup consumes it or must
+/// run after it; anything the workers alone need is derived inside `prepare`.
 ///
 /// No genesis app instance: `setup` already registered the finalized genesis
 /// snapshot, so the lane reloads via `A::from_dump`. No EIP-712 domain
@@ -62,14 +60,13 @@ pub(super) enum FirstExit {
 pub(super) struct WorkersConfig {
     pub run_config: RunConfig,
     pub l1_config: L1Config,
-    pub timing: ProtocolTiming,
     pub input_reader: InputReader,
     /// Launch-ready without source I/O: setup supplied the persisted price,
     /// and a Uniswap worker quotes on its first supervised iteration. Fixed
     /// pricing has no worker (`None`).
     pub fee_oracle: Option<FeeOracle>,
     /// Exclusive data-directory ownership, acquired before bootstrap and
-    /// transferred into the runtime lifetime at worker admission.
+    /// transferred into the runtime lifetime at worker launch.
     pub process_lock: ProcessLock,
 }
 
@@ -78,7 +75,7 @@ pub(super) struct WorkersConfig {
 /// Data-directory exclusivity does not depend on this guard: every worker
 /// holds a construction-required [`ProcessLock`] clone — the lane and
 /// server through their [`RuntimeScope`], the submitter both ways, the
-/// reader, detector, and fee oracle directly — so the lock stays held until
+/// reader, landing watch, and fee oracle directly — so the lock stays held until
 /// the workers finish even though Drop cannot join asynchronously.
 struct ShutdownOnDrop(RuntimeScope);
 
@@ -102,7 +99,8 @@ pub(super) struct PreparedRuntime<A> {
     storage: crate::storage::Storage,
     lane_config: InclusionLaneConfig,
     submitter: BatchSubmitter<EthereumBatchPoster>,
-    detector: DangerDetector,
+    landing_watch: LandingWatch,
+    landing_feed: crate::landing::LandingFeed,
     tx_feed: L2TxFeed,
     listeners: http::ApiListeners,
     public_addr: std::net::SocketAddr,
@@ -124,7 +122,7 @@ pub(super) struct Workers {
     lane: JoinHandle<Result<(), InclusionLaneError>>,
     reader: JoinHandle<Result<(), InputReaderError>>,
     submitter: JoinHandle<Result<(), BatchSubmitterError>>,
-    detector: JoinHandle<Result<DetectorExit, DangerDetectorError>>,
+    landing_watch: JoinHandle<Result<LandingWatchExit, LandingWatchError>>,
     fee_oracle: Option<JoinHandle<Result<(), crate::l1::fee_oracle::worker::FeeOracleError>>>,
     shutdown: RuntimeScope,
     _shutdown_on_drop: ShutdownOnDrop,
@@ -132,12 +130,11 @@ pub(super) struct Workers {
 
 impl<A: Application + 'static> PreparedRuntime<A> {
     /// Prepare every fallible or awaited runtime dependency while launching
-    /// zero tasks. Durable admission remains the controller's responsibility.
+    /// zero tasks.
     pub(super) async fn prepare(cfg: WorkersConfig) -> Result<Self, CommandError> {
         let WorkersConfig {
             run_config,
             l1_config,
-            timing,
             input_reader,
             fee_oracle,
             process_lock,
@@ -171,7 +168,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         // and the egress handlers share it (`SnapshotLeases`).
         let snapshot_leases = crate::storage::SnapshotLeases::default();
 
-        // Validate rollback checkpoint metadata and collect obsolete snapshots before admission.
+        // Validate checkpoint metadata and collect obsolete snapshots before launch.
         super::startup_hygiene::run_snapshot_hygiene(
             &mut storage,
             &snapshot_leases,
@@ -189,7 +186,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             batch_submitter_address: l1_config.identity.batch_submitter_address,
             start_block: l1_config.identity.app_deployment_block,
             confirmation_depth: run_config.batch_submitter_confirmation_depth,
-            seconds_per_block: timing.seconds_per_block(),
+            seconds_per_block: run_config.timing.seconds_per_block,
             expected_chain_id: l1_config.identity.chain_id,
         };
         let providers = build_batch_submitter_providers(&l1_config)?;
@@ -205,13 +202,13 @@ impl<A: Application + 'static> PreparedRuntime<A> {
         );
         submitter.preflight_storage()?;
 
-        let detector = DangerDetector::new(
+        let (landing_watch, landing_feed) = LandingWatch::new(
             db_path.clone(),
-            timing,
-            DANGER_DETECTOR_POLL_INTERVAL,
+            l1_config.identity.max_wait_blocks,
+            LANDING_WATCH_POLL_INTERVAL,
             shutdown.process_lock(),
         );
-        detector.preflight_storage()?;
+        landing_watch.preflight_storage()?;
 
         let tx_feed = L2TxFeed::new(db_path.clone(), shutdown.clone(), L2TxFeedConfig::default());
 
@@ -250,7 +247,8 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             storage,
             lane_config,
             submitter,
-            detector,
+            landing_watch,
+            landing_feed,
             tx_feed,
             listeners,
             public_addr,
@@ -263,10 +261,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
     }
 
     /// Launch all workers in one infallible, non-async, non-yielding step.
-    /// Consuming the [`crate::recovery::RuntimeAdmission`] witness here is
-    /// what gates launching on the reducer's fresh clean decision — the
-    /// witness's sole constructor is `admit_runtime`, and launch uses it up.
-    pub(super) fn launch(self, _admission: crate::recovery::RuntimeAdmission) -> Workers {
+    pub(super) fn launch(self) -> Workers {
         let Self {
             input_reader,
             api_config,
@@ -274,7 +269,8 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             storage,
             lane_config,
             submitter,
-            detector,
+            landing_watch,
+            landing_feed,
             tx_feed,
             listeners,
             public_addr,
@@ -287,13 +283,13 @@ impl<A: Application + 'static> PreparedRuntime<A> {
 
         let (tx, lane) =
             InclusionLane::<A>::start(QUEUE_CAPACITY, shutdown.clone(), storage, lane_config);
-        // The reader, detector, and fee oracle only need to stop: they take
+        // The reader, landing watch, and fee oracle only need to stop: they take
         // the notification half and hold the process lock directly. The
         // lane, server, and submitter retain the complete scope, so they take
         // the scope.
         let reader = input_reader.start_preflighted(shutdown.signal());
         let submitter = submitter.start_preflighted(shutdown.clone());
-        let detector = detector.start_preflighted(shutdown.signal());
+        let landing_watch = landing_watch.start_preflighted(shutdown.signal());
         let fee_oracle = fee_oracle.map(|oracle| oracle.start(shutdown.signal()));
         // One task serves the public and internal listeners.
         let server = http::start_on_listeners(
@@ -303,6 +299,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             tx_feed,
             api_config,
             snapshot_state,
+            landing_feed,
         );
         tracing::info!(public = %public_addr, internal = %internal_addr, "listening");
 
@@ -311,7 +308,7 @@ impl<A: Application + 'static> PreparedRuntime<A> {
             lane,
             reader,
             submitter,
-            detector,
+            landing_watch,
             fee_oracle,
             shutdown,
             _shutdown_on_drop: shutdown_on_drop,
@@ -331,7 +328,7 @@ impl Workers {
             lane,
             reader,
             submitter,
-            detector,
+            landing_watch,
             fee_oracle,
             shutdown,
             _shutdown_on_drop: _,
@@ -351,7 +348,8 @@ impl Workers {
             submitter_result = &mut *submitter => FirstExit::Worker(WorkerExit::BatchSubmitter(
                 WorkerStop::from_select(submitter_result),
             )),
-            detector_result = &mut *detector => FirstExit::detector(detector_result),
+            landing_watch_result = &mut *landing_watch =>
+                FirstExit::landing_watch(landing_watch_result),
             fee_oracle_result = async {
                 match fee_oracle.as_mut() {
                     Some(handle) => handle.await,
@@ -380,7 +378,7 @@ impl Workers {
             lane,
             reader,
             submitter,
-            detector,
+            landing_watch,
             fee_oracle,
             shutdown: _shutdown,
             _shutdown_on_drop,
@@ -397,8 +395,8 @@ impl Workers {
                 Box::pin(wait_for_batch_submitter_shutdown(submitter)),
             ),
             (
-                WorkerId::DangerDetector,
-                Box::pin(wait_for_danger_detector_shutdown(detector)),
+                WorkerId::LandingWatch,
+                Box::pin(wait_for_landing_watch_shutdown(landing_watch)),
             ),
         ];
         if let Some(fee_oracle) = fee_oracle {
@@ -497,7 +495,7 @@ enum WorkerId {
     Lane,
     InputReader,
     BatchSubmitter,
-    DangerDetector,
+    LandingWatch,
     FeeOracle,
 }
 
@@ -509,7 +507,7 @@ impl WorkerId {
             WorkerId::Lane => "inclusion lane",
             WorkerId::InputReader => "input reader",
             WorkerId::BatchSubmitter => "batch submitter",
-            WorkerId::DangerDetector => "danger detector",
+            WorkerId::LandingWatch => "landing watch",
             WorkerId::FeeOracle => "fee oracle",
         }
     }
@@ -523,9 +521,7 @@ impl WorkerExit {
             WorkerExit::Lane(_) => WorkerId::Lane,
             WorkerExit::InputReader(_) => WorkerId::InputReader,
             WorkerExit::BatchSubmitter(_) => WorkerId::BatchSubmitter,
-            WorkerExit::DangerDetector(_) | WorkerExit::DangerDetected { .. } => {
-                WorkerId::DangerDetector
-            }
+            WorkerExit::LandingWatch(_) | WorkerExit::TerminalFact(_) => WorkerId::LandingWatch,
             WorkerExit::FeeOracle(_) => WorkerId::FeeOracle,
         }
     }
@@ -544,20 +540,20 @@ impl FirstExit {
         FirstExit::Signal(result.err().map(CommandError::from))
     }
 
-    /// The detector's `RecoveryRequired` trip is a first-class exit, not an
+    /// The landing watch's terminal fact is a first-class exit, not an
     /// error; `Shutdown` outside a real shutdown means it stopped on its own.
-    fn detector(
-        result: Result<Result<DetectorExit, DangerDetectorError>, tokio::task::JoinError>,
+    fn landing_watch(
+        result: Result<Result<LandingWatchExit, LandingWatchError>, tokio::task::JoinError>,
     ) -> Self {
         let stop = match result {
-            Ok(Ok(DetectorExit::RecoveryRequired { status })) => {
-                return FirstExit::Worker(WorkerExit::DangerDetected { status });
+            Ok(Ok(LandingWatchExit::Terminal(fact))) => {
+                return FirstExit::Worker(WorkerExit::TerminalFact(fact));
             }
-            Ok(Ok(DetectorExit::Shutdown)) => WorkerStop::StoppedUnexpectedly,
+            Ok(Ok(LandingWatchExit::Shutdown)) => WorkerStop::StoppedUnexpectedly,
             Ok(Err(source)) => WorkerStop::Source(source),
             Err(source) => WorkerStop::Join(source),
         };
-        FirstExit::Worker(WorkerExit::DangerDetector(stop))
+        FirstExit::Worker(WorkerExit::LandingWatch(stop))
     }
 }
 
@@ -620,18 +616,16 @@ async fn wait_for_batch_submitter_shutdown(
     WorkerStop::from_shutdown(handle.await).map_err(WorkerExit::BatchSubmitter)
 }
 
-/// Detector `Shutdown` is the graceful drain; a `RecoveryRequired` trip
-/// during drain still surfaces as the first-class danger exit.
-async fn wait_for_danger_detector_shutdown(
-    handle: JoinHandle<Result<DetectorExit, DangerDetectorError>>,
+/// The watch's `Shutdown` is the graceful drain; a terminal fact found
+/// during drain still surfaces as the first-class terminal exit.
+async fn wait_for_landing_watch_shutdown(
+    handle: JoinHandle<Result<LandingWatchExit, LandingWatchError>>,
 ) -> Result<(), WorkerExit> {
     match handle.await {
-        Ok(Ok(DetectorExit::Shutdown)) => Ok(()),
-        Ok(Ok(DetectorExit::RecoveryRequired { status })) => {
-            Err(WorkerExit::DangerDetected { status })
-        }
-        Ok(Err(source)) => Err(WorkerExit::DangerDetector(WorkerStop::Source(source))),
-        Err(source) => Err(WorkerExit::DangerDetector(WorkerStop::Join(source))),
+        Ok(Ok(LandingWatchExit::Shutdown)) => Ok(()),
+        Ok(Ok(LandingWatchExit::Terminal(fact))) => Err(WorkerExit::TerminalFact(fact)),
+        Ok(Err(source)) => Err(WorkerExit::LandingWatch(WorkerStop::Source(source))),
+        Err(source) => Err(WorkerExit::LandingWatch(WorkerStop::Join(source))),
     }
 }
 
@@ -659,39 +653,45 @@ fn build_batch_submitter_providers(l1: &L1Config) -> Result<KeyedProviders, Comm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recovery::DangerDetectorError;
-    use crate::storage::DangerStatus;
+    use crate::storage::{BatchId, Divergence, LandingLag, TerminalFact};
     use crate::test_support::{StubApp, create_structured_dump};
     use clap::Parser;
 
     // ── select!-arm `From<JoinResult>` conversions ──────────────────
     //
-    // The detector arm is the interesting one (DangerDetected vs Shutdown vs
-    // Source vs Join). The other workers follow a uniform 3-way mapping
-    // covered by the type system.
+    // The landing watch arm is the interesting one (TerminalFact vs
+    // Shutdown vs Source vs Join). The other workers follow a uniform 3-way
+    // mapping covered by the type system.
 
-    type DetectorJoinResult =
-        Result<Result<DetectorExit, DangerDetectorError>, tokio::task::JoinError>;
+    type LandingWatchJoinResult =
+        Result<Result<LandingWatchExit, LandingWatchError>, tokio::task::JoinError>;
+
+    fn void_history() -> TerminalFact {
+        TerminalFact::VoidHistory {
+            lag: LandingLag {
+                batch: BatchId::from_raw(7),
+                first_frame_safe_block: 10,
+                safe_block: 1209,
+            },
+            max_wait_blocks: 1200,
+        }
+    }
 
     #[test]
-    fn detector_shutdown_in_select_maps_to_stopped_unexpectedly() {
-        let result: DetectorJoinResult = Ok(Ok(DetectorExit::Shutdown));
+    fn landing_watch_shutdown_in_select_maps_to_stopped_unexpectedly() {
+        let result: LandingWatchJoinResult = Ok(Ok(LandingWatchExit::Shutdown));
         assert!(matches!(
-            FirstExit::detector(result),
-            FirstExit::Worker(WorkerExit::DangerDetector(WorkerStop::StoppedUnexpectedly))
+            FirstExit::landing_watch(result),
+            FirstExit::Worker(WorkerExit::LandingWatch(WorkerStop::StoppedUnexpectedly))
         ));
     }
 
     #[test]
-    fn detector_recovery_required_maps_to_danger_detected() {
-        let result: DetectorJoinResult = Ok(Ok(DetectorExit::RecoveryRequired {
-            status: DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(7)),
-        }));
+    fn landing_watch_terminal_fact_maps_to_the_terminal_exit() {
+        let result: LandingWatchJoinResult = Ok(Ok(LandingWatchExit::Terminal(void_history())));
         assert!(matches!(
-            FirstExit::detector(result),
-            FirstExit::Worker(WorkerExit::DangerDetected {
-                status: DangerStatus::ClosedBatchInDanger(index)
-            }) if index == crate::storage::BatchId::from_raw(7)
+            FirstExit::landing_watch(result),
+            FirstExit::Worker(WorkerExit::TerminalFact(fact)) if fact == void_history()
         ));
     }
 
@@ -726,11 +726,11 @@ mod tests {
                 Ok(())
             }
         });
-        let detector = tokio::spawn({
+        let landing_watch = tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
                 shutdown.wait_for_shutdown().await;
-                Ok(DetectorExit::Shutdown)
+                Ok(LandingWatchExit::Shutdown)
             }
         });
         (
@@ -739,7 +739,7 @@ mod tests {
                 lane,
                 reader,
                 submitter,
-                detector,
+                landing_watch,
                 fee_oracle: None,
                 shutdown: shutdown.clone(),
                 _shutdown_on_drop: ShutdownOnDrop(shutdown.clone()),
@@ -826,7 +826,6 @@ mod tests {
         let run_config = *run_config;
         let db_path = run_config.db_path();
         let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
-        let timing = run_config.protocol_timing(window).expect("valid timing");
         let submitter_address =
             crate::commands::batch_submitter_address_from_private_key(KEY).expect("key address");
         let dumps_dir = dir.path().join("dumps");
@@ -842,7 +841,7 @@ mod tests {
             .publish_era(&finalized, &crate::storage::NewEra::EMPTY_GENESIS)
             .expect("register finalized dump");
         storage
-            .append_safe_inputs(0, &[], submitter_address, &timing)
+            .append_safe_inputs(0, &[], submitter_address)
             .expect("initialize safe head");
         storage
             .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
@@ -876,7 +875,6 @@ mod tests {
             identity.input_box_address,
             identity.app_deployment_block,
             db_path.clone(),
-            timing,
             ProcessLock::test(),
         );
         let l1_config = L1Config {
@@ -894,7 +892,6 @@ mod tests {
             WorkersConfig {
                 run_config,
                 l1_config,
-                timing,
                 input_reader,
                 fee_oracle: None,
                 process_lock,
@@ -923,7 +920,7 @@ mod tests {
         assert!(err.to_string().contains("public listener"), "{err}");
         // The boundary check: a worker spawned during preparation would keep
         // the process lock held — through its `RuntimeScope` clone or, for
-        // the reader, detector, and fee oracle, its own `ProcessLock` — so
+        // the reader, landing watch, and fee oracle, its own `ProcessLock` — so
         // this acquire succeeding proves zero workers launched.
         ProcessLock::acquire_released(&data_dir);
     }
@@ -950,17 +947,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_requires_a_fresh_admission_after_preparation() {
-        let (_dir, data_dir, db_path, workers_config) =
+    async fn launched_workers_drain_cleanly_and_release_the_lock() {
+        let (_dir, data_dir, _db_path, workers_config) =
             startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
 
-        let timing = workers_config.timing;
         let prepared = PreparedRuntime::<StubApp>::prepare(workers_config)
             .await
             .expect("runtime prepares");
-        let admission = crate::recovery::admit_runtime(&db_path, &timing)
-            .expect("the reducer admits over clean facts and returns its witness");
-        let workers = prepared.launch(admission);
+        let workers = prepared.launch();
 
         workers
             .finish(FirstExit::Signal(None))
@@ -981,47 +975,6 @@ mod tests {
         .expect("nested runtime work releases process ownership after clean drain");
     }
 
-    #[tokio::test]
-    async fn admission_refuses_when_facts_age_during_preparation() {
-        let (_dir, _data_dir, db_path, workers_config) =
-            startup_workers_config("127.0.0.1:0".to_string(), "127.0.0.1:0".to_string());
-        let timing = workers_config.timing;
-
-        let prepared = PreparedRuntime::<StubApp>::prepare(workers_config)
-            .await
-            .expect("runtime prepares");
-
-        // Simulate time moving behind the persisted local-progress baseline
-        // while preparation was in flight. The final reducer invocation must
-        // classify the new clock refusal before durable Live or launch.
-        // The persisted safe head is re-stamped as synced two blocks ahead.
-        let future_ms = crate::clock::unix_now_ms() + timing.seconds_per_block() * 2_000;
-        let mut storage = crate::storage::Storage::open_writer(&db_path).expect("open test writer");
-        let safe_block = storage
-            .current_safe_block()
-            .expect("read safe block")
-            .expect("prepared runtime has a safe head");
-        let safe_block_timestamp = storage
-            .current_safe_block_timestamp()
-            .expect("read safe block timestamp")
-            .expect("prepared runtime has a safe head");
-        storage
-            .append_ingested_safe_inputs_with_timestamp(
-                safe_block,
-                safe_block_timestamp,
-                &[],
-                &timing,
-                future_ms,
-            )
-            .expect("move progress baseline into the future");
-        drop(storage);
-
-        let error = crate::recovery::admit_runtime(&db_path, &timing)
-            .expect_err("aged clean decision must not admit");
-        assert!(matches!(error, crate::recovery::RecoveryError::Retry(_)));
-        drop(prepared);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
     async fn terminal_primary_worker_exit_aborts() {
@@ -1033,9 +986,12 @@ mod tests {
         let shutdown = RuntimeScope::default();
         let (workers, _dir) = waiting_workers(&shutdown);
         let _ = workers
-            .finish(FirstExit::Worker(WorkerExit::DangerDetected {
-                status: DangerStatus::CanonicalDivergence(7),
-            }))
+            .finish(FirstExit::Worker(WorkerExit::TerminalFact(
+                TerminalFact::Divergence(Divergence {
+                    nonce: 7,
+                    safe_input_index: 0,
+                }),
+            )))
             .await;
         panic!("terminal runtime returned instead of aborting");
     }
@@ -1056,18 +1012,22 @@ mod tests {
         panic!("terminal runtime returned instead of aborting");
     }
 
-    #[tokio::test]
-    async fn recovery_primary_uses_ordinary_shutdown() {
+    /// A void history found by the landing watch stops the process the way a
+    /// divergence does: the terminal abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn void_history_primary_exit_aborts() {
+        if !crate::runtime::shutdown::abort_test_child(
+            "commands::run::workers::tests::void_history_primary_exit_aborts",
+        ) {
+            return;
+        }
         let shutdown = RuntimeScope::default();
         let (workers, _dir) = waiting_workers(&shutdown);
-
-        let err = workers
-            .finish(FirstExit::Worker(WorkerExit::DangerDetected {
-                status: DangerStatus::TipInDanger(crate::storage::BatchId::from_raw(3)),
-            }))
-            .await
-            .expect_err("danger exit must fail run");
-        assert!(matches!(err, CommandError::Worker(_)));
+        let _ = workers
+            .finish(FirstExit::Worker(WorkerExit::TerminalFact(void_history())))
+            .await;
+        panic!("terminal runtime returned instead of aborting");
     }
 
     #[tokio::test]
@@ -1178,11 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn detector_inner_error_maps_to_source_variant() {
-        let result: DetectorJoinResult = Ok(Err(DangerDetectorError::Join("boom".into())));
+    fn landing_watch_inner_error_maps_to_source_variant() {
+        let result: LandingWatchJoinResult = Ok(Err(LandingWatchError::Join("boom".into())));
         assert!(matches!(
-            FirstExit::detector(result),
-            FirstExit::Worker(WorkerExit::DangerDetector(WorkerStop::Source(_)))
+            FirstExit::landing_watch(result),
+            FirstExit::Worker(WorkerExit::LandingWatch(WorkerStop::Source(_)))
         ));
     }
 }

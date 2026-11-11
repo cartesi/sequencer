@@ -100,7 +100,7 @@ fn archive_state(bytes: &[u8]) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_block_divergence_refuses_every_finalized_endpoint() {
-    use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
+    use crate::storage::test_helpers::local_batch_payload;
     use crate::storage::{L2TxCount, SafeInputRange, StoredSafeInput};
     use crate::test_support::pin_test_deployment_identity;
     use sequencer_core::batch::{Batch, Frame};
@@ -145,9 +145,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
             block_number: 10,
         },
     ];
-    storage
-        .append_safe_inputs(10, &inputs, submitter, &default_protocol_timing())
-        .unwrap();
+    storage.append_safe_inputs(10, &inputs, submitter).unwrap();
     assert!(storage.canonical_divergence().unwrap().is_some());
 
     // The foreign batch consumes the next nonce and drains a direct that the

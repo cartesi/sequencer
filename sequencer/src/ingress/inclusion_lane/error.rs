@@ -47,8 +47,8 @@ pub enum InclusionLaneError {
     #[error("snapshot garbage collection failed: {0}")]
     Gc(#[from] GcError),
     #[error(
-        "no open Tip at lane startup; the runtime must establish it via \
-         guarded startup recovery before starting the lane"
+        "no open Tip at lane startup; run must open one at startup before \
+         starting the lane"
     )]
     NoOpenTip,
 }

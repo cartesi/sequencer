@@ -264,7 +264,6 @@ impl Iterator for InputPages<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::test_helpers::default_protocol_timing;
     use crate::storage::{IngestedSafeInput, LifecycleCommand};
     use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
     use alloy_primitives::B256;
@@ -367,8 +366,6 @@ mod tests {
                 safe_block,
                 1_700_000_000 + safe_block,
                 inputs,
-                &default_protocol_timing(),
-                crate::clock::unix_now_ms(),
             )
             .unwrap();
         (db, storage)
@@ -1177,20 +1174,14 @@ mod tests {
             direct(14, vec![3]),
             direct(20, vec![4]),
         ];
-        // The safe head is fresh, so run's danger check lets the root open.
+        // Inside the window, so run's terminal-fact check lets the root open.
         let db = temp_db("root-drain");
         let mut storage =
             Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
         pin_test_deployment_identity(&mut storage, SUBMITTER);
         let now_ms = crate::clock::unix_now_ms();
         storage
-            .append_ingested_safe_inputs_with_timestamp(
-                30,
-                now_ms / 1000,
-                &inputs,
-                &default_protocol_timing(),
-                now_ms,
-            )
+            .append_ingested_safe_inputs_with_timestamp(30, now_ms / 1000, &inputs)
             .unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         let era = finish(&mut storage, 14, 30, (1, 1), data_dir.path())
@@ -1200,9 +1191,7 @@ mod tests {
         assert_eq!((era.first_queued_input, era.anchor_batch_nonce), (1, 1));
 
         // Run's startup opens the root at its own safe head.
-        storage
-            .ensure_open_tip_for_recovery(&default_protocol_timing(), now_ms)
-            .unwrap();
+        assert!(storage.open_batch_if_none().unwrap());
         let root = storage.open_state().unwrap().expect("the root is open");
         assert_eq!(root.safe_block(), 30);
         let version = storage.history_version().unwrap();

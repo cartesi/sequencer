@@ -2233,7 +2233,7 @@ mod tests {
         }
     }
 
-    // `ProtocolTiming::scheduler_accepts` (the off-chain predicate) and the
+    // `protocol::scheduler_accepts` (the off-chain predicate) and the
     // scheduler are maintained apart and must agree on accept-vs-reject (I1).
     // The documented self-trust omissions are pinned at the end, so any other
     // drift fails this test.
@@ -2252,20 +2252,18 @@ mod tests {
         let mut input = raw_batch(inclusion, payload.to_vec());
         input.sender = sender;
         let canonical = h.feed(input).0 == InputOutcome::BatchAccepted;
-        let timing = crate::protocol::ProtocolTiming::try_new(DUALITY_MAX_WAIT, 1, 1, 12)
-            .expect("valid duality timing");
-        let offchain = timing
-            .scheduler_accepts(
-                SEQUENCER,
-                crate::protocol::SafeInputView {
-                    safe_input_index: 0,
-                    sender,
-                    payload,
-                    inclusion_block: inclusion,
-                },
-                expected_nonce,
-            )
-            .is_some();
+        let offchain = crate::protocol::scheduler_accepts(
+            SEQUENCER,
+            DUALITY_MAX_WAIT,
+            crate::protocol::SafeInputView {
+                safe_input_index: 0,
+                sender,
+                payload,
+                inclusion_block: inclusion,
+            },
+            expected_nonce,
+        )
+        .is_some();
         (canonical, offchain)
     }
 

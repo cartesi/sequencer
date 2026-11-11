@@ -3,7 +3,7 @@
 
 //! Operator commands. Each child is one bracket: take the process lock, preflight
 //! the admission facts, run the body, and best-effort record a terminal cause.
-//! Mechanisms live in `crate::recovery` and `crate::runtime`; this module holds
+//! Mechanisms live in `crate::landing` and `crate::runtime`; this module holds
 //! the helpers shared by brackets, and [`crate::harness`] dispatches them.
 
 pub mod config;
@@ -325,17 +325,13 @@ mod tests {
         deployment_identity_mismatch_fields, preflight_lifecycle_command, require_data_dir,
         require_deployment_identity_match, require_pinned_scheduler_limits,
     };
-    use crate::recovery::{RecoveryError, RecoveryRetryReason};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
     use crate::test_support::temp_db;
     use alloy_primitives::Address;
-    use sequencer_core::protocol::ProtocolTimingError;
 
-    // Margin/stale-boundary validation is exercised directly in
-    // `sequencer-core/src/protocol.rs`. The runtime tests below only cover
-    // the typed `From` conversions into `CommandError` and the bootstrap-time
-    // identity guards. Worker `From<JoinResult>` conversions live in
-    // `run::workers`.
+    // The runtime tests below cover the typed `From` conversions into
+    // `CommandError` and the bootstrap-time identity guards. Worker
+    // `From<JoinResult>` conversions live in `run::workers`.
 
     #[test]
     fn previous_terminal_fault_read_is_verdict_neutral() {
@@ -398,24 +394,20 @@ mod tests {
     }
 
     #[test]
-    fn invalid_protocol_config_propagates_through_run_error() {
-        let err: CommandError = ProtocolTimingError::MarginNotLessThanMaxWait {
-            margin: 1200,
-            max_wait: 1200,
-        }
-        .into();
+    fn startup_terminal_fact_propagates_as_a_bootstrap_refusal() {
+        use crate::storage::{BatchId, LandingLag, TerminalFact};
+        let fact = TerminalFact::VoidHistory {
+            lag: LandingLag {
+                batch: BatchId::from_raw(0),
+                first_frame_safe_block: 0,
+                safe_block: 1199,
+            },
+            max_wait_blocks: 1200,
+        };
+        let err: CommandError = fact.into();
         assert!(matches!(
             err,
-            CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(_))
-        ));
-    }
-
-    #[test]
-    fn startup_recovery_error_preserves_recovery_category() {
-        let err: CommandError = RecoveryError::retry(RecoveryRetryReason::L1ViewStale).into();
-        assert!(matches!(
-            err,
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::Retry(_)))
+            CommandError::Bootstrap(BootstrapError::TerminalFact(inner)) if inner == fact
         ));
     }
 

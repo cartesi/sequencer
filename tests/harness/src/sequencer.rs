@@ -22,8 +22,8 @@ use crate::default_private_keys;
 use crate::paths;
 use crate::rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 use crate::util::{
-    build_local_endpoint, io_other, path_as_str, send_graceful_terminate, timestamped_log_path,
-    wait_for_http_readiness,
+    Readiness, build_local_endpoint, io_other, path_as_str, send_graceful_terminate,
+    timestamped_log_path, wait_for_http_readiness,
 };
 use crate::wallet::{TestSigner, WalletL1Client, WalletL2Client};
 use crate::ws::WsClient;
@@ -34,20 +34,15 @@ pub type DataDirEntry = (String, Option<(u64, B256)>);
 
 const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-/// Cadence at which the harness mines an L1 block during a recovery boot's
-/// readiness wait when [`ManagedSequencer::set_mine_l1_during_boot`] is on.
-/// One block per wall-clock second keeps the ordinary live-chain timestamp
-/// coupled while still advancing Anvil's `safe` tag well within the recovery
-/// readiness window.
-const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
-/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The startup
-/// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
-/// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
-/// the stranded slot in under one poll cycle — well past the 10 s normal-boot
-/// budget. Allow several cycles of slack so a recovery boot has room to flush,
-/// cascade, and come up. Recovery boots are legitimately slow (exit-code class
-/// 10: restart and expect recovery); this is the harness counterpart to that.
-const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Cadence at which the harness mines an L1 block while a setup runs when
+/// [`ManagedSequencer::set_mine_l1_during_setup`] is on. One block per
+/// wall-clock second keeps the live-chain timestamp coupled while still
+/// advancing Anvil's `safe` tag well within [`FLUSHING_SETUP_TIMEOUT`].
+const SETUP_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
+/// Budget for a setup that flushes stranded transactions: the flush polls
+/// `get_transaction_count(Safe)` once per L1 block time (12 s here), so it
+/// needs several poll cycles of slack.
+const FLUSHING_SETUP_TIMEOUT: Duration = Duration::from_secs(45);
 /// Budget for a setup from genesis: it syncs the chain and rebuilds the
 /// history from its start, which on an aged devnet is hundreds of rows.
 const GENESIS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,9 +61,12 @@ const DATA_DIR_NAME: &str = "data";
 /// is the highest standard funded account, clear of the e2e wallets (0-3) and
 /// the bench workload (indices 0..concurrency).
 const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
-/// Passed to `setup` and `run` as `--preemptive-margin-blocks`, so the e2e
-/// zone math owns the value.
-pub const DEVNET_PREEMPTIVE_MARGIN_BLOCKS: u64 = 300;
+/// The exit code of a command that must not be restarted (README "Running"):
+/// among others, every start of `run` while a terminal fact holds.
+pub const EXIT_TERMINAL: i32 = 30;
+/// The signal a running sequencer raises on a terminal runtime fault, a
+/// terminal fact included: it aborts instead of draining.
+const SIGABRT: i32 = 6;
 pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
 pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 
@@ -151,35 +149,42 @@ impl SetupOutcome {
     }
 }
 
-/// Outcome of a single [`ManagedSequencer::respawn_and_watch`] attempt.
+/// How a start of `run` ended: it reached readiness, or the process exited
+/// first. Returned by [`ManagedSequencer::try_respawn`].
 #[derive(Debug)]
-pub enum RespawnAttemptOutcome {
-    /// The child came up and stayed alive for the requested stabilization
-    /// window.
-    Stable,
-    /// `respawn()` itself returned `Err` — the child exited during bootstrap
-    /// before HTTP became ready. Typically surfaces
-    /// `RecoveryError::Refuse(...)` from the startup decision table.
-    RespawnFailed(String),
-    /// `respawn()` returned `Ok` but the child exited within the
-    /// stabilization window. Typically surfaces a danger-detector worker
-    /// exit from the first post-boot poll.
-    ExitedPostRespawn(std::process::ExitStatus),
+pub enum RunStart {
+    Ready,
+    Exited(ExitStatus),
 }
 
-impl RespawnAttemptOutcome {
-    pub fn is_stable(&self) -> bool {
-        matches!(self, Self::Stable)
-    }
+/// Whether a running sequencer stopped on a terminal runtime fault: it
+/// aborts (SIGABRT) instead of draining.
+pub fn is_terminal_abort(status: &ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(SIGABRT)
 }
 
-/// Parameters for [`ManagedSequencer::respawn_until_stable`]. See that
-/// method's doc for how `advance_per_retry` interacts with the restart cycle.
-#[derive(Debug, Clone)]
-pub struct RespawnPolicy {
-    pub max_attempts: u32,
-    pub stabilization: Duration,
-    pub advance_per_retry: Option<Duration>,
+/// The landing reading `GET /healthz` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct LandingHealth {
+    /// `H + 1 - s` for the oldest unaccepted batch: its age at the earliest
+    /// block it can still land in, void at `max_wait_blocks`. `None` when
+    /// every batch is accepted or before the first reading.
+    pub landing_lag_blocks: Option<u64>,
+    pub max_wait_blocks: u64,
+    /// Wall clock minus the safe block's L1 timestamp; `None` before the
+    /// first reading.
+    pub safe_head_age_seconds: Option<u64>,
+}
+
+/// The oldest batch L1 has not accepted, closed or open. Returned by
+/// [`ManagedSequencer::oldest_unaccepted_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnacceptedBatch {
+    pub nonce: u64,
+    /// Its first frame's safe block: the batch is stale on chain once it
+    /// lands this many blocks plus the window later.
+    pub first_frame_safe_block: u64,
 }
 
 /// Which child in the devnet stack exited during [`ManagedSequencer::observe_stack_for`].
@@ -228,15 +233,14 @@ pub struct ManagedSequencer {
     /// Path to the file libfaketime re-reads for its offset. `None` when
     /// faketime is disabled.
     faketime_rc_path: Option<PathBuf>,
-    /// Internal cumulative forward-offset tracker for
-    /// [`Self::advance_wall_and_mine`]. Not touched by
-    /// [`Self::set_faketime_offset`].
+    /// The cumulative forward offset [`Self::advance_wall_and_mine`] wrote.
     cumulative_offset_secs: u64,
-    /// When `true`, [`Self::respawn`] mines L1 blocks concurrently with the
-    /// post-boot readiness wait so a recovery boot's mempool flush can make
-    /// progress. See [`Self::set_mine_l1_during_boot`]. Persists across
-    /// respawns like the other overrides.
-    mine_l1_during_boot: bool,
+    /// When `true`, every setup mines L1 blocks while it runs so its flush
+    /// can make progress. See [`Self::set_mine_l1_during_setup`].
+    mine_l1_during_setup: bool,
+    /// The submitter's balance while [`Self::hold_batch_submissions`] holds
+    /// it at zero; restored by [`Self::release_batch_submissions`].
+    held_submitter_balance: Option<U256>,
     /// When `Some(secs)`, passes `--max-batch-open-seconds` to the `run` phase
     /// so the inclusion lane seals the open batch promptly (the default is 2h).
     /// Used by tests that need a batch to close + be promoted. Persists across
@@ -332,14 +336,11 @@ impl ManagedSequencer {
             child,
             endpoint,
             internal_endpoint,
-        } = spawn_run_process(
-            &child_env, &log_path,
-            // First boot has no stranded nonce to flush, so it never needs L1
-            // to advance during readiness.
-            false, // Default batch-open deadline on first boot.
-            None,
-        )
-        .await?;
+        } = require_ready(
+            // The default batch-open deadline on first boot.
+            spawn_run_process(&child_env, &log_path, None).await?,
+            &log_path,
+        )?;
 
         Ok(Self {
             rollups,
@@ -362,7 +363,8 @@ impl ManagedSequencer {
             faketime_rc_path,
             libfaketime_path,
             cumulative_offset_secs: 0,
-            mine_l1_during_boot: false,
+            mine_l1_during_setup: false,
+            held_submitter_balance: None,
             max_batch_open_seconds: None,
             fee_oracle_fixed_log_gas_price: config.fee_oracle_fixed_log_gas_price,
         })
@@ -398,57 +400,16 @@ impl ManagedSequencer {
         self.setup_base = base;
     }
 
-    /// Make [`Self::respawn`] (this one and subsequent ones, until cleared)
-    /// mine L1 blocks concurrently with the post-boot readiness wait.
+    /// Make every setup (until cleared) mine L1 blocks while it runs.
     ///
-    /// Why this exists: a *recovery* boot whose persisted state names a wallet
-    /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
-    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the mempool
-    /// flush during startup. The flush submits a no-op at the stranded
-    /// wallet-nonce slot and blocks until that slot becomes *safe*
-    /// (`safe_wallet_nonce >= watermark + 1`, I14). Re-enabling auto-mining is not enough:
-    /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
-    /// `safe` tag never advances past it and the flush waits until the boot
-    /// hits the readiness timeout. In production the chain keeps producing
-    /// blocks throughout a slow recovery boot; an on-demand-mining devnet
-    /// produces none. This makes the harness mine a steady trickle for the
-    /// boot window (dropped the instant readiness is reached), reproducing that
-    /// drift so the flush — and the cascade behind it — can complete on the
-    /// first respawn.
-    ///
-    /// Only the tests that deliberately strand a submitted nonce before a
-    /// recovery respawn need this. Leave it off otherwise: every other boot
-    /// reaches readiness without new blocks, and mining empty blocks during an
-    /// unrelated boot would perturb L1-block-sensitive assertions.
-    pub fn set_mine_l1_during_boot(&mut self, enabled: bool) {
-        self.mine_l1_during_boot = enabled;
-    }
-
-    /// Write a faketime offset to the rc file. Effective **immediately** for
-    /// the running sequencer (if any) and persists across respawns. The
-    /// libfaketime library re-reads the file on every time call (we pass
-    /// `FAKETIME_NO_CACHE=1`), so the next `SystemTime::now()` inside the
-    /// child sees the new offset.
-    ///
-    /// Format follows faketime's `-f` flag: `"+5h"`, `"-1h"`, `"+1d"`, or
-    /// `"+NNNs"` for absolute seconds. Passing `None` resets to `+0`.
-    /// See `man faketime` for advanced options (speed-up, interval mode).
-    ///
-    /// Does not mine L1 blocks — use [`Self::advance_wall_and_mine`] when you
-    /// want wall-clock and L1 to move together.
-    ///
-    /// Replaces any cumulative advance tracked by
-    /// [`Self::advance_wall_and_mine`], and resets its counter.
-    pub fn set_faketime_offset(&mut self, offset: Option<String>) -> HarnessResult<()> {
-        let rc = self
-            .faketime_rc_path
-            .as_ref()
-            .ok_or_else(|| io_other("faketime is disabled for this ManagedSequencer"))?;
-        let s = offset.as_deref().unwrap_or("+0");
-        fs::write(rc.as_path(), format!("{s}\n"))
-            .map_err(|err| io_other(format!("write faketime rc file: {err}")))?;
-        self.cumulative_offset_secs = 0;
-        Ok(())
+    /// Setup flushes the submitter's wallet and waits until the flushed
+    /// slots are *safe*. Auto-mining lands a flush transaction but mints no
+    /// further blocks, so on an on-demand-mining devnet Anvil's `safe` tag
+    /// never passes it; a live chain keeps producing blocks. Only a setup
+    /// that follows an instance with stranded submissions needs this: mining
+    /// during an unrelated setup would perturb block-sensitive assertions.
+    pub fn set_mine_l1_during_setup(&mut self, enabled: bool) {
+        self.mine_l1_during_setup = enabled;
     }
 
     /// Move to a new, empty data directory, as an operator does for a new
@@ -479,7 +440,7 @@ impl ManagedSequencer {
             &self.child_env(),
             &self.setup_request(false),
             &log_path,
-            self.mine_l1_during_boot,
+            self.mine_l1_during_setup,
         )
         .await?;
         if outcome.success() {
@@ -614,57 +575,85 @@ impl ManagedSequencer {
         Ok((frame_safe_block, persisted_safe_head))
     }
 
-    /// Rewrite the L1 safe-head observation to "unknown", simulating a DB
-    /// that has never successfully synced from L1. Call while the sequencer
-    /// is stopped.
-    ///
-    /// Used by the wall-clock-never-synced test: the danger check treats a
-    /// missing safe-head row as an unusable L1 view and refuses to
-    /// proceed. Deleting this row while the deployment identity is
-    /// populated lets us hit that branch without losing the pinned chain
-    /// ID / InputBox address (which would fail earlier in bootstrap, not
-    /// in the wall-clock fallback).
-    pub fn clear_l1_safe_head_observation(&self) -> HarnessResult<()> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open(db_path.as_path())
-            .map_err(|err| io_other(format!("open DB: {err}")))?;
-        conn.execute("DELETE FROM l1_safe_head WHERE singleton_id = 0", [])
-            .map_err(|err| io_other(format!("reset L1 safe-head observation: {err}")))?;
-        Ok(())
+    /// The oldest batch L1 has not accepted, closed or open, and its first
+    /// frame's safe block, from one read-only snapshot; `None` when every
+    /// batch is accepted.
+    pub fn oldest_unaccepted_batch(&self) -> HarnessResult<Option<UnacceptedBatch>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.read_only_connection()?;
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT b.nonce, \
+                        (SELECT f.safe_block FROM frames f \
+                          WHERE f.batch_index = b.batch_index \
+                          ORDER BY f.frame_in_batch LIMIT 1) \
+                 FROM valid_batches b \
+                 WHERE b.accepted_input IS NULL \
+                 ORDER BY b.nonce LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|err| io_other(format!("read the oldest unaccepted batch: {err}")))?;
+        row.map(|(nonce, first_frame_safe_block)| {
+            Ok(UnacceptedBatch {
+                nonce: u64::try_from(nonce)
+                    .map_err(|_| io_other(format!("negative batch nonce {nonce}")))?,
+                first_frame_safe_block: u64::try_from(first_frame_safe_block).map_err(|_| {
+                    io_other(format!(
+                        "negative first-frame safe block {first_frame_safe_block}"
+                    ))
+                })?,
+            })
+        })
+        .transpose()
     }
 
-    /// Read-only snapshot of the accepted batches (`batches.accepted_input`
-    /// set): the batches the sequencer has *observed accepted on chain*.
-    /// Returns `(count, min_nonce)` — the accepted batch count and their
-    /// `MIN(nonce)`, or `None` if none.
-    ///
-    /// Used by the nonce-0 recovery test to confirm a recovery batch (which reuses nonce 0)
-    /// actually lands and gets accepted on L1 — proving the
-    /// `record_accepted_batches` cursor handles
-    /// reused-nonce-after-cascade correctly.
-    pub fn count_safe_accepted_batches(&self) -> HarnessResult<(u64, Option<u64>)> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path.as_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+    /// The accepted batches as `(nonce, accepted safe input)`, by nonce.
+    pub fn accepted_batches(&self) -> HarnessResult<Vec<(u64, u64)>> {
+        let conn = self.read_only_connection()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT nonce, accepted_input FROM batches \
+                 WHERE accepted_input IS NOT NULL ORDER BY nonce",
+            )
+            .map_err(|err| io_other(format!("prepare accepted batches: {err}")))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|err| io_other(format!("read accepted batches: {err}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| io_other(format!("read accepted batches: {err}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(nonce, input)| (nonce as u64, input as u64))
+            .collect())
+    }
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM batches WHERE accepted_input IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("count accepted batches: {err}")))?;
-        let min_nonce: Option<i64> = conn
-            .query_row(
-                "SELECT MIN(nonce) FROM batches WHERE accepted_input IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("min nonce: {err}")))?;
-        Ok((count as u64, min_nonce.map(|n| n as u64)))
+    /// The causes the terminal-fault black box recorded, oldest first. A
+    /// start refused on a terminal fact records one; a runtime abort records
+    /// none.
+    pub fn terminal_fault_causes(&self) -> HarnessResult<Vec<String>> {
+        let conn = self.read_only_connection()?;
+        let mut statement = conn
+            .prepare("SELECT cause FROM terminal_faults ORDER BY fault_id")
+            .map_err(|err| io_other(format!("prepare terminal faults: {err}")))?;
+        let causes = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| io_other(format!("read terminal faults: {err}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| io_other(format!("read terminal faults: {err}")))?;
+        Ok(causes)
+    }
+
+    /// The landing reading `GET /healthz` serves on the internal listener,
+    /// whatever its status code.
+    pub async fn landing_health(&self) -> HarnessResult<LandingHealth> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/healthz", self.internal_endpoint()))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        Ok(response.json().await?)
     }
 
     /// Read-only; safe to call while the sequencer is running.
@@ -780,10 +769,9 @@ impl ManagedSequencer {
     }
 
     /// The canonical-divergence marker (I9/I15) from the run DB, or `None`
-    /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
-    /// to prove the content-identity check did NOT spuriously freeze the frontier
-    /// (e.g. a false-positive against below-anchor collapsed history) — otherwise
-    /// that silent-failure class is invisible at e2e level.
+    /// when the frontier is healthy: its `kind`, `foreign` or `mismatch`. A
+    /// rebuilt era asserts `None` to prove the content-identity check did not
+    /// spuriously freeze the frontier against its rebuilt history.
     pub fn canonical_divergence(&self) -> HarnessResult<Option<String>> {
         use rusqlite::OptionalExtension;
         let db_path = self.data_dir_path.join("sequencer.db");
@@ -1103,10 +1091,10 @@ impl ManagedSequencer {
     }
 
     /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
-    /// the mempool until an explicit mine or re-enable. Used to hold a
-    /// sequencer's batch-submission tx out of a block while the chain
-    /// advances, reproducing the "delayed inclusion" fault that the
-    /// scheduler handles by skipping past-stale batches.
+    /// the mempool until an explicit mine or re-enable: a sequencer's
+    /// batch-submission tx waits there, where [`Self::drop_all_pending_txs`]
+    /// can lose it. `anvil_mine` includes pending txs, so hold submissions
+    /// across mining with [`Self::hold_batch_submissions`] instead.
     pub async fn set_automine(&self, enabled: bool) -> HarnessResult<()> {
         self.rollups.set_automine(enabled).await
     }
@@ -1141,12 +1129,7 @@ impl ManagedSequencer {
     ///     call (or a post-respawn first call) sees the shifted clock.
     ///   - Anvil mines `duration.as_secs() / DEVNET_SECONDS_PER_BLOCK` blocks.
     ///
-    /// **Cumulative**: calling with `1h` twice totals `+2h`, not `+1h`. Use
-    /// [`Self::set_faketime_offset`] to jump to a specific offset or reset.
-    ///
-    /// Tests that need decoupled wall-clock vs L1 (e.g., the `saturating_sub`
-    /// backward-jump test) should use [`Self::set_faketime_offset`] and
-    /// [`Self::mine_l1_blocks`] directly.
+    /// **Cumulative**: calling with `1h` twice totals `+2h`, not `+1h`.
     pub async fn advance_wall_and_mine(&mut self, duration: Duration) -> HarnessResult<()> {
         let secs = duration.as_secs();
         let blocks = secs / DEVNET_SECONDS_PER_BLOCK;
@@ -1165,9 +1148,8 @@ impl ManagedSequencer {
     /// exit handle.
     ///
     /// - Returns `Ok(None)` if the child is still alive when `grace`
-    ///   elapses. The internal `wait()` future is dropped, so subsequent
-    ///   calls to [`Self::wait_for_exit`] / [`Self::respawn_and_watch`]
-    ///   still work.
+    ///   elapses. The internal `wait()` future is dropped, so a later
+    ///   [`Self::wait_for_exit`] still works.
     /// - Returns `Ok(Some(status))` if the child exited inside the
     ///   window. The exit status is captured and the child is reaped;
     ///   the caller shouldn't call `wait_for_exit` afterwards (it would
@@ -1226,9 +1208,9 @@ impl ManagedSequencer {
     /// process's exit status. Times out after `timeout` to avoid hanging
     /// tests when the process refuses to exit.
     ///
-    /// Used by tests that expect the sequencer to detect a condition
-    /// (e.g., wall-clock danger) and self-exit with a non-zero status.
-    /// After this returns, call [`Self::respawn`] to start a fresh process.
+    /// Used by tests that expect the sequencer to stop on its own, such as
+    /// on a terminal fact. After this returns, call [`Self::respawn`] or
+    /// [`Self::try_respawn`] to start a fresh process.
     pub async fn wait_for_exit(
         &mut self,
         timeout: Duration,
@@ -1242,84 +1224,6 @@ impl ManagedSequencer {
             })?
             .map_err(|err| io_other(format!("wait_for_exit: {err}")))?;
         Ok(status)
-    }
-
-    /// Respawn the sequencer and watch the child for `stabilization` to
-    /// confirm it stays alive. Classifies the outcome so tests can model an
-    /// orchestrator restart cycle without re-deriving the failure modes.
-    ///
-    /// There are two distinct "unstable" shapes the sequencer can take:
-    ///   - The child dies during bootstrap (before HTTP readiness), which
-    ///     makes `respawn()` itself return `Err`. Canonical cause:
-    ///     `RecoveryError::Refuse(...)` from the startup decision table
-    ///     when L1 is unreachable and the persisted state looks stalled.
-    ///   - The child comes up (HTTP ready, bootstrap passed), then one of
-    ///     the internal tasks returns a fatal error and the process exits.
-    ///     Canonical cause: danger-detector worker exit when the first
-    ///     post-boot poll sees a batch past `danger_threshold`.
-    ///
-    /// The race between bootstrap-finishes and submitter-first-tick is
-    /// short (the poll interval is 5s by default, but the first tick runs
-    /// immediately), so both cases can surface for a single logical event —
-    /// tests should generally treat either as "not stable" and retry.
-    ///
-    /// Callers must ensure the previous child is already reaped (via
-    /// [`Self::stop`] or [`Self::wait_for_exit`]) — same rule as
-    /// [`Self::respawn`].
-    pub async fn respawn_and_watch(
-        &mut self,
-        stabilization: Duration,
-    ) -> HarnessResult<RespawnAttemptOutcome> {
-        if let Err(err) = self.respawn().await {
-            return Ok(RespawnAttemptOutcome::RespawnFailed(err.to_string()));
-        }
-        tokio::select! {
-            wait_result = self.child.wait() => {
-                let status = wait_result
-                    .map_err(|err| io_other(format!("child.wait(): {err}")))?;
-                Ok(RespawnAttemptOutcome::ExitedPostRespawn(status))
-            }
-            _ = tokio::time::sleep(stabilization) => {
-                Ok(RespawnAttemptOutcome::Stable)
-            }
-        }
-    }
-
-    /// Loop [`Self::respawn_and_watch`] until the sequencer stays up for
-    /// `policy.stabilization`, or `policy.max_attempts` is reached. Returns
-    /// the full sequence of attempts.
-    ///
-    /// The restart-loop convergence story: an aged Tip in the danger zone
-    /// (not yet past-stale) auto-closes on respawn, and the resulting closed
-    /// batch is in the danger zone, so the detector exits with `DangerDetected`.
-    /// Startup recovery's cascade fires at the staleness window, not at the
-    /// danger threshold — so the loop only converges once enough *additional*
-    /// L1 blocks have aged the batch past the window. In production
-    /// the orchestrator restart itself takes seconds, during which real L1
-    /// blocks are produced; `advance_per_retry` simulates that drift. Tests
-    /// that expect a short hiccup to self-heal (no danger involved) should
-    /// leave `advance_per_retry` unset.
-    ///
-    /// The loop always returns Ok — assert on the final attempt's outcome
-    /// to decide pass/fail in the test body.
-    pub async fn respawn_until_stable(
-        &mut self,
-        policy: RespawnPolicy,
-    ) -> HarnessResult<Vec<RespawnAttemptOutcome>> {
-        let mut outcomes = Vec::with_capacity(policy.max_attempts as usize);
-        for attempt in 0..policy.max_attempts {
-            let outcome = self.respawn_and_watch(policy.stabilization).await?;
-            let stable = outcome.is_stable();
-            outcomes.push(outcome);
-            if stable {
-                break;
-            }
-            let is_last = attempt + 1 == policy.max_attempts;
-            if let Some(advance) = policy.advance_per_retry.filter(|_| !is_last) {
-                self.advance_wall_and_mine(advance).await?;
-            }
-        }
-        Ok(outcomes)
     }
 
     /// Kill the sequencer process. Anvil stays running, so `mine_l1_blocks()` still works.
@@ -1347,15 +1251,29 @@ impl ManagedSequencer {
     /// Respawn the sequencer process using the same data directory and Anvil instance.
     ///
     /// Honors any `l1_endpoint_override` set via [`Self::set_l1_endpoint_override`]
-    /// and the faketime offset in the rc file (see [`Self::set_faketime_offset`] /
-    /// [`Self::advance_wall_and_mine`]).
+    /// and the faketime offset [`Self::advance_wall_and_mine`] wrote.
     ///
     /// Runs `setup` first only when the data directory is new
     /// ([`Self::discard_data_dir`]): setup refuses a directory that holds
     /// anything, so a set-up directory goes straight to `run`. A failed setup
     /// stays pending, and its retry meets whatever the failure left behind,
-    /// as an operator's would.
+    /// as an operator's would. A `run` that exits before readiness is an
+    /// error; [`Self::try_respawn`] reports its status instead.
     pub async fn respawn(&mut self) -> HarnessResult<()> {
+        match self.try_respawn().await? {
+            RunStart::Ready => Ok(()),
+            RunStart::Exited(status) => Err(io_other(format!(
+                "sequencer exited before readiness: status={status} (see {})",
+                self.log_path.display()
+            ))
+            .into()),
+        }
+    }
+
+    /// [`Self::respawn`], reporting a `run` that exits before readiness by
+    /// its exit status, so a refused start is asserted by its code. The
+    /// exited process becomes the managed child.
+    pub async fn try_respawn(&mut self) -> HarnessResult<RunStart> {
         let log_path = timestamped_log_path(self.logs_dir.as_path(), self.log_prefix.as_str());
         if self.setup_pending {
             require_setup_success(
@@ -1363,29 +1281,111 @@ impl ManagedSequencer {
                     &self.child_env(),
                     &self.setup_request(false),
                     &log_path,
-                    self.mine_l1_during_boot,
+                    self.mine_l1_during_setup,
                 )
                 .await?,
                 &log_path,
             )?;
             self.setup_pending = false;
         }
-        let SpawnedSequencerProcess {
-            child,
-            endpoint,
-            internal_endpoint,
-        } = spawn_run_process(
-            &self.child_env(),
-            &log_path,
-            self.mine_l1_during_boot,
-            self.max_batch_open_seconds,
-        )
-        .await?;
-        self.child = child;
-        self.endpoint = endpoint;
-        self.internal_endpoint = internal_endpoint;
+        let started =
+            spawn_run_process(&self.child_env(), &log_path, self.max_batch_open_seconds).await?;
         self.log_path = log_path;
+        match started {
+            RunProcess::Ready(SpawnedSequencerProcess {
+                child,
+                endpoint,
+                internal_endpoint,
+            }) => {
+                self.child = child;
+                self.endpoint = endpoint;
+                self.internal_endpoint = internal_endpoint;
+                Ok(RunStart::Ready)
+            }
+            RunProcess::Exited(child, status) => {
+                self.child = child;
+                Ok(RunStart::Exited(status))
+            }
+        }
+    }
+
+    /// Hold the batch submitter's transactions back while the sequencer
+    /// runs: its balance goes to zero, so every send is refused for
+    /// insufficient funds and the poster retries on its next tick. Nothing
+    /// reaches the mempool, so mining does not land it either.
+    pub async fn hold_batch_submissions(&mut self) -> HarnessResult<()> {
+        if self.held_submitter_balance.is_some() {
+            return Err(io_other("batch submissions are already held").into());
+        }
+        let submitter = app_core::application::DEVNET_SEQUENCER_ADDRESS;
+        let balance = self.rollups.balance_of(submitter).await?;
+        self.rollups.set_balance(submitter, U256::ZERO).await?;
+        self.held_submitter_balance = Some(balance);
         Ok(())
+    }
+
+    /// Restore the balance [`Self::hold_batch_submissions`] took away.
+    pub async fn release_batch_submissions(&mut self) -> HarnessResult<()> {
+        let balance = self
+            .held_submitter_balance
+            .take()
+            .ok_or_else(|| io_other("batch submissions are not held"))?;
+        self.rollups
+            .set_balance(app_core::application::DEVNET_SEQUENCER_ADDRESS, balance)
+            .await
+    }
+
+    /// Broadcast `payload` to the application's InputBox from `signer` without
+    /// waiting for it to be mined; returns its hash. With auto-mining off it
+    /// stays in the mempool, as a zombie of an old instance would.
+    pub async fn broadcast_input_as(
+        &self,
+        signer: &TestSigner,
+        payload: Vec<u8>,
+    ) -> HarnessResult<B256> {
+        use cartesi_rollups_contracts::input_box::InputBox;
+        let provider = signer.connect_l1_provider(self.l1_endpoint()).await?;
+        let pending = InputBox::new(self.input_box_address(), &provider)
+            .addInput(self.app_address(), payload.into())
+            .send()
+            .await
+            .map_err(|err| io_other(format!("failed to send InputBox input: {err}")))?;
+        Ok(*pending.tx_hash())
+    }
+
+    /// Whether the transaction `hash` is in a block.
+    pub async fn transaction_mined(&self, hash: B256) -> HarnessResult<bool> {
+        let provider = ProviderBuilder::new()
+            .connect(self.l1_endpoint())
+            .await
+            .map_err(|err| io_other(format!("failed to connect L1 provider: {err}")))?;
+        let receipt = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|err| io_other(format!("failed to read receipt {hash}: {err}")))?;
+        Ok(receipt.is_some())
+    }
+
+    /// Send `payload` to the application's InputBox from `signer`, as any
+    /// account can; returns the block that holds it. Inputs from the batch
+    /// submitter's key are batches, whatever process signs them.
+    pub async fn add_input_as(&self, signer: &TestSigner, payload: Vec<u8>) -> HarnessResult<u64> {
+        use cartesi_rollups_contracts::input_box::InputBox;
+        let provider = signer.connect_l1_provider(self.l1_endpoint()).await?;
+        let receipt = InputBox::new(self.input_box_address(), &provider)
+            .addInput(self.app_address(), payload.into())
+            .send()
+            .await
+            .map_err(|err| io_other(format!("failed to send InputBox input: {err}")))?
+            .get_receipt()
+            .await
+            .map_err(|err| io_other(format!("failed to confirm InputBox input: {err}")))?;
+        if !receipt.status() {
+            return Err(io_other("InputBox input reverted").into());
+        }
+        receipt
+            .block_number
+            .ok_or_else(|| io_other("InputBox receipt has no block number").into())
     }
 
     pub async fn restart(&mut self) -> HarnessResult<()> {
@@ -1501,21 +1501,49 @@ impl ManagedSequencer {
 
 use alloy_primitives::Address;
 
-/// The timing flags the e2e zone math depends on, passed explicitly so an
-/// exported `CARTESI_SEQUENCER_*` variable cannot shift them.
-fn timing_args() -> [String; 4] {
+/// The block time the harness mines outages at, passed explicitly so an
+/// exported `CARTESI_SEQUENCER_*` variable cannot shift it.
+fn timing_args() -> [String; 2] {
     [
-        "--preemptive-margin-blocks".into(),
-        DEVNET_PREEMPTIVE_MARGIN_BLOCKS.to_string(),
         "--seconds-per-block".into(),
         DEVNET_SECONDS_PER_BLOCK.to_string(),
     ]
+}
+
+/// The batch submitter's signer (Anvil account 9). A transaction it signs to
+/// the InputBox is a batch, whichever process sends it.
+pub fn batch_submitter_signer() -> HarnessResult<TestSigner> {
+    TestSigner::from_private_key_hex(&devnet_submitter()?.0)
+}
+
+/// A batch's InputBox payload: its SSZ encoding, with no envelope or tag.
+pub fn encode_batch(batch: &sequencer_core::batch::Batch) -> Vec<u8> {
+    ssz::Encode::as_ssz_bytes(batch)
 }
 
 struct SpawnedSequencerProcess {
     child: Child,
     endpoint: String,
     internal_endpoint: String,
+}
+
+/// How a `run` child's start ended.
+enum RunProcess {
+    Ready(SpawnedSequencerProcess),
+    /// The child exited before readiness, with this status.
+    Exited(Child, ExitStatus),
+}
+
+/// A start a spawn depends on must reach readiness.
+fn require_ready(started: RunProcess, log_path: &Path) -> HarnessResult<SpawnedSequencerProcess> {
+    match started {
+        RunProcess::Ready(process) => Ok(process),
+        RunProcess::Exited(_, status) => Err(io_other(format!(
+            "sequencer exited before readiness: status={status} (see {})",
+            log_path.display()
+        ))
+        .into()),
+    }
 }
 
 /// `(page_count - freelist_count) * page_size`, read in one statement so all
@@ -1690,7 +1718,7 @@ async fn run_setup_process(
     let timeout = if request.base.is_some() {
         BASE_SETUP_TIMEOUT
     } else if mine_l1_during_setup {
-        RECOVERY_BOOT_START_TIMEOUT
+        FLUSHING_SETUP_TIMEOUT
     } else {
         GENESIS_SETUP_TIMEOUT
     };
@@ -1785,24 +1813,24 @@ async fn run_genesis_tool(genesis_bin: &Path) -> HarnessResult<TempDir> {
     Ok(dir)
 }
 
-/// Mine one block per [`BOOT_L1_MINE_INTERVAL`] until dropped, as a live chain
-/// advances during a slow boot. Transient RPC hiccups are non-fatal — the next
-/// tick retries; a genuine mining failure shows as the caller's timeout.
+/// Mine one block per [`SETUP_L1_MINE_INTERVAL`] until dropped, as a live
+/// chain advances while setup flushes. Transient RPC hiccups are non-fatal —
+/// the next tick retries; a genuine mining failure shows as the caller's
+/// timeout.
 async fn mine_forever(rollups: &DevnetRollupsStack) {
     loop {
-        tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
+        tokio::time::sleep(SETUP_L1_MINE_INTERVAL).await;
         let _ = rollups.mine_l1_block_at_wall_clock().await;
     }
 }
 
-/// Start `run` on a set-up data directory and wait for its public listener.
-/// Its output is appended to `log_path`.
+/// Start `run` on a set-up data directory and wait for its public listener,
+/// or for the process to exit first. Its output is appended to `log_path`.
 async fn spawn_run_process(
     env: &ChildEnv<'_>,
     log_path: &Path,
-    mine_l1_during_boot: bool,
     max_batch_open_seconds: Option<u64>,
-) -> HarnessResult<SpawnedSequencerProcess> {
+) -> HarnessResult<RunProcess> {
     let (endpoint, http_addr) = build_local_endpoint()?;
     let (internal_endpoint, internal_http_addr) = build_local_endpoint()?;
     let (submitter_key, _) = devnet_submitter()?;
@@ -1841,36 +1869,20 @@ async fn spawn_run_process(
         ))
     })?;
 
-    if mine_l1_during_boot {
-        // A recovery boot blocks in the mempool flush until the stranded
-        // wallet-nonce slot becomes safe, which needs L1 to keep producing
-        // blocks. On an on-demand-mining devnet nothing produces them, so mine
-        // a trickle concurrently with the readiness wait — mirroring a live
-        // chain that advances during a slow boot. The miner is dropped the
-        // instant readiness resolves, so L1 only advances for the boot window.
-        let miner = mine_forever(env.rollups);
-        tokio::select! {
-            res = wait_for_http_readiness(
-                endpoint.as_str(),
-                &mut child,
-                RECOVERY_BOOT_START_TIMEOUT,
-            ) => res?,
-            _ = miner => unreachable!("boot miner loops forever; only readiness resolves"),
-        }
-    } else {
-        wait_for_http_readiness(
-            endpoint.as_str(),
-            &mut child,
-            DEFAULT_SEQUENCER_START_TIMEOUT,
-        )
-        .await?;
+    match wait_for_http_readiness(
+        endpoint.as_str(),
+        &mut child,
+        DEFAULT_SEQUENCER_START_TIMEOUT,
+    )
+    .await?
+    {
+        Readiness::Ready => Ok(RunProcess::Ready(SpawnedSequencerProcess {
+            child,
+            endpoint,
+            internal_endpoint,
+        })),
+        Readiness::Exited(status) => Ok(RunProcess::Exited(child, status)),
     }
-
-    Ok(SpawnedSequencerProcess {
-        child,
-        endpoint,
-        internal_endpoint,
-    })
 }
 
 /// Configure the child process env to preload libfaketime and point it at

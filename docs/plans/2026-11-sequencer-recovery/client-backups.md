@@ -9,10 +9,8 @@ for a client that keeps its state in SQLite, as Bart's does, at any size:
    count, era and generation, and stores the rows themselves. Any consistent
    copy of the database, taken at any time, is then at a transaction boundary,
    says which, and holds every row before it.
-2. **A cut discards later snapshots.** A standard recovery cuts the history at
-   its preserved count
-   ([checkpoint compatibility](../../protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)),
-   and a rebuild at the count the client restored to. The new history replaces
+2. **A cut discards later snapshots.** Only a rebuild cuts the history, at the
+   count the client restored to. The new history replaces
    the rows past the cut and reuses their counts. So once realigned, the client
    deletes every snapshot past the cut and stops snapshotting its old live
    database.

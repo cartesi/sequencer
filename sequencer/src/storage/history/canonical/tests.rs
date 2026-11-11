@@ -11,9 +11,7 @@ use super::*;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp};
 use crate::storage::L2TxContext;
 use crate::storage::history::insert_era_in;
-use crate::storage::test_helpers::{
-    SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload, set_up_storage,
-};
+use crate::storage::test_helpers::{SENDER_A, SENDER_B, local_batch_payload, set_up_storage};
 use crate::storage::{
     DirectInputExecution, IngestedSafeInput, LifecycleCommand, NewEra, SafeInputRange,
 };
@@ -46,22 +44,6 @@ fn claim(bounds: HistoryBounds, next: u64) -> HistoryClaim {
         version: bounds.version,
         next_input: L2TxCount::new(next),
     }
-}
-
-fn seed_aging_tip(storage: &mut Storage) {
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .unwrap();
-    storage
-        .append_included_user_ops(&mut head, &[included(0, 0, 0xaa)])
-        .unwrap();
-    storage.close_frame_and_batch(&mut head).unwrap();
-    storage
-        .append_included_user_ops(&mut head, &[included(1, 1, 0xbb)])
-        .unwrap();
-    storage
-        .append_safe_inputs(1_500, &[], SENDER_A, &default_protocol_timing())
-        .unwrap();
 }
 
 #[test]
@@ -98,8 +80,6 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
                     transaction_hash: B256::repeat_byte(0x43),
                 },
             ],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .unwrap();
     storage
@@ -173,65 +153,6 @@ fn canonical_pages_are_inclusive_and_preserve_context_without_batch_envelopes() 
     assert_eq!(zero.next_claim(), claim(bounds, 1));
 }
 
-#[test]
-fn recovery_refuses_old_claims_and_reuses_canonical_offsets_after_suffix_replacement() {
-    let db = temp_db("canonical-page-recovery");
-    let mut storage = set_up_storage(&db.path, SENDER_A);
-    seed_aging_tip(&mut storage);
-    let before = storage.history_bounds().unwrap();
-    assert_eq!(before.head, L2TxCount::new(2));
-
-    assert_eq!(
-        storage.recover_aging_tip(1_200).unwrap(),
-        crate::storage::test_helpers::batch_ids(&[1])
-    );
-    let recovered = storage.history_bounds().unwrap();
-    assert_eq!(recovered.version.era_id, before.version.era_id);
-    assert_eq!(recovered.version.recovery_generation.get(), 1);
-    assert_eq!(recovered.head, L2TxCount::new(1));
-    for limit in [0, 2] {
-        assert!(matches!(
-            storage.canonical_history_page(claim(before, 2), limit),
-            Err(HistoryReadError::Policy(HistoryPolicyError::StaleGeneration { current }))
-                if current == recovered.version
-        ));
-    }
-    assert!(
-        storage
-            .canonical_history_page(claim(recovered, 1), 2)
-            .unwrap()
-            .rows
-            .is_empty()
-    );
-    let mut head = storage.open_state().unwrap().unwrap();
-    storage
-        .append_included_user_ops(&mut head, &[included(1, 1, 0xcc)])
-        .unwrap();
-    let page = storage
-        .canonical_history_page(claim(recovered, 1), 2)
-        .unwrap();
-    assert_eq!(page.rows.len(), 1);
-    assert_eq!(page.rows[0].offset, L2TxCount::new(1));
-    assert_eq!(page.next_input, before.head);
-    match &page.rows[0].context {
-        L2TxContext::UserOp { tx, .. } => assert_eq!(tx.data, vec![0xcc]),
-        other => panic!("expected replacement user op, got {other:?}"),
-    }
-    let audit_rows: i64 = storage
-        .conn
-        .query_row("SELECT COUNT(*) FROM user_ops", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(audit_rows, 3);
-    assert_eq!(
-        storage
-            .canonical_history_page(claim(recovered, 0), 10)
-            .unwrap()
-            .rows
-            .len(),
-        2
-    );
-}
-
 fn scheduled_direct(input_index: u64, batch_nonce: u64) -> Scheduled {
     Scheduled {
         batch_nonce,
@@ -275,8 +196,6 @@ fn seed_two_table_era(storage: &mut Storage) {
             10,
             1_010,
             &[input(5, 0xa0), input(6, 0xa1), input(10, 0xa2)],
-            &default_protocol_timing(),
-            crate::clock::unix_now_ms(),
         )
         .unwrap();
     // The op at nonce 5 is skipped, so it has no row.
@@ -456,42 +375,6 @@ fn a_deep_backlog_can_be_read_in_small_bounded_pages() {
             vec![from, from + 1]
         );
         assert_eq!(page.next_claim(), claim(bounds, from + 2));
-    }
-}
-
-#[test]
-fn one_read_transaction_keeps_history_identity_and_rows_coherent_during_recovery() {
-    let db = temp_db("canonical-page-read-snapshot");
-    let mut writer = set_up_storage(&db.path, SENDER_A);
-    seed_aging_tip(&mut writer);
-    let mut reader = Storage::open_read_only(&db.path).unwrap();
-    let tx = reader.conn.transaction().unwrap();
-    let before = history_bounds_in(&tx).unwrap();
-
-    writer.recover_aging_tip(1_200).unwrap();
-    let mut head = writer.open_state().unwrap().unwrap();
-    writer
-        .append_included_user_ops(&mut head, &[included(1, 1, 0xcc)])
-        .unwrap();
-    let era = crate::storage::history::era_in(&tx).unwrap();
-    let retained = canonical_page_in(&tx, &era, before, L2TxCount::new(1), 2).unwrap();
-    assert_eq!(retained.bounds, before);
-    assert_eq!(history_bounds_in(&tx).unwrap(), before);
-    assert_eq!(retained.rows.len(), 1);
-    match &retained.rows[0].context {
-        L2TxContext::UserOp { tx, .. } => assert_eq!(tx.data, vec![0xbb]),
-        other => panic!("expected old snapshot user op, got {other:?}"),
-    }
-    tx.commit().unwrap();
-
-    let after = reader.history_bounds().unwrap();
-    assert_eq!(after.head, before.head);
-    assert_ne!(after.version, before.version);
-    let fresh = reader.canonical_history_page(claim(after, 1), 2).unwrap();
-    assert_eq!(fresh.bounds, after);
-    match &fresh.rows[0].context {
-        L2TxContext::UserOp { tx, .. } => assert_eq!(tx.data, vec![0xcc]),
-        other => panic!("expected current user op, got {other:?}"),
     }
 }
 

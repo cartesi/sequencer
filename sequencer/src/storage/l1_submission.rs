@@ -26,8 +26,8 @@ impl Storage {
     ///
     /// **Precondition:** at least one safe-head observation must have been
     /// recorded (by `Storage::append_ingested_safe_inputs_with_timestamp`). In production this is
-    /// always true because the startup recovery procedure completes InitialSync and
-    /// refuses admission unless its persisted view is usable. Tests must seed
+    /// always true because setup's sync records one before `run` starts.
+    /// Tests must seed
     /// an observation explicitly; a fresh DB returns `QueryReturnedNoRows`.
     pub fn submitter_frontier(&mut self) -> Result<SubmitterFrontier> {
         self.read(|tx| {
@@ -174,8 +174,7 @@ pub(super) fn load_batch_frames_in(
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        SENDER_A, default_protocol_timing, seed_closed_batches, seed_safe_inputs_with_batch_nonces,
-        set_up_storage,
+        SENDER_A, seed_closed_batches, seed_safe_inputs_with_batch_nonces, set_up_storage,
     };
     use crate::storage::{SafeInputRange, Storage};
     use crate::test_support::temp_db;
@@ -357,7 +356,7 @@ mod tests {
         let db = temp_db("submitter-frontier-empty");
         let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .append_safe_inputs(0, &[], SENDER_A)
             .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.safe_block, 0);
@@ -381,7 +380,7 @@ mod tests {
             },
         );
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .append_safe_inputs(0, &[], SENDER_A)
             .expect("record observed safe head");
         let frontier = storage.submitter_frontier().expect("submitter frontier");
         assert_eq!(frontier.accepted_next_nonce, 7);
@@ -437,48 +436,5 @@ mod tests {
             from_three.is_empty(),
             "no batch should remain at nonce >= 3"
         );
-    }
-
-    #[test]
-    fn nonce_is_reused_after_torn_cascade() {
-        // After a torn cascade invalidates every batch (including genesis),
-        // no batch is valid, so the recovery batch carries the era's anchor,
-        // 0 — reusing the nonce of the original genesis. The scheduler's "expected next nonce" also
-        // resets to 0, since no accepted batches were ever submitted.
-        let db = temp_db("nonce-reuse-after-torn-cascade");
-        let mut storage = set_up_storage(&db.path, SENDER_A);
-
-        let mut head = storage
-            .initialize_open_state(10, SafeInputRange::empty_at(0))
-            .expect("initialize");
-        storage
-            .close_frame_and_batch(&mut head)
-            .expect("close batch 0");
-
-        storage.insert_invalid_batch(0).expect("invalidate batch 0");
-        storage.insert_invalid_batch(1).expect("invalidate batch 1");
-        storage
-            .append_safe_inputs(10, &[], SENDER_A, &default_protocol_timing())
-            .expect("record observed safe head");
-        storage
-            .recover_post_flush(1200)
-            .expect("open recovery batch after torn invalidation");
-
-        let head = storage
-            .open_state()
-            .expect("load open state")
-            .expect("recovery batch");
-        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(2));
-
-        // No valid batch remains → the recovery Tip carries the anchor, 0.
-        let recovery_nonce: i64 = storage
-            .conn
-            .query_row(
-                "SELECT nonce FROM batches WHERE batch_index = 2",
-                [],
-                |row| row.get(0),
-            )
-            .expect("query recovery nonce");
-        assert_eq!(recovery_nonce, 0, "recovery Tip reuses nonce 0");
     }
 }

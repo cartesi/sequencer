@@ -22,7 +22,6 @@ use crate::l1::provider::error_chain;
 use crate::runtime::process_lock::{ProcessLock, spawn_blocking_with_lock};
 use crate::runtime::shutdown::ShutdownSignal;
 use crate::storage::{IngestedSafeInput, Storage, StorageOpenError};
-use sequencer_core::protocol::ProtocolTiming;
 
 #[derive(Debug, Clone)]
 pub struct InputReaderConfig {
@@ -39,7 +38,7 @@ pub struct InputReaderConfig {
     /// contact — the RPC URL is an operator CLI/env arg that may be repointed
     /// across restarts (token rotation, provider swap), so `run` cannot assume
     /// it still matches the pinned identity. The check lives on the reader so
-    /// both startup recovery and the long-lived worker verify identity before
+    /// both the startup sync and the long-lived worker verify identity before
     /// ingesting from the first successful provider contact.
     pub expected_chain_id: u64,
 }
@@ -104,8 +103,8 @@ impl InputReaderError {
     }
 
     /// Whether a failure in a startup phase is worth retrying: setup's
-    /// discovery and initial sync, and run's `InitialSync` and
-    /// `PostFlushSync` (both through `sync_to_current_safe_head`).
+    /// discovery and initial sync, and run's startup sync (through
+    /// `sync_to_current_safe_head`).
     /// `ChainIdMismatch` and `StorageTaskPanicked` are refused at startup and
     /// terminal in the live worker alike. Two variants are phase-dependent by
     /// design and differ from [`Self::is_terminal_invariant`]:
@@ -163,10 +162,6 @@ pub struct InputReader {
     /// 0 and the InputBox count at the scanned safe head.
     app_deployment_block: u64,
     db_path: String,
-    /// Protocol timing used to keep the accepted batches consistent with
-    /// every safe-input write; storage reads the batch submitter from the
-    /// pinned deployment identity.
-    timing: ProtocolTiming,
     /// Set once the provider's chain id has been verified against
     /// [`InputReaderConfig::expected_chain_id`] on a successful RPC contact.
     /// Until then every `advance_once` re-attempts the check, so an unreachable
@@ -182,7 +177,6 @@ impl InputReader {
     pub(crate) async fn new(
         db_path: impl Into<String>,
         config: InputReaderConfig,
-        timing: ProtocolTiming,
         process_lock: ProcessLock,
     ) -> Result<Self, InputReaderError> {
         let provider =
@@ -223,7 +217,6 @@ impl InputReader {
             input_box_address,
             app_deployment_block,
             db_path.into(),
-            timing,
             process_lock,
         ))
     }
@@ -233,7 +226,6 @@ impl InputReader {
         input_box_address: Address,
         app_deployment_block: u64,
         db_path: String,
-        timing: ProtocolTiming,
         process_lock: ProcessLock,
     ) -> Self {
         Self {
@@ -241,7 +233,6 @@ impl InputReader {
             input_box_address,
             app_deployment_block,
             db_path,
-            timing,
             chain_id_verified: false,
             process_lock,
         }
@@ -359,9 +350,9 @@ impl InputReader {
     /// Reads `[cursor, safe]` as one span for one commit, with the InputBox
     /// count at `safe` as its completeness witness: a commit at a lower head
     /// would rest on index contiguity alone, which a dropped tail input passes
-    /// (I6). In `run` the span stays under about `l1_read_stale_after_blocks`,
-    /// since the danger detector stops `run` first; setup and startup syncs
-    /// read the whole gap, from the app's deployment on a fresh database.
+    /// (I6). In `run` the span is one poll's worth of blocks, or the whole
+    /// outage once the provider returns; setup and startup syncs read the
+    /// whole gap, from the app's deployment on a fresh database.
     /// Bounding those is a known optimization in `docs/review/register.md`.
     async fn read_safe_inputs(
         &mut self,
@@ -392,7 +383,7 @@ impl InputReader {
         if current_safe_block < start_block {
             // A head behind the persisted one is environmental (a lagging,
             // resyncing or repointed endpoint) and is held as no progress; log
-            // it, or only the stale-view danger check surfaces it, hours later.
+            // it, or only the safe head's age surfaces it.
             if let Some(persisted_safe_block) = previous_safe_block
                 && current_safe_block < persisted_safe_block
             {
@@ -528,7 +519,7 @@ impl InputReader {
     /// on the first successful contact. A transport failure is retryable
     /// (`Provider`) and leaves the flag unset, so the check re-fires on the next
     /// tick until L1 is reachable; a value mismatch is fatal (`ChainIdMismatch`)
-    /// and propagates out of the run loop / aborts a recovery sync. Keeping the
+    /// and propagates out of the run loop / aborts the startup sync. Keeping the
     /// check on the reader itself also covers a warm boot whose initial refresh
     /// tolerated an unreachable provider: a later reconnect to the wrong chain
     /// cannot ingest address-filtered foreign logs unnoticed.
@@ -590,20 +581,14 @@ impl InputReader {
         batch: Vec<IngestedSafeInput>,
     ) -> Result<(), InputReaderError> {
         let db_path = self.db_path.clone();
-        let timing = self.timing;
         let process_lock = self.process_lock.clone();
         spawn_blocking_with_lock(process_lock, move || {
             let mut storage = Storage::open_writer(&db_path)?;
-            // Read right before the append, so the stamp is at most the
-            // commit time and staleness can only err toward "stale" (I12).
-            let now_ms = crate::clock::unix_now_ms();
             storage
                 .append_ingested_safe_inputs_with_timestamp(
                     current_safe_head.block_number,
                     current_safe_head.block_timestamp,
                     &batch,
-                    &timing,
-                    now_ms,
                 )
                 .map_err(InputReaderError::from)
         })
@@ -917,10 +902,6 @@ mod tests {
     use alloy::sol_types::SolCall;
     use tempfile::NamedTempFile;
 
-    fn test_timing() -> ProtocolTiming {
-        crate::storage::test_helpers::default_protocol_timing()
-    }
-
     /// A reader over `db_path` with a deployment identity pinned (submitter
     /// `Address::ZERO`) unless a seeding append already pinned it, as setup
     /// pins it before any sync.
@@ -952,7 +933,6 @@ mod tests {
             Address::ZERO,
             app_deployment_block,
             db_path,
-            test_timing(),
             ProcessLock::test(),
         )
     }
@@ -1074,7 +1054,6 @@ mod tests {
             Address::ZERO,
             0,
             db_file.path().to_string_lossy().into_owned(),
-            test_timing(),
             ProcessLock::test(),
         );
         let provider = alloy::providers::ProviderBuilder::new()
@@ -1161,7 +1140,6 @@ mod tests {
                 poll_interval: Duration::from_secs(1),
                 expected_chain_id: 31337,
             },
-            test_timing(),
             ProcessLock::test(),
         )
         .await;
@@ -1234,14 +1212,9 @@ mod tests {
         let db_file = NamedTempFile::new().expect("temp file");
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path).expect("open storage");
-        let timing = test_timing();
         storage
-            .append_safe_inputs(1000, &[], Address::ZERO, &timing)
+            .append_safe_inputs_with_timestamp(1000, 42, &[], Address::ZERO)
             .expect("set safe head ahead of chain");
-        let recorded_sync = storage
-            .last_safe_progress_ms()
-            .expect("read safe-progress timestamp")
-            .expect("append_safe_inputs should stamp safe progress");
         drop(storage);
 
         let mut reader = test_reader(
@@ -1262,14 +1235,14 @@ mod tests {
             "safe head should remain unchanged when already ahead of chain"
         );
 
-        let storage =
+        let mut storage =
             Storage::open(db_file.path().to_string_lossy().as_ref()).expect("re-open storage");
         assert_eq!(
             storage
-                .last_safe_progress_ms()
-                .expect("read unchanged safe-progress timestamp"),
-            Some(recorded_sync),
-            "same-head polls must not refresh the safe-progress marker"
+                .current_safe_block_timestamp()
+                .expect("read unchanged safe-block timestamp"),
+            Some(42),
+            "same-head polls must not rewrite the safe head"
         );
     }
 
@@ -1827,7 +1800,6 @@ mod tests {
                     block_number: 5,
                 }],
                 Address::ZERO,
-                &test_timing(),
             )
             .expect("seed one stored direct input");
         drop(storage);
@@ -1925,7 +1897,7 @@ mod tests {
         let db_path = db_file.path().to_string_lossy().into_owned();
         let mut storage = Storage::open(&db_path).expect("open storage");
         storage
-            .append_safe_inputs(9, &[], Address::ZERO, &test_timing())
+            .append_safe_inputs(9, &[], Address::ZERO)
             .expect("seed a persisted safe head");
         drop(storage);
 

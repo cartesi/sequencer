@@ -371,14 +371,16 @@ checkpoint from a watchdog that already follows the deployment.
 ## Sequencer restart policy
 
 The sequencer's [exit codes](../../README.md#running) are its whole restart
-contract: there is no database gate and no acknowledgement command. Standard
-recovery is automatic on every boot, and a persistent terminal fault
-re-detects fail-loud when the faulty state is next read, so the supervisor's
+contract: there is no database gate and no acknowledgement command. A start
+repairs nothing. A recorded divergence or a void history refuses every boot
+([what the sequencer does](../recovery/README.md#what-the-sequencer-does)),
+and any other persistent terminal fault re-detects fail-loud when the faulty
+state is next read, so the supervisor's
 handling of 30 and SIGABRT (stop and page, do not auto-restart) is what bounds
 a crash loop.
 
 The final `sequencer exiting` line logs at ERROR for exits 30 and 1, and at
-WARN for 10, 20 and 40, with `verdict` and `supervisor_action` fields; the
+WARN for 20 and 40, with `verdict` and `supervisor_action` fields; the
 SIGABRT line says so. Alert on the exit status, not the log level.
 
 - **Supervisor recipes.** systemd can act on the code directly:
@@ -427,12 +429,16 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   a controller panic — leaves only the process logs.
 - **Untrustworthy local state requires manual recovery.** The reader's
   content-identity divergence marker freezes the acceptance frontier and
-  blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
+  refuses every start ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
   A watchdog state mismatch independently signals application-state
   disagreement ([incident runbook](incident-runbook.md)). Diagnose the cause
   and follow the [incident runbook](incident-runbook.md#3-resolve), which
-  rebuilds in a new directory with `setup --base`; standard recovery does not
-  repair bugs.
+  rebuilds in a new directory with `setup --base`; the sequencer repairs
+  nothing by itself.
+- **Batches not landing is an outage to fix inside the window.** Keep `run`
+  up and follow [the outage playbook](../recovery/README.md#when-batches-are-not-landing);
+  once the history is void, every start refuses
+  ([when the sequencer has stopped for good](../recovery/README.md#when-the-sequencer-has-stopped-for-good)).
 
 ## Troubleshooting (live deployments)
 

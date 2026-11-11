@@ -190,9 +190,8 @@ mod tests {
     /// `setup` never completed is deterministic operator error, class 30.
     /// The per-variant table in `commands::error` pins every shape against
     /// the constants; this is the in-process assertion of a wire value
-    /// through the real command bracket, beside the e2e suite's 10 (the
-    /// aging-tip scenario) and 0 (`ManagedSequencer::stop_expecting_clean_exit`)
-    /// from a real process. Offline by construction: the admission preflight
+    /// through the real command bracket, beside the e2e suite's 0
+    /// (`ManagedSequencer::stop_expecting_clean_exit`) from a real process. Offline by construction: the admission preflight
     /// refuses before the key is read or any provider is built.
     #[tokio::test]
     async fn run_on_a_never_set_up_data_dir_exits_30() {

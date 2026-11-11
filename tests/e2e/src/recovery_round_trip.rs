@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256};
 use rollups_harness::{
-    ManagedSequencer, RebuiltHistoryRows, ReplayWalletApp, TestSigner, WalletL2Client, WsClient,
+    EXIT_TERMINAL, ManagedSequencer, RebuiltHistoryRows, ReplayWalletApp, TestSigner,
+    WalletL2Client, WsClient,
 };
 use sequencer_core::api::WsTxMessage;
 use sequencer_core::scheduler::{SCHEDULER_INSPECT_QUERY, SchedulerExport};
@@ -31,9 +32,6 @@ use crate::watchdog_compare::{
     DEVNET_MACHINE_IMAGE, StoredMachine, Watchdog, cm_inspect, head_block, machine_image,
     require_cartesi_machine,
 };
-
-/// Setup's terminal exit class: do not restart, page.
-const EXIT_TERMINAL: i32 = 30;
 
 /// Bound on single-block mines while waiting for Anvil's safe tag to cover a
 /// block; its safe head trails the chain head by a few blocks.

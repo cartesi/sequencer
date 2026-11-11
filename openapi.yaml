@@ -171,7 +171,7 @@ paths:
       description: |
         `next_nonce` is one past the sender's latest included op, or 0 if it
         has none. It counts soft-confirmed ops. The value is a hint, not a
-        reservation: it can go down after automatic recovery. It reads only
+        reservation; it does not go down within an era. It reads only
         the era's live ops, so after a setup a sender whose last op lies in
         the rebuilt history or below the base count reads 0; the `422`
         bad-nonce message names the expected nonce.
@@ -623,8 +623,10 @@ paths:
       operationId: healthz
       summary: Health report
       description: |
-        Same status as `/readyz`. Does not certify L1 freshness, submitter
-        balance, or canonical agreement.
+        Same status as `/readyz`. Reports the landing lag and the safe
+        head's age for monitoring, with no threshold of its own; they do not
+        change the status. Does not certify submitter balance or canonical
+        agreement.
       responses:
         "200":
           description: Healthy.
@@ -632,14 +634,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
-              example: { status: ok, inclusion_lane: ok }
+              example:
+                status: ok
+                inclusion_lane: ok
+                landing_lag_blocks: 40
+                max_wait_blocks: 1200
+                safe_head_age_seconds: 780
         "503":
           description: Degraded.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
-              example: { status: degraded, inclusion_lane: stopped }
+              example:
+                status: degraded
+                inclusion_lane: stopped
+                landing_lag_blocks: 40
+                max_wait_blocks: 1200
+                safe_head_age_seconds: 780
 
 components:
   headers:
@@ -979,7 +991,8 @@ components:
             - $ref: "#/components/schemas/U64"
           description: |
             Checkpoint counts up to and including this boundary preserve
-            their input prefix across every recovery since `from_generation`.
+            their input prefix since `from_generation`. No operation advances
+            the generation.
 
     HistoryInfo:
       type: object
@@ -1091,11 +1104,31 @@ components:
 
     HealthStatus:
       type: object
-      required: [status, inclusion_lane]
+      required:
+        [status, inclusion_lane, landing_lag_blocks, max_wait_blocks, safe_head_age_seconds]
       properties:
         status:
           type: string
           enum: [ok, degraded]
+        landing_lag_blocks:
+          oneOf:
+            - $ref: "#/components/schemas/U64"
+            - type: "null"
+          description: |
+            `H + 1 - s` in L1 blocks: the age, at the block after the persisted
+            safe head, of the oldest batch L1 has not accepted, counted from
+            its first frame's safe block. The history is void when it reaches
+            `max_wait_blocks`. `null` until the first reading after start.
+        max_wait_blocks:
+          $ref: "#/components/schemas/U64"
+        safe_head_age_seconds:
+          oneOf:
+            - $ref: "#/components/schemas/U64"
+            - type: "null"
+          description: |
+            The wall clock less the safe block's L1 timestamp, at least 0.
+            It keeps growing while the provider is down, when the landing lag
+            freezes. `null` until the first reading after start.
         inclusion_lane:
           type: string
           enum: [ok, stopped]

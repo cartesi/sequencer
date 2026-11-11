@@ -40,7 +40,8 @@ replaces gets bug fixes only, and its docs are not polished:
 - Reshaped or retired with the new sync: the WS wire format, the SDK
   snapshot-then-subscribe bootstrap, `/latest_snapshot` and its history headers,
   `/history`'s baseline, accepted checkpoint and compatibility query, and the
-  era/generation identity types. In-era generation signalling survives in some form.
+  era/generation identity types. Nothing advances the generation inside an era
+  ([one recovery](2026-11-sequencer-recovery/outages.md)).
 
 Not frozen: the ingress routes, `/finalized_state` and its probes,
 `/finalized_snapshot`, download leases, and the canonical page reader with `HistoryClaim`.

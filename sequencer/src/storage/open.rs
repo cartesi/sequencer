@@ -42,7 +42,7 @@ pub struct Storage {
 
 impl Storage {
     /// Production open: runs migrations, uses the canonical synchronous pragma.
-    /// `run` calls it once, before startup recovery; every later open of the
+    /// `run` calls it once, before its startup sync; every later open of the
     /// run is [`Storage::open_writer`] or [`Storage::open_read_only`].
     ///
     /// Refuses a path with no database file (production builds): every

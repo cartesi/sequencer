@@ -6,19 +6,8 @@ use crate::storage::Storage;
 use crate::storage::test_helpers::{SENDER_A, set_up_storage};
 use crate::test_support::temp_db;
 
-fn ledger(storage: &Storage) -> Vec<(i64, i64)> {
-    storage
-        .conn
-        .prepare("SELECT recovery_generation, preserved_l2_tx_count FROM history_generation_cuts ORDER BY recovery_generation")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .collect::<Result<_>>()
-        .unwrap()
-}
-
-// Synthetic cuts exercise the query's full interval contract independently
-// of today's recovery pivot policy. Actual cascades are tested separately.
+// Synthetic cuts exercise the query's full interval contract; no production
+// path writes a cut.
 fn seed_cuts(storage: &mut Storage, cuts: &[u64]) {
     storage
         .write(|tx| {
@@ -32,46 +21,6 @@ fn seed_cuts(storage: &mut Storage, cuts: &[u64]) {
             Ok(())
         })
         .unwrap();
-}
-
-#[test]
-fn generation_and_cut_are_atomic_and_immutable() {
-    let db = temp_db("generation-cut-atomic");
-    let mut storage = set_up_storage(&db.path, SENDER_A);
-    let result: Result<()> = storage.write(|tx| {
-        advance_recovery_generation_in(tx)?;
-        Err(rusqlite::Error::InvalidQuery)
-    });
-    assert!(result.is_err());
-    assert!(ledger(&storage).is_empty());
-    assert_eq!(
-        storage.history_version().unwrap().recovery_generation.get(),
-        0
-    );
-
-    storage.write(advance_recovery_generation_in).unwrap();
-    assert_eq!(ledger(&storage), [(1, 0)]);
-    for sql in [
-        "UPDATE history_generation_cuts SET preserved_l2_tx_count=1",
-        "UPDATE history_generation_cuts SET recovery_generation=2",
-        "DELETE FROM history_generation_cuts",
-        "INSERT INTO history_generation_cuts VALUES (1,1)",
-        "INSERT INTO history_generation_cuts VALUES (0,0)",
-        "INSERT INTO history_generation_cuts VALUES (2,-1)",
-    ] {
-        assert!(storage.conn.execute(sql, []).is_err(), "{sql}");
-    }
-    drop(storage);
-    let mut reopened = Storage::open(&db.path).unwrap();
-    assert_eq!(ledger(&reopened), [(1, 0)]);
-    assert_eq!(
-        reopened
-            .history_version()
-            .unwrap()
-            .recovery_generation
-            .get(),
-        1
-    );
 }
 
 #[test]

@@ -58,9 +58,6 @@ where
     A: Application + 'static,
     F: FnOnce() -> Result<A, AppError>,
 {
-    config
-        .timing
-        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
     if config.dry_run {
         return dry_run(&config, genesis_app, read_export).await;
     }
@@ -102,12 +99,9 @@ where
     F: FnOnce() -> Result<A, AppError>,
 {
     let db_path = config.db_path();
-    let timing = config
-        .timing
-        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
 
     // ── Before anything is written: every L1 check that can fail retryably.
-    let mut input_reader = discover(config, &db_path, timing, process_lock.clone()).await?;
+    let mut input_reader = discover(config, &db_path, process_lock.clone()).await?;
     let fee_oracle = prepare_fee_oracle(config).await?;
     let identity = DeploymentIdentity {
         chain_id: config.chain_id,
@@ -173,7 +167,7 @@ where
     let stop_block = MempoolFlusher::flush_to_safe(
         providers,
         submitter,
-        timing.seconds_per_block(),
+        config.timing.seconds_per_block,
         db_path.clone(),
         watermark,
     )
@@ -337,15 +331,12 @@ where
     A: Application + 'static,
     F: FnOnce() -> Result<A, AppError>,
 {
-    let timing = config
-        .timing
-        .protocol_timing(A::scheduler_limits().max_wait_blocks)?;
     let scratch = ScratchDir::create(&std::env::temp_dir())?;
     let scratch_dir = scratch.path().to_string_lossy().into_owned();
     let process_lock = ProcessLock::acquire(&scratch_dir)?;
     let db_path = crate::commands::config::db_path_in(&scratch_dir);
 
-    let mut input_reader = discover(config, &db_path, timing, process_lock).await?;
+    let mut input_reader = discover(config, &db_path, process_lock).await?;
     let fee_oracle = resolve_fee_oracle(config)?;
     let identity = DeploymentIdentity {
         chain_id: config.chain_id,
@@ -485,7 +476,6 @@ impl std::fmt::Display for SetupSummary {
 async fn discover(
     config: &SetupConfig,
     db_path: &str,
-    timing: sequencer_core::protocol::ProtocolTiming,
     process_lock: ProcessLock,
 ) -> Result<InputReader, CommandError> {
     // The chain check comes first, so a wrong-chain endpoint is reported as
@@ -510,13 +500,8 @@ async fn discover(
     let discovered = async {
         let safe_block =
             sample_safe_block(&config.rpc.eth_rpc_url, config.rpc.allow_insecure_rpc).await?;
-        let reader = InputReader::new(
-            db_path.to_owned(),
-            input_reader_config,
-            timing,
-            process_lock,
-        )
-        .await?;
+        let reader =
+            InputReader::new(db_path.to_owned(), input_reader_config, process_lock).await?;
         Ok::<_, InputReaderError>((safe_block, reader))
     }
     .await;
@@ -759,7 +744,7 @@ fn require_deployment_safe(
 mod tests {
     use super::*;
     use crate::storage::StoredSafeInput;
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
+    use crate::storage::test_helpers::SENDER_A;
     use crate::test_support::temp_db;
 
     const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -902,7 +887,7 @@ mod tests {
             .collect();
         let safe_block = blocks.iter().copied().max().unwrap_or(0);
         storage
-            .append_safe_inputs(safe_block, &inputs, SENDER_A, &default_protocol_timing())
+            .append_safe_inputs(safe_block, &inputs, SENDER_A)
             .expect("seed safe inputs");
     }
 

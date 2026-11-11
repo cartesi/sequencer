@@ -270,11 +270,8 @@ CREATE TABLE IF NOT EXISTS l1_safe_head (
     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     -- Highest L1 safe block the input reader has observed and atomically synced into storage.
     block_number INTEGER NOT NULL CHECK (block_number >= 0),
-    -- L1 timestamp (Unix seconds) of block_number.
-    block_timestamp INTEGER NOT NULL CHECK (block_timestamp >= 0),
-    -- Wall-clock time (Unix ms) of the last successful L1 sync.
-    -- Used for wall-clock danger estimation when L1 is unreachable.
-    synced_at_ms INTEGER NOT NULL CHECK (synced_at_ms >= 0)
+    -- L1 timestamp (Unix seconds) of block_number: the safe head's age.
+    block_timestamp INTEGER NOT NULL CHECK (block_timestamp >= 0)
 ) STRICT;
 
 -- Highest wallet nonce ever broadcast by this deployment's batch-submitter
@@ -296,11 +293,11 @@ CREATE TABLE IF NOT EXISTS wallet_nonce_watermark (
 -- either no valid closed local batch exists at the accepted nonce
 -- (kind = 'foreign': a zombie or foreign batch from our key) or the landed
 -- bytes hash differently from ours (kind = 'mismatch'). Once present, the
--- acceptance frontier freezes, `check_danger` reports `CanonicalDivergence`
--- ahead of every other arm, startup refuses, and the runtime detector exits.
--- The remedy is cockroach recovery (wipe + rebuild from L1), never standard
--- recovery — canonical state contains executed effects with no reliable
--- local source. Keep-first: only the earliest detection is recorded.
+-- acceptance frontier freezes, `terminal_fact` reports the divergence first,
+-- `run` refuses at start, and the landing watch stops a running process.
+-- The remedy is cockroach recovery (a new era in a new data directory):
+-- canonical state contains executed effects with no reliable local source.
+-- Keep-first: only the earliest detection is recorded.
 CREATE TABLE IF NOT EXISTS canonical_divergence (
     singleton_id     INTEGER PRIMARY KEY CHECK (singleton_id = 0),
     nonce            INTEGER NOT NULL CHECK (nonce >= 0),
@@ -311,10 +308,10 @@ CREATE TABLE IF NOT EXISTS canonical_divergence (
 
 -- I15 structural enforcement: while the divergence marker exists, the batch
 -- tree, its accepted frontier and snapshot collection are frozen in the engine
--- itself. Standard recovery is forbidden on a diverged frontier; the typed
--- Rust refusals (the local-first startup recovery procedure plus guarded Tip/Cascade
--- mutations and atomic runtime admission) remain the friendly error surface, but these
--- triggers are the enforcement a forgotten call site cannot bypass. Created
+-- itself. The typed Rust refusals (`run`'s terminal-fact check at start, the
+-- landing watch, and the open-a-batch transaction's re-check) remain the
+-- friendly error surface, but these triggers are the enforcement a forgotten
+-- call site cannot bypass. Created
 -- after every other BEFORE trigger on `batches`, so they answer first.
 CREATE TRIGGER IF NOT EXISTS trg_batches_frozen_on_divergence_insert
 BEFORE INSERT ON batches FOR EACH ROW

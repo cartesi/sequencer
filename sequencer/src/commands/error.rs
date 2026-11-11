@@ -13,13 +13,12 @@ use crate::ingress::inclusion_lane::{
 use crate::l1::fee_oracle::worker::FeeOracleError;
 use crate::l1::reader::InputReaderError;
 use crate::l1::submitter::BatchSubmitterError;
-use crate::recovery::{DangerDetectorError, RecoveryError};
+use crate::landing::LandingWatchError;
 use crate::storage::{
-    DangerStatus, DeploymentIdentity, LifecycleError, StorageOpenError,
+    DeploymentIdentity, LifecycleError, OpenBatchError, StorageOpenError, TerminalFact,
     is_persistent_storage_error, is_persistent_storage_open_error,
 };
 use sequencer_core::application::AppError;
-use sequencer_core::protocol::ProtocolTimingError;
 
 // ── Top-level CommandError ────────────────────────────────────────────────
 
@@ -27,7 +26,7 @@ use sequencer_core::protocol::ProtocolTimingError;
 ///
 /// - `Bootstrap`: startup failures before runtime workers come up.
 /// - `Worker`: one of the runtime workers exited (server, inclusion lane,
-///   input reader, batch submitter, danger detector, fee oracle).
+///   input reader, batch submitter, landing watch, fee oracle).
 /// - `Io` / `Storage`: generic catch-alls used widely; not worth nesting.
 #[derive(Debug, Error)]
 pub enum CommandError {
@@ -58,10 +57,8 @@ pub enum CommandError {
 // panic before the command harness). Diagnosed terminal runtime faults bypass
 // this projection with `abort()` (SIGABRT, 134).
 
-/// Restart; a recovery boot follows and may take 15+ min (flush plus
-/// safe-finality wait), so startup probes must allow for it.
-pub const EXIT_RESTART_EXPECT_RECOVERY: u8 = 10;
-/// Restart with backoff; the refusal clears when the L1 view freshens.
+/// Restart with backoff; the refusal clears once the provider or the
+/// contended resource recovers.
 pub const EXIT_RESTART_TRANSIENT: u8 = 20;
 /// Do not restart; page an operator.
 pub const EXIT_TERMINAL: u8 = 30;
@@ -79,7 +76,6 @@ pub const EXIT_UNCLASSIFIED: u8 = 1;
 /// best-effort records a cause (and exits 30: do not restart, page).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandFailureVerdict {
-    ExpectedRecovery,
     Retryable,
     Terminal,
     SetupEscape,
@@ -94,8 +90,8 @@ impl CommandFailureVerdict {
     }
 
     /// Exit-line severity: ERROR when the cause is a fault or unknown, WARN
-    /// when the verdict names a planned procedure (a recovery boot, a retry,
-    /// a setup refusal). Alert on the exit code, not the level.
+    /// when the verdict names a planned procedure (a retry, a setup
+    /// refusal). Alert on the exit code, not the level.
     pub(crate) const fn logs_at_error(self) -> bool {
         matches!(self, Self::Terminal | Self::Unclassified)
     }
@@ -103,7 +99,6 @@ impl CommandFailureVerdict {
     /// The supervisor action this verdict asks for, named on the exit line.
     pub(crate) const fn supervisor_action(self) -> &'static str {
         match self {
-            Self::ExpectedRecovery => "restart; a recovery boot follows",
             Self::Retryable => "restart with backoff; alert if it persists",
             Self::Terminal => "do not restart; page an operator",
             Self::SetupEscape => {
@@ -115,7 +110,6 @@ impl CommandFailureVerdict {
 
     const fn exit_code(self) -> u8 {
         match self {
-            Self::ExpectedRecovery => EXIT_RESTART_EXPECT_RECOVERY,
             Self::Retryable => EXIT_RESTART_TRANSIENT,
             Self::Terminal => EXIT_TERMINAL,
             Self::SetupEscape => EXIT_SETUP_ESCAPE,
@@ -129,9 +123,6 @@ impl CommandError {
     /// supervisor-facing projection.
     pub(crate) fn failure_verdict(&self) -> CommandFailureVerdict {
         match self {
-            CommandError::Worker(WorkerExit::DangerDetected { status }) => {
-                danger_failure_verdict(status)
-            }
             // Admission-fact refusals are terminal: the wrong command for
             // this database, the absorbing divergence, a malformed black
             // box. A plain storage failure underneath a lifecycle operation
@@ -201,33 +192,7 @@ impl CommandError {
 
 // Per-worker terminality lives as `is_terminal_invariant` on each worker's
 // own error type, beside its enum; `WorkerExit::is_terminal` below
-// composes them, and takes danger exits from `danger_failure_verdict`.
-
-fn danger_failure_verdict(status: &DangerStatus) -> CommandFailureVerdict {
-    match status {
-        // A doomed closed batch / aging Tip: the next boot legitimately runs
-        // a slow recovery (flush + cascade).
-        DangerStatus::ClosedBatchInDanger(_) | DangerStatus::TipInDanger(_) => {
-            CommandFailureVerdict::ExpectedRecovery
-        }
-        // View-dependent refusals that self-heal once the provider recovers.
-        DangerStatus::L1ViewStale | DangerStatus::EstimatedBatchInDanger(_) => {
-            CommandFailureVerdict::Retryable
-        }
-        // The only genuinely terminal danger: canonical divergence.
-        DangerStatus::CanonicalDivergence(_) => CommandFailureVerdict::Terminal,
-        // `Safe` is never a detector exit. If it ever reaches here the danger
-        // classification is self-contradicting — page an operator (EXIT_TERMINAL)
-        // rather than silently restart-loop with backoff (EXIT_UNCLASSIFIED).
-        DangerStatus::Safe => {
-            debug_assert!(
-                false,
-                "danger_failure_verdict called with DangerStatus::Safe"
-            );
-            CommandFailureVerdict::Terminal
-        }
-    }
-}
+// composes them.
 
 fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
     match err {
@@ -240,17 +205,9 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         BootstrapError::Flush(source) if source.is_terminal_invariant() => {
             CommandFailureVerdict::Terminal
         }
-        // The recovery controller owns classification. No raw provider,
-        // storage, flush, or phase error crosses this boundary.
-        BootstrapError::Recovery(source) => {
-            if source.is_retryable() {
-                CommandFailureVerdict::Retryable
-            } else {
-                CommandFailureVerdict::Terminal
-            }
-        }
-        // Setup's reader failures take the startup polarity.
-        BootstrapError::SetupInputReader(source) => {
+        // Setup's reader failures and run's startup sync take the startup
+        // polarity.
+        BootstrapError::SetupInputReader(source) | BootstrapError::StartupSync(source) => {
             if source.is_retryable_at_startup() {
                 CommandFailureVerdict::Retryable
             } else {
@@ -274,8 +231,9 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
         // was never set up).
         BootstrapError::ChainIdMismatch { .. }
         | BootstrapError::RpcRedirect { .. }
-        | BootstrapError::InvalidProtocolTiming(_)
-        | BootstrapError::BatchOpenPastDanger { .. }
+        | BootstrapError::TerminalFact(_)
+        | BootstrapError::StartBatchNotOpened
+        | BootstrapError::BatchOpenPastWindow { .. }
         | BootstrapError::FeeOracleMisconfig { .. }
         | BootstrapError::FeeOracleFatal { .. }
         | BootstrapError::SignerMisconfig { .. }
@@ -295,7 +253,8 @@ fn bootstrap_failure_verdict(err: &BootstrapError) -> CommandFailureVerdict {
 // ── Bootstrap-phase errors ─────────────────────────────────────────────
 
 /// Anything that can go wrong before runtime workers start: config validation,
-/// deployment-identity guards, startup recovery, initial DB open.
+/// deployment-identity guards, the startup terminal-fact check and sync,
+/// initial DB open.
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error(transparent)]
@@ -318,24 +277,19 @@ pub enum BootstrapError {
          followed, so configure the provider's final URL"
     )]
     RpcRedirect { status: u16 },
-    /// Protocol-level config (`preemptive_margin_blocks` vs `max_wait_blocks`,
-    /// `l1_read_stale_after_blocks` vs `danger_threshold`) failed validation.
-    /// See [`ProtocolTimingError`].
-    #[error(transparent)]
-    InvalidProtocolTiming(#[from] ProtocolTimingError),
     /// `max_batch_open_seconds`, in blocks, leaves less than the submission
-    /// margin below the danger threshold, so a low-volume Tip would reach
-    /// danger before it can be sealed, submitted and safe-accepted.
+    /// margin below the staleness window, so a low-volume batch could be
+    /// sealed too late to land: its history would be void.
     #[error(
         "max_batch_open_seconds ({max_batch_open_seconds}) spans {open_blocks} blocks at \
-         seconds_per_block ({seconds_per_block}); it must be at most danger_threshold \
-         ({danger_threshold}) minus the {margin_blocks}-block submission margin"
+         seconds_per_block ({seconds_per_block}); it must be at most max_wait_blocks \
+         ({max_wait_blocks}) minus the {margin_blocks}-block submission margin"
     )]
-    BatchOpenPastDanger {
+    BatchOpenPastWindow {
         max_batch_open_seconds: u64,
         seconds_per_block: u64,
         open_blocks: u64,
-        danger_threshold: u64,
+        max_wait_blocks: u64,
         margin_blocks: u64,
     },
     /// Setup-pinned fee oracle configuration or validation is invalid.
@@ -365,9 +319,19 @@ pub enum BootstrapError {
         #[source]
         source: std::io::Error,
     },
-    /// Startup recovery (or refusal) failed before runtime workers started.
+    /// A fact that ends the era holds at startup: a recorded divergence or a
+    /// void history. Every later `run` refuses on it.
     #[error(transparent)]
-    Recovery(#[from] RecoveryError),
+    TerminalFact(TerminalFact),
+    /// `run`'s startup sync failed with something other than an unreachable
+    /// provider (which falls back to the stored view), classified by
+    /// [`InputReaderError::is_retryable_at_startup`].
+    #[error("startup L1 sync: {0}")]
+    StartupSync(InputReaderError),
+    /// Opening the start batch left no valid open batch: a broken
+    /// postcondition, rolled back.
+    #[error("opening the start batch left no valid open batch")]
+    StartBatchNotOpened,
     /// An input-reader failure in setup's L1 discovery (the chain-id check's
     /// client, the safe-head sample, the reader) or initial sync, classified by
     /// [`InputReaderError::is_retryable_at_startup`].
@@ -559,8 +523,8 @@ pub enum IdentityError {
 // ── Worker exits ───────────────────────────────────────────────────────
 
 /// Which runtime worker exited, and why: one generic stop shape per worker, plus
-/// the danger detector's deliberate `RecoveryRequired` trip, which is not an error
-/// but exits the runtime so the orchestrator respawns into startup recovery.
+/// the landing watch's terminal fact, which is not a worker error but ends the
+/// era: the runtime stops terminally and every later `run` refuses.
 #[derive(Debug, Error)]
 pub enum WorkerExit {
     #[error("server: {0}")]
@@ -571,12 +535,12 @@ pub enum WorkerExit {
     InputReader(WorkerStop<InputReaderError>),
     #[error("batch submitter: {0}")]
     BatchSubmitter(WorkerStop<BatchSubmitterError>),
-    #[error("danger detector: {0}")]
-    DangerDetector(WorkerStop<DangerDetectorError>),
+    #[error("landing watch: {0}")]
+    LandingWatch(WorkerStop<LandingWatchError>),
     #[error("fee oracle: {0}")]
     FeeOracle(WorkerStop<FeeOracleError>),
-    #[error("danger detector: danger detected ({status:?}) — stopping for startup recovery")]
-    DangerDetected { status: DangerStatus },
+    #[error("landing watch: {0}")]
+    TerminalFact(TerminalFact),
 }
 
 impl WorkerExit {
@@ -600,14 +564,14 @@ impl WorkerExit {
             WorkerExit::BatchSubmitter(stop) => {
                 stop.is_terminal_with(BatchSubmitterError::is_terminal_invariant)
             }
-            WorkerExit::DangerDetector(stop) => {
-                stop.is_terminal_with(DangerDetectorError::is_terminal_invariant)
+            WorkerExit::LandingWatch(stop) => {
+                stop.is_terminal_with(LandingWatchError::is_terminal_invariant)
             }
             WorkerExit::FeeOracle(stop) => {
                 stop.is_terminal_with(FeeOracleError::is_terminal_invariant)
             }
-            // One home with the exit code, so the abort decision cannot drift.
-            WorkerExit::DangerDetected { status } => danger_failure_verdict(status).is_terminal(),
+            // A fact that ends the era: a divergence or a void history.
+            WorkerExit::TerminalFact(_) => true,
         }
     }
 }
@@ -691,9 +655,7 @@ impl From<crate::runtime::process_lock::ProcessLockError> for CommandError {
 }
 
 /// One shared classification for the keyed signer-provider constructor, so
-/// `setup`, `flush-mempool` and any future keyed command agree. Run recovery
-/// keeps its own Retry/Refuse polarity map, but its terminal/transient split must
-/// agree with this one.
+/// `setup`, `flush-mempool` and any future keyed command agree.
 impl From<crate::l1::provider::VerifiedSignerProviderError> for BootstrapError {
     fn from(e: crate::l1::provider::VerifiedSignerProviderError) -> Self {
         use crate::l1::provider::VerifiedSignerProviderError as E;
@@ -714,15 +676,23 @@ impl From<crate::l1::provider::VerifiedSignerProviderError> for CommandError {
     }
 }
 
-impl From<ProtocolTimingError> for CommandError {
-    fn from(e: ProtocolTimingError) -> Self {
-        CommandError::Bootstrap(e.into())
+impl From<TerminalFact> for CommandError {
+    fn from(fact: TerminalFact) -> Self {
+        CommandError::Bootstrap(BootstrapError::TerminalFact(fact))
     }
 }
 
-impl From<RecoveryError> for CommandError {
-    fn from(e: RecoveryError) -> Self {
-        CommandError::Bootstrap(e.into())
+/// A storage failure keeps its persistence classification; the other two
+/// arms are terminal refusals.
+impl From<OpenBatchError> for CommandError {
+    fn from(error: OpenBatchError) -> Self {
+        match error {
+            OpenBatchError::Storage(source) => CommandError::Storage(source),
+            OpenBatchError::Terminal(fact) => fact.into(),
+            OpenBatchError::OpenBatchMissing => {
+                CommandError::Bootstrap(BootstrapError::StartBatchNotOpened)
+            }
+        }
     }
 }
 
@@ -780,14 +750,24 @@ mod tests {
     use crate::l1::provider::VerifiedSignerProviderError;
     use crate::l1::submitter::BatchPosterError;
     use crate::l1::watermark::WalletNonceWatermarkError;
-    use crate::recovery::{
-        RecoveryError, RecoveryFailure, RecoveryRefusalReason, RecoveryRetryReason,
-    };
-    use crate::storage::DeploymentIdentity;
-    use sequencer_core::protocol::ProtocolTimingError;
+    use crate::storage::{BatchId, DeploymentIdentity, Divergence, LandingLag};
 
-    fn danger(status: DangerStatus) -> CommandError {
-        CommandError::Worker(WorkerExit::DangerDetected { status })
+    fn divergence() -> TerminalFact {
+        TerminalFact::Divergence(Divergence {
+            nonce: 0,
+            safe_input_index: 4,
+        })
+    }
+
+    fn void_history() -> TerminalFact {
+        TerminalFact::VoidHistory {
+            lag: LandingLag {
+                batch: BatchId::from_raw(3),
+                first_frame_safe_block: 10,
+                safe_block: 1209,
+            },
+            max_wait_blocks: 1200,
+        }
     }
 
     fn dummy_identity() -> DeploymentIdentity {
@@ -829,12 +809,8 @@ mod tests {
         })
     }
 
-    fn recovery_retry(failure: impl Into<RecoveryFailure>) -> CommandError {
-        CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::retry(failure)))
-    }
-
-    fn recovery_refuse(failure: impl Into<RecoveryFailure>) -> CommandError {
-        CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::refuse(failure)))
+    fn startup_sync(error: InputReaderError) -> CommandError {
+        CommandError::Bootstrap(BootstrapError::StartupSync(error))
     }
 
     fn input_reader_worker(error: InputReaderError) -> CommandError {
@@ -845,8 +821,8 @@ mod tests {
         CommandError::Worker(WorkerExit::BatchSubmitter(WorkerStop::Source(error)))
     }
 
-    fn detector_worker(error: DangerDetectorError) -> CommandError {
-        CommandError::Worker(WorkerExit::DangerDetector(WorkerStop::Source(error)))
+    fn landing_watch_worker(error: LandingWatchError) -> CommandError {
+        CommandError::Worker(WorkerExit::LandingWatch(WorkerStop::Source(error)))
     }
 
     fn fee_oracle_worker(error: FeeOracleError) -> CommandError {
@@ -856,24 +832,6 @@ mod tests {
     /// One row of the exit-code table: a failure shape and the label the
     /// assertion prints when its projection moves.
     type Row = (CommandError, &'static str);
-
-    /// Class 10: restart; the next boot legitimately runs a slow recovery.
-    fn expect_recovery() -> Vec<Row> {
-        vec![
-            (
-                danger(DangerStatus::ClosedBatchInDanger(
-                    crate::storage::BatchId::from_raw(0),
-                )),
-                "a doomed closed batch",
-            ),
-            (
-                danger(DangerStatus::TipInDanger(
-                    crate::storage::BatchId::from_raw(3),
-                )),
-                "an aging Tip",
-            ),
-        ]
-    }
 
     fn setup_reader(error: InputReaderError) -> CommandError {
         CommandError::Bootstrap(BootstrapError::SetupInputReader(error))
@@ -896,25 +854,18 @@ mod tests {
                 "busy storage during setup's L1 sync",
             ),
             (
-                danger(DangerStatus::L1ViewStale),
-                "a stale L1 view at runtime",
+                startup_sync(InputReaderError::InconsistentL1Response("gap".into())),
+                "an inconsistent L1 response during run's startup sync",
             ),
             (
-                danger(DangerStatus::EstimatedBatchInDanger(
-                    crate::storage::BatchId::from_raw(2),
-                )),
-                "an estimated batch in danger",
+                startup_sync(InputReaderError::Storage(busy())),
+                "busy storage during run's startup sync",
             ),
             (
-                recovery_retry(RecoveryRetryReason::L1ViewStale),
-                "a stale L1 view at startup recovery",
-            ),
-            (
-                recovery_retry(RecoveryRetryReason::ResyncBehindFlushView {
-                    resynced_safe_block: 1,
-                    flush_observed_safe_block: 2,
-                }),
-                "a resync behind the flush's observed view",
+                startup_sync(InputReaderError::OpenStorage(StorageOpenError::Sqlite(
+                    busy(),
+                ))),
+                "a busy open during run's startup sync remains restartable",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(
@@ -947,19 +898,6 @@ mod tests {
                 CommandError::from(FlushError::Provider("x".into())),
                 "the flush's provider",
             ),
-            // A flush failure surfaced via startup recovery lands in the same
-            // class as the flush-mempool subcommand's `FlushError`.
-            (
-                recovery_retry(RecoveryFailure::Flush(FlushError::Provider("x".into()))),
-                "the same flush provider failure under startup recovery",
-            ),
-            // `bootstrap_failure_verdict` classifies `Recovery` on its
-            // retry/refuse wrapper alone; which wrapper a provider failure
-            // gets is pinned where it is built (`classify_signer_provider`).
-            (
-                recovery_retry(RecoveryFailure::ProviderUnreachable("timeout".into())),
-                "the recovery flush's signer provider unreachable",
-            ),
             // Documented "may self-heal": the definition of the retryable class.
             (
                 CommandError::from(FeeOracleError::Transient("RPC unavailable".into())),
@@ -970,12 +908,6 @@ mod tests {
                     busy(),
                 ))),
                 "operational watermark contention remains retryable",
-            ),
-            (
-                recovery_retry(RecoveryFailure::OpenStorage(StorageOpenError::Sqlite(
-                    busy(),
-                ))),
-                "a busy open during the startup sync remains restartable",
             ),
         ]
     }
@@ -1048,11 +980,6 @@ mod tests {
                 CommandError::from(VerifiedSignerProviderError::Create("bad key".into())),
                 "a signer-construction misconfig",
             ),
-            // Retry/refuse is the wrapper's, pinned at `classify_signer_provider`.
-            (
-                recovery_refuse(RecoveryFailure::SignerMisconfig("bad key".into())),
-                "the same signer misconfig under startup recovery",
-            ),
             (
                 CommandError::ReferencedSnapshotArtifact {
                     path: "/durable/snapshot".into(),
@@ -1065,7 +992,9 @@ mod tests {
                 "a mandatory durable row disappearing cannot self-heal on restart",
             ),
             (
-                detector_worker(DangerDetectorError::Storage(rusqlite::Error::QueryReturnedNoRows)),
+                landing_watch_worker(LandingWatchError::Storage(
+                    rusqlite::Error::QueryReturnedNoRows,
+                )),
                 "typed persistent storage errors retain terminal classification through workers",
             ),
             (
@@ -1089,8 +1018,8 @@ mod tests {
                 "a submitter storage-task panic",
             ),
             (
-                detector_worker(DangerDetectorError::StorageTaskPanicked),
-                "a detector storage-task panic",
+                landing_watch_worker(LandingWatchError::StorageTaskPanicked),
+                "a landing-watch storage-task panic",
             ),
             (
                 submitter_worker(BatchSubmitterError::Poster(BatchPosterError::Watermark(
@@ -1105,12 +1034,6 @@ mod tests {
             (
                 CommandError::from(FlushError::UnsignableTransaction("no signer".into())),
                 "a flush no-op the submit provider cannot sign",
-            ),
-            (
-                recovery_refuse(RecoveryFailure::Flush(FlushError::UnsignableTransaction(
-                    "no signer".into(),
-                ))),
-                "the same unsignable no-op under startup recovery",
             ),
             (
                 submitter_worker(BatchSubmitterError::Poster(
@@ -1129,18 +1052,28 @@ mod tests {
                 "an undecodable batch from our own submitter key",
             ),
             (
-                recovery_refuse(RecoveryFailure::Flush(FlushError::Watermark(
-                    persistent_watermark(),
-                ))),
-                "the same watermark failure under startup recovery",
-            ),
-            (
-                danger(DangerStatus::CanonicalDivergence(0)),
+                CommandError::Worker(WorkerExit::TerminalFact(divergence())),
                 "canonical divergence at runtime",
             ),
             (
-                recovery_refuse(RecoveryRefusalReason::CanonicalDivergence { nonce: 0 }),
-                "canonical divergence at startup recovery",
+                CommandError::Worker(WorkerExit::TerminalFact(void_history())),
+                "a void history at runtime",
+            ),
+            (
+                CommandError::from(divergence()),
+                "canonical divergence at startup",
+            ),
+            (
+                CommandError::from(void_history()),
+                "a void history at startup",
+            ),
+            (
+                CommandError::from(OpenBatchError::Terminal(void_history())),
+                "a void history the start batch's transaction refuses",
+            ),
+            (
+                CommandError::from(OpenBatchError::OpenBatchMissing),
+                "a start batch whose transaction left no open batch",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::SetupNotComplete {
@@ -1157,23 +1090,14 @@ mod tests {
                 "an RPC endpoint that redirects setup's chain-id read",
             ),
             (
-                CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(
-                    ProtocolTimingError::MarginNotLessThanMaxWait {
-                        margin: 1200,
-                        max_wait: 1200,
-                    },
-                )),
-                "invalid protocol timing",
-            ),
-            (
-                CommandError::Bootstrap(BootstrapError::BatchOpenPastDanger {
-                    max_batch_open_seconds: 9601,
+                CommandError::Bootstrap(BootstrapError::BatchOpenPastWindow {
+                    max_batch_open_seconds: 13201,
                     seconds_per_block: 12,
-                    open_blocks: 801,
-                    danger_threshold: 900,
+                    open_blocks: 1101,
+                    max_wait_blocks: 1200,
                     margin_blocks: 100,
                 }),
-                "a batch-open window past the danger budget",
+                "a batch-open window past the staleness window",
             ),
             (
                 CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch {
@@ -1259,30 +1183,31 @@ mod tests {
                 }),
                 "the reader's warm-boot chain-id backstop",
             ),
-            // The same mismatch surfacing during a startup-recovery safe-head
-            // sync (RecoveryError path) is terminal too — not the unclassified
-            // Recovery catch-all (which would loop on the wrong chain).
+            // The same mismatch surfacing during run's startup sync is
+            // terminal too, not a retry that would loop on the wrong chain.
             (
-                recovery_refuse(RecoveryFailure::InputReader(InputReaderError::ChainIdMismatch {
+                startup_sync(InputReaderError::ChainIdMismatch {
                     rpc: 1,
                     expected: 31337,
-                })),
+                }),
                 "the same mismatch during the startup sync",
             ),
             (
-                recovery_refuse(RecoveryFailure::InputReader(
-                    InputReaderError::StorageTaskPanicked {
-                        operation: "startup sync",
-                    },
-                )),
+                startup_sync(InputReaderError::StorageTaskPanicked {
+                    operation: "startup sync",
+                }),
                 "a storage-task panic during the startup sync",
             ),
             (
-                recovery_refuse(RecoveryFailure::OpenStorage(StorageOpenError::Sqlite(sqlite(
+                startup_sync(InputReaderError::OpenStorage(StorageOpenError::Sqlite(sqlite(
                     rusqlite::ffi::ErrorCode::NotADatabase,
                     26,
                 )))),
                 "a persistent open failure during the startup sync",
+            ),
+            (
+                startup_sync(InputReaderError::Bootstrap("plaintext rpc url".into())),
+                "a malformed RPC URL at run's startup sync",
             ),
             (
                 CommandError::from(FeeOracleError::Join("storage task panicked".into())),
@@ -1327,7 +1252,7 @@ mod tests {
 
     /// Class 40: the escape check. The old instance must be stopped before
     /// a setup in a fresh directory can succeed, so it gets a dedicated code,
-    /// distinct from the auto-recovery class (10).
+    /// distinct from the terminal class (30).
     fn setup_escape() -> Vec<Row> {
         vec![
             (
@@ -1426,12 +1351,11 @@ mod tests {
 
     /// Every failure shape the suite pins, projected once onto the exit-code
     /// contract. Each row asserts its class and that the black-box verdict
-    /// agrees with it (`is_terminal` exactly for class 30). The five classes
+    /// agrees with it (`is_terminal` exactly for class 30). The four classes
     /// carry distinct codes (pinned below), so a code pin is a verdict pin.
     #[test]
     fn every_pinned_failure_projects_to_its_class() {
         let table = [
-            (EXIT_RESTART_EXPECT_RECOVERY, expect_recovery()),
             (EXIT_RESTART_TRANSIENT, transient()),
             (EXIT_TERMINAL, terminal()),
             (EXIT_SETUP_ESCAPE, setup_escape()),
@@ -1450,42 +1374,31 @@ mod tests {
         }
     }
 
-    /// A detector exit aborts the run exactly when its exit code is terminal:
-    /// only canonical divergence.
+    /// Every terminal fact the landing watch reports aborts the run, with the
+    /// operator-facing text naming the remedy.
     #[test]
-    fn danger_exit_aborts_only_on_canonical_divergence() {
-        for status in [
-            DangerStatus::ClosedBatchInDanger(crate::storage::BatchId::from_raw(1)),
-            DangerStatus::TipInDanger(crate::storage::BatchId::from_raw(1)),
-            DangerStatus::L1ViewStale,
-            DangerStatus::EstimatedBatchInDanger(crate::storage::BatchId::from_raw(1)),
-            DangerStatus::CanonicalDivergence(1),
-        ] {
-            let terminal = matches!(status, DangerStatus::CanonicalDivergence(_));
-            assert_eq!(
-                WorkerExit::DangerDetected { status }.is_terminal(),
-                terminal,
-                "{status:?}"
-            );
+    fn terminal_fact_exits_abort_and_name_the_remedy() {
+        for fact in [divergence(), void_history()] {
+            assert!(WorkerExit::TerminalFact(fact).is_terminal(), "{fact:?}");
         }
+        assert_eq!(
+            void_history().to_string(),
+            "the history is void: batch 3, opened at safe block 10, was not accepted by safe \
+             block 1209, and no later block can accept it (max_wait_blocks 1200); recover with \
+             setup --base in a new data directory"
+        );
     }
 
-    /// The exhaustive match makes a sixth verdict a compile error until its
+    /// The exhaustive match makes a new verdict a compile error until its
     /// exit-line level is chosen here.
     #[test]
     fn exit_line_logs_at_error_only_for_terminal_and_unclassified() {
         use CommandFailureVerdict::*;
         let at_error = |verdict: CommandFailureVerdict| match verdict {
             Terminal | Unclassified => true,
-            ExpectedRecovery | Retryable | SetupEscape => false,
+            Retryable | SetupEscape => false,
         };
-        let all = [
-            ExpectedRecovery,
-            Retryable,
-            Terminal,
-            SetupEscape,
-            Unclassified,
-        ];
+        let all = [Retryable, Terminal, SetupEscape, Unclassified];
         for verdict in all {
             assert_eq!(verdict.logs_at_error(), at_error(verdict), "{verdict:?}");
         }
@@ -1499,27 +1412,20 @@ mod tests {
     /// The wire values a supervisor matches on, as integers: a renumbered
     /// constant must fail here, not in a runbook. They are pairwise distinct,
     /// which is what lets the table above pin verdicts through codes; the
-    /// exhaustive match makes a sixth verdict a compile error until it is
-    /// given its integer here.
+    /// exhaustive match makes a new verdict a compile error until it is
+    /// given its integer here. Code 10 is retired and never reused.
     #[test]
     fn exit_codes_are_the_documented_integers() {
         use CommandFailureVerdict::*;
         let documented = |verdict: CommandFailureVerdict| -> u8 {
             match verdict {
-                ExpectedRecovery => 10,
                 Retryable => 20,
                 Terminal => 30,
                 SetupEscape => 40,
                 Unclassified => 1,
             }
         };
-        let all = [
-            ExpectedRecovery,
-            Retryable,
-            Terminal,
-            SetupEscape,
-            Unclassified,
-        ];
+        let all = [Retryable, Terminal, SetupEscape, Unclassified];
         for verdict in all {
             assert_eq!(verdict.exit_code(), documented(verdict), "{verdict:?}");
         }
