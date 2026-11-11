@@ -1367,22 +1367,12 @@ fn void_history_facts(first_frame_safe_block: u64, safe_head: Option<u64>) -> Ve
     facts
 }
 
-/// Whether a refused start leaves a record in the terminal-fault black box.
-/// A fact the start finds itself (on the database or at its sync) does; a
-/// recorded divergence is refused by the lifecycle preflight, before the
-/// command's black-box bracket, and leaves none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlackBox {
-    Records,
-    Untouched,
-}
-
-/// Start `run` and expect the terminal refusal: exit 30 before readiness, its
-/// exit line naming `facts`, and the black box as `black_box` says.
+/// Start `run` and expect the terminal refusal: exit 30 before readiness and
+/// its exit line naming `facts`. The terminal-fault black box stays as it
+/// was: the database already holds a terminal fact, so a refusal copies none.
 async fn expect_start_refused(
     runtime: &mut ManagedSequencer,
     facts: &[String],
-    black_box: BlackBox,
 ) -> ScenarioResult<()> {
     let recorded = runtime.terminal_fault_causes()?;
     match runtime.try_respawn().await? {
@@ -1395,25 +1385,22 @@ async fn expect_start_refused(
         }
     }
     let log = runtime.read_log_contents()?;
-    let causes = runtime.terminal_fault_causes()?;
-    let new_causes = &causes[recorded.len().min(causes.len())..];
-    let named = |text: &str| facts.iter().all(|fact| text.contains(fact.as_str()));
-    if !named(&log) {
+    if !facts.iter().all(|fact| log.contains(fact.as_str())) {
         return Err(format!(
             "the refusal must name {facts:?}; see {}",
             runtime.log_path().display()
         )
         .into());
     }
-    match (black_box, new_causes) {
-        (BlackBox::Records, [cause]) if named(cause) => Ok(()),
-        (BlackBox::Untouched, []) => Ok(()),
-        _ => Err(format!(
-            "expected the black box to be {black_box:?} by the refusal naming {facts:?}; \
+    let causes = runtime.terminal_fault_causes()?;
+    if causes != recorded {
+        return Err(format!(
+            "a start refused on {facts:?} must leave the black box as it was ({recorded:?}); \
              it holds {causes:?}"
         )
-        .into()),
+        .into());
     }
+    Ok(())
 }
 
 /// Mine one block per second until L1 has accepted every batch through
@@ -1794,8 +1781,8 @@ async fn run_void_history_while_running_stops_for_good_test(
     advance_safe_head_to(runtime, void_at).await?;
     let facts = void_history_facts(batch.first_frame_safe_block, Some(void_at));
     expect_terminal_abort(runtime, &facts).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
+    expect_start_refused(runtime, &facts).await?;
 
     // The cause is fixed, but a transaction signed with the submitter's key
     // is still in the mempool when the operator follows the playbook.
@@ -1900,7 +1887,7 @@ async fn run_blind_past_the_window_stops_at_the_first_sync_that_shows_it_test(
     proxy.reconnect();
     let facts = void_history_facts(batch.first_frame_safe_block, None);
     expect_terminal_abort(runtime, &facts).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
     proxy.shutdown().await?;
     Ok(())
 }
@@ -1954,7 +1941,7 @@ async fn run_blind_start_boots_on_the_stored_view_then_stops_at_the_first_sync_t
     proxy.reconnect();
     let facts = void_history_facts(batch.first_frame_safe_block, None);
     expect_terminal_abort(runtime, &facts).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
     proxy.shutdown().await?;
     Ok(())
 }
@@ -2029,8 +2016,8 @@ async fn run_stopped_past_the_window_refuses_every_start_test(
     let facts = void_history_facts(batch.first_frame_safe_block, Some(void_at));
     let batches = runtime.count_batches()?;
     let frontier = runtime.batch_nonce_frontier()?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
+    expect_start_refused(runtime, &facts).await?;
     assert_eq!(
         runtime.count_batches()?,
         batches,
@@ -2053,12 +2040,12 @@ async fn run_stopped_past_the_window_with_nothing_confirmed_refuses_test(
     advance_safe_head_to(runtime, void_at).await?;
 
     let facts = void_history_facts(batch.first_frame_safe_block, Some(void_at));
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
 
     let proxy = TcpProxy::spawn(runtime.l1_endpoint()).await?;
     runtime.set_l1_endpoint_override(Some(proxy.endpoint()));
     proxy.disconnect();
-    expect_start_refused(runtime, &facts, BlackBox::Records).await?;
+    expect_start_refused(runtime, &facts).await?;
     proxy.shutdown().await?;
     Ok(())
 }
@@ -2086,8 +2073,8 @@ async fn run_foreign_batch_at_our_nonce_stops_for_good_test(
     )];
     expect_terminal_abort(runtime, &facts).await?;
     assert_eq!(runtime.canonical_divergence()?.as_deref(), Some("foreign"));
-    expect_start_refused(runtime, &facts, BlackBox::Untouched).await?;
-    expect_start_refused(runtime, &facts, BlackBox::Untouched).await?;
+    expect_start_refused(runtime, &facts).await?;
+    expect_start_refused(runtime, &facts).await?;
     Ok(())
 }
 

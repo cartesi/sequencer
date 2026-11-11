@@ -73,7 +73,8 @@ pub const EXIT_UNCLASSIFIED: u8 = 1;
 ///
 /// This is the single classification boundary shared by the terminal-fault
 /// black box and the process exit-code projection: only [`Self::Terminal`]
-/// best-effort records a cause (and exits 30: do not restart, page).
+/// exits 30 (do not restart, page) and best-effort records its cause, unless
+/// the cause is a terminal fact ([`CommandError::is_terminal_fact`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandFailureVerdict {
     Retryable,
@@ -83,8 +84,9 @@ pub(crate) enum CommandFailureVerdict {
 }
 
 impl CommandFailureVerdict {
-    /// Whether the black box records a terminal cause (and the process
-    /// exits 30: do not restart, page an operator).
+    /// Whether the process exits 30 (do not restart, page an operator). The
+    /// black box records the cause of a terminal failure that is not a
+    /// terminal fact.
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal)
     }
@@ -181,6 +183,24 @@ impl CommandError {
             | CommandError::Storage(_)
             | CommandError::AppBootstrap(_) => CommandFailureVerdict::Unclassified,
         }
+    }
+
+    /// Whether this failure states a terminal fact: a recorded divergence or
+    /// a void history. The database holds a terminal fact and every `run`
+    /// states it, so the black box, which keeps causes that would otherwise
+    /// be lost, does not copy it.
+    pub(crate) fn is_terminal_fact(&self) -> bool {
+        matches!(
+            self,
+            CommandError::Bootstrap(BootstrapError::TerminalFact(_))
+                | CommandError::Worker(
+                    WorkerExit::TerminalFact(_)
+                        | WorkerExit::Lane(WorkerStop::Source(
+                            InclusionLaneError::CanonicalDivergence { .. }
+                        ))
+                )
+                | CommandError::Lifecycle(LifecycleError::CanonicalDivergence { .. })
+        )
     }
 
     /// Project this error onto the exit-code contract. Clean shutdown
@@ -912,8 +932,8 @@ mod tests {
         ]
     }
 
-    /// Class 30: do not restart; page. The state cannot self-heal, so the
-    /// black box records the cause (`is_terminal`) for exactly these rows.
+    /// Class 30: do not restart; page. The state cannot self-heal
+    /// (`is_terminal` for exactly these rows).
     fn terminal() -> Vec<Row> {
         let mut rows: Vec<Row> = vec![
             (
@@ -1058,6 +1078,15 @@ mod tests {
             (
                 CommandError::Worker(WorkerExit::TerminalFact(void_history())),
                 "a void history at runtime",
+            ),
+            (
+                CommandError::Worker(WorkerExit::Lane(WorkerStop::Source(
+                    InclusionLaneError::CanonicalDivergence {
+                        nonce: 0,
+                        safe_input_index: 4,
+                    },
+                ))),
+                "canonical divergence at the lane's frontier read",
             ),
             (
                 CommandError::from(divergence()),
@@ -1350,7 +1379,7 @@ mod tests {
     }
 
     /// Every failure shape the suite pins, projected once onto the exit-code
-    /// contract. Each row asserts its class and that the black-box verdict
+    /// contract. Each row asserts its class and that the terminal verdict
     /// agrees with it (`is_terminal` exactly for class 30). The four classes
     /// carry distinct codes (pinned below), so a code pin is a verdict pin.
     #[test]
@@ -1372,6 +1401,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Of every failure shape the suite pins, exactly the ones that state a
+    /// divergence or a void history are terminal facts, and each is terminal.
+    #[test]
+    fn only_a_divergence_or_a_void_history_is_a_terminal_fact() {
+        let pinned = [transient(), terminal(), setup_escape(), unclassified()];
+        let facts: Vec<&str> = pinned
+            .iter()
+            .flatten()
+            .filter(|(error, _)| error.is_terminal_fact())
+            .map(|(error, why)| {
+                assert!(error.failure_verdict().is_terminal(), "{why}: {error:?}");
+                *why
+            })
+            .collect();
+        assert_eq!(
+            facts,
+            [
+                "canonical divergence at runtime",
+                "a void history at runtime",
+                "canonical divergence at the lane's frontier read",
+                "canonical divergence at startup",
+                "a void history at startup",
+                "a void history the start batch's transaction refuses",
+                "divergence pages",
+            ]
+        );
     }
 
     /// Every terminal fact the landing watch reports aborts the run, with the

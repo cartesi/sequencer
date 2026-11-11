@@ -629,8 +629,7 @@ impl ManagedSequencer {
     }
 
     /// The causes the terminal-fault black box recorded, oldest first. A
-    /// start refused on a terminal fact records one; a runtime abort records
-    /// none.
+    /// terminal fact records none, at a refused start or at a runtime abort.
     pub fn terminal_fault_causes(&self) -> HarnessResult<Vec<String>> {
         let conn = self.read_only_connection()?;
         let mut statement = conn

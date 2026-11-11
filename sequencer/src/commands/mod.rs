@@ -80,6 +80,11 @@ fn preflight_lifecycle_command(
 /// still carry it. Failures raised before a command's bracket (the
 /// admission preflight, identity, the key file) return before this write
 /// and leave only the exit code and logs.
+///
+/// The black box keeps causes that would otherwise be lost. A terminal fact,
+/// a recorded divergence or a void history, is never lost: the database holds
+/// it and every `run` states it, so it is not copied, wherever the command
+/// met it.
 pub(crate) fn record_terminal_fault_best_effort(
     db_path: &str,
     command: LifecycleCommand,
@@ -96,7 +101,7 @@ pub(crate) fn record_terminal_error_best_effort(
     command: LifecycleCommand,
     error: &CommandError,
 ) {
-    if !error.failure_verdict().is_terminal() {
+    if !error.failure_verdict().is_terminal() || error.is_terminal_fact() {
         return;
     }
     let cause = error.to_string();
@@ -357,7 +362,9 @@ mod tests {
     #[test]
     fn settlement_write_records_terminal_verdicts_only() {
         use super::record_terminal_fault_best_effort;
-        use crate::storage::LifecycleCommand;
+        use crate::storage::{
+            Divergence, LandingLag, LifecycleCommand, LifecycleError, TerminalFact,
+        };
 
         let db = temp_db("settlement-write");
         let storage =
@@ -378,8 +385,37 @@ mod tests {
             None
         );
 
-        // A terminal startup verdict lands as one row carrying the error's
-        // Display form. Runtime faults abort before settlement.
+        // A terminal fact is terminal and leaves the black box empty too: the
+        // database holds the fact itself.
+        let facts = [
+            CommandError::from(TerminalFact::VoidHistory {
+                lag: LandingLag {
+                    batch_nonce: 3,
+                    first_frame_safe_block: 10,
+                    safe_block: 1209,
+                },
+                max_wait_blocks: 1200,
+            }),
+            CommandError::from(TerminalFact::Divergence(Divergence {
+                nonce: 0,
+                safe_input_index: 4,
+            })),
+            CommandError::Lifecycle(LifecycleError::CanonicalDivergence { nonce: 0 }),
+        ];
+        for fact in facts {
+            assert_eq!(fact.exit_code(), crate::commands::error::EXIT_TERMINAL);
+            record_terminal_fault_best_effort(&db.path, LifecycleCommand::Run, &Err(fact));
+            assert_eq!(
+                Storage::open_read_only(&db.path)
+                    .expect("reopen")
+                    .latest_terminal_fault()
+                    .expect("read"),
+                None
+            );
+        }
+
+        // Any other terminal startup verdict lands as one row carrying the
+        // error's Display form. Runtime faults abort before settlement.
         let error = CommandError::Storage(rusqlite::Error::InvalidQuery);
         let expected_cause = error.to_string();
         let terminal = Err(error);

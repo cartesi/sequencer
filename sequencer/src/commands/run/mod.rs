@@ -80,10 +80,10 @@ where
     // rediscovery chain (restart, then refusal), and the landing watch's poll
     // cadence leaves a window where a clean shutdown outruns its detection.
     let result = result.and_then(|()| startup::refuse_terminal_fact(&db_path));
-    // Verdict-neutral black-box settlement: a terminal failure records
-    // its cause best-effort — never changing the verdict — while a
-    // panic/cancellation/SIGKILL writes nothing; the next boot proceeds and
-    // re-derives everything from facts.
+    // Verdict-neutral black-box settlement: a terminal failure that is not a
+    // terminal fact records its cause best-effort — never changing the
+    // verdict — while a panic/cancellation/SIGKILL writes nothing; the next
+    // boot proceeds and re-derives everything from facts.
     record_terminal_fault_best_effort(&db_path, LifecycleCommand::Run, &result);
     result
 }

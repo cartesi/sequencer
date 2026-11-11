@@ -87,8 +87,10 @@ supervisor is expected to honor.
 
 `terminal_faults` stores append-only causes for terminal errors returned
 through a command bracket, best-effort and verdict-neutrally. Runtime aborts
-do not pass through that bracket and leave only process diagnostics. Nothing
-reads the black box for decisions.
+do not pass through that bracket and leave only process diagnostics. It keeps
+causes that would otherwise be lost, so a terminal fact is not copied into
+it: the database holds the fact and every `run` states it. Nothing reads the
+black box for decisions.
 
 A known-terminal fault refuses at re-detection rather than at a boot gate.
 Every fault whose evidence the boot path reads re-refuses before the first

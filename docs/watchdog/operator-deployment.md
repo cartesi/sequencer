@@ -426,7 +426,9 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   CLI of 3.37 or later, since the tables are STRICT; each `run` boot
   logs the latest row at WARN, with its age). Any death that did not return
   through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
-  a controller panic — leaves only the process logs.
+  a controller panic — leaves only the process logs. A recorded divergence
+  or a void history leaves no row either: the database holds the fact, and
+  every `run` on the directory refuses with it.
 - **Untrustworthy local state requires manual recovery.** The reader's
   content-identity divergence marker freezes the acceptance frontier and
   refuses every start ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
