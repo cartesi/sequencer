@@ -86,7 +86,7 @@ lane, and a history can be void with no direct queued at all.
 ```rust
 /// The oldest batch L1 has not accepted, closed or open, at the safe head.
 pub struct LandingLag {
-    pub batch: BatchId,
+    pub batch_nonce: u64,
     pub first_frame_safe_block: u64,
     pub safe_block: u64,
 }

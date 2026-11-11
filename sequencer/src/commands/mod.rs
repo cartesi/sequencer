@@ -395,10 +395,10 @@ mod tests {
 
     #[test]
     fn startup_terminal_fact_propagates_as_a_bootstrap_refusal() {
-        use crate::storage::{BatchId, LandingLag, TerminalFact};
+        use crate::storage::{LandingLag, TerminalFact};
         let fact = TerminalFact::VoidHistory {
             lag: LandingLag {
-                batch: BatchId::from_raw(0),
+                batch_nonce: 0,
                 first_frame_safe_block: 0,
                 safe_block: 1199,
             },

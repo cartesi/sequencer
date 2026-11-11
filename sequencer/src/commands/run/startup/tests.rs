@@ -64,17 +64,14 @@ fn after_setup(name: &str) -> TestDb {
     db
 }
 
-/// The batches as `(batch_index, nonce, sealed)`.
-fn batch_rows(db: &TestDb) -> Vec<(i64, i64, bool)> {
+/// The batches as `(nonce, sealed)`, in nonce order.
+fn batch_rows(db: &TestDb) -> Vec<(i64, bool)> {
     Storage::open(&db.path)
         .expect("open storage")
         .raw_read(|tx| {
-            tx.prepare(
-                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL \
-                 FROM batches ORDER BY batch_index",
-            )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect()
+            tx.prepare("SELECT nonce, sealed_at_ms IS NOT NULL FROM batches ORDER BY nonce")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
         })
         .expect("read batches")
 }
@@ -91,7 +88,7 @@ async fn the_first_start_of_an_era_opens_its_first_batch_once() {
     );
     start(&db.path, &mut l1).await.expect("start");
     assert_eq!(l1.syncs, 1);
-    assert_eq!(batch_rows(&db), vec![(0, 0, false)]);
+    assert_eq!(batch_rows(&db), vec![(0, false)]);
     let head = Storage::open(&db.path)
         .unwrap()
         .open_state()
@@ -102,7 +99,7 @@ async fn the_first_start_of_an_era_opens_its_first_batch_once() {
     // A restart finds it open and opens nothing.
     let mut l1 = TestL1::new(&db, vec![SyncStep::Keep]);
     start(&db.path, &mut l1).await.expect("restart");
-    assert_eq!(batch_rows(&db), vec![(0, 0, false)]);
+    assert_eq!(batch_rows(&db), vec![(0, false)]);
 }
 
 /// A start inside the window repairs nothing: the same batches, the same
@@ -124,7 +121,7 @@ async fn a_start_inside_the_window_changes_nothing() {
             .unwrap();
     }
     let before = batch_rows(&db);
-    assert_eq!(before, vec![(0, 0, true), (1, 1, true), (2, 2, false)]);
+    assert_eq!(before, vec![(0, true), (1, true), (2, false)]);
 
     for step in [
         SyncStep::Keep,

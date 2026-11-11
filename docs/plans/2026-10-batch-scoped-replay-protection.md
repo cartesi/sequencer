@@ -20,7 +20,7 @@ batch-scoped design fixes that race too.
 **Signed coordinates.** The user signs `(b, i)` in place of a nonce:
 
 - `b` is the scheduler batch nonce the op targets: the canonical batch sequence
-  number, not the sequencer's local `batch_index`.
+  number.
 - `i` orders the sender's ops within `b`.
 
 **Look-back.** The sequencer adds an unsigned field `k` (2 bits, so `k` ∈ 0..=3)

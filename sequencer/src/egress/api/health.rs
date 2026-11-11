@@ -84,7 +84,7 @@ pub(crate) async fn healthz(State(state): State<Arc<HealthState>>) -> impl IntoR
 mod tests {
     use super::*;
     use crate::landing::LandingReading;
-    use crate::storage::{BatchId, LandingLag};
+    use crate::storage::LandingLag;
 
     fn fresh_state() -> (Arc<HealthState>, mpsc::Receiver<PendingUserOp>) {
         let (tx_sender, rx) = mpsc::channel::<PendingUserOp>(1);
@@ -173,7 +173,7 @@ mod tests {
         let now_secs = crate::clock::unix_now_ms() / 1000;
         publish.send_replace(LandingReading {
             lag: Some(LandingLag {
-                batch: BatchId::from_raw(4),
+                batch_nonce: 4,
                 first_frame_safe_block: 100,
                 safe_block: 1400,
             }),

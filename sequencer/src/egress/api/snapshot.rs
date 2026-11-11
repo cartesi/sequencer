@@ -710,7 +710,7 @@ mod tests {
         conn.execute_batch("DROP TRIGGER trg_snapshot_immutable")
             .unwrap();
         conn.execute(
-            "UPDATE snapshots SET l2_tx_count = -1 WHERE batch_index IS NULL",
+            "UPDATE snapshots SET l2_tx_count = -1 WHERE batch_nonce IS NULL",
             [],
         )
         .expect("corrupt finalized cursor");
@@ -755,7 +755,7 @@ mod tests {
         let mut head = storage
             .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
             .expect("open the genesis tip");
-        let batch_index = head.batch_index();
+        let batch_nonce = head.batch_nonce();
         let count = storage.next_l2_tx_count().expect("next count");
         storage
             .close_frame_and_batch_with_snapshot(
@@ -772,8 +772,8 @@ mod tests {
         let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
         let deleted = conn
             .execute(
-                "DELETE FROM snapshots WHERE batch_index = ?1",
-                [batch_index.to_raw() as i64],
+                "DELETE FROM snapshots WHERE batch_nonce = ?1",
+                [batch_nonce as i64],
             )
             .expect("remove the accepted batch's snapshot row");
         assert_eq!(deleted, 1);

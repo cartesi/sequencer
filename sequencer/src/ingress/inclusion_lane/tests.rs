@@ -649,14 +649,14 @@ fn read_count(db_path: &str, table: &str) -> i64 {
         .expect("count rows")
 }
 
-fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64) -> i64 {
+fn read_frame_direct_count(db_path: &str, batch_nonce: i64, frame_in_batch: i64) -> i64 {
     let conn = Storage::open_connection(db_path).expect("open sqlite reader");
     conn.query_row(
         "SELECT COUNT(*) FROM application_inputs
-         WHERE batch_index = ?1
+         WHERE batch_nonce = ?1
            AND frame_in_batch = ?2
            AND safe_input_index IS NOT NULL",
-        params![batch_index, frame_in_batch],
+        params![batch_nonce, frame_in_batch],
         |row| row.get(0),
     )
     .expect("query frame direct count")
@@ -667,7 +667,7 @@ fn read_frame_safe_blocks(db_path: &str) -> Vec<u64> {
     let mut statement = conn
         .prepare(
             "SELECT safe_block FROM frames \
-             ORDER BY batch_index ASC, frame_in_batch ASC",
+             ORDER BY batch_nonce ASC, frame_in_batch ASC",
         )
         .expect("prepare frame-clock query");
     statement
@@ -1305,7 +1305,7 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
     super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
-    let tip = head.batch_index();
+    let tip = head.batch_nonce();
     let dump_count = storage.list_snapshots().unwrap().len();
 
     app.fail_dump = true;
@@ -1318,9 +1318,9 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
             AppError::Io(ref source)
         )) if source.to_string() == "injected application dump failure"
     ));
-    assert_eq!(head.batch_index(), tip);
-    assert_eq!(storage.open_state().unwrap().unwrap().batch_index(), tip);
-    assert_eq!(storage.latest_batch_index().unwrap(), Some(tip.to_raw()));
+    assert_eq!(head.batch_nonce(), tip);
+    assert_eq!(storage.open_state().unwrap().unwrap().batch_nonce(), tip);
+    assert_eq!(storage.latest_batch_nonce().unwrap(), Some(tip));
     assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
     assert_eq!(storage.list_snapshots().unwrap().len(), dump_count);
 }

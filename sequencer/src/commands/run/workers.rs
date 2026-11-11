@@ -653,7 +653,7 @@ fn build_batch_submitter_providers(l1: &L1Config) -> Result<KeyedProviders, Comm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{BatchId, Divergence, LandingLag, TerminalFact};
+    use crate::storage::{Divergence, LandingLag, TerminalFact};
     use crate::test_support::{StubApp, create_structured_dump};
     use clap::Parser;
 
@@ -669,7 +669,7 @@ mod tests {
     fn void_history() -> TerminalFact {
         TerminalFact::VoidHistory {
             lag: LandingLag {
-                batch: BatchId::from_raw(7),
+                batch_nonce: 7,
                 first_frame_safe_block: 10,
                 safe_block: 1209,
             },

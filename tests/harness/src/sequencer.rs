@@ -530,7 +530,7 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
         let fee: i64 = conn
             .query_row(
-                "SELECT fee FROM frames ORDER BY batch_index, frame_in_batch LIMIT 1",
+                "SELECT fee FROM frames ORDER BY batch_nonce, frame_in_batch LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -554,7 +554,7 @@ impl ManagedSequencer {
             .query_row(
                 "SELECT f.safe_block, h.block_number \
                  FROM open_batch b \
-                 JOIN frames f ON f.batch_index = b.batch_index \
+                 JOIN frames f ON f.batch_nonce = b.nonce \
                  JOIN l1_safe_head h ON h.singleton_id = 0 \
                  ORDER BY f.frame_in_batch DESC LIMIT 1",
                 [],
@@ -584,7 +584,7 @@ impl ManagedSequencer {
             .query_row(
                 "SELECT b.nonce, \
                         (SELECT f.safe_block FROM frames f \
-                          WHERE f.batch_index = b.batch_index \
+                          WHERE f.batch_nonce = b.nonce \
                           ORDER BY f.frame_in_batch LIMIT 1) \
                  FROM batches b \
                  WHERE b.accepted_input IS NULL \
@@ -685,7 +685,7 @@ impl ManagedSequencer {
     /// read-only: the resume nonce of a rebuilt deployment, `0` for a genesis
     /// one. The batch nonces are contiguous from it (I16). Fails when the era
     /// is absent.
-    pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
+    pub fn anchor_batch_nonce(&self) -> HarnessResult<u64> {
         let db_path = self.data_dir_path.join("sequencer.db");
         let conn = rusqlite::Connection::open_with_flags(
             db_path.as_path(),
@@ -822,8 +822,7 @@ impl ManagedSequencer {
     ///   1. At most one `open_batch` row (partial unique index
     ///      `ux_single_open_batch` should guarantee this structurally —
     ///      we verify it in case the index ever regressed).
-    ///   2. In `batch_index` order, each batch's nonce is the era's anchor
-    ///      plus its position (I16): unique and contiguous.
+    ///   2. The batch nonces are contiguous from the era's anchor (I16).
     ///
     /// Panics with a specific violation message if any invariant fails.
     /// Harness-only check (no sequencer changes) that catches regressions
@@ -838,10 +837,10 @@ impl ManagedSequencer {
 
         // The era's anchor: the first batch's nonce (0 for a genesis
         // deployment, N' for a cockroach-recovered one). Mirrors
-        // `trg_batch_insert`. Reuses the `batch_tree_anchor()`
+        // `trg_batch_insert`. Reuses the `anchor_batch_nonce()`
         // accessor (its own short-lived read-only handle) rather than
         // re-issuing the query against `conn`.
-        let anchor = self.batch_tree_anchor()? as i64;
+        let anchor = self.anchor_batch_nonce()? as i64;
 
         // 1. At most one open batch.
         let open_count: i64 = conn
@@ -851,9 +850,9 @@ impl ManagedSequencer {
             panic!("schema invariant: more than one open batch ({open_count} rows)");
         }
 
-        // 2. The nonces follow the batches from the anchor.
+        // 2. The nonces are contiguous from the anchor.
         let mut stmt = conn
-            .prepare("SELECT nonce FROM batches ORDER BY batch_index ASC")
+            .prepare("SELECT nonce FROM batches ORDER BY nonce ASC")
             .map_err(|err| io_other(format!("prepare batch nonces: {err}")))?;
         let nonces: Vec<i64> = stmt
             .query_map([], |row| row.get::<_, i64>(0))
@@ -863,8 +862,8 @@ impl ManagedSequencer {
         for (i, &n) in nonces.iter().enumerate() {
             if n != anchor + i as i64 {
                 panic!(
-                    "schema invariant: batch nonces are not the anchor {anchor} plus their \
-                     position: {nonces:?}"
+                    "schema invariant: batch nonces are not contiguous from the anchor \
+                     {anchor}: {nonces:?}"
                 );
             }
         }

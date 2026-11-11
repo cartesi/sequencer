@@ -216,13 +216,13 @@ impl LandingWatch {
 }
 
 fn log_reading(reading: &LandingReading, info: bool) {
-    let batch = reading.lag.map(|lag| tracing::field::display(lag.batch));
+    let batch_nonce = reading.lag.map(|lag| lag.batch_nonce);
     let landing_lag_blocks = reading.landing_lag_blocks();
     let max_wait_blocks = reading.max_wait_blocks;
     let safe_head_age_seconds = reading.safe_head_age_seconds(crate::clock::unix_now_ms());
     if info {
         tracing::info!(
-            batch,
+            batch_nonce,
             landing_lag_blocks,
             max_wait_blocks,
             safe_head_age_seconds,
@@ -230,7 +230,7 @@ fn log_reading(reading: &LandingReading, info: bool) {
         );
     } else {
         tracing::debug!(
-            batch,
+            batch_nonce,
             landing_lag_blocks,
             max_wait_blocks,
             safe_head_age_seconds,

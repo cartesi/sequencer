@@ -52,7 +52,7 @@ pub(crate) async fn run_setup_refuses_a_set_up_data_directory_test(
     assert_eq!(era.first_queued_input, 0, "nothing is queued");
     assert_eq!(
         era.next_batch_nonce, 0,
-        "the batch tree starts at nonce zero"
+        "the batch list starts at nonce zero"
     );
     assert_eq!(
         runtime.rebuilt_history_rows()?,

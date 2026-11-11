@@ -493,7 +493,7 @@ canonical agreement.
 
 ## Storage Model
 
-- `batches`: batch metadata, including the safe input that carried its accepted landing (`accepted_input`)
+- `batches`: one row per batch, keyed by its nonce, with the safe input that carried its accepted landing (`accepted_input`)
 - `frames`: frame boundaries within each batch
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations

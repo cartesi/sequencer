@@ -65,10 +65,9 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
     // before `run` opens its first batch).
     let latest_batch = match tx.query_row(
         "SELECT
-            b.batch_index,
             b.nonce,
             b.created_at_ms,
-            (SELECT COUNT(*) FROM user_ops u WHERE u.batch_index = b.batch_index) AS user_op_count
+            (SELECT COUNT(*) FROM user_ops u WHERE u.batch_nonce = b.nonce) AS user_op_count
          FROM open_batch b",
         [],
         |row| {
@@ -76,7 +75,6 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
             ))
         },
     ) {
@@ -84,25 +82,23 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(other) => return Err(other),
     };
-    let (batch_index_i64, batch_nonce_i64, batch_created_at_ms, batch_user_op_count_i64) =
-        latest_batch;
+    let (batch_nonce_i64, batch_created_at_ms, batch_user_op_count_i64) = latest_batch;
 
     let (frame_in_batch_i64, frame_fee_i64, safe_block_i64): (i64, i64, i64) = tx.query_row(
         "SELECT frame_in_batch, fee, safe_block FROM frames \
-         WHERE batch_index = ?1 ORDER BY frame_in_batch DESC LIMIT 1",
-        params![batch_index_i64],
+         WHERE batch_nonce = ?1 ORDER BY frame_in_batch DESC LIMIT 1",
+        params![batch_nonce_i64],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
 
     let open_frame_user_op_count: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2",
-        params![batch_index_i64, frame_in_batch_i64],
+        "SELECT COUNT(*) FROM user_ops WHERE batch_nonce = ?1 AND frame_in_batch = ?2",
+        params![batch_nonce_i64, frame_in_batch_i64],
         |row| row.get(0),
     )?;
 
     let policy = query_batch_policy(tx)?;
     Ok(Some(WriteHead {
-        batch_index: i64_to_u64(batch_index_i64),
         batch_nonce: i64_to_u64(batch_nonce_i64),
         batch_created_at: from_unix_ms(batch_created_at_ms),
         frame_fee: i64_to_u16(frame_fee_i64),

@@ -175,7 +175,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
     );
     storage
         .conn
-        .execute("DELETE FROM snapshots WHERE batch_index=1", [])
+        .execute("DELETE FROM snapshots WHERE batch_nonce=8", [])
         .unwrap();
     assert!(matches!(
         storage.history_info(None, None),

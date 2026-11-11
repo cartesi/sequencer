@@ -240,9 +240,9 @@ fn collect_unleased_in(tx: &Transaction<'_>, registry: &mut LeaseCounters) -> Re
     let candidates = {
         let mut stmt = tx.prepare(
             "SELECT s.snapshot_id, s.prefix FROM snapshots s \
-             LEFT JOIN batches b ON b.batch_index = s.batch_index \
+             LEFT JOIN batches b ON b.nonce = s.batch_nonce \
              WHERE (?1 IS NULL OR s.snapshot_id != ?1) \
-               AND (s.batch_index IS NULL OR b.accepted_input IS NOT NULL) \
+               AND (s.batch_nonce IS NULL OR b.accepted_input IS NOT NULL) \
              ORDER BY s.snapshot_id",
         )?;
         stmt.query_map(params![anchor_id], |row| {
@@ -282,22 +282,22 @@ pub(super) fn insert_baseline_snapshot_in(
 pub(super) fn insert_batch_snapshot_in(
     tx: &Transaction<'_>,
     prefix: &Path,
-    batch_index: u64,
+    batch_nonce: u64,
     count: L2TxCount,
 ) -> Result<i64> {
     // Registration is composed with sealing, so the batch must already be closed.
     tx.query_row(
-        "SELECT batch_index FROM closed_batches WHERE batch_index = ?1",
-        [u64_to_i64(batch_index)],
+        "SELECT nonce FROM closed_batches WHERE nonce = ?1",
+        [u64_to_i64(batch_nonce)],
         |_| Ok(()),
     )?;
-    insert_snapshot_in(tx, prefix, Some(batch_index), count)
+    insert_snapshot_in(tx, prefix, Some(batch_nonce), count)
 }
 
 fn insert_snapshot_in(
     tx: &Transaction<'_>,
     prefix: &Path,
-    batch_index: Option<u64>,
+    batch_nonce: Option<u64>,
     count: L2TxCount,
 ) -> Result<i64> {
     assert_eq!(
@@ -306,9 +306,9 @@ fn insert_snapshot_in(
         "snapshot count differs from canonical storage history"
     );
     tx.execute(
-        "INSERT INTO snapshots (batch_index, l2_tx_count, prefix) VALUES (?1, ?2, ?3)",
+        "INSERT INTO snapshots (batch_nonce, l2_tx_count, prefix) VALUES (?1, ?2, ?3)",
         params![
-            batch_index.map(u64_to_i64),
+            batch_nonce.map(u64_to_i64),
             u64_to_i64(count.get()),
             prefix.to_string_lossy().as_ref()
         ],
@@ -324,41 +324,35 @@ pub(super) fn has_rollback_safe_snapshot_in(conn: &Connection) -> Result<bool> {
 
 fn rollback_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     match latest_accepted_boundary_in(conn)? {
-        Some((batch_index, _, _)) => snapshot_for_batch_in(conn, batch_index).map(Some),
+        Some((nonce, _)) => snapshot_for_batch_in(conn, nonce).map(Some),
         None => baseline_snapshot_in(conn),
     }
 }
 
-/// The greatest accepted batch: `(batch_index, nonce, inclusion block)`, the
-/// block of the safe input that carried its accepted landing.
-fn latest_accepted_boundary_in(conn: &Connection) -> Result<Option<(u64, u64, u64)>> {
+/// The greatest accepted batch: `(nonce, inclusion block)`, the block of the
+/// safe input that carried its accepted landing.
+fn latest_accepted_boundary_in(conn: &Connection) -> Result<Option<(u64, u64)>> {
     conn.query_row(
-        "SELECT b.batch_index, b.nonce, s.block_number FROM batches b \
+        "SELECT b.nonce, s.block_number FROM batches b \
          JOIN safe_inputs s ON s.safe_input_index = b.accepted_input \
          WHERE b.accepted_input = (SELECT MAX(accepted_input) FROM batches)",
         [],
-        |row| {
-            Ok((
-                i64_to_u64(row.get(0)?),
-                i64_to_u64(row.get(1)?),
-                i64_to_u64(row.get(2)?),
-            ))
-        },
+        |row| Ok((i64_to_u64(row.get(0)?), i64_to_u64(row.get(1)?))),
     )
     .optional()
 }
 
-fn snapshot_for_batch_in(conn: &Connection, batch_index: u64) -> Result<Snapshot> {
+fn snapshot_for_batch_in(conn: &Connection, batch_nonce: u64) -> Result<Snapshot> {
     conn.query_row(
-        "SELECT snapshot_id, prefix, l2_tx_count FROM snapshots WHERE batch_index = ?1",
-        [u64_to_i64(batch_index)],
+        "SELECT snapshot_id, prefix, l2_tx_count FROM snapshots WHERE batch_nonce = ?1",
+        [u64_to_i64(batch_nonce)],
         row_to_snapshot,
     )
 }
 
 fn baseline_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     conn.query_row(
-        "SELECT snapshot_id, prefix, l2_tx_count FROM snapshots WHERE batch_index IS NULL",
+        "SELECT snapshot_id, prefix, l2_tx_count FROM snapshots WHERE batch_nonce IS NULL",
         [],
         row_to_snapshot,
     )
@@ -373,9 +367,9 @@ pub(super) fn finalized_dump_in(
     if super::acceptance::canonical_divergence_in(conn)?.is_some() {
         return Err(FinalizedSelectionError::CanonicalDivergence);
     }
-    if let Some((batch_index, nonce, inclusion_block)) = latest_accepted_boundary_in(conn)? {
+    if let Some((nonce, inclusion_block)) = latest_accepted_boundary_in(conn)? {
         return Ok(Some(FinalizedDump {
-            snapshot: snapshot_for_batch_in(conn, batch_index)?,
+            snapshot: snapshot_for_batch_in(conn, nonce)?,
             inclusion_block,
             next_batch_nonce: nonce.checked_add(1).expect("accepted nonce overflow"),
         }));
@@ -399,39 +393,31 @@ pub(super) fn finalized_dump_in(
 }
 
 fn latest_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
-    let batch_index: Option<i64> = conn
+    let nonce: Option<i64> = conn
         .query_row(
-            "SELECT batch_index FROM closed_batches ORDER BY batch_index DESC LIMIT 1",
+            "SELECT nonce FROM closed_batches ORDER BY nonce DESC LIMIT 1",
             [],
             |r| r.get(0),
         )
         .optional()?;
-    match batch_index {
-        Some(index) => snapshot_for_batch_in(conn, i64_to_u64(index)).map(Some),
+    match nonce {
+        Some(nonce) => snapshot_for_batch_in(conn, i64_to_u64(nonce)).map(Some),
         None => baseline_snapshot_in(conn),
     }
 }
 
 fn snapshot_next_nonce_in(conn: &Connection, snapshot_id: i64) -> Result<u64> {
-    let batch_index: Option<i64> = conn.query_row(
-        "SELECT batch_index FROM snapshots WHERE snapshot_id = ?1",
+    let batch_nonce: Option<i64> = conn.query_row(
+        "SELECT batch_nonce FROM snapshots WHERE snapshot_id = ?1",
         [snapshot_id],
         |r| r.get(0),
     )?;
-    match batch_index {
-        Some(index) => Ok(batch_nonce_in(conn, i64_to_u64(index))?
+    match batch_nonce {
+        Some(nonce) => Ok(i64_to_u64(nonce)
             .checked_add(1)
             .expect("batch nonce overflow")),
         None => Ok(era_in(conn)?.anchor_batch_nonce),
     }
-}
-
-pub(super) fn batch_nonce_in(conn: &Connection, batch_index: u64) -> Result<u64> {
-    conn.query_row(
-        "SELECT nonce FROM batches WHERE batch_index = ?1",
-        [u64_to_i64(batch_index)],
-        |row| Ok(i64_to_u64(row.get(0)?)),
-    )
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<Snapshot> {

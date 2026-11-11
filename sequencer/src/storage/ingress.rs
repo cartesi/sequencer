@@ -74,14 +74,14 @@ impl Storage {
     pub fn current_fee_quote(&mut self) -> Result<Option<FeeQuote>> {
         self.read(|tx| {
             let tip: Option<i64> = tx
-                .query_row("SELECT batch_index FROM open_batch", [], |row| row.get(0))
+                .query_row("SELECT nonce FROM open_batch", [], |row| row.get(0))
                 .optional()?;
             let Some(tip) = tip else {
                 return Ok(None);
             };
             // Every batch has a frame; a missing one fails loud.
             let frame_fee: i64 = tx.query_row(
-                "SELECT fee FROM frames WHERE batch_index = ?1 \
+                "SELECT fee FROM frames WHERE batch_nonce = ?1 \
                  ORDER BY frame_in_batch DESC LIMIT 1",
                 params![tip],
                 |row| row.get(0),
@@ -207,7 +207,7 @@ impl Storage {
         self.write(|tx| {
             insert_executed_user_ops_batch(
                 tx,
-                head.batch_index,
+                head.batch_nonce,
                 head.frame_in_batch,
                 head.open_frame_user_op_count,
                 user_ops,
@@ -250,7 +250,7 @@ impl Storage {
                 "application count changed between dump creation and batch close"
             );
             let next = seal_and_open_next_batch(tx, head)?;
-            insert_batch_snapshot_in(tx, dump_dir, head.batch_index, l2_tx_count)?;
+            insert_batch_snapshot_in(tx, dump_dir, head.batch_nonce, l2_tx_count)?;
             Ok(next)
         })?;
         next.apply_to(head);
@@ -259,25 +259,21 @@ impl Storage {
 }
 
 /// Insert the Tip and its first frame. Callers separately attach the complete
-/// leading application range. Returns its local identity; callers load
-/// `WriteHead` through the shared reader.
-pub(super) fn insert_tip_rows(
-    tx: &Transaction<'_>,
-    batch_index_opt: Option<u64>,
-    safe_block: u64,
-) -> Result<u64> {
+/// leading application range. Returns its nonce; callers load `WriteHead`
+/// through the shared reader.
+pub(super) fn insert_tip_rows(tx: &Transaction<'_>, safe_block: u64) -> Result<u64> {
     let now_ms = now_unix_ms();
     let policy = query_batch_policy(tx)?;
-    let (batch_index, _nonce) = insert_new_batch(tx, batch_index_opt, now_ms)?;
+    let batch_nonce = insert_new_batch(tx, now_ms)?;
     insert_open_frame(
         tx,
-        batch_index,
+        batch_nonce,
         0,
         now_ms,
         policy.recommended_fee,
         safe_block,
     )?;
-    Ok(batch_index)
+    Ok(batch_nonce)
 }
 
 /// Extend the batch list with a fresh open Tip at the current safe head,
@@ -288,20 +284,11 @@ pub(super) fn insert_tip_rows(
 /// Its production caller is `run`'s startup, through the guarded
 /// `Storage::open_batch_if_none` (`storage/landing.rs`), which opens the era's
 /// first batch. The new Tip follows the last batch, at the era's anchor
-/// nonce when there is none; `batch_index` is the explicit genesis `0` only
-/// when the `batches` table is empty, otherwise the monotonic PK (so indices
-/// are never reused).
+/// nonce when there is none.
 pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
     let safe_block = current_safe_block_required(tx)?;
-    let table_empty = tx
-        .query_row("SELECT MAX(batch_index) FROM batches", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?
-        .is_none();
-    let batch_index_opt = if table_empty { Some(0) } else { None };
     insert_draining_tip_with_executions(
         tx,
-        batch_index_opt,
         safe_block,
         query_latest_safe_input_index_exclusive(tx)?,
     )
@@ -312,14 +299,13 @@ pub(super) fn open_fresh_tip_in_tx(tx: &Transaction<'_>) -> Result<()> {
 /// processing queued user operations.
 fn insert_draining_tip_with_executions(
     tx: &Transaction<'_>,
-    batch_index: Option<u64>,
     safe_block: u64,
     drain_upper: u64,
 ) -> Result<()> {
     let leading_direct_range =
         SafeInputRange::new(next_undrained_safe_input_index_in(tx)?, drain_upper);
-    let batch_index = insert_tip_rows(tx, batch_index, safe_block)?;
-    persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
+    let batch_nonce = insert_tip_rows(tx, safe_block)?;
+    persist_frame_direct_sequence_derived(tx, batch_nonce, 0, leading_direct_range)?;
     Ok(())
 }
 
@@ -332,7 +318,7 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
     let latest_frame: Option<i64> = tx
         .query_row(
             "SELECT safe_block FROM frames
-         WHERE batch_index = (SELECT MAX(batch_index) FROM batches)
+         WHERE batch_nonce = (SELECT MAX(nonce) FROM batches)
          ORDER BY frame_in_batch DESC LIMIT 1",
             [],
             |row| row.get(0),
@@ -349,7 +335,6 @@ fn next_undrained_safe_input_index_in(tx: &Transaction<'_>) -> Result<u64> {
 /// The successor batch a close opened, for the caller to apply to its
 /// in-memory write head after the commit.
 pub(super) struct NextBatch {
-    batch_index: u64,
     nonce: u64,
     created_at_ms: i64,
     policy: BatchPolicy,
@@ -357,12 +342,7 @@ pub(super) struct NextBatch {
 
 impl NextBatch {
     pub(super) fn apply_to(self, head: &mut WriteHead) {
-        head.move_to_next_batch(
-            self.batch_index,
-            self.nonce,
-            from_unix_ms(self.created_at_ms),
-            self.policy,
-        );
+        head.move_to_next_batch(self.nonce, from_unix_ms(self.created_at_ms), self.policy);
     }
 }
 
@@ -386,26 +366,21 @@ pub(super) fn seal_and_open_next_batch(
     // the same path the submitter uses and stamp their keccak256 on the row,
     // atomically with the seal. The content-identity check later compares
     // accepted L1 landings against this hash.
-    let nonce = super::snapshots::batch_nonce_in(tx, head.batch_index)?;
-    assert_eq!(
-        nonce, head.batch_nonce,
-        "the sealed batch's nonce differs from the write head's"
-    );
-    let frames = super::l1_submission::load_batch_frames_in(tx, head.batch_index)?;
+    let nonce = head.batch_nonce;
+    let frames = super::l1_submission::load_batch_frames_in(tx, nonce)?;
     let encoded = ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch { nonce, frames });
     let payload_hash = alloy_primitives::keccak256(&encoded);
-    seal_batch(tx, head.batch_index, now_ms, &payload_hash.0)?;
-    let (next_batch_index, next_nonce) = insert_new_batch(tx, None, now_ms)?;
+    seal_batch(tx, nonce, now_ms, &payload_hash.0)?;
+    let next_nonce = insert_new_batch(tx, now_ms)?;
     insert_open_frame(
         tx,
-        next_batch_index,
+        next_nonce,
         0,
         now_ms,
         policy.recommended_fee,
         head.safe_block,
     )?;
     Ok(NextBatch {
-        batch_index: next_batch_index,
         nonce: next_nonce,
         created_at_ms: now_ms,
         policy,
@@ -413,7 +388,7 @@ pub(super) fn seal_and_open_next_batch(
 }
 
 /// Fail loud unless the Tip reloaded inside `tx` agrees with `head` on every
-/// persisted fact: batch, nonce, frame, counts, fee and safe block. The size
+/// persisted fact: batch nonce, frame, counts, fee and safe block. The size
 /// target is left out: a reload samples the policy now, while the head keeps
 /// the value sampled when its frame opened. Runs once per rotation or close.
 fn assert_head_matches_tip(tx: &Transaction<'_>, head: &WriteHead) -> Result<()> {
@@ -421,7 +396,6 @@ fn assert_head_matches_tip(tx: &Transaction<'_>, head: &WriteHead) -> Result<()>
         load_current_write_head(tx)?.expect("a frame rotation or batch close requires the Tip");
     let persisted = |head: &WriteHead| {
         (
-            head.batch_index,
             head.batch_nonce,
             head.frame_in_batch,
             head.batch_user_op_count,
@@ -461,7 +435,7 @@ fn close_frame_in(
     let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
     persist_frame_direct_sequence(
         tx,
-        head.batch_index,
+        head.batch_nonce,
         next_frame_in_batch,
         leading_direct_range,
         executions,
@@ -487,7 +461,7 @@ pub(super) fn open_successor_frame_in(
         .expect("frame index overflow: contract-impossible");
     insert_open_frame(
         tx,
-        head.batch_index,
+        head.batch_nonce,
         next_frame_in_batch,
         now_ms,
         policy.recommended_fee,
@@ -498,14 +472,14 @@ pub(super) fn open_successor_frame_in(
 
 fn insert_user_op_iter<'a>(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     frame_pos_start: u32,
     user_ops: impl Iterator<Item = ExecutedUserOp<'a>>,
 ) -> Result<()> {
     let mut stmt = tx.prepare_cached(
         "INSERT INTO user_ops (
-            batch_index, frame_in_batch, pos_in_frame,
+            batch_nonce, frame_in_batch, pos_in_frame,
             sender, nonce, max_fee, data, sig, received_at_ms
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
@@ -517,7 +491,7 @@ fn insert_user_op_iter<'a>(
             .expect("user-op position overflow: contract-impossible");
         let sig = item.signed.signature.as_bytes();
         stmt.execute(params![
-            u64_to_i64(batch_index),
+            u64_to_i64(batch_nonce),
             i64::from(frame_in_batch),
             i64::from(pos_in_frame),
             item.signed.sender.as_slice(),
@@ -534,20 +508,20 @@ fn insert_user_op_iter<'a>(
 /// User-op source and application position become durable before acknowledgement.
 fn insert_executed_user_ops_batch<'a>(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     frame_pos_start: u32,
     user_ops: impl Iterator<Item = ExecutedUserOp<'a>> + Clone,
 ) -> Result<()> {
     insert_user_op_iter(
         tx,
-        batch_index,
+        batch_nonce,
         frame_in_batch,
         frame_pos_start,
         user_ops.clone(),
     )?;
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO application_inputs (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame)
+        "INSERT INTO application_inputs (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (position, item) in user_ops.enumerate() {
@@ -556,7 +530,7 @@ fn insert_executed_user_ops_batch<'a>(
             .expect("user-op position overflow");
         stmt.execute(params![
             u64_to_i64(item.l2_tx_index.get()),
-            u64_to_i64(batch_index),
+            u64_to_i64(batch_nonce),
             i64::from(frame_in_batch),
             i64::from(position)
         ])?;
@@ -619,14 +593,14 @@ mod tests {
         storage
             .insert_baseline_snapshot(prefix, L2TxCount::ZERO)
             .unwrap();
-        let batch = head.batch_index();
+        let batch = head.batch_nonce();
         let error = storage
             .close_frame_and_batch_with_snapshot(&mut head, prefix, L2TxCount::ZERO)
             .expect_err("colliding artifact name must roll back the whole close");
         assert!(error.to_string().contains("UNIQUE"));
-        assert_eq!(head.batch_index(), batch);
+        assert_eq!(head.batch_nonce(), batch);
         let persisted = storage.open_state().unwrap().unwrap();
-        assert_eq!(persisted.batch_index(), batch);
+        assert_eq!(persisted.batch_nonce(), batch);
         assert_eq!(persisted.frame_in_batch(), head.frame_in_batch());
         assert_eq!(
             storage
@@ -655,7 +629,7 @@ mod tests {
     }
 
     /// Heads that each disagree with the durable Tip on one persisted fact:
-    /// an older batch, a wrong nonce, an older or later frame, a position past
+    /// an older batch, a later one, an older or later frame, a position past
     /// the frame's rows, a batch count, a fee or a safe block.
     fn stale_heads(head: &WriteHead) -> Vec<(&'static str, WriteHead)> {
         let live = WriteHeadParts::of(head);
@@ -664,7 +638,7 @@ mod tests {
             stale(
                 "batch",
                 WriteHeadParts {
-                    batch_index: live.batch_index - 1,
+                    batch_nonce: live.batch_nonce - 1,
                     ..live
                 },
             ),
@@ -791,7 +765,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(storage.latest_batch_index().unwrap(), Some(1));
+        assert_eq!(storage.latest_batch_nonce().unwrap(), Some(1));
         let mut head = head;
         storage
             .close_frame_and_batch_with_snapshot(
@@ -800,7 +774,7 @@ mod tests {
                 count,
             )
             .expect("the live head still closes");
-        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(2));
+        assert_eq!(head.batch_nonce(), 2);
     }
 
     /// The head carries its batch's nonce from the loader and through every
@@ -864,25 +838,25 @@ mod tests {
             .expect("load existing open state")
             .expect("open state should now exist");
 
-        assert_eq!(head_a.batch_index(), head_b.batch_index());
+        assert_eq!(head_a.batch_nonce(), head_b.batch_nonce());
         assert_eq!(head_a.frame_in_batch(), head_b.frame_in_batch());
         assert_eq!(head_a.frame_fee(), head_b.frame_fee());
         // Default log_recommended_fee = 0+296+20+419+621 = 1356
         assert_eq!(head_a.frame_fee(), 1356);
 
-        let batch_b = head_b.batch_index();
+        let batch_b = head_b.batch_nonce();
         let mut head = head_b;
         let next_safe_block = head.safe_block();
         storage
             .close_frame_only(&mut head, next_safe_block, SafeInputRange::empty_at(0))
             .expect("rotate within same batch");
-        assert_eq!(head.batch_index(), batch_b);
+        assert_eq!(head.batch_nonce(), batch_b);
         assert_eq!(head.frame_in_batch(), 1);
 
         storage
             .close_frame_and_batch(&mut head)
             .expect("close batch and rotate");
-        assert!(head.batch_index() > batch_b);
+        assert!(head.batch_nonce() > batch_b);
         assert_eq!(head.frame_in_batch(), 0);
     }
 
@@ -1103,7 +1077,7 @@ mod tests {
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        let original_batch_index = head.batch_index();
+        let original_batch_nonce = head.batch_nonce();
         let original_frame_in_batch = head.frame_in_batch();
         // Default: log_gas_price=0 → log_recommended_fee = 0+296+20+419+621 = 1356
         assert_eq!(head.frame_fee(), 1356);
@@ -1123,11 +1097,8 @@ mod tests {
         let persisted_frame_fee: i64 = storage
             .conn
             .query_row(
-                "SELECT fee FROM frames WHERE batch_index = ?1 AND frame_in_batch = ?2",
-                rusqlite::params![
-                    original_batch_index.to_raw() as i64,
-                    original_frame_in_batch as i64,
-                ],
+                "SELECT fee FROM frames WHERE batch_nonce = ?1 AND frame_in_batch = ?2",
+                rusqlite::params![original_batch_nonce as i64, original_frame_in_batch as i64,],
                 |row| row.get(0),
             )
             .expect("query open frame fee");
@@ -1290,7 +1261,7 @@ mod tests {
             .initialize_open_state(12, SafeInputRange::empty_at(0))
             .expect("initialize open state");
 
-        assert_eq!(head.batch_index(), crate::storage::BatchId::from_raw(0));
+        assert_eq!(head.batch_nonce(), 0);
         assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(head.safe_block(), 12);
 
@@ -1298,7 +1269,7 @@ mod tests {
             .open_state()
             .expect("load open state")
             .expect("open state should exist");
-        assert_eq!(loaded.batch_index(), crate::storage::BatchId::from_raw(0));
+        assert_eq!(loaded.batch_nonce(), 0);
         assert_eq!(loaded.frame_in_batch(), 0);
         assert_eq!(loaded.safe_block(), 12);
     }
@@ -1386,9 +1357,9 @@ mod tests {
             .expect("load open state")
             .expect("genesis tip exists");
         assert_eq!(
-            head.batch_index(),
-            crate::storage::BatchId::from_raw(0),
-            "genesis batch is index 0"
+            head.batch_nonce(),
+            0,
+            "the genesis era's first batch carries nonce 0"
         );
         assert_eq!(head.frame_in_batch(), 0);
         assert_eq!(
@@ -1448,8 +1419,8 @@ mod tests {
             .expect("load open state")
             .expect("tip still exists");
         assert_eq!(
-            head.batch_index(),
-            seeded.batch_index(),
+            head.batch_nonce(),
+            seeded.batch_nonce(),
             "warm path leaves the existing Tip, does not reopen"
         );
         assert_eq!(
@@ -1472,7 +1443,7 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO application_inputs \
-                 (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame) \
+                 (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame) \
                  VALUES (0, 0, 0, 0)",
                 [],
             )
@@ -1490,7 +1461,7 @@ mod tests {
             .append_included_user_ops(&mut head, &[included_user_op(0, 0)])
             .unwrap();
         storage.close_frame_and_batch(&mut head).unwrap();
-        let err = storage.conn.execute("INSERT INTO application_inputs (l2_tx_count,batch_index,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
+        let err = storage.conn.execute("INSERT INTO application_inputs (l2_tx_count,batch_nonce,frame_in_batch,user_op_pos_in_frame) VALUES (1,0,0,0)", []).unwrap_err();
         assert!(err.to_string().contains("must target the open batch"));
         assert!(
             storage

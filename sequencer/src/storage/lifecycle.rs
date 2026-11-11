@@ -379,7 +379,7 @@ mod tests {
             .conn
             .execute_batch(
                 "DROP TRIGGER trg_batch_insert; \
-                 INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (0, 0, 0);",
+                 INSERT INTO batches (nonce, created_at_ms) VALUES (0, 0);",
             )
             .expect("seed a batch");
         assert!(matches!(

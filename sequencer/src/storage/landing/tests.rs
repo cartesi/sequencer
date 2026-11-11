@@ -16,16 +16,13 @@ fn void_at(storage: &mut Storage, safe_block: u64) -> Option<TerminalFact> {
     storage.terminal_fact().expect("terminal fact")
 }
 
-/// The batches as `(batch_index, nonce, sealed)`.
-fn batch_rows(storage: &mut Storage) -> Vec<(i64, i64, bool)> {
+/// The batches as `(nonce, sealed)`, in nonce order.
+fn batch_rows(storage: &mut Storage) -> Vec<(i64, bool)> {
     storage
         .read(|tx| {
-            tx.prepare(
-                "SELECT batch_index, nonce, sealed_at_ms IS NOT NULL \
-                 FROM batches ORDER BY batch_index",
-            )?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect()
+            tx.prepare("SELECT nonce, sealed_at_ms IS NOT NULL FROM batches ORDER BY nonce")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect()
         })
         .expect("read batches")
 }
@@ -69,13 +66,13 @@ mod void_history {
             .landing_lag()
             .expect("lag")
             .expect("an unaccepted batch");
-        assert_eq!(lag.batch, BatchId::new(0));
+        assert_eq!(lag.batch_nonce, 0);
         assert_eq!(lag.blocks(), W - 1);
         assert!(!lag.is_void(W));
 
         let fact = void_at(&mut storage, last_live + 1).expect("void at the boundary");
         let lag = LandingLag {
-            batch: BatchId::new(0),
+            batch_nonce: 0,
             first_frame_safe_block: 100,
             safe_block: 100 + W - 1,
         };
@@ -130,14 +127,14 @@ mod void_history {
         assert_eq!(
             storage.landing_lag().expect("lag"),
             Some(LandingLag {
-                batch: BatchId::new(0),
+                batch_nonce: 0,
                 first_frame_safe_block: 10,
                 safe_block: 10 + W - 2,
             })
         );
         assert!(matches!(
             void_at(&mut storage, 10 + W - 1),
-            Some(TerminalFact::VoidHistory { lag, .. }) if lag.batch == BatchId::new(0)
+            Some(TerminalFact::VoidHistory { lag, .. }) if lag.batch_nonce == 0
         ));
     }
 
@@ -174,7 +171,7 @@ mod void_history {
         assert_eq!(
             storage.landing_lag().expect("lag"),
             Some(LandingLag {
-                batch: BatchId::new(1),
+                batch_nonce: 1,
                 first_frame_safe_block: 1000,
                 safe_block,
             })
@@ -197,12 +194,15 @@ mod void_history {
         storage
             .close_batch_at(&mut head, 500)
             .expect("close batch 1");
-        assert_eq!(head.batch_index(), BatchId::new(2));
+        assert_eq!(head.batch_nonce(), 2);
 
         assert_eq!(void_at(&mut storage, 20), None);
         assert_eq!(
-            storage.landing_lag().expect("lag").map(|lag| lag.batch),
-            Some(BatchId::new(0))
+            storage
+                .landing_lag()
+                .expect("lag")
+                .map(|lag| lag.batch_nonce),
+            Some(0)
         );
 
         // Accepting batch 0 moves the judgement to batch 1, not to the open
@@ -210,13 +210,16 @@ mod void_history {
         let landed = local_batch_payload(&mut storage, 0);
         storage.land(30, &[(SENDER_A, landed)]);
         assert_eq!(
-            storage.landing_lag().expect("lag").map(|lag| lag.batch),
-            Some(BatchId::new(1))
+            storage
+                .landing_lag()
+                .expect("lag")
+                .map(|lag| lag.batch_nonce),
+            Some(1)
         );
         assert!(matches!(
             void_at(&mut storage, 10 + W - 1),
             Some(TerminalFact::VoidHistory { lag, .. })
-                if lag.batch == BatchId::new(1) && lag.first_frame_safe_block == 10
+                if lag.batch_nonce == 1 && lag.first_frame_safe_block == 10
         ));
     }
 
@@ -249,7 +252,7 @@ mod void_history {
             .conn
             .execute_batch(
                 "DROP TRIGGER trg_frames_not_deletable; \
-                 DELETE FROM frames WHERE batch_index = 0;",
+                 DELETE FROM frames WHERE batch_nonce = 0;",
             )
             .expect("inject missing-frame corruption");
         let err = storage
@@ -268,10 +271,10 @@ mod open_batch_if_none {
         storage.advance_safe_head(42);
         assert!(storage.open_batch_if_none().expect("open"));
         let head = storage.open_state().expect("load").expect("an open batch");
-        assert_eq!(head.batch_index(), BatchId::new(0));
+        assert_eq!(head.batch_nonce(), 0);
         assert_eq!(head.safe_block(), 42);
         let opened = batch_rows(&mut storage);
-        assert_eq!(opened, vec![(0, 0, false)]);
+        assert_eq!(opened, vec![(0, false)]);
 
         assert!(!storage.open_batch_if_none().expect("no-op"));
         assert_eq!(batch_rows(&mut storage), opened);
@@ -309,7 +312,7 @@ mod open_batch_if_none {
         assert!(matches!(
             error,
             OpenBatchError::Terminal(TerminalFact::VoidHistory { lag, .. })
-                if lag.batch == BatchId::new(0)
+                if lag.batch_nonce == 0
         ));
         assert_eq!(batch_rows(&mut storage), before);
     }
@@ -329,7 +332,7 @@ mod open_batch_if_none {
                 "CREATE TRIGGER test_seal_new_tip AFTER INSERT ON frames \
                  BEGIN \
                    UPDATE batches SET sealed_at_ms = 1, payload_hash = zeroblob(32) \
-                   WHERE batch_index = NEW.batch_index; \
+                   WHERE nonce = NEW.batch_nonce; \
                  END",
             )
             .expect("install failure trigger");

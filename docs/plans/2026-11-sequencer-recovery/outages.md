@@ -1,6 +1,6 @@
 # One recovery: when batches stop landing
 
-**Status:** steps 1 to 3 of five are code. The sequencer has one recovery,
+**Status:** steps 1 to 3 of six are code. The sequencer has one recovery,
 [cockroach recovery](../../recovery/cockroach.md), and repairs nothing by
 itself. This page keeps what remains.
 
@@ -26,6 +26,8 @@ the operator's playbook, and why there is no automatic repair.
 3. **The batches are an append-only list.** No batch, frame, user op or
    application input is ever replaced or deleted, and the schema carries no
    invalidation ([I5](../../invariants.md#i5-batches-and-application-history-only-append)).
+   A nonce then names one batch for the life of the database, so it is the
+   batch's key: the separate local index and its `BatchId` type are gone.
 
 ## What remains
 
@@ -41,24 +43,17 @@ are rebuilt before the machine and devnet suites run.
    `HistoryVersion` goes: a claim is an era id and a count. The subscribe
    query refuses a field it does not know, so a client that still sends a
    generation fails loudly.
-5. **A last pass over the docs**, once 3 and 4 are in: the invariant register,
+5. **The wallet's window becomes 7200 blocks**, about 24 hours. At 1200 with
+   the default two-hour batch, a quiet wallet deployment has under two hours
+   to land each batch, and a posting stall past that ends the era. Tests do
+   not need the short window: they mine it in one call. Two things move with
+   it. The consensus vectors: four of the 41 guest scenarios pin the window's
+   boundary, and for them ten landing blocks, one batch payload, two expected
+   clocks and the config value change, while outcomes, transactions, outputs
+   and states do not. And one acceptance test with literal blocks, which
+   derives them from the window instead. The worked-boundary rebuild test
+   also gains a second stop block right after its malformed batch: it
+   documents the backstop firing, but its rows cannot tell a backstop drain
+   from a frame's.
+6. **A last pass over the docs**, once the rest is in: the invariant register,
    the threat model and `AGENTS.md`.
-
-## Still to decide
-
-- **The wallet's window.** At 1200 blocks with the default two-hour batch, a
-  quiet wallet deployment has under two hours to land each batch, and a
-  posting stall past that ends the era. Tests do not need the short window:
-  they mine it in one call. Moving the wallet to 7200 after step 4 touches
-  two things. The consensus vectors: four of the 41 guest scenarios pin the
-  window's boundary, and for them ten landing blocks, one batch payload, two
-  expected clocks and the config value move, while outcomes, transactions,
-  outputs and states do not. And one acceptance test with literal blocks,
-  which should derive them from the window. The worked-boundary rebuild test
-  also needs a second stop block right after its malformed batch: it
-  documents the backstop firing, but its rows cannot tell a backstop drain
-  from a frame's.
-- **The batch's key.** A batch nonce names one batch for the life of an era,
-  so `BatchId` and the nonce are two names for one thing. Making the nonce the
-  key touches every table that points at a batch; it is decided after step 3,
-  on what the schema looks like then.

@@ -14,10 +14,9 @@ limits this work accepts and the paths it left unverified.
 
 The sequencer repairs nothing by itself and stops for good on a void history
 ([batch landing and outages](../../recovery/README.md)). [outages.md](outages.md)
-keeps what remains: the batches as an append-only list, the recovery
-generation off every client interface, which the
-[egress redesign](#redesign-the-egress-api) below then need not do, and what is
-[still to decide](outages.md#still-to-decide).
+keeps what remains: the recovery generation off every client interface,
+which the [egress redesign](#redesign-the-egress-api) below then need not do,
+and the wallet's window at 24 hours.
 
 ## Promote to real docs
 

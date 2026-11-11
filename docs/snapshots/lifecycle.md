@@ -5,7 +5,7 @@ contents and boundary are immutable. L1 acceptance is a separate durable fact:
 there is no promotion operation and no mutable finalized pointer.
 
 Keep three boundaries separate: the engine embeds its L2 tx count;
-SQLite associates an artifact with a local batch or era baseline; safe L1
+SQLite associates an artifact with a batch or the era baseline; safe L1
 acceptance selects a comparison checkpoint. A count alone does not establish
 acceptance. The [history guide](../protocol/application-history.md)
 explains these coordinates.
@@ -30,12 +30,12 @@ SQLite holds one row per artifact and the boundary it holds:
 
 | Fact | Meaning |
 |---|---|
-| `snapshots` | Artifact path, immutable application count, and local batch identity |
-| Baseline snapshot (`batch_index IS NULL`) | The application at the end of the era's stop block, at its rebuilt history end |
+| `snapshots` | Artifact path, immutable application count, and the batch's nonce |
+| Baseline snapshot (`batch_nonce IS NULL`) | The application at the end of the era's stop block, at its rebuilt history end |
 | `batches.accepted_input` | The safe input whose scheduler-accepted, content-matched landing accepted the batch |
 
 The application count is the next canonical input position, never a physical
-SQLite cursor. The batch identity disambiguates empty batches, which can share
+SQLite cursor. The batch's nonce disambiguates empty batches, which can share
 an application count.
 
 ## Creation and restart

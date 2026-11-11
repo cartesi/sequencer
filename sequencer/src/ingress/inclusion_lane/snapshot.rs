@@ -48,7 +48,6 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     head: &mut WriteHead,
     dumps_dir: &Path,
 ) -> Result<(), TakeDumpError> {
-    let batch_index = head.batch_index();
     let nonce = head.batch_nonce();
     let dump_dir = make_dump_dir(dumps_dir, nonce);
     let started = Instant::now();
@@ -58,15 +57,13 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     let snapshot_ms = snapshot_elapsed.as_millis();
     if snapshot_elapsed >= SLOW_SNAPSHOT {
         tracing::warn!(
-            %batch_index,
-            nonce,
+            batch_nonce = nonce,
             snapshot_ms,
             "slow batch-close snapshot blocked user-op admission"
         );
     } else {
         tracing::debug!(
-            %batch_index,
-            nonce,
+            batch_nonce = nonce,
             snapshot_ms,
             "batch closed with snapshot"
         );

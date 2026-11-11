@@ -5,7 +5,7 @@ use super::*;
 use crate::storage::test_helpers::{
     LandingFixture, SENDER_A, open_temp_storage, record_canonical_divergence,
 };
-use crate::storage::{BatchId, Divergence, SafeInputRange};
+use crate::storage::{Divergence, SafeInputRange};
 use crate::test_support::TestDb;
 
 /// The window the test identity pins (the wallet's).
@@ -70,7 +70,7 @@ async fn publishes_the_reading_inside_the_window_and_stops_on_shutdown() {
         reading,
         LandingReading {
             lag: Some(LandingLag {
-                batch: BatchId::from_raw(0),
+                batch_nonce: 0,
                 first_frame_safe_block: 10,
                 safe_block: 100,
             }),
@@ -118,7 +118,7 @@ async fn stops_on_a_void_history_reached_while_running() {
             lag,
             max_wait_blocks,
         }) => {
-            assert_eq!(lag.batch, BatchId::from_raw(0));
+            assert_eq!(lag.batch_nonce, 0);
             assert_eq!(lag.first_frame_safe_block, 10);
             assert_eq!(lag.safe_block, 10 + W - 1);
             assert_eq!(max_wait_blocks, W);

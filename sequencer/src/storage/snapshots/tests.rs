@@ -15,9 +15,9 @@ fn prefix(n: u64) -> PathBuf {
     PathBuf::from(format!("/snapshot/{n}"))
 }
 
-/// Close the open batch with a snapshot at `prefix(batch_index + 1)`.
+/// Close the open batch with a snapshot at `prefix(batch_nonce + 1)`.
 fn close(storage: &mut Storage, head: &mut WriteHead) -> i64 {
-    let index = head.batch_index().to_raw();
+    let index = head.batch_nonce();
     let count = storage.next_l2_tx_count().unwrap();
     storage
         .close_frame_and_batch_with_snapshot(head, &prefix(index + 1), count)
@@ -74,7 +74,7 @@ fn missing_exact_accepted_snapshot_never_falls_back_or_collects() {
     seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0, 1]);
     storage
         .conn
-        .execute("DELETE FROM snapshots WHERE batch_index=1", [])
+        .execute("DELETE FROM snapshots WHERE batch_nonce=1", [])
         .unwrap();
     assert!(matches!(
         storage.finalized_dump(),

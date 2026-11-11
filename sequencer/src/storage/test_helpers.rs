@@ -20,8 +20,8 @@ use super::mutations::persist_frame_direct_sequence_derived;
 use super::queries::{load_current_write_head, query_batch_policy};
 use super::snapshots::{insert_baseline_snapshot_in, insert_batch_snapshot_in};
 use super::{
-    BatchId, BatchPolicy, IngestedSafeInput, L2TxCount, LifecycleCommand, NewEra, SafeInputRange,
-    Storage, StorageOpenError, WriteHead,
+    BatchPolicy, IngestedSafeInput, L2TxCount, LifecycleCommand, NewEra, SafeInputRange, Storage,
+    StorageOpenError, WriteHead,
 };
 use crate::test_support::{TestDb, pin_test_deployment_identity, temp_db};
 
@@ -46,17 +46,6 @@ impl NewEra {
         first_queued_input: 0,
         anchor_batch_nonce: 0,
     };
-}
-
-impl BatchId {
-    pub(crate) fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// For tests outside storage that read the database with raw SQL.
-    pub(crate) fn to_raw(self) -> u64 {
-        self.0
-    }
 }
 
 impl SafeInputRange {
@@ -136,7 +125,6 @@ pub(crate) fn era(base: u64, rebuilt_end: u64, stop_block: u64) -> super::NewEra
 /// tests. Production heads come only from storage's loader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WriteHeadParts {
-    pub batch_index: u64,
     pub batch_nonce: u64,
     pub batch_created_at: std::time::SystemTime,
     pub frame_fee: u16,
@@ -148,9 +136,8 @@ pub(crate) struct WriteHeadParts {
 }
 
 impl WriteHeadParts {
-    /// Batch 0, nonce 0, frame 0, everything zero, a one-byte size target.
+    /// Nonce 0, frame 0, everything zero, a one-byte size target.
     pub(crate) const ZERO: Self = Self {
-        batch_index: 0,
         batch_nonce: 0,
         batch_created_at: std::time::UNIX_EPOCH,
         frame_fee: 0,
@@ -163,7 +150,6 @@ impl WriteHeadParts {
 
     pub(crate) fn of(head: &WriteHead) -> Self {
         Self {
-            batch_index: head.batch_index,
             batch_nonce: head.batch_nonce,
             batch_created_at: head.batch_created_at,
             frame_fee: head.frame_fee,
@@ -177,7 +163,6 @@ impl WriteHeadParts {
 
     pub(crate) fn build(self) -> WriteHead {
         WriteHead {
-            batch_index: self.batch_index,
             batch_nonce: self.batch_nonce,
             batch_created_at: self.batch_created_at,
             frame_fee: self.frame_fee,
@@ -205,8 +190,8 @@ impl Storage {
                 load_current_write_head(tx)?.is_none(),
                 "open state already exists"
             );
-            let batch_index = insert_tip_rows(tx, Some(0), safe_block)?;
-            persist_frame_direct_sequence_derived(tx, batch_index, 0, leading_direct_range)?;
+            let batch_nonce = insert_tip_rows(tx, safe_block)?;
+            persist_frame_direct_sequence_derived(tx, batch_nonce, 0, leading_direct_range)?;
             Ok(load_current_write_head(tx)?.expect("genesis tip just inserted"))
         })
     }
@@ -364,11 +349,11 @@ impl Storage {
         )
     }
 
-    /// Highest `batch_index` (the open batch included), or `None`.
-    pub(crate) fn latest_batch_index(&mut self) -> rusqlite::Result<Option<u64>> {
+    /// Highest batch nonce (the open batch included), or `None`.
+    pub(crate) fn latest_batch_nonce(&mut self) -> rusqlite::Result<Option<u64>> {
         let value: Option<i64> =
             self.conn
-                .query_row("SELECT MAX(batch_index) FROM batches", [], |row| row.get(0))?;
+                .query_row("SELECT MAX(nonce) FROM batches", [], |row| row.get(0))?;
         Ok(value.map(i64_to_u64))
     }
 
@@ -376,7 +361,7 @@ impl Storage {
     /// Production replay pages the stream by offset, never per batch.
     pub(crate) fn ordered_l2_txs_for_batch(
         &mut self,
-        batch_index: u64,
+        batch_nonce: u64,
     ) -> rusqlite::Result<Vec<L2Tx>> {
         const SQL: &str = "
             SELECT
@@ -396,33 +381,33 @@ impl Storage {
                 CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp ELSE NULL END AS block_timestamp
             FROM application_inputs s
             LEFT JOIN user_ops u
-              ON u.batch_index    = s.batch_index
+              ON u.batch_nonce    = s.batch_nonce
              AND u.frame_in_batch = s.frame_in_batch
              AND u.pos_in_frame   = s.user_op_pos_in_frame
             LEFT JOIN frames f
-              ON f.batch_index    = s.batch_index
+              ON f.batch_nonce    = s.batch_nonce
              AND f.frame_in_batch = s.frame_in_batch
             LEFT JOIN safe_inputs d
               ON d.safe_input_index = s.safe_input_index
-            WHERE s.batch_index = ?1
+            WHERE s.batch_nonce = ?1
             ORDER BY s.l2_tx_count ASC
         ";
         let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![u64_to_i64(batch_index)], decode_l2_tx_row)?;
+        let rows = stmt.query_map(params![u64_to_i64(batch_nonce)], decode_l2_tx_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     }
 
     pub(crate) fn insert_batch_snapshot(
         &mut self,
         prefix: &Path,
-        batch_index: u64,
+        batch_nonce: u64,
     ) -> rusqlite::Result<i64> {
-        self.write(|tx| insert_batch_snapshot_in(tx, prefix, batch_index, next_l2_tx_count_in(tx)?))
+        self.write(|tx| insert_batch_snapshot_in(tx, prefix, batch_nonce, next_l2_tx_count_in(tx)?))
     }
 
     /// Close the open batch (the genesis Tip when none is open) and register
     /// `prefix` as its snapshot: the fixture for a non-baseline row, since a
-    /// second baseline is refused. Returns the snapshot id and batch index.
+    /// second baseline is refused. Returns the snapshot id and batch nonce.
     pub(crate) fn insert_closed_batch_snapshot(
         &mut self,
         prefix: &Path,
@@ -431,11 +416,11 @@ impl Storage {
             Some(head) => head,
             None => self.initialize_open_state(0, SafeInputRange::empty_at(0))?,
         };
-        let batch_index = head.batch_index;
+        let batch_nonce = head.batch_nonce;
         self.close_frame_and_batch(&mut head)?;
         Ok((
-            self.insert_batch_snapshot(prefix, batch_index)?,
-            batch_index,
+            self.insert_batch_snapshot(prefix, batch_nonce)?,
+            batch_nonce,
         ))
     }
 
@@ -541,7 +526,7 @@ fn close_frame_derived_in(
     let (policy, next_frame_in_batch) = open_successor_frame_in(tx, head, next_safe_block)?;
     persist_frame_direct_sequence_derived(
         tx,
-        head.batch_index,
+        head.batch_nonce,
         next_frame_in_batch,
         leading_direct_range,
     )?;
@@ -619,7 +604,7 @@ pub(crate) fn seed_safe_inputs_with_batch_nonces(
         .expect("append safe inputs");
 }
 
-/// Create N closed batches (batch indices `0..count-1`) plus one open batch (index `count`).
+/// Create N closed batches plus one open batch, from the era's anchor nonce.
 pub(crate) fn seed_closed_batches(storage: &mut Storage, count: u64) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))

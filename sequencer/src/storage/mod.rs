@@ -164,33 +164,9 @@ pub struct FrameHeader {
     pub safe_block: u64,
 }
 
-/// A batch's local key, `batches.batch_index`. Opaque outside storage, with no
-/// arithmetic; it prints as the bare number.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BatchId(u64);
-
-impl BatchId {
-    fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-}
-
-impl std::fmt::Display for BatchId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl std::fmt::Debug for BatchId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-/// A batch ready for L1 submission: its local index, assigned nonce, and SSZ-encoded payload.
+/// A batch ready for L1 submission: its nonce and SSZ-encoded payload.
 #[derive(Debug)]
 pub struct PendingBatch {
-    pub batch_index: BatchId,
     pub nonce: u64,
     pub encoded: Vec<u8>,
 }
@@ -285,8 +261,7 @@ pub struct BatchPolicy {
 /// rotation and batch close. Failed writes and restarts discard it.
 #[derive(Debug)]
 pub struct WriteHead {
-    batch_index: u64,
-    /// The open batch's nonce; immutable once the batch is inserted.
+    /// The open batch's nonce, its key.
     batch_nonce: u64,
     batch_created_at: SystemTime,
     /// Log-space fee exponent (base 129/128) committed for this open frame.
@@ -300,10 +275,6 @@ pub struct WriteHead {
 }
 
 impl WriteHead {
-    pub(crate) fn batch_index(&self) -> BatchId {
-        BatchId::new(self.batch_index)
-    }
-
     pub(crate) fn batch_nonce(&self) -> u64 {
         self.batch_nonce
     }
@@ -365,12 +336,10 @@ impl WriteHead {
 
     fn move_to_next_batch(
         &mut self,
-        batch_index: u64,
         batch_nonce: u64,
         batch_created_at: SystemTime,
         policy: BatchPolicy,
     ) {
-        self.batch_index = batch_index;
         self.batch_nonce = batch_nonce;
         self.batch_created_at = batch_created_at;
         self.frame_fee = policy.recommended_fee;

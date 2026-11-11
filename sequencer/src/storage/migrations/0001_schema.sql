@@ -1,7 +1,7 @@
 -- ---------------------------------------------------------------------------
 -- Batch lifecycle
 --
--- The batches of an era are an append-only list in `batch_index` order: each
+-- The batches of an era are an append-only list in nonce order: each
 -- batch is created once, sealed once, accepted once, and never removed. A
 -- batch has two monotonic events in its lifetime, each stored as a nullable
 -- write-once column on the row:
@@ -18,10 +18,10 @@
 -- The **open batch** is the one batch still taking ops: sealed_at_ms IS NULL.
 -- A partial unique index enforces at-most-one.
 --
--- `nonce` is the scheduler's view of a batch's identity: the last batch's
--- nonce + 1, or the era's `anchor_batch_nonce` (0 at genesis) for the era's
--- first batch. Enforced by trigger on INSERT, and unique: a nonce names one
--- batch for the life of the database.
+-- `nonce` is the key, and the scheduler's view of a batch's identity: the last
+-- batch's nonce + 1, or the era's `anchor_batch_nonce` (0 at genesis) for the
+-- era's first batch. Enforced by trigger on INSERT, so a nonce names one batch
+-- for the life of the database and no insert lands on an existing one.
 -- ---------------------------------------------------------------------------
 -- `sealed_at_ms` is a write-once observability stamp from the wall clock,
 -- deliberately not cross-checked against `created_at_ms`: wall-clock order is
@@ -35,11 +35,12 @@
 -- `accepted_input` is the safe input whose landing of this batch the scheduler
 -- accepted; the accepted batches are a prefix of the list, in input order, and
 -- the greatest one is the accepted frontier. Its UNIQUE index serves the
--- frontier reads. The UNIQUE index on `nonce` serves the submitter's hot path
--- ("closed batches with nonce >= N", ordered).
+-- frontier reads. The key serves the submitter's hot path ("closed batches
+-- with nonce >= N", ordered). `nonce` is a rowid alias: an insert without one
+-- would be numbered by SQLite, and a BEFORE trigger sees that nonce as -1,
+-- which `trg_batch_insert` refuses.
 CREATE TABLE IF NOT EXISTS batches (
-    batch_index        INTEGER PRIMARY KEY,
-    nonce              INTEGER NOT NULL UNIQUE CHECK (nonce >= 0),
+    nonce              INTEGER PRIMARY KEY CHECK (nonce >= 0),
     created_at_ms      INTEGER NOT NULL,
     sealed_at_ms       INTEGER CHECK (sealed_at_ms IS NULL OR sealed_at_ms >= 0),
     payload_hash       BLOB CHECK (payload_hash IS NULL OR length(payload_hash) = 32),
@@ -103,7 +104,7 @@ END;
 -- first, then the acceptance order, then this one.
 CREATE TRIGGER IF NOT EXISTS trg_batch_lifecycle
 BEFORE UPDATE ON batches FOR EACH ROW
-WHEN NOT (NEW.batch_index IS OLD.batch_index AND NEW.nonce IS OLD.nonce
+WHEN NOT (NEW.nonce IS OLD.nonce
       AND NEW.created_at_ms IS OLD.created_at_ms
       AND ( (OLD.sealed_at_ms IS NULL AND NEW.sealed_at_ms IS NOT NULL
              AND OLD.payload_hash IS NULL AND NEW.payload_hash IS NOT NULL
@@ -136,19 +137,19 @@ BEGIN SELECT RAISE(ABORT, 'an acceptance extends the accepted prefix of the batc
 -- Frames and user ops: must target the open batch.
 --
 -- These catch "stale WriteHead" bugs — where a writer holds an in-memory
--- batch_index that's no longer the open batch (sealed between reads).
+-- batch nonce that's no longer the open batch (sealed between reads).
 -- A PK lookup per row: microseconds, negligible overhead even on hot paths.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS frames (
-    batch_index          INTEGER NOT NULL REFERENCES batches(batch_index),
+    batch_nonce          INTEGER NOT NULL REFERENCES batches(nonce),
     frame_in_batch       INTEGER NOT NULL CHECK (frame_in_batch >= 0),
     created_at_ms        INTEGER NOT NULL,
     -- Fee committed by the sequencer for this whole frame.
     fee                  INTEGER NOT NULL CHECK (fee >= 0),
     -- Claimed safe L1 block frontier for this frame.
     safe_block           INTEGER NOT NULL CHECK (safe_block >= 0),
-    PRIMARY KEY(batch_index, frame_in_batch)
+    PRIMARY KEY(batch_nonce, frame_in_batch)
 ) STRICT;
 
 CREATE TRIGGER IF NOT EXISTS trg_frames_target_must_be_tip
@@ -156,7 +157,7 @@ BEFORE INSERT ON frames
 FOR EACH ROW
 WHEN NOT EXISTS (
     SELECT 1 FROM batches
-    WHERE batch_index = NEW.batch_index
+    WHERE nonce = NEW.batch_nonce
       AND sealed_at_ms IS NULL
 )
 BEGIN
@@ -177,7 +178,7 @@ BEGIN SELECT RAISE(ABORT, 'frames are retained for the database lifetime'); END;
 -- is tracked by application nonce logic, which admits an op only at its
 -- sender's next nonce and advances that nonce on every included op.
 CREATE TABLE IF NOT EXISTS user_ops (
-    batch_index      INTEGER NOT NULL,
+    batch_nonce      INTEGER NOT NULL,
     frame_in_batch   INTEGER NOT NULL,
     pos_in_frame     INTEGER NOT NULL CHECK (pos_in_frame >= 0),
     sender           BLOB NOT NULL CHECK (length(sender) = 20),
@@ -186,8 +187,8 @@ CREATE TABLE IF NOT EXISTS user_ops (
     data             BLOB NOT NULL,
     sig              BLOB NOT NULL CHECK (length(sig) = 65),
     received_at_ms   INTEGER NOT NULL,
-    PRIMARY KEY(batch_index, frame_in_batch, pos_in_frame),
-    FOREIGN KEY(batch_index, frame_in_batch) REFERENCES frames(batch_index, frame_in_batch)
+    PRIMARY KEY(batch_nonce, frame_in_batch, pos_in_frame),
+    FOREIGN KEY(batch_nonce, frame_in_batch) REFERENCES frames(batch_nonce, frame_in_batch)
 ) STRICT;
 
 -- `GET /nonce` reads a sender's latest op. Rows are never
@@ -203,7 +204,7 @@ BEFORE INSERT ON user_ops
 FOR EACH ROW
 WHEN NOT EXISTS (
     SELECT 1 FROM batches
-    WHERE batch_index = NEW.batch_index
+    WHERE nonce = NEW.batch_nonce
       AND sealed_at_ms IS NULL
 )
 BEGIN
@@ -247,19 +248,19 @@ BEGIN SELECT RAISE(ABORT, 'safe inputs are retained for the database lifetime');
 -- remain in their owning tables.
 CREATE TABLE IF NOT EXISTS application_inputs (
     l2_tx_count INTEGER PRIMARY KEY CHECK (l2_tx_count >= 0),
-    batch_index INTEGER NOT NULL,
+    batch_nonce INTEGER NOT NULL,
     frame_in_batch INTEGER NOT NULL,
     user_op_pos_in_frame INTEGER,
     safe_input_index INTEGER,
-    FOREIGN KEY(batch_index, frame_in_batch)
-        REFERENCES frames(batch_index, frame_in_batch),
-    FOREIGN KEY(batch_index, frame_in_batch, user_op_pos_in_frame)
-        REFERENCES user_ops(batch_index, frame_in_batch, pos_in_frame),
+    FOREIGN KEY(batch_nonce, frame_in_batch)
+        REFERENCES frames(batch_nonce, frame_in_batch),
+    FOREIGN KEY(batch_nonce, frame_in_batch, user_op_pos_in_frame)
+        REFERENCES user_ops(batch_nonce, frame_in_batch, pos_in_frame),
     FOREIGN KEY(safe_input_index) REFERENCES safe_inputs(safe_input_index),
     CHECK ((user_op_pos_in_frame IS NOT NULL AND safe_input_index IS NULL)
         OR (user_op_pos_in_frame IS NULL AND safe_input_index IS NOT NULL)),
     -- Its index also serves lookups by batch and by frame.
-    UNIQUE(batch_index, frame_in_batch, user_op_pos_in_frame),
+    UNIQUE(batch_nonce, frame_in_batch, user_op_pos_in_frame),
     UNIQUE(safe_input_index)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS idx_safe_inputs_block
@@ -456,7 +457,7 @@ BEGIN SELECT RAISE(ABORT, 'history generation cuts are retained throughout the e
 
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_target_must_be_tip
 BEFORE INSERT ON application_inputs FOR EACH ROW
-WHEN NOT EXISTS (SELECT 1 FROM batches WHERE batch_index = NEW.batch_index
+WHEN NOT EXISTS (SELECT 1 FROM batches WHERE nonce = NEW.batch_nonce
     AND sealed_at_ms IS NULL)
 BEGIN SELECT RAISE(ABORT, 'application input must target the open batch'); END;
 -- Live rows continue the era's rebuilt history. With no era the subquery is
@@ -652,7 +653,7 @@ FROM batch_policy;
 -- Snapshots
 --
 -- A snapshot: an immutable artifact directory and the boundary it holds — one
--- local batch at its close, or the era baseline (batch_index NULL). Files are
+-- local batch at its close, or the era baseline (batch_nonce NULL). Files are
 -- durable before the row is inserted; rows are deleted before files.
 -- Acceptance is read from `batches.accepted_input`; it never mutates snapshots.
 -- Download leases live in the serving process, not here
@@ -661,12 +662,12 @@ FROM batch_policy;
 
 CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_id INTEGER PRIMARY KEY,
-    batch_index INTEGER UNIQUE REFERENCES batches(batch_index) ON DELETE RESTRICT,
+    batch_nonce INTEGER UNIQUE REFERENCES batches(nonce) ON DELETE RESTRICT,
     l2_tx_count INTEGER NOT NULL CHECK (l2_tx_count >= 0),
     prefix      TEXT    NOT NULL UNIQUE
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_single_baseline
-ON snapshots ((1)) WHERE batch_index IS NULL;
+ON snapshots ((1)) WHERE batch_nonce IS NULL;
 
 CREATE TRIGGER IF NOT EXISTS trg_snapshot_immutable
 BEFORE UPDATE ON snapshots

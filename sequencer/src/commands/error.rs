@@ -750,7 +750,7 @@ mod tests {
     use crate::l1::provider::VerifiedSignerProviderError;
     use crate::l1::submitter::BatchPosterError;
     use crate::l1::watermark::WalletNonceWatermarkError;
-    use crate::storage::{BatchId, DeploymentIdentity, Divergence, LandingLag};
+    use crate::storage::{DeploymentIdentity, Divergence, LandingLag};
 
     fn divergence() -> TerminalFact {
         TerminalFact::Divergence(Divergence {
@@ -762,7 +762,7 @@ mod tests {
     fn void_history() -> TerminalFact {
         TerminalFact::VoidHistory {
             lag: LandingLag {
-                batch: BatchId::from_raw(3),
+                batch_nonce: 3,
                 first_frame_safe_block: 10,
                 safe_block: 1209,
             },

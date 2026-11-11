@@ -198,7 +198,7 @@ The adopt rule compares counts, not rows. Two faults pass it:
 | Watchdog | Start from independently trusted canonical machine state and replay L1. Compare at the sequencer's accepted checkpoint; the replica feed does not establish independent trust. |
 | Application projection | Restore its own checkpoint at a count the era serves, then follow the feed ([the client's playbook](../recovery/cockroach.md#the-clients-playbook)). The feed starts at the base count; the rows below it exist only on L1. |
 
-A batch-close snapshot is identified by its local batch identity, not just its
+A batch-close snapshot is identified by its batch's nonce, not just its
 count. Empty batches can repeat a count.
 Acceptance derives the comparison point without modifying the artifact.
 Selection must first choose the required accepted batch and then require its

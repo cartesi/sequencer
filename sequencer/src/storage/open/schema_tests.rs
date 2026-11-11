@@ -39,7 +39,7 @@ fn schema_rejects_a_second_open_batch() {
     // Try to bypass the lane and insert a second open batch directly, at the
     // right nonce so only the Tip index can refuse it.
     let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (99, 1, 1000)",
+        "INSERT INTO batches (nonce, created_at_ms) VALUES (1, 1000)",
         [],
     );
     let msg = format!("{err:?}");
@@ -67,8 +67,8 @@ fn schema_rejects_a_wrong_batch_nonce() {
         assert_refused(
             &storage,
             &format!(
-                "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, \
-                 payload_hash) VALUES (999, {nonce}, 100, 100, zeroblob(32))"
+                "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, \
+                 payload_hash) VALUES ({nonce}, 100, 100, zeroblob(32))"
             ),
             NONCE_RULE,
         );
@@ -76,8 +76,8 @@ fn schema_rejects_a_wrong_batch_nonce() {
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (999, 2, 100, 100, zeroblob(32))",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (2, 100, 100, zeroblob(32))",
             [],
         )
         .expect("the batch after nonce 1 carries nonce 2");
@@ -94,9 +94,7 @@ fn schema_rejects_a_batch_before_the_era_exists() {
     for nonce in [0, 7] {
         assert_refused(
             &storage,
-            &format!(
-                "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (0, {nonce}, 100)"
-            ),
+            &format!("INSERT INTO batches (nonce, created_at_ms) VALUES ({nonce}, 100)"),
             NONCE_RULE,
         );
     }
@@ -109,7 +107,19 @@ fn schema_rejects_genesis_with_nonzero_nonce() {
     let (_db, storage) = open_temp_storage("schema-genesis-nonzero");
     assert_refused(
         &storage,
-        "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (0, 7, 100)",
+        "INSERT INTO batches (nonce, created_at_ms) VALUES (7, 100)",
+        NONCE_RULE,
+    );
+}
+
+#[test]
+fn schema_rejects_a_batch_without_its_nonce() {
+    // `nonce` is a rowid alias: SQLite would number a row inserted without
+    // one, and the insert trigger sees that nonce as -1 and refuses it.
+    let (_db, storage) = open_temp_storage("schema-batch-without-nonce");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (created_at_ms) VALUES (100)",
         NONCE_RULE,
     );
 }
@@ -130,29 +140,29 @@ fn schema_first_batch_carries_the_era_anchor() {
     );
     assert_refused(
         &storage,
-        "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-         VALUES (0, 0, 100, 100, zeroblob(32))",
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+         VALUES (0, 100, 100, zeroblob(32))",
         NONCE_RULE,
     );
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (0, 42, 100, 100, zeroblob(32))",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (42, 100, 100, zeroblob(32))",
             [],
         )
         .expect("the first batch at the anchor nonce is allowed");
     assert_refused(
         &storage,
-        "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-         VALUES (1, 42, 100, 100, zeroblob(32))",
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+         VALUES (42, 100, 100, zeroblob(32))",
         NONCE_RULE,
     );
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (1, 43, 100, 100, zeroblob(32))",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (43, 100, 100, zeroblob(32))",
             [],
         )
         .expect("the next batch carries the anchor + 1");
@@ -161,27 +171,27 @@ fn schema_first_batch_carries_the_era_anchor() {
 #[test]
 fn schema_rejects_two_batches_at_one_nonce() {
     // The nonce trigger refuses a duplicate nonce first (it is never the last
-    // nonce + 1); the UNIQUE constraint on `nonce` refuses it on its own.
+    // nonce + 1); the primary key on `nonce` refuses it on its own.
     let (_db, storage) = open_temp_storage("schema-duplicate-nonce");
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (0, 0, 100, 100, zeroblob(32))",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32))",
             [],
         )
         .expect("first batch");
-    let duplicate = "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, \
-                     payload_hash) VALUES (1, 0, 100, 100, zeroblob(32))";
+    let duplicate = "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, \
+                     payload_hash) VALUES (0, 100, 100, zeroblob(32))";
     assert_refused(&storage, duplicate, NONCE_RULE);
     storage
         .conn
         .execute_batch("DROP TRIGGER trg_batch_insert")
-        .expect("isolate the index");
+        .expect("isolate the key");
     let msg = format!("{:?}", storage.conn.execute(duplicate, []));
     assert!(
         msg.contains("UNIQUE constraint failed") && msg.contains("batches.nonce"),
-        "expected a UNIQUE violation on batches.nonce, got: {msg}"
+        "expected a key violation on batches.nonce, got: {msg}"
     );
 }
 
@@ -196,19 +206,19 @@ fn schema_rejects_a_sealed_batch_without_its_hash() {
     storage.close_batch_at(&mut head, 0).expect("close batch 0");
     assert_refused(
         &storage,
-        "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms) \
-         VALUES (99, 2, 100, 100)",
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms) \
+         VALUES (2, 100, 100)",
         "CHECK constraint failed",
     );
     assert_refused(
         &storage,
-        "INSERT INTO batches (batch_index, nonce, created_at_ms, payload_hash) \
-         VALUES (99, 2, 100, zeroblob(32))",
+        "INSERT INTO batches (nonce, created_at_ms, payload_hash) \
+         VALUES (2, 100, zeroblob(32))",
         "CHECK constraint failed",
     );
     assert_refused(
         &storage,
-        "UPDATE batches SET sealed_at_ms = 100 WHERE batch_index = 1",
+        "UPDATE batches SET sealed_at_ms = 100 WHERE nonce = 1",
         LIFECYCLE_RULE,
     );
 }
@@ -233,7 +243,7 @@ fn lifecycle_allows_sealing_the_tip_with_its_hash() {
         .conn
         .execute(
             "UPDATE batches SET sealed_at_ms = 100, payload_hash = zeroblob(32) \
-             WHERE batch_index = 1",
+             WHERE nonce = 1",
             [],
         )
         .expect("the seal arm admits the open Tip's seal");
@@ -244,7 +254,7 @@ fn lifecycle_rejects_un_seal() {
     let (_db, storage) = lifecycle_fixture("lifecycle-un-seal");
     assert_refused(
         &storage,
-        "UPDATE batches SET sealed_at_ms = NULL, payload_hash = NULL WHERE batch_index = 0",
+        "UPDATE batches SET sealed_at_ms = NULL, payload_hash = NULL WHERE nonce = 0",
         LIFECYCLE_RULE,
     );
 }
@@ -254,7 +264,7 @@ fn lifecycle_rejects_re_seal() {
     let (_db, storage) = lifecycle_fixture("lifecycle-re-seal");
     assert_refused(
         &storage,
-        "UPDATE batches SET sealed_at_ms = sealed_at_ms + 1 WHERE batch_index = 0",
+        "UPDATE batches SET sealed_at_ms = sealed_at_ms + 1 WHERE nonce = 0",
         LIFECYCLE_RULE,
     );
 }
@@ -267,7 +277,7 @@ fn lifecycle_rejects_a_payload_hash_rewrite() {
     let (_db, storage) = lifecycle_fixture("lifecycle-hash-rewrite");
     assert_refused(
         &storage,
-        "UPDATE batches SET payload_hash = randomblob(32) WHERE batch_index = 0",
+        "UPDATE batches SET payload_hash = randomblob(32) WHERE nonce = 0",
         LIFECYCLE_RULE,
     );
 }
@@ -278,7 +288,7 @@ fn lifecycle_rejects_a_nonce_change() {
     let (_db, storage) = lifecycle_fixture("lifecycle-nonce");
     assert_refused(
         &storage,
-        "UPDATE batches SET nonce = nonce + 1 WHERE batch_index = 0",
+        "UPDATE batches SET nonce = nonce + 1 WHERE nonce = 0",
         LIFECYCLE_RULE,
     );
 }
@@ -288,17 +298,7 @@ fn lifecycle_rejects_a_created_at_change() {
     let (_db, storage) = lifecycle_fixture("lifecycle-created-at");
     assert_refused(
         &storage,
-        "UPDATE batches SET created_at_ms = created_at_ms + 1 WHERE batch_index = 0",
-        LIFECYCLE_RULE,
-    );
-}
-
-#[test]
-fn lifecycle_rejects_a_batch_index_change() {
-    let (_db, storage) = lifecycle_fixture("lifecycle-batch-index");
-    assert_refused(
-        &storage,
-        "UPDATE batches SET batch_index = 99 WHERE batch_index = 0",
+        "UPDATE batches SET created_at_ms = created_at_ms + 1 WHERE nonce = 0",
         LIFECYCLE_RULE,
     );
 }
@@ -307,10 +307,10 @@ fn lifecycle_rejects_a_batch_index_change() {
 fn lifecycle_rejects_an_update_that_changes_nothing() {
     // A no-op update is neither a seal nor an acceptance.
     let (_db, storage) = lifecycle_fixture("lifecycle-no-op");
-    for batch_index in [0, 1] {
+    for nonce in [0, 1] {
         assert_refused(
             &storage,
-            &format!("UPDATE batches SET nonce = nonce WHERE batch_index = {batch_index}"),
+            &format!("UPDATE batches SET nonce = nonce WHERE nonce = {nonce}"),
             LIFECYCLE_RULE,
         );
     }
@@ -327,14 +327,14 @@ fn a_batch_is_never_deleted() {
     storage
         .conn
         .execute_batch(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (0, 0, 100, 100, zeroblob(32));
-             INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (1, 1, 100);",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32));
+             INSERT INTO batches (nonce, created_at_ms) VALUES (1, 100);",
         )
         .expect("a sealed batch and an open one");
     for sql in [
-        "DELETE FROM batches WHERE batch_index = 0",
-        "DELETE FROM batches WHERE batch_index = 1",
+        "DELETE FROM batches WHERE nonce = 0",
+        "DELETE FROM batches WHERE nonce = 1",
         "DELETE FROM batches",
     ] {
         assert_refused(&storage, sql, NOT_DELETABLE_RULE);
@@ -348,8 +348,8 @@ fn a_batch_is_never_deleted() {
 
 // ── Acceptance (`trg_batch_acceptance_extends_the_prefix`, `trg_batch_lifecycle`) ──
 //
-// The fixture's era is anchored at 7: batches 0, 1, 2 are sealed (nonces 7,
-// 8, 9), batch 3 is the open Tip (nonce 10), and safe inputs 0..=5 exist.
+// The fixture's era is anchored at 7: batches 7, 8, 9 are sealed, batch 10 is
+// the open Tip, and safe inputs 0..=5 exist.
 
 fn acceptance_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
     let db = crate::test_support::temp_db(name);
@@ -380,18 +380,18 @@ fn acceptance_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
     (db, storage)
 }
 
-fn accept(storage: &Storage, batch_index: i64, input: i64) -> rusqlite::Result<usize> {
+fn accept(storage: &Storage, nonce: i64, input: i64) -> rusqlite::Result<usize> {
     storage.conn.execute(
-        "UPDATE batches SET accepted_input = ?1 WHERE batch_index = ?2",
-        [input, batch_index],
+        "UPDATE batches SET accepted_input = ?1 WHERE nonce = ?2",
+        [input, nonce],
     )
 }
 
 #[test]
 fn acceptance_extends_the_prefix_from_the_anchor() {
     let (_db, storage) = acceptance_fixture("acceptance-prefix");
-    assert_eq!(accept(&storage, 0, 1).expect("the batch at the anchor"), 1);
-    assert_eq!(accept(&storage, 1, 3).expect("the next batch, later"), 1);
+    assert_eq!(accept(&storage, 7, 1).expect("the batch at the anchor"), 1);
+    assert_eq!(accept(&storage, 8, 3).expect("the next batch, later"), 1);
 }
 
 #[test]
@@ -422,13 +422,13 @@ fn acceptance_rejects_skipping_a_nonce() {
     let (_db, storage) = acceptance_fixture("acceptance-skip");
     assert_refused(
         &storage,
-        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 1",
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 8",
         ACCEPTANCE_RULE,
     );
-    accept(&storage, 0, 1).expect("the batch at the anchor");
+    accept(&storage, 7, 1).expect("the batch at the anchor");
     assert_refused(
         &storage,
-        "UPDATE batches SET accepted_input = 2 WHERE batch_index = 2",
+        "UPDATE batches SET accepted_input = 2 WHERE nonce = 9",
         ACCEPTANCE_RULE,
     );
 }
@@ -436,11 +436,11 @@ fn acceptance_rejects_skipping_a_nonce() {
 #[test]
 fn acceptance_rejects_an_input_not_after_the_last_acceptance() {
     let (_db, storage) = acceptance_fixture("acceptance-earlier-input");
-    accept(&storage, 0, 3).expect("the batch at the anchor");
+    accept(&storage, 7, 3).expect("the batch at the anchor");
     for input in [2, 3] {
         assert_refused(
             &storage,
-            &format!("UPDATE batches SET accepted_input = {input} WHERE batch_index = 1"),
+            &format!("UPDATE batches SET accepted_input = {input} WHERE nonce = 8"),
             ACCEPTANCE_RULE,
         );
     }
@@ -449,13 +449,13 @@ fn acceptance_rejects_an_input_not_after_the_last_acceptance() {
 #[test]
 fn acceptance_rejects_an_unsealed_batch() {
     let (_db, storage) = acceptance_fixture("acceptance-unsealed");
-    accept(&storage, 0, 1).expect("accept nonce 7");
-    accept(&storage, 1, 2).expect("accept nonce 8");
-    accept(&storage, 2, 3).expect("accept nonce 9");
+    accept(&storage, 7, 1).expect("accept nonce 7");
+    accept(&storage, 8, 2).expect("accept nonce 8");
+    accept(&storage, 9, 3).expect("accept nonce 9");
     // The Tip carries the frontier nonce 10, so only the lifecycle refuses.
     assert_refused(
         &storage,
-        "UPDATE batches SET accepted_input = 4 WHERE batch_index = 3",
+        "UPDATE batches SET accepted_input = 4 WHERE nonce = 10",
         LIFECYCLE_RULE,
     );
 }
@@ -463,14 +463,14 @@ fn acceptance_rejects_an_unsealed_batch() {
 #[test]
 fn acceptance_rejects_sealing_and_accepting_in_one_statement() {
     let (_db, storage) = acceptance_fixture("acceptance-seal-and-accept");
-    accept(&storage, 0, 1).expect("accept nonce 7");
-    accept(&storage, 1, 2).expect("accept nonce 8");
-    accept(&storage, 2, 3).expect("accept nonce 9");
+    accept(&storage, 7, 1).expect("accept nonce 7");
+    accept(&storage, 8, 2).expect("accept nonce 8");
+    accept(&storage, 9, 3).expect("accept nonce 9");
     // The Tip carries the frontier nonce 10, so only the lifecycle refuses.
     assert_refused(
         &storage,
         "UPDATE batches SET sealed_at_ms = 100, payload_hash = zeroblob(32), \
-         accepted_input = 4 WHERE batch_index = 3",
+         accepted_input = 4 WHERE nonce = 10",
         LIFECYCLE_RULE,
     );
 }
@@ -478,10 +478,10 @@ fn acceptance_rejects_sealing_and_accepting_in_one_statement() {
 #[test]
 fn acceptance_is_written_once() {
     let (_db, storage) = acceptance_fixture("acceptance-twice");
-    accept(&storage, 0, 1).expect("the batch at the anchor");
+    accept(&storage, 7, 1).expect("the batch at the anchor");
     for sql in [
-        "UPDATE batches SET accepted_input = 2 WHERE batch_index = 0",
-        "UPDATE batches SET accepted_input = NULL WHERE batch_index = 0",
+        "UPDATE batches SET accepted_input = 2 WHERE nonce = 7",
+        "UPDATE batches SET accepted_input = NULL WHERE nonce = 7",
     ] {
         assert_refused(&storage, sql, LIFECYCLE_RULE);
     }
@@ -493,7 +493,7 @@ fn acceptance_changes_nothing_else() {
     assert_refused(
         &storage,
         "UPDATE batches SET accepted_input = 1, payload_hash = randomblob(32) \
-         WHERE batch_index = 0",
+         WHERE nonce = 7",
         LIFECYCLE_RULE,
     );
 }
@@ -505,12 +505,12 @@ fn the_divergence_freeze_answers_an_acceptance_first() {
     // A well-formed acceptance, then one that breaks both other rules.
     assert_refused(
         &storage,
-        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 0",
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 7",
         FROZEN_RULE,
     );
     assert_refused(
         &storage,
-        "UPDATE batches SET accepted_input = 1 WHERE batch_index = 3",
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 10",
         FROZEN_RULE,
     );
 }
@@ -528,7 +528,7 @@ fn schema_rejects_frame_insert_into_sealed_batch() {
         .expect("close batch 0; batch 0 is now sealed");
     // Batch 0 is sealed. Any direct insert into its frames must fail.
     let err = storage.conn.execute(
-        "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
+        "INSERT INTO frames (batch_nonce, frame_in_batch, created_at_ms, fee, safe_block) \
          VALUES (0, 1, 100, 1356, 0)",
         [],
     );
@@ -555,13 +555,13 @@ fn schema_rejects_user_op_insert_into_sealed_batch() {
     );
 }
 
-/// A well-formed user-op row at `(batch_index, frame_in_batch, pos_in_frame)`.
-fn raw_user_op_insert(batch_index: u64, frame_in_batch: u64, pos_in_frame: u64) -> String {
+/// A well-formed user-op row at `(batch_nonce, frame_in_batch, pos_in_frame)`.
+fn raw_user_op_insert(batch_nonce: u64, frame_in_batch: u64, pos_in_frame: u64) -> String {
     format!(
         "INSERT INTO user_ops \
-         (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, \
+         (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, \
           received_at_ms) \
-         VALUES ({batch_index}, {frame_in_batch}, {pos_in_frame}, zeroblob(20), 0, 0, X'', \
+         VALUES ({batch_nonce}, {frame_in_batch}, {pos_in_frame}, zeroblob(20), 0, 0, X'', \
           zeroblob(65), 0)"
     )
 }
@@ -585,19 +585,19 @@ fn frames_and_user_ops_are_written_once() {
     storage.close_batch_at(&mut head, 0).expect("seal batch 0");
     for (sql, message) in [
         (
-            "UPDATE user_ops SET data = X'01' WHERE batch_index = 0",
+            "UPDATE user_ops SET data = X'01' WHERE batch_nonce = 0",
             "user ops are immutable",
         ),
         (
-            "DELETE FROM user_ops WHERE batch_index = 0",
+            "DELETE FROM user_ops WHERE batch_nonce = 0",
             "user ops are retained for the database lifetime",
         ),
         (
-            "UPDATE frames SET fee = fee + 1 WHERE batch_index = 0",
+            "UPDATE frames SET fee = fee + 1 WHERE batch_nonce = 0",
             "frames are immutable",
         ),
         (
-            "DELETE FROM frames WHERE batch_index = 1",
+            "DELETE FROM frames WHERE batch_nonce = 1",
             "frames are retained for the database lifetime",
         ),
     ] {
@@ -618,17 +618,21 @@ fn a_replace_never_deletes_a_batch() {
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, nonce, created_at_ms, sealed_at_ms, payload_hash) \
-             VALUES (0, 0, 100, 100, zeroblob(32))",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32))",
             [],
         )
         .expect("a sealed batch");
-    // Nonce 1 passes the insert rule; the row conflicts on batch_index 0.
-    assert_refused(
-        &storage,
-        "INSERT OR REPLACE INTO batches (batch_index, nonce, created_at_ms) VALUES (0, 1, 100)",
-        NOT_DELETABLE_RULE,
-    );
+    // An insert over an existing nonce is never the last nonce + 1, so the
+    // nonce rule refuses it first; without that rule the REPLACE's delete
+    // still fires `trg_batches_not_deletable`.
+    let replace = "INSERT OR REPLACE INTO batches (nonce, created_at_ms) VALUES (0, 100)";
+    assert_refused(&storage, replace, NONCE_RULE);
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER trg_batch_insert")
+        .expect("isolate the delete trigger");
+    assert_refused(&storage, replace, NOT_DELETABLE_RULE);
 }
 
 #[test]
@@ -645,7 +649,7 @@ fn a_replace_never_deletes_an_application_input() {
     assert_refused(
         &storage,
         "INSERT OR REPLACE INTO application_inputs \
-         (l2_tx_count, batch_index, frame_in_batch, safe_input_index) VALUES (1, 0, 1, 0)",
+         (l2_tx_count, batch_nonce, frame_in_batch, safe_input_index) VALUES (1, 0, 1, 0)",
         "application inputs are retained for the database lifetime",
     );
 }
@@ -680,7 +684,7 @@ fn schema_rejects_application_input_into_non_tip() {
     // trigger fires before the safe_input_index FK is evaluated.
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-         (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+         (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
          VALUES (0, 0, 0, NULL, 0)",
         [],
     );
@@ -755,7 +759,7 @@ fn schema_rejects_user_op_with_wrong_sender_length() {
         .expect("initialize");
     let err = storage.conn.execute(
             "INSERT INTO user_ops \
-             (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
+             (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
              VALUES (0, 0, 0, X'010203', 0, 0, X'', ?1, 0)",
             params![vec![0u8; 65]],
         );
@@ -778,7 +782,7 @@ fn schema_rejects_user_op_with_wrong_signature_length() {
     let short_sig = vec![0u8; 32]; // Should be 65.
     let err = storage.conn.execute(
             "INSERT INTO user_ops \
-             (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
+             (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
              VALUES (0, 0, 0, ?1, 0, 0, X'', ?2, 0)",
             params![valid_sender, short_sig],
         );
@@ -802,7 +806,7 @@ fn schema_rejects_application_input_with_neither_xor_branch() {
         .expect("initialize");
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-             (l2_tx_count, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+             (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
              VALUES (0, 0, 0, NULL, NULL)",
         [],
     );
@@ -904,7 +908,7 @@ fn schema_rejects_safe_input_with_negative_block_number() {
 }
 
 #[test]
-fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
+fn divergence_marker_freezes_batch_list_promotions_and_pending_clears() {
     // I15 structural enforcement: with the canonical-divergence marker
     // present, the trg_*_frozen_on_divergence family must RAISE on batch
     // inserts/updates, promotion inserts, and pending-snapshot deletes —
@@ -935,7 +939,7 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
         storage
             .conn
             .execute(
-                "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (99, 0, 0)",
+                "INSERT INTO batches (nonce, created_at_ms) VALUES (0, 0)",
                 [],
             )
             .expect_err("batch INSERT must be frozen"),
@@ -944,7 +948,7 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
     frozen(
         storage
             .conn
-            .execute("UPDATE batches SET nonce = 7 WHERE batch_index = 0", [])
+            .execute("UPDATE batches SET nonce = 7 WHERE nonce = 0", [])
             .expect_err("batch UPDATE must be frozen"),
     );
     frozen(

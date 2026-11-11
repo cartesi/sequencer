@@ -11,36 +11,16 @@ use super::history::{era_in, next_l2_tx_count_in};
 use super::queries::{DIRECT_EXECUTES_SQL, DirectOperands};
 use super::{DirectInputExecution, SafeInputRange};
 
-/// Insert a new batch after the last one. Its nonce is the last nonce + 1, or
-/// the era's anchor for the era's first batch.
-///
-/// If `batch_index_opt` is None, SQLite auto-assigns (highest existing +1).
-/// The explicit form pins the very first genesis batch at `batch_index = 0`.
+/// Insert a new batch after the last one and return its nonce: one past the
+/// last nonce, or the era's anchor for the era's first batch.
 /// `trg_batch_insert` checks the same rule, so caller and schema agree.
-/// Returns the new batch's index and nonce.
-pub(super) fn insert_new_batch(
-    tx: &Transaction<'_>,
-    batch_index_opt: Option<u64>,
-    created_at_ms: i64,
-) -> Result<(u64, u64)> {
+pub(super) fn insert_new_batch(tx: &Transaction<'_>, created_at_ms: i64) -> Result<u64> {
     let nonce = compute_next_nonce(tx)?;
-    let batch_index = match batch_index_opt {
-        Some(bi) => {
-            tx.execute(
-                "INSERT INTO batches (batch_index, nonce, created_at_ms) VALUES (?1, ?2, ?3)",
-                params![u64_to_i64(bi), u64_to_i64(nonce), created_at_ms],
-            )?;
-            bi
-        }
-        None => {
-            tx.execute(
-                "INSERT INTO batches (nonce, created_at_ms) VALUES (?1, ?2)",
-                params![u64_to_i64(nonce), created_at_ms],
-            )?;
-            i64_to_u64(tx.last_insert_rowid())
-        }
-    };
-    Ok((batch_index, nonce))
+    tx.execute(
+        "INSERT INTO batches (nonce, created_at_ms) VALUES (?1, ?2)",
+        params![u64_to_i64(nonce), created_at_ms],
+    )?;
+    Ok(nonce)
 }
 
 /// The last nonce + 1, or the era's anchor when there is no batch: the rule of
@@ -62,16 +42,16 @@ fn compute_next_nonce(tx: &Transaction<'_>) -> Result<u64> {
 /// landings against (hash-at-seal).
 pub(super) fn seal_batch(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     sealed_at_ms: i64,
     payload_hash: &[u8; 32],
 ) -> Result<()> {
     let changed = tx.execute(
-        "UPDATE batches SET sealed_at_ms = ?1, payload_hash = ?2 WHERE batch_index = ?3",
+        "UPDATE batches SET sealed_at_ms = ?1, payload_hash = ?2 WHERE nonce = ?3",
         params![
             sealed_at_ms,
             payload_hash.as_slice(),
-            u64_to_i64(batch_index)
+            u64_to_i64(batch_nonce)
         ],
     )?;
     if changed != 1 {
@@ -82,17 +62,17 @@ pub(super) fn seal_batch(
 
 pub(super) fn insert_open_frame(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     created_at_ms: i64,
     frame_fee: u16,
     safe_block: u64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
+        "INSERT INTO frames (batch_nonce, frame_in_batch, created_at_ms, fee, safe_block) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            u64_to_i64(batch_index),
+            u64_to_i64(batch_nonce),
             i64::from(frame_in_batch),
             created_at_ms,
             i64::from(frame_fee),
@@ -105,7 +85,7 @@ pub(super) fn insert_open_frame(
 /// Commit the exact direct inputs executed while opening a frame.
 pub(super) fn persist_frame_direct_sequence(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
     executions: &[DirectInputExecution],
@@ -115,35 +95,35 @@ pub(super) fn persist_frame_direct_sequence(
         derive_direct_input_executions_in(tx, range)?,
         "direct executions must cover the complete external-input range at the next application count"
     );
-    persist_direct_executions(tx, batch_index, frame_in_batch, executions)
+    persist_direct_executions(tx, batch_nonce, frame_in_batch, executions)
 }
 
 /// Startup fixes the replay sequence before the engine is restored. Admission
 /// succeeds only after catch-up applies every committed application input.
 pub(super) fn persist_frame_direct_sequence_derived(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     range: SafeInputRange,
 ) -> Result<()> {
     let executions = derive_direct_input_executions_in(tx, range)?;
-    persist_direct_executions(tx, batch_index, frame_in_batch, &executions)
+    persist_direct_executions(tx, batch_nonce, frame_in_batch, &executions)
 }
 
 fn persist_direct_executions(
     tx: &Transaction<'_>,
-    batch_index: u64,
+    batch_nonce: u64,
     frame_in_batch: u32,
     executions: &[DirectInputExecution],
 ) -> Result<()> {
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO application_inputs (l2_tx_count, batch_index, frame_in_batch, safe_input_index)
+        "INSERT INTO application_inputs (l2_tx_count, batch_nonce, frame_in_batch, safe_input_index)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for execution in executions {
         stmt.execute(params![
             u64_to_i64(execution.l2_tx_index.get()),
-            u64_to_i64(batch_index),
+            u64_to_i64(batch_nonce),
             i64::from(frame_in_batch),
             u64_to_i64(execution.safe_input_index)
         ])?;

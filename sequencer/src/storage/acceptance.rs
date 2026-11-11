@@ -596,7 +596,7 @@ mod tests {
         let stamped: Vec<u8> = storage
             .conn
             .query_row(
-                "SELECT payload_hash FROM batches WHERE batch_index = 0",
+                "SELECT payload_hash FROM batches WHERE nonce = 0",
                 [],
                 |row| row.get(0),
             )

@@ -9,18 +9,18 @@
 use rusqlite::{Connection, OptionalExtension, Result, TransactionBehavior, params};
 use sequencer_core::protocol::age_exceeds;
 
+use super::Storage;
 use super::acceptance::{Divergence, canonical_divergence_in, frontier_nonce};
 use super::convert::{i64_to_u64, u64_to_i64};
 use super::ingress::open_fresh_tip_in_tx;
 use super::l1_inputs::query_deployment_identity;
 use super::queries::current_safe_block;
-use super::{BatchId, Storage};
 
 /// The oldest batch L1 has not accepted, closed or open, at the safe head
 /// `H`, with its first frame's safe block `s`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LandingLag {
-    pub batch: BatchId,
+    pub batch_nonce: u64,
     pub first_frame_safe_block: u64,
     pub safe_block: u64,
 }
@@ -61,7 +61,7 @@ pub enum TerminalFact {
         "the history is void: batch {}, opened at safe block {}, was not accepted by safe block {}, \
          and no later block can accept it (max_wait_blocks {max_wait_blocks}); recover with \
          setup --base in a new data directory",
-        lag.batch,
+        lag.batch_nonce,
         lag.first_frame_safe_block,
         lag.safe_block
     )]
@@ -160,16 +160,16 @@ fn landing_lag_in(conn: &Connection) -> Result<Option<LandingLag>> {
     let Some(safe_block) = current_safe_block(conn)? else {
         return Ok(None);
     };
-    let batch_index = match first_unaccepted_closed_batch(conn)? {
-        Some(batch_index) => batch_index,
+    let batch_nonce = match first_unaccepted_closed_batch(conn)? {
+        Some(nonce) => nonce,
         None => match open_batch(conn)? {
-            Some(batch_index) => batch_index,
+            Some(nonce) => nonce,
             None => return Ok(None),
         },
     };
     Ok(Some(LandingLag {
-        batch: BatchId::new(batch_index),
-        first_frame_safe_block: first_frame_safe_block_of(conn, batch_index)?,
+        batch_nonce,
+        first_frame_safe_block: first_frame_safe_block_of(conn, batch_nonce)?,
         safe_block,
     }))
 }
@@ -182,32 +182,32 @@ fn landing_lag_in(conn: &Connection) -> Result<Option<LandingLag>> {
 /// accepted.
 fn first_unaccepted_closed_batch(conn: &Connection) -> Result<Option<u64>> {
     let frontier = frontier_nonce(conn)?;
-    let batch_index: Option<i64> = conn
+    let nonce: Option<i64> = conn
         .query_row(
-            "SELECT batch_index FROM closed_batches \
+            "SELECT nonce FROM closed_batches \
              WHERE nonce >= ?1 ORDER BY nonce ASC LIMIT 1",
             params![u64_to_i64(frontier)],
             |row| row.get(0),
         )
         .optional()?;
-    Ok(batch_index.map(i64_to_u64))
+    Ok(nonce.map(i64_to_u64))
 }
 
 fn open_batch(conn: &Connection) -> Result<Option<u64>> {
-    let batch_index: Option<i64> = conn
-        .query_row("SELECT batch_index FROM open_batch", [], |row| row.get(0))
+    let nonce: Option<i64> = conn
+        .query_row("SELECT nonce FROM open_batch", [], |row| row.get(0))
         .optional()?;
-    Ok(batch_index.map(i64_to_u64))
+    Ok(nonce.map(i64_to_u64))
 }
 
-/// `frames.safe_block` of the lowest `frame_in_batch` in `batch_index`.
+/// `frames.safe_block` of the lowest `frame_in_batch` in `batch_nonce`.
 /// Every committed batch has a first frame; missing one is an invariant
 /// violation and propagates as `QueryReturnedNoRows`.
-fn first_frame_safe_block_of(conn: &Connection, batch_index: u64) -> Result<u64> {
+fn first_frame_safe_block_of(conn: &Connection, batch_nonce: u64) -> Result<u64> {
     conn.query_row(
         "SELECT safe_block FROM frames \
-         WHERE batch_index = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
-        params![u64_to_i64(batch_index)],
+         WHERE batch_nonce = ?1 ORDER BY frame_in_batch ASC LIMIT 1",
+        params![u64_to_i64(batch_nonce)],
         |row| row.get::<_, i64>(0).map(i64_to_u64),
     )
 }

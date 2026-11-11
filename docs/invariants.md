@@ -178,7 +178,7 @@ writers target the base tables.
 ### I7. Every committed batch close has an immutable snapshot
 
 - **Holds:** file creation precedes the transaction sealing the batch, opening
-  the next Tip, and registering its snapshot by local `batch_index` and count.
+  the next Tip, and registering its snapshot by batch nonce and count.
 - **Enforced by:** `close_batch_with_snapshot` and
   `close_frame_and_batch_with_snapshot`. Selection requires the exact expected
   batch's snapshot; a missing artifact fails loud.
@@ -390,7 +390,7 @@ writers target the base tables.
 
 ### I16. Batches carry contiguous, unique nonces from the era's anchor
 
-- **Holds:** the batches, in `batch_index` order, carry the nonces
+- **Holds:** a batch's key is its nonce, and the batches carry the nonces
   `N'`, `N' + 1`, … where `N'` is the era's `anchor_batch_nonce` — the
   scheduler's next batch nonce at the end of the era's stop block, which
   setup's rebuild ends with and publishes in the era row. A new batch carries
@@ -401,7 +401,7 @@ writers target the base tables.
 - **Enforced by:** `trg_batch_insert`, a BEFORE INSERT check that
   `nonce IS COALESCE(last nonce + 1, era anchor)` (with neither, it
   compares against NULL and aborts); `compute_next_nonce` computes the same
-  rule and fails when the era is absent; the uniqueness of `batches.nonce`;
+  rule and fails when the era is absent; `batches.nonce` as the primary key;
   `trg_batch_lifecycle`, which keeps a nonce fixed
   once inserted; and the era row's immutability (`trg_era_immutable`, `trg_era_not_deletable`,
   `trg_era_single_insert`), so a live deployment is never re-anchored.

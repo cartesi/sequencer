@@ -12,7 +12,7 @@ use super::Storage;
 use super::acceptance::frontier_nonce;
 use super::convert::{external_u64_to_i64, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::queries::current_safe_block_required;
-use super::{BatchId, FrameHeader, PendingBatch, SubmitterFrontier};
+use super::{FrameHeader, PendingBatch, SubmitterFrontier};
 use sequencer_core::batch::{Batch, Frame as BatchFrame, WireUserOp};
 
 impl Storage {
@@ -85,45 +85,39 @@ impl Storage {
     /// insert, I16). The caller never sees an unstamped batch —
     /// there is no way to accidentally encode with the wrong nonce.
     pub fn pending_batches(&mut self, min_nonce: u64) -> Result<Vec<PendingBatch>> {
-        const SQL: &str = "SELECT batch_index, nonce FROM closed_batches \
+        const SQL: &str = "SELECT nonce FROM closed_batches \
                            WHERE nonce >= ?1 ORDER BY nonce ASC";
-        let pending_refs: Vec<(u64, u64)> = {
+        let nonces: Vec<u64> = {
             let mut stmt = self.conn.prepare_cached(SQL)?;
             let rows = stmt.query_map(params![u64_to_i64(min_nonce)], |row| {
-                let bi: i64 = row.get(0)?;
-                let nonce: i64 = row.get(1)?;
-                Ok((i64_to_u64(bi), i64_to_u64(nonce)))
+                row.get::<_, i64>(0).map(i64_to_u64)
             })?;
             rows.collect::<Result<Vec<_>>>()?
         };
 
-        let mut batches = Vec::with_capacity(pending_refs.len());
-        for (batch_index, nonce) in pending_refs {
-            let frames = self.load_batch_frames(batch_index)?;
+        let mut batches = Vec::with_capacity(nonces.len());
+        for nonce in nonces {
+            let frames = self.load_batch_frames(nonce)?;
             let batch = Batch { nonce, frames };
             let encoded = ssz::Encode::as_ssz_bytes(&batch);
-            batches.push(PendingBatch {
-                batch_index: BatchId::new(batch_index),
-                nonce,
-                encoded,
-            });
+            batches.push(PendingBatch { nonce, encoded });
         }
         Ok(batches)
     }
 
-    /// Load every frame (header + user ops) of `batch_index` in frame order.
+    /// Load every frame (header + user ops) of `batch_nonce` in frame order.
     /// Internal helper for [`Self::pending_batches`].
-    fn load_batch_frames(&mut self, batch_index: u64) -> Result<Vec<BatchFrame>> {
-        load_batch_frames_in(&self.conn, batch_index)
+    fn load_batch_frames(&mut self, batch_nonce: u64) -> Result<Vec<BatchFrame>> {
+        load_batch_frames_in(&self.conn, batch_nonce)
     }
 }
 
-fn frames_for_batch_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<Vec<FrameHeader>> {
+fn frames_for_batch_in(conn: &rusqlite::Connection, batch_nonce: u64) -> Result<Vec<FrameHeader>> {
     let mut stmt = conn.prepare_cached(
         "SELECT frame_in_batch, fee, safe_block FROM frames \
-         WHERE batch_index = ?1 ORDER BY frame_in_batch ASC",
+         WHERE batch_nonce = ?1 ORDER BY frame_in_batch ASC",
     )?;
-    let rows = stmt.query_map(params![u64_to_i64(batch_index)], |row| {
+    let rows = stmt.query_map(params![u64_to_i64(batch_nonce)], |row| {
         Ok(FrameHeader {
             frame_in_batch: i64_to_u32(row.get(0)?),
             fee: i64_to_u16(row.get(1)?),
@@ -139,18 +133,18 @@ fn frames_for_batch_in(conn: &rusqlite::Connection, batch_index: u64) -> Result<
 /// function being that single path is load-bearing.
 pub(super) fn load_batch_frames_in(
     conn: &rusqlite::Connection,
-    batch_index: u64,
+    batch_nonce: u64,
 ) -> Result<Vec<BatchFrame>> {
-    let frame_headers = frames_for_batch_in(conn, batch_index)?;
+    let frame_headers = frames_for_batch_in(conn, batch_nonce)?;
     let mut frames = Vec::with_capacity(frame_headers.len());
     for header in frame_headers {
         let mut stmt = conn.prepare_cached(
             "SELECT nonce, max_fee, data, sig FROM user_ops \
-             WHERE batch_index = ?1 AND frame_in_batch = ?2 \
+             WHERE batch_nonce = ?1 AND frame_in_batch = ?2 \
              ORDER BY pos_in_frame ASC",
         )?;
         let rows = stmt.query_map(
-            params![u64_to_i64(batch_index), i64::from(header.frame_in_batch)],
+            params![u64_to_i64(batch_nonce), i64::from(header.frame_in_batch)],
             |row| {
                 Ok(WireUserOp {
                     nonce: i64_to_u32(row.get(0)?),
@@ -202,7 +196,6 @@ mod tests {
         let pending = storage.pending_batches(0).expect("load pending batches");
         assert_eq!(pending.len(), 1);
         let entry = &pending[0];
-        assert_eq!(entry.batch_index, crate::storage::BatchId::from_raw(0));
         assert_eq!(entry.nonce, 0, "genesis batch has nonce 0");
 
         // The wire bytes must decode back to the authoritative nonce AND the
@@ -226,7 +219,7 @@ mod tests {
         // Before initialization there should be no batches.
         assert!(
             storage
-                .latest_batch_index()
+                .latest_batch_nonce()
                 .expect("query latest batch nonce on empty db")
                 .is_none()
         );
@@ -243,7 +236,7 @@ mod tests {
 
         // Latest batch nonce should now be 1 (open), with batch 0 closed.
         let latest = storage
-            .latest_batch_index()
+            .latest_batch_nonce()
             .expect("query latest batch nonce")
             .expect("latest batch should exist");
         assert_eq!(latest, 1);
@@ -301,19 +294,13 @@ mod tests {
             "exactly one batch should be eligible after the first close",
         );
         assert_eq!(
-            pending_after[0].batch_index,
-            crate::storage::BatchId::from_raw(0)
-        );
-        assert_eq!(
             pending_after[0].nonce, 0,
             "closed batch 0 must carry nonce 0 (genesis, the era's anchor)",
         );
         // The new open Tip (batch 1) must NOT be eligible even though it
         // exists — eligibility requires sealed_at_ms NOT NULL.
         assert!(
-            pending_after
-                .iter()
-                .all(|b| b.batch_index != crate::storage::BatchId::from_raw(1)),
+            pending_after.iter().all(|b| b.nonce != 1),
             "open batch 1 (the new Tip) must not be eligible: {pending_after:?}",
         );
     }

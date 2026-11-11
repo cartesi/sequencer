@@ -169,20 +169,19 @@ const LIVE_PAGE_SQL: &str = "
         CASE WHEN s.safe_input_index IS NOT NULL THEN d.payload ELSE NULL END,
         CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_number ELSE NULL END,
         f.safe_block,
-        b.nonce,
+        s.batch_nonce,
         s.safe_input_index,
         CASE WHEN s.user_op_pos_in_frame IS NOT NULL THEN u.nonce ELSE NULL END,
         CASE WHEN s.safe_input_index IS NOT NULL THEN d.block_timestamp ELSE NULL END,
         CASE WHEN s.safe_input_index IS NOT NULL THEN d.transaction_hash ELSE NULL END
     FROM application_inputs s
     LEFT JOIN user_ops u
-      ON u.batch_index = s.batch_index
+      ON u.batch_nonce = s.batch_nonce
      AND u.frame_in_batch = s.frame_in_batch
      AND u.pos_in_frame = s.user_op_pos_in_frame
     LEFT JOIN frames f
-      ON f.batch_index = s.batch_index AND f.frame_in_batch = s.frame_in_batch
+      ON f.batch_nonce = s.batch_nonce AND f.frame_in_batch = s.frame_in_batch
     LEFT JOIN safe_inputs d ON d.safe_input_index = s.safe_input_index
-    LEFT JOIN batches b ON b.batch_index = s.batch_index
     WHERE s.l2_tx_count >= ?1
     ORDER BY s.l2_tx_count
     LIMIT ?2
