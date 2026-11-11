@@ -166,15 +166,16 @@ cannot establish, or the supported guarantee changes.
 ## External history
 
 ```text
-HistoryVersion = (EraId, RecoveryGeneration)
-HistoryPosition = (HistoryVersion, ExecutedInputCount)
+HistoryClaim = (EraId, L2TxCount)
 ```
 
-`EraId` (UUIDv4, minted write-once in the baseline transaction) identifies a
-setup/rebuild era; no operation advances `RecoveryGeneration`, and a clean
-restart changes neither. The pair is an equality/discontinuity token,
-not an ordered counter. Snapshot headers and mandatory WS claims expose these coordinates. Every
-application row has its pre-execution count. See the [history contract](../protocol/application-history.md) and
+`EraId` (UUIDv4, minted write-once in the baseline transaction) is the
+history's identity: it identifies a setup/rebuild era, inside which the
+history only appends, and a clean restart leaves it unchanged. It is an
+equality/discontinuity token, not an ordered counter. Snapshot headers and
+mandatory WS claims expose the era id and the count. Every application row
+has its pre-execution count. See the
+[history contract](../protocol/application-history.md) and
 [register](../review/register.md#integration-work-owned-elsewhere).
 
 ## Performance posture

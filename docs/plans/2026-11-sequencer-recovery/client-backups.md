@@ -6,14 +6,13 @@ for a client that keeps its state in SQLite, as Bart's does, at any size:
 
 1. **Every commit is a boundary and keeps its rows.** Apply each feed row, or
    each run of rows, in one SQLite transaction that also writes the L2 tx
-   count, era and generation, and stores the rows themselves. Any consistent
+   count and era, and stores the rows themselves. Any consistent
    copy of the database, taken at any time, is then at a transaction boundary,
    says which, and holds every row before it.
-2. **A cut discards later snapshots.** Only a rebuild cuts the history, at the
-   count the client restored to. The new history replaces
-   the rows past the cut and reuses their counts. So once realigned, the client
-   deletes every snapshot past the cut and stops snapshotting its old live
-   database.
+2. **A new era discards later snapshots.** Inside an era the history only
+   appends; only a new era replaces it, past the count the client realigned
+   at, and reuses those counts. So once realigned, the client deletes every
+   snapshot past that count and stops snapshotting its old live database.
 
 To reach a count, restore the newest snapshot at or below it, replay the rows
 after it from the live database or a newer snapshot through the client's
@@ -43,8 +42,9 @@ From the SQLite, Litestream, OpenZFS and AWS documentation as of 2026-10-29:
   of one of its own files (`-txid`, `-timestamp`), which can batch many
   transactions, so pick one at or below the count and let the rows in the live
   database cover the rest. It deletes only by age, so it cannot discard the
-  restore points past a cut (rule 2): at a cut, replicate to a new path, and
-  restore from the old path only at or below the cut.
+  restore points past the realignment count (rule 2): on a new era,
+  replicate to a new path, and restore from the old path only at or below
+  that count.
 - The backup API and `VACUUM INTO` copy every page on every run. On a busy
   database a copy either restarts after each write from another connection or
   holds one read transaction, which stops WAL checkpoints until it ends.

@@ -91,7 +91,7 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 
 Subscribers restore an HTTP snapshot, then use one WebSocket stream to replay
 application inputs and follow the optimistic tip. A cockroach rebuild starts
-a new era; the snapshot's era, generation, and input count bind a resume request
+a new era; the snapshot's era and input count bind a resume request
 to the state the consumer actually holds. The endpoint serves a small number of
 infrastructure subscribers, which serve users directly. See the
 [bootstrap workflow](docs/protocol/application-history.md#replica-bootstrap-and-resume)
@@ -291,7 +291,7 @@ The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTyp
 
 Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
 
-### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
+### `GET /ws/subscribe?era_id=<uuid>&next_input=<u64>`
 
 WebSocket stream of the current application history, replaying from the inclusive
 `next_input` offset and then following the optimistic tip. Fetch and restore
@@ -299,16 +299,17 @@ WebSocket stream of the current application history, replaying from the inclusiv
 After each successfully applied input at offset `X`, persist the claim with
 `next_input = X + 1` alongside the replica state.
 
-- All three query fields are required. Missing or malformed fields, or missing
-  or invalid WebSocket upgrade headers, return HTTP `400` with a plain-text body.
-- An era or generation mismatch, an unavailable prefix, or a position ahead of
-  the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
-  header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,
-  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. On `ERA_CHANGED`, adopt the
-  current era at the saved count when `/history` allows it (below), or
-  rebootstrap. Rebootstrap on `HISTORY_UNAVAILABLE`. On `STALE_GENERATION`, a
-  compatible saved checkpoint can first be selected through `/history`.
-  `AHEAD_OF_HEAD` is an invalid claim to correct.
+- Both query fields are required. Missing, malformed or unknown fields, or
+  missing or invalid WebSocket upgrade headers, return HTTP `400` with a
+  plain-text body.
+- An era mismatch, an unavailable prefix, or a position ahead of the head
+  returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
+  header carry the same typed refusal: `ERA_CHANGED`, `HISTORY_UNAVAILABLE`,
+  or `AHEAD_OF_HEAD`. `ERA_CHANGED` names the server's current era, as in
+  `{"code": "ERA_CHANGED", "era_id": "22222222-2222-4222-8222-222222222222"}`;
+  adopt it at the saved count when `/history` allows it (below), or
+  rebootstrap. Rebootstrap on `HISTORY_UNAVAILABLE`. `AHEAD_OF_HEAD` is an
+  invalid claim to correct.
 - A claim exactly at the head waits for the next input. Replay uses bounded
   pages and queues, with no total catch-up limit. The subscriber cap is `64`.
 - Before upgrade, checks run in order: query and upgrade headers (`400`),
@@ -349,6 +350,7 @@ realign after a recovery
 `GET /history` returns one coherent view of the deployment, current application
 history, immutable era baseline, and latest accepted checkpoint. Optional
 `era_id=<uuid>` requires the selected era; a mismatch returns `409 ERA_CHANGED`.
+Any other query parameter returns `400`.
 Example immediately after a setup from a machine stopped at the stop block:
 
 ```json
@@ -361,10 +363,7 @@ Example immediately after a setup from a machine stopped at the stop block:
     "batch_submitter_address": "0x3333333333333333333333333333333333333333"
   },
   "history": {
-    "version": {
-      "era_id": "22222222-2222-4222-8222-222222222222",
-      "recovery_generation": 0
-    },
+    "era_id": "22222222-2222-4222-8222-222222222222",
     "available_from": 7,
     "head": 7
   },
@@ -378,8 +377,7 @@ Example immediately after a setup from a machine stopped at the stop block:
     "inclusion_block": 1240,
     "executed_input_count": 7,
     "next_batch_nonce": 2
-  },
-  "compatibility": null
+  }
 }
 ```
 
@@ -390,36 +388,23 @@ Example immediately after a setup from a machine stopped at the stop block:
   pinned after flushing the submitter's wallet, the exclusive InputBox end `R`
   through `C`, the scheduler's next batch nonce at the end of `C`, and
   `rebuilt_history_end` `E`, the count at the end of `C`. The rebuilt history
-  covers `[K,E)` and the live rows follow. It survives generation changes and
-  baseline artifact GC. It is distinct from the moving safe head.
+  covers `[K,E)` and the live rows follow. It survives baseline artifact GC,
+  and it is distinct from the moving safe head.
 - `accepted_checkpoint`, when available, has `inclusion_block`,
-  `executed_input_count`, and `next_batch_nonce`, under `history.version`.
+  `executed_input_count`, and `next_batch_nonce`, under `history.era_id`.
   Until a batch of the era is accepted, it is the era baseline: block `C`,
   count `E` and the baseline's nonce, since the canonical machine reaches the
   same state at the end of `C`. The metadata does not lease or download a native artifact
   and does not certify a client projection. A known divergence returns `503`.
-- `compatibility` is `null` unless `from_generation=<u64>` is supplied together
-  with `era_id`. It then contains `from_generation` and `preserved_input_count`:
-  the prefix preserved since that generation, bounded by the current head. No
-  operation advances the generation, so within an era this is the current head. A future generation or missing era returns
-  `400 BAD_REQUEST`; an era mismatch takes precedence over the generation bound.
 
-For example, `GET /history?era_id=<uuid>&from_generation=0` can return
-`"compatibility": {"from_generation": 0, "preserved_input_count": 3}`.
-A saved checkpoint from that era/generation is reusable when its count `X`
-satisfies `K <= X <= 3`. The boundary is inclusive: the checkpoint has executed
-entries before `X`, and resumes at entry `X`. Each checkpoint must be checked
-using its own saved generation. Within an era the bound is the current head. The [history contract](docs/protocol/application-history.md#checkpoint-compatibility-across-generations)
-defines the calculation and trust boundary.
-
-Restore an eligible checkpoint, persist the response's current history version
-with it, and subscribe using that version and its actual count. Compatibility does
-not certify the client's application or projection implementation, and cannot
-cross a cockroach recovery's new era.
+Inside an era the history only appends, so a saved state at any count `X`
+with `K <= X <= head` resumes with the claim it was saved with: its era id and
+`next_input = X`. The [history contract](docs/protocol/application-history.md#identity-and-available-history)
+owns this rule.
 
 A client of an older era (its claim refused with `ERA_CHANGED`) holding state at
 count `X` adopts the current era when `K <= X <= E`: it subscribes with the
-current `history.version` and `next_input = X`. Below `K`, the era's base is
+current `history.era_id` and `next_input = X`. Below `K`, the era's base is
 newer than its state; above `E`, its state holds rows the old instance served
 that never landed by `C`, even when `head` is past `X`. Both need another
 starting state. The check compares counts only: a state that is wrong below
@@ -427,7 +412,7 @@ its count passes it, and only comparing the feed's rows from `K` with its own
 exposes that. The [history contract](docs/protocol/application-history.md#adopting-a-new-era)
 defines the rule; the server adds no check of its own.
 
-The Rust SDK exposes `history(expected_era, from_generation)` and
+The Rust SDK exposes `history(expected_era)` and
 `adopt_current_era(count)` with typed metadata, adoption and era refusals.
 Both use the configured request deadline, including body transfer. The client
 owns persistence, checkpoint selection, and subscription.
@@ -455,8 +440,8 @@ they are served only on the internal listener, behind network controls.
   adding a coherent `checkpoint.toml` receipt with its L1 inclusion block and
   next batch nonce: an operator backup, which no command consumes.
 
-Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
-and `X-Executed-Input-Count`, selected in the read that takes the artifact lease.
+Successful state/archive downloads include `X-History-Era` and
+`X-Executed-Input-Count`, selected in the read that takes the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 Bodies stream without `Content-Length`; a failure after the headers aborts the
 transfer, so treat an incomplete body as a failed download.
@@ -500,7 +485,6 @@ canonical agreement.
 - `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
 - `safe_inputs`: every raw InputBox observation, including batch envelopes
 - `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
-- `history_generation_cuts`: one immutable cut per generation transition; the greatest is the recovery generation, and no operation advances it
 - `rebuilt_history`: the transactions setup executed from the base through the stop block, each with its count; the feed serves them before the live rows
 - `snapshots`: one immutable row per batch-close or baseline artifact (its directory and count); accepted status is read from `batches.accepted_input`, and download leases live in the serving process
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.

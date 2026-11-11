@@ -68,8 +68,9 @@ pub(crate) enum TickOutcome {
 /// observed nonce equal to the next expected one. The observed nonces are our own
 /// `InputAdded` events past the frontier's safe block up to latest, in event (so
 /// wallet-nonce, so submission) order; matching by equality advances once for a
-/// nonce repeated across recovery generations. A resubmission heuristic, not a
-/// scheduler mirror: it reads unsafe events and applies no staleness rule.
+/// nonce L1 carries twice, such as an earlier era's batch. A resubmission
+/// heuristic, not a scheduler mirror: it reads unsafe events and applies no
+/// staleness rule.
 fn decide_submit_start(frontier: SubmitterFrontier, recently_observed_nonces: &[u64]) -> u64 {
     let mut expected = frontier.accepted_next_nonce;
     for &nonce in recently_observed_nonces {

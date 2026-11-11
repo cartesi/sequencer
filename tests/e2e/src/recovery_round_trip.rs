@@ -359,7 +359,7 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
     assert_eq!(runtime.canonical_divergence()?, None);
 
     let sequencer = runtime.sequencer_client()?;
-    let info = sequencer.history(None, None).await?;
+    let info = sequencer.history(None).await?;
     assert_eq!(info.history.available_from.get(), base_count);
     assert_eq!(info.baseline.rebuilt_history_end.get(), trusted);
     assert_eq!(info.baseline.l1_stop_block, era.stop_block);
@@ -376,7 +376,7 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
         (era.stop_block, trusted, 2)
     );
     assert_ne!(
-        info.history.version.era_id, old.claim.version.era_id,
+        info.history.era_id, old.claim.era_id,
         "setup starts a new era"
     );
 
@@ -498,7 +498,7 @@ async fn run_round_trip(runtime: &mut ManagedSequencer, base: RecoveryBase) -> S
         "the new era's first batch holds the drained directs and the live rows: \
          count {landed_count}, rebuilt end {trusted}"
     );
-    let info = sequencer.history(None, None).await?;
+    let info = sequencer.history(None).await?;
     let landed = info
         .accepted_checkpoint
         .ok_or("the landed batch is an accepted checkpoint")?;
@@ -572,7 +572,7 @@ async fn land_a_batch(
     let block = mine_until_finalized_advances(runtime, floor).await?;
     let checkpoint = runtime
         .sequencer_client()?
-        .history(None, None)
+        .history(None)
         .await?
         .accepted_checkpoint
         .ok_or("a landed batch is an accepted checkpoint")?;

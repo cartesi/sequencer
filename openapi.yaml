@@ -275,11 +275,6 @@ paths:
           required: true
           schema:
             $ref: "#/components/schemas/EraId"
-        - name: recovery_generation
-          in: query
-          required: true
-          schema:
-            $ref: "#/components/schemas/U64"
         - name: next_input
           in: query
           required: true
@@ -293,8 +288,9 @@ paths:
             `BroadcastTxMessage` JSON documents.
         "400":
           description: |
-            Missing or malformed query fields, or a missing or invalid
-            upgrade header. The body is plain text, not the JSON error shape.
+            Missing, malformed or unknown query fields, or a missing or
+            invalid upgrade header. The body is plain text, not the JSON
+            error shape.
           content:
             text/plain:
               schema:
@@ -317,10 +313,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/HistoryPolicyError"
               example:
-                code: STALE_GENERATION
-                current:
-                  era_id: 22222222-2222-4222-8222-222222222222
-                  recovery_generation: 1
+                code: ERA_CHANGED
+                era_id: 22222222-2222-4222-8222-222222222222
         "429":
           description: Subscriber limit reached.
           content:
@@ -345,14 +339,14 @@ paths:
       description: |
         One coherent view. `history.available_from` is the era's base count;
         the feed serves the rebuilt history from there up to
-        `baseline.rebuilt_history_end`, then the live rows. `compatibility`
-        is `null` unless `from_generation` is supplied together with
-        `era_id`. Unknown query fields are rejected. An era mismatch (`409`)
-        takes precedence over the `from_generation` bound (`400`).
+        `baseline.rebuilt_history_end`, then the live rows. Inside an era
+        the history only appends, so a state saved at any count from
+        `available_from` to `head` resumes with its era id. An unknown query
+        parameter is `400`.
 
         A client holding state from an older era at count `X` adopts this
         era when `available_from <= X <= baseline.rebuilt_history_end`: it
-        subscribes with `history.version` and `next_input = X`. Below the
+        subscribes with `history.era_id` and `next_input = X`. Below the
         range the era's base is newer than its state; above it, its state
         holds rows that never landed by the stop block.
       parameters:
@@ -362,12 +356,6 @@ paths:
           description: Require this era; a mismatch returns `409 ERA_CHANGED`.
           schema:
             $ref: "#/components/schemas/EraId"
-        - name: from_generation
-          in: query
-          required: false
-          description: Requires `era_id`. A generation ahead of the current one is `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
       responses:
         "200":
           description: History metadata.
@@ -383,9 +371,7 @@ paths:
                   app_deployment_block: 1
                   batch_submitter_address: "0x3333333333333333333333333333333333333333"
                 history:
-                  version:
-                    era_id: 22222222-2222-4222-8222-222222222222
-                    recovery_generation: 0
+                  era_id: 22222222-2222-4222-8222-222222222222
                   available_from: 7
                   head: 7
                 baseline:
@@ -397,7 +383,6 @@ paths:
                   inclusion_block: 1240
                   executed_input_count: 7
                   next_batch_nonce: 2
-                compatibility: null
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -497,8 +482,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/octet-stream:
               schema:
@@ -537,8 +520,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/x-tar:
               schema:
@@ -574,8 +555,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/x-tar:
               schema:
@@ -676,16 +655,10 @@ components:
         type: string
         pattern: "^[0-9]+$"
     XHistoryEra:
-      description: Era of the artifact's history version.
+      description: Era of the artifact's history; the `era_id` to subscribe with.
       required: true
       schema:
         $ref: "#/components/schemas/EraId"
-    XRecoveryGeneration:
-      description: Recovery generation of the artifact's history version.
-      required: true
-      schema:
-        type: string
-        pattern: "^[0-9]+$"
 
   responses:
     BadRequest:
@@ -725,17 +698,14 @@ components:
             message: canonical divergence prevents accepted checkpoint selection
     HistoryConflict:
       description: |
-        The requested era is not the current era. These routes refuse only
-        on era; a generation change does not invalidate their results.
+        The requested era is not the current era.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/HistoryEraChanged"
           example:
             code: ERA_CHANGED
-            current:
-              era_id: 22222222-2222-4222-8222-222222222222
-              recovery_generation: 0
+            era_id: 22222222-2222-4222-8222-222222222222
 
   schemas:
     U64:
@@ -896,22 +866,14 @@ components:
         message:
           type: string
 
-    HistoryVersion:
-      type: object
-      required: [era_id, recovery_generation]
-      description: Identity of locally available application history; claim both fields when resuming.
-      properties:
-        era_id:
-          $ref: "#/components/schemas/EraId"
-        recovery_generation:
-          $ref: "#/components/schemas/U64"
-
     HistoryBounds:
       type: object
-      required: [version, available_from, head]
+      required: [era_id, available_from, head]
       properties:
-        version:
-          $ref: "#/components/schemas/HistoryVersion"
+        era_id:
+          allOf:
+            - $ref: "#/components/schemas/EraId"
+          description: The history's identity; claim it with the count when resuming.
         available_from:
           allOf:
             - $ref: "#/components/schemas/U64"
@@ -980,23 +942,9 @@ components:
         next_batch_nonce:
           $ref: "#/components/schemas/U64"
 
-    HistoryCompatibility:
-      type: object
-      required: [from_generation, preserved_input_count]
-      properties:
-        from_generation:
-          $ref: "#/components/schemas/U64"
-        preserved_input_count:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: |
-            Checkpoint counts up to and including this boundary preserve
-            their input prefix since `from_generation`. No operation advances
-            the generation.
-
     HistoryInfo:
       type: object
-      required: [deployment, history, baseline, accepted_checkpoint, compatibility]
+      required: [deployment, history, baseline, accepted_checkpoint]
       properties:
         deployment:
           $ref: "#/components/schemas/HistoryDeployment"
@@ -1008,55 +956,37 @@ components:
           oneOf:
             - $ref: "#/components/schemas/AcceptedCheckpoint"
             - type: "null"
-        compatibility:
-          oneOf:
-            - $ref: "#/components/schemas/HistoryCompatibility"
-            - type: "null"
 
     HistoryPolicyError:
       description: Typed refusal of a history claim, discriminated by `code`.
       oneOf:
         - $ref: "#/components/schemas/HistoryEraChanged"
-        - $ref: "#/components/schemas/HistoryStaleGeneration"
         - $ref: "#/components/schemas/HistoryUnavailable"
         - $ref: "#/components/schemas/HistoryAheadOfHead"
       discriminator:
         propertyName: code
         mapping:
           ERA_CHANGED: "#/components/schemas/HistoryEraChanged"
-          STALE_GENERATION: "#/components/schemas/HistoryStaleGeneration"
           HISTORY_UNAVAILABLE: "#/components/schemas/HistoryUnavailable"
           AHEAD_OF_HEAD: "#/components/schemas/HistoryAheadOfHead"
 
     HistoryEraChanged:
       type: object
-      required: [code, current]
+      required: [code, era_id]
       description: |
         The claimed era is not the current era. A client holding state at
         count `X` adopts the current era when
         `available_from <= X <= baseline.rebuilt_history_end` (`GET /history`)
-        and subscribes with `current` at `X`. Otherwise it needs another
+        and subscribes with `era_id` at `X`. Otherwise it needs another
         starting state: a replica rebootstraps from a current snapshot.
       properties:
         code:
           type: string
           const: ERA_CHANGED
-        current:
-          $ref: "#/components/schemas/HistoryVersion"
-
-    HistoryStaleGeneration:
-      type: object
-      required: [code, current]
-      description: |
-        Same era, different recovery generation (normally an older one).
-        Select a compatible saved checkpoint through
-        `GET /history?era_id=&from_generation=`, or rebootstrap.
-      properties:
-        code:
-          type: string
-          const: STALE_GENERATION
-        current:
-          $ref: "#/components/schemas/HistoryVersion"
+        era_id:
+          allOf:
+            - $ref: "#/components/schemas/EraId"
+          description: The server's current era.
 
     HistoryUnavailable:
       type: object

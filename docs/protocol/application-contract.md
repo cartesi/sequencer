@@ -182,8 +182,8 @@ advances; a recovery from a canonical machine starts at that machine's count
 ([§7](#7-canonical-recovery-integration)). SQLite stores an independent expected snapshot count and per-input
 execution offsets, checked during catch-up.
 
-HTTP snapshot metadata and mandatory WS claims carry the history version and
-this count. Both restart and subscriber replay read the same current application
+HTTP snapshot metadata and mandatory WS claims carry the era id and this
+count. Both restart and subscriber replay read the same current application
 sequence. The [history guide](application-history.md) owns coordinates and
 replica bootstrap; the [API contract](../../README.md) owns wire shapes.
 

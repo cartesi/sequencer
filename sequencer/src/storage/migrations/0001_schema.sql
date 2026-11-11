@@ -432,28 +432,6 @@ BEGIN SELECT RAISE(ABORT, 'the era is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_era_not_deletable
 BEFORE DELETE ON era FOR EACH ROW
 BEGIN SELECT RAISE(ABORT, 'the era is retained for the database lifetime'); END;
--- One cut for each recovery transition, measured after invalidation removes
--- the old suffix and before reopening attributes replacement direct inputs.
--- The recovery generation is the greatest cut's (0 with none): there is no
--- stored counter, so this ledger is the generation's only home.
-CREATE TABLE IF NOT EXISTS history_generation_cuts (
-    recovery_generation INTEGER PRIMARY KEY CHECK (recovery_generation > 0),
-    preserved_l2_tx_count INTEGER NOT NULL CHECK (preserved_l2_tx_count >= 0)
-) STRICT;
--- With no era the subquery yields no row, `IS NOT` compares with NULL and
--- holds, and the insert aborts: a cut never exists without its era.
-CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_contiguous
-BEFORE INSERT ON history_generation_cuts FOR EACH ROW
-WHEN NEW.recovery_generation IS NOT (
-    SELECT COALESCE((SELECT MAX(recovery_generation) FROM history_generation_cuts), 0) + 1
-      FROM era WHERE singleton_id = 0)
-BEGIN SELECT RAISE(ABORT, 'a cut advances the recovery generation by exactly one, within an era'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_immutable
-BEFORE UPDATE ON history_generation_cuts FOR EACH ROW
-BEGIN SELECT RAISE(ABORT, 'history generation cuts are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_history_generation_cuts_not_deletable
-BEFORE DELETE ON history_generation_cuts FOR EACH ROW
-BEGIN SELECT RAISE(ABORT, 'history generation cuts are retained throughout the era'); END;
 
 CREATE TRIGGER IF NOT EXISTS trg_application_inputs_target_must_be_tip
 BEFORE INSERT ON application_inputs FOR EACH ROW

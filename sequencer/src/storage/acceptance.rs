@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn acceptance_skips_below_anchor_collapsed_history_without_divergence() {
         // Below the anchor the local list has no batches (that history was folded
-        // into S'). Old-generation L1 landings at nonces < N' are trusted
+        // into S'). Earlier-era L1 landings at nonces < N' are trusted
         // collapsed history: skipped by nonce-mismatch BEFORE the content-identity
         // check, so they must NOT be flagged Foreign (which would freeze the
         // frontier and force a false recovery). Pins the anchor-aware-frontier
@@ -807,7 +807,7 @@ mod tests {
         );
         let submitter = SENDER_A;
 
-        // Old-generation batches at nonces 0, 1, 2 (< anchor) land from the submitter.
+        // Earlier-era batches at nonces 0, 1, 2 (< anchor) land from the submitter.
         let mk = |nonce: u64| {
             ssz::Encode::as_ssz_bytes(&sequencer_core::batch::Batch {
                 nonce,

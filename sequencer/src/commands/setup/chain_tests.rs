@@ -287,11 +287,11 @@ fn with_key(extra: &[&'static str]) -> Vec<&'static str> {
 
 /// The rows the feed serves from `from` on.
 fn feed(storage: &mut Storage, from: u64) -> Vec<Row> {
-    let version = storage.history_version().unwrap();
+    let era_id = storage.era().unwrap().id;
     let page = storage
         .canonical_history_page(
             HistoryClaim {
-                version,
+                era_id,
                 next_input: L2TxCount::new(from),
             },
             1024,

@@ -332,7 +332,7 @@ feed it already uses, with no file and no separate tool:
    each row up to `X` with the row it stored. Any difference means its state is
    not canonical.
 5. **Subscribe with the adopted claim** and follow the feed as always. The
-   claim carries the new era's version, and the server checks it like any
+   claim carries the new era's id, and the server checks it like any
    other; it does not check the rebuilt history end itself, so step 3 is the
    client's to do.
 
@@ -372,7 +372,7 @@ it exist only on L1.
 | The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, whose unit tests drive every failure arm through a scripted emulator, and `canonical-test`'s `export` cases run on the built image. |
 | Export check, and the rebuild executing as it goes | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs); `admitted_directs_in` in [`storage/l1_inputs.rs`](../../sequencer/src/storage/l1_inputs.rs) for the closing direct count. |
 | Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
-| The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`, `history_version_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
+| The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
 | The root frame's drain from the first queued input | `next_undrained_safe_input_index_in` in [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs). |
 | The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshots.rs`](../../sequencer/src/storage/snapshots.rs). |
 | The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |

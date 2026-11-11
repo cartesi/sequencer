@@ -3,7 +3,7 @@
 
 use crate::{
     AdoptEraError, EraId, HistoryClaim, HistoryInfo, HistoryPolicyError, HistoryReadError,
-    L2TxCount, RecoveryGeneration, SequencerClient,
+    L2TxCount, SequencerClient,
 };
 
 impl SequencerClient {
@@ -14,23 +14,19 @@ impl SequencerClient {
     /// rows that never landed. Both refusals need another starting state, and
     /// neither check sees a state that is wrong below its count.
     pub async fn adopt_current_era(&self, count: L2TxCount) -> Result<HistoryClaim, AdoptEraError> {
-        Ok(self.history(None, None).await?.adopt_claim(count)?)
+        Ok(self.history(None).await?.adopt_claim(count)?)
     }
 
-    /// Discover history, optionally requiring the era selected for bootstrap.
-    /// A compatibility query supplies both the checkpoint's era and its generation.
+    /// Discover history, optionally requiring the era selected for bootstrap:
+    /// a different current era is the typed `ERA_CHANGED` refusal.
     pub async fn history(
         &self,
         expected_era: Option<EraId>,
-        from_generation: Option<RecoveryGeneration>,
     ) -> Result<HistoryInfo, HistoryReadError> {
-        let mut query: Vec<_> = expected_era
+        let query: Vec<_> = expected_era
             .map(|era| ("era_id", era.to_string()))
             .into_iter()
             .collect();
-        if let Some(generation) = from_generation {
-            query.push(("from_generation", generation.get().to_string()));
-        }
         let request = self
             .http_client
             .get(format!("{}/history", self.endpoint.trim_end_matches('/')))
@@ -121,7 +117,7 @@ mod tests {
                 "batch_submitter_address": "0x3333333333333333333333333333333333333333"
             },
             "history": {
-                "version": { "era_id": ERA, "recovery_generation": 2 },
+                "era_id": ERA,
                 "available_from": 7,
                 "head": 12
             },
@@ -135,8 +131,7 @@ mod tests {
                 "inclusion_block": 1250,
                 "executed_input_count": 10,
                 "next_batch_nonce": 3
-            },
-            "compatibility": null
+            }
         })
         .to_string()
     }
@@ -145,13 +140,12 @@ mod tests {
     async fn discovery_decodes_history_and_encodes_optional_era() {
         for expected_era in [None, Some(ERA.parse().unwrap())] {
             let (client, server) = serve_once(200, history_body()).await;
-            let info = client.history(expected_era, None).await.unwrap();
+            let info = client.history(expected_era).await.unwrap();
             assert_eq!(info.history.available_from.get(), 7);
             assert_eq!(info.history.head.get(), 12);
-            assert_eq!(info.history.version.era_id.to_string(), ERA);
+            assert_eq!(info.history.era_id.to_string(), ERA);
             assert_eq!(info.baseline.l1_stop_block, 1240);
             assert_eq!(info.baseline.rebuilt_history_end.get(), 9);
-            assert!(info.compatibility.is_none());
             let url = request_url(&server.await.unwrap());
             assert_eq!(url.path(), "/history");
             let query: Vec<_> = url.query_pairs().collect();
@@ -161,33 +155,6 @@ mod tests {
                 assert!(query.is_empty());
             }
         }
-    }
-
-    #[tokio::test]
-    async fn compatibility_encodes_checkpoint_generation_and_decodes_preserved_boundary() {
-        let mut body: serde_json::Value = serde_json::from_str(&history_body()).unwrap();
-        body["compatibility"] = serde_json::json!({
-            "from_generation": 1,
-            "preserved_input_count": 9
-        });
-        let (client, server) = serve_once(200, body.to_string()).await;
-        let info = client
-            .history(Some(ERA.parse().unwrap()), Some(RecoveryGeneration::new(1)))
-            .await
-            .unwrap();
-        let compatibility = info.compatibility.unwrap();
-        assert_eq!(compatibility.from_generation.get(), 1);
-        assert_eq!(compatibility.preserved_input_count.get(), 9);
-        assert_eq!(info.history.version.recovery_generation.get(), 2);
-        let url = request_url(&server.await.unwrap());
-        assert_eq!(url.path(), "/history");
-        assert_eq!(
-            url.query_pairs().collect::<Vec<_>>(),
-            [
-                ("era_id".into(), ERA.into()),
-                ("from_generation".into(), "1".into())
-            ]
-        );
     }
 
     #[tokio::test]
@@ -202,8 +169,7 @@ mod tests {
         };
         for count in [7, 8, 9] {
             let claim = adopt(count).await.unwrap();
-            assert_eq!(claim.version.era_id.to_string(), ERA);
-            assert_eq!(claim.version.recovery_generation.get(), 2);
+            assert_eq!(claim.era_id.to_string(), ERA);
             assert_eq!(claim.next_input.get(), count);
         }
         for count in [0, 6] {
@@ -239,14 +205,13 @@ mod tests {
 
     #[tokio::test]
     async fn era_change_is_a_typed_refusal() {
+        let current = "11111111-1111-4111-8111-111111111111";
         let policy = HistoryPolicyError::EraChanged {
-            current: crate::HistoryVersion {
-                era_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-                recovery_generation: sequencer_core::history::RecoveryGeneration::new(0),
-            },
+            era_id: current.parse().unwrap(),
         };
-        let (client, server) = serve_once(409, serde_json::to_string(&policy).unwrap()).await;
-        let result = client.history(Some(ERA.parse().unwrap()), None).await;
+        let body = serde_json::json!({ "code": "ERA_CHANGED", "era_id": current }).to_string();
+        let (client, server) = serve_once(409, body).await;
+        let result = client.history(Some(ERA.parse().unwrap())).await;
         assert!(matches!(result, Err(HistoryReadError::History(actual)) if actual == policy));
         server.await.unwrap();
     }
@@ -257,7 +222,7 @@ mod tests {
             let body = format!("refusal {status}");
             let (client, server) = serve_once(status, body.clone()).await;
             assert!(matches!(
-                client.history(None, None).await,
+                client.history(None).await,
                 Err(HistoryReadError::Http { status: actual_status, body: actual_body })
                     if actual_status == status && actual_body == body
             ));
@@ -269,7 +234,7 @@ mod tests {
     async fn malformed_success_is_a_decode_error() {
         let (client, server) = serve_once(200, "{}".into()).await;
         assert!(matches!(
-            client.history(None, None).await,
+            client.history(None).await,
             Err(HistoryReadError::Decode(_))
         ));
         server.await.unwrap();
@@ -291,7 +256,7 @@ mod tests {
         let client = SequencerClient::new(endpoint)
             .unwrap()
             .with_request_timeout(Duration::from_millis(100));
-        let result = tokio::time::timeout(Duration::from_secs(5), client.history(None, None))
+        let result = tokio::time::timeout(Duration::from_secs(5), client.history(None))
             .await
             .expect("the configured deadline must include body transfer");
         server.abort();

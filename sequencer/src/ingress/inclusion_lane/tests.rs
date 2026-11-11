@@ -1350,7 +1350,7 @@ fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::Appl
     storage
         .canonical_history_page(
             sequencer_core::history::HistoryClaim {
-                version: bounds.version,
+                era_id: bounds.era_id,
                 next_input: bounds.available_from,
             },
             limit,
@@ -1792,7 +1792,7 @@ async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
     let live: Vec<_> = storage
         .canonical_history_page(
             sequencer_core::history::HistoryClaim {
-                version: bounds.version,
+                era_id: bounds.era_id,
                 next_input: L2TxCount::new(test_era::REBUILT_END),
             },
             16,

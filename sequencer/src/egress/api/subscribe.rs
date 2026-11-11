@@ -18,17 +18,19 @@ use crate::egress::l2_tx_feed::Subscription;
 use crate::egress::l2_tx_feed::{BroadcastTxMessage, L2TxFeed, SubscribeError};
 use crate::http::ApiError;
 use axum::{Json, http::StatusCode};
-use sequencer_core::history::{EraId, HistoryClaim, HistoryVersion, L2TxCount, RecoveryGeneration};
+use sequencer_core::history::{EraId, HistoryClaim, L2TxCount};
 
 use super::SubscribeState;
 
 const MAX_INBOUND_WS_MESSAGE_SIZE: usize = 8 * 1024;
 const MAX_INBOUND_WS_FRAME_SIZE: usize = 8 * 1024;
 
+/// The claim, field for field. An unknown field is a `400`, so a client
+/// that sends coordinates the server does not check fails loudly.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SubscribeQuery {
     era_id: EraId,
-    recovery_generation: RecoveryGeneration,
     next_input: L2TxCount,
 }
 
@@ -42,10 +44,7 @@ pub(crate) async fn subscribe_l2_txs(
     }
 
     let claim = HistoryClaim {
-        version: HistoryVersion {
-            era_id: query.era_id,
-            recovery_generation: query.recovery_generation,
-        },
+        era_id: query.era_id,
         next_input: query.next_input,
     };
     let permit = match state.try_acquire_ws_subscriber_permit() {

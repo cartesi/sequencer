@@ -1426,10 +1426,7 @@ fn test_domain() -> Eip712Domain {
 
 fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
     HistoryClaim {
-        version: Storage::open_read_only(db_path)
-            .unwrap()
-            .history_version()
-            .unwrap(),
+        era_id: Storage::open_read_only(db_path).unwrap().era().unwrap().id,
         next_input: L2TxCount::new(next),
     }
 }

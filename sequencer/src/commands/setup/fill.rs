@@ -281,11 +281,11 @@ mod tests {
         assert_eq!(storage.open_state().unwrap().unwrap().safe_block(), 1500);
 
         let drained = |storage: &mut Storage| {
-            let version = storage.history_version().unwrap();
+            let era_id = storage.era().unwrap().id;
             let page = storage
                 .canonical_history_page(
                     HistoryClaim {
-                        version,
+                        era_id,
                         next_input: L2TxCount::new(41),
                     },
                     16,

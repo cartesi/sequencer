@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! External history identity and version coordinates.
+//! External history identity and coordinates: the era and the L2 tx count.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -147,44 +147,22 @@ pub enum EraIdParseError {
     InvalidVariant,
 }
 
-/// Monotonic soft-history revision within one [`EraId`].
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct RecoveryGeneration(u64);
-
-impl RecoveryGeneration {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Equality/discontinuity token for locally available application history.
-/// Consumers must claim both fields when resuming application history; a
-/// client of an older era adopts a new one only through
-/// [`crate::history_api::HistoryInfo::adopt_claim`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HistoryVersion {
-    pub era_id: EraId,
-    pub recovery_generation: RecoveryGeneration,
-}
-
 /// The history a consumer holds and the next application input it can execute.
+///
+/// An era is the history's whole identity: inside one era the history only
+/// appends, so a claim needs no revision besides its era. A client of an older
+/// era adopts a new one only through
+/// [`crate::history_api::HistoryInfo::adopt_claim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryClaim {
-    pub version: HistoryVersion,
+    pub era_id: EraId,
     pub next_input: L2TxCount,
 }
 
 /// One coherent view of the locally available canonical history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryBounds {
-    pub version: HistoryVersion,
+    pub era_id: EraId,
     pub available_from: L2TxCount,
     pub head: L2TxCount,
 }
@@ -192,7 +170,7 @@ pub struct HistoryBounds {
 impl HistoryBounds {
     /// Validate identity before position: equal counts cannot resume a different
     /// history by themselves. A client of another era first checks its count
-    /// against the new era's rebuilt range and claims the current version
+    /// against the new era's rebuilt range and claims the current era
     /// ([`crate::history_api::HistoryInfo::adopt_claim`]). Every count in the
     /// inclusive range is admissible; `head` waits for the next input.
     pub fn validate(&self, claim: HistoryClaim) -> Result<(), HistoryPolicyError> {
@@ -200,14 +178,9 @@ impl HistoryBounds {
             self.available_from <= self.head,
             "available history base exceeds its head"
         );
-        if claim.version.era_id != self.version.era_id {
+        if claim.era_id != self.era_id {
             return Err(HistoryPolicyError::EraChanged {
-                current: self.version,
-            });
-        }
-        if claim.version.recovery_generation != self.version.recovery_generation {
-            return Err(HistoryPolicyError::StaleGeneration {
-                current: self.version,
+                era_id: self.era_id,
             });
         }
         if claim.next_input < self.available_from {
@@ -225,10 +198,9 @@ impl HistoryBounds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryPolicyError {
+    /// The claim names another era; `era_id` is the server's current one.
     #[error("history era changed")]
-    EraChanged { current: HistoryVersion },
-    #[error("history generation changed")]
-    StaleGeneration { current: HistoryVersion },
+    EraChanged { era_id: EraId },
     #[error("requested input precedes locally available history")]
     HistoryUnavailable { available_from: L2TxCount },
     #[error("requested input is ahead of the history head")]
@@ -253,12 +225,16 @@ mod tests {
             "\"00112233-4455-4677-8899-aabbccddeeff\""
         );
         let claim = HistoryClaim {
-            version: HistoryVersion {
-                era_id: era,
-                recovery_generation: RecoveryGeneration::new(7),
-            },
+            era_id: era,
             next_input: L2TxCount::new(u64::MAX),
         };
+        assert_eq!(
+            serde_json::to_value(claim).unwrap(),
+            serde_json::json!({
+                "era_id": "00112233-4455-4677-8899-aabbccddeeff",
+                "next_input": u64::MAX
+            })
+        );
         assert_eq!(
             serde_json::from_str::<HistoryClaim>(&serde_json::to_string(&claim).unwrap()).unwrap(),
             claim
@@ -273,24 +249,11 @@ mod tests {
 
     #[test]
     fn history_policy_errors_preserve_literal_wire_codes_and_fields() {
-        let current = HistoryVersion {
-            era_id: CANONICAL.parse().unwrap(),
-            recovery_generation: RecoveryGeneration::new(7),
-        };
+        let era_id: EraId = CANONICAL.parse().unwrap();
         for (error, json) in [
             (
-                HistoryPolicyError::EraChanged { current },
-                serde_json::json!({
-                    "code": "ERA_CHANGED",
-                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
-                }),
-            ),
-            (
-                HistoryPolicyError::StaleGeneration { current },
-                serde_json::json!({
-                    "code": "STALE_GENERATION",
-                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
-                }),
+                HistoryPolicyError::EraChanged { era_id },
+                serde_json::json!({ "code": "ERA_CHANGED", "era_id": CANONICAL }),
             ),
             (
                 HistoryPolicyError::HistoryUnavailable {
@@ -355,55 +318,36 @@ mod tests {
 
     fn history_bounds(base: u64, head: u64) -> HistoryBounds {
         HistoryBounds {
-            version: HistoryVersion {
-                era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
-                recovery_generation: RecoveryGeneration::new(4),
-            },
+            era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
             available_from: L2TxCount::new(base),
             head: L2TxCount::new(head),
         }
     }
 
     #[test]
-    fn history_claim_checks_era_before_generation_and_position() {
+    fn history_bounds_json_pins_the_era_and_both_counts() {
+        assert_eq!(
+            serde_json::to_value(history_bounds(7, 12)).unwrap(),
+            serde_json::json!({ "era_id": CANONICAL, "available_from": 7, "head": 12 })
+        );
+    }
+
+    #[test]
+    fn history_claim_checks_era_before_position() {
         let bounds = history_bounds(41, 45);
         let mut other_era = CANONICAL_BYTES;
         other_era[0] ^= 1;
         let other_era = EraId::from_bytes(other_era).unwrap();
-        for (generation, next_input) in [(4, 43), (3, 0), (u64::MAX, u64::MAX)] {
+        for next_input in [43, 0, u64::MAX] {
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: HistoryVersion {
-                        era_id: other_era,
-                        recovery_generation: RecoveryGeneration::new(generation),
-                    },
+                    era_id: other_era,
                     next_input: L2TxCount::new(next_input),
                 }),
                 Err(HistoryPolicyError::EraChanged {
-                    current: bounds.version,
+                    era_id: bounds.era_id,
                 })
             );
-        }
-    }
-
-    #[test]
-    fn history_claim_requires_equal_generation_before_checking_position() {
-        let bounds = history_bounds(41, 45);
-        for generation in [0, 3, 5, u64::MAX] {
-            for next_input in [0, 43, u64::MAX] {
-                assert_eq!(
-                    bounds.validate(HistoryClaim {
-                        version: HistoryVersion {
-                            recovery_generation: RecoveryGeneration::new(generation),
-                            ..bounds.version
-                        },
-                        next_input: L2TxCount::new(next_input),
-                    }),
-                    Err(HistoryPolicyError::StaleGeneration {
-                        current: bounds.version,
-                    })
-                );
-            }
         }
     }
 
@@ -420,7 +364,7 @@ mod tests {
             };
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: bounds.version,
+                    era_id: bounds.era_id,
                     next_input: L2TxCount::new(next_input),
                 }),
                 Err(expected)
@@ -442,7 +386,7 @@ mod tests {
             let bounds = history_bounds(base, head);
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: bounds.version,
+                    era_id: bounds.era_id,
                     next_input: L2TxCount::new(next_input),
                 }),
                 Ok(())
@@ -455,7 +399,7 @@ mod tests {
     fn incoherent_history_bounds_fail_loud() {
         let bounds = history_bounds(42, 41);
         let _ = bounds.validate(HistoryClaim {
-            version: bounds.version,
+            era_id: bounds.era_id,
             next_input: L2TxCount::new(41),
         });
     }

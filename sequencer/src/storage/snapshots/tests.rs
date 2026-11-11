@@ -156,14 +156,14 @@ fn snapshot_prefix_is_immutable() {
 }
 
 #[test]
-fn leases_keep_artifact_count_and_version_together_after_acceptance() {
+fn leases_keep_artifact_count_and_era_together_after_acceptance() {
     let (_db, mut storage, baseline, mut head) = baseline_and_tip("snapshot-version");
     let leases = SnapshotLeases::default();
     let old = storage
         .acquire_latest_snapshot_lease(&leases)
         .unwrap()
         .unwrap();
-    let old_version = old.history_version;
+    let old_era = old.era_id;
     let (respond_to, _) = tokio::sync::oneshot::channel();
     storage
         .append_included_user_ops(
@@ -191,10 +191,10 @@ fn leases_keep_artifact_count_and_version_together_after_acceptance() {
     let new = storage.acquire_finalized_lease(&leases).unwrap().unwrap();
     assert_eq!(old.prefix, prefix(0));
     assert_eq!(old.l2_tx_count, L2TxCount::ZERO);
-    assert_eq!(old.history_version, old_version);
+    assert_eq!(old.era_id, old_era);
     assert_eq!(new.dump.l2_tx_count.get(), 1);
     assert_eq!(new.dump.next_batch_nonce, 1);
-    assert_eq!(new.dump.history_version, old_version);
+    assert_eq!(new.dump.era_id, old_era);
     assert!(storage.collect_snapshots(&leases).unwrap().is_empty());
     assert_eq!(leases.count(baseline), Some(1));
     drop(old);

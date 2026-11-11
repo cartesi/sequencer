@@ -235,13 +235,6 @@ impl Storage {
     pub(crate) fn era(&mut self) -> rusqlite::Result<super::history::Era> {
         self.read(|tx| super::history::era_in(tx))
     }
-
-    /// The era id and the recovery generation (the greatest cut).
-    pub(crate) fn history_version(
-        &mut self,
-    ) -> rusqlite::Result<sequencer_core::history::HistoryVersion> {
-        self.read(|tx| super::history::history_version_in(tx))
-    }
 }
 
 /// Reads only tests make.
@@ -623,7 +616,7 @@ pub(crate) fn all_ordered_l2_txs(storage: &mut Storage) -> Vec<L2Tx> {
     storage
         .canonical_history_page(
             sequencer_core::history::HistoryClaim {
-                version: bounds.version,
+                era_id: bounds.era_id,
                 next_input: bounds.available_from,
             },
             1_000_000,

@@ -1194,11 +1194,11 @@ mod tests {
         assert!(storage.open_batch_if_none().unwrap());
         let root = storage.open_state().unwrap().expect("the root is open");
         assert_eq!(root.safe_block(), 30);
-        let version = storage.history_version().unwrap();
+        let era_id = storage.era().unwrap().id;
         let drained: Vec<(u64, u64, u64)> = storage
             .canonical_history_page(
                 sequencer_core::history::HistoryClaim {
-                    version,
+                    era_id,
                     next_input: era.rebuilt_end,
                 },
                 16,

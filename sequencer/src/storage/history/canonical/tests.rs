@@ -41,7 +41,7 @@ fn included(nonce: u32, offset: u64, payload: u8) -> IncludedUserOp {
 
 fn claim(bounds: HistoryBounds, next: u64) -> HistoryClaim {
     HistoryClaim {
-        version: bounds.version,
+        era_id: bounds.era_id,
         next_input: L2TxCount::new(next),
     }
 }

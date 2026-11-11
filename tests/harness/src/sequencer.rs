@@ -1384,20 +1384,12 @@ impl ManagedSequencer {
             self.data_dir_path.join("sequencer.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        let (era, generation): (Vec<u8>, i64) = conn.query_row(
-            "SELECT era_id, \
-                    (SELECT COALESCE(MAX(recovery_generation), 0) FROM history_generation_cuts) \
-               FROM era WHERE singleton_id = 0",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let era: Vec<u8> =
+            conn.query_row("SELECT era_id FROM era WHERE singleton_id = 0", [], |r| {
+                r.get(0)
+            })?;
         Ok(sequencer_rust_client::HistoryClaim {
-            version: sequencer_rust_client::HistoryVersion {
-                era_id: sequencer_core::history::EraId::try_from(era.as_slice())?,
-                recovery_generation: sequencer_core::history::RecoveryGeneration::new(
-                    u64::try_from(generation)?,
-                ),
-            },
+            era_id: sequencer_core::history::EraId::try_from(era.as_slice())?,
             next_input: sequencer_rust_client::L2TxCount::new(next_input),
         })
     }

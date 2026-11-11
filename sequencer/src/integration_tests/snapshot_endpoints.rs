@@ -89,6 +89,19 @@ fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonc
     storage.latest_snapshot().unwrap().unwrap().id
 }
 
+/// The response's `X-` headers, sorted: the claim travels in the era and the
+/// count, and nothing else names the history.
+fn history_headers(response: &reqwest::Response) -> Vec<&str> {
+    let mut names: Vec<_> = response
+        .headers()
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with("x-"))
+        .collect();
+    names.sort_unstable();
+    names
+}
+
 fn archive_state(bytes: &[u8]) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     tar::Archive::new(bytes).unpack(dir.path()).unwrap();
@@ -234,7 +247,14 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     assert_eq!(resp.headers()["x-inclusion-block"], "4242");
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        [
+            "x-executed-input-count",
+            "x-history-era",
+            "x-inclusion-block"
+        ]
+    );
     assert_eq!(resp.headers()["etag"], "\"block-4242\"");
     let body = resp.bytes().await.expect("body");
     assert_eq!(
@@ -327,7 +347,10 @@ async fn latest_snapshot_prefers_newest_valid_batch() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        ["x-executed-input-count", "x-history-era"]
+    );
     let body = resp.bytes().await.expect("body");
     assert_eq!(
         archive_state(body.as_ref()).as_slice(),
@@ -535,7 +558,10 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        ["x-executed-input-count", "x-history-era"]
+    );
     let body = resp.bytes().await.expect("body");
     assert_eq!(
         archive_state(body.as_ref()).as_slice(),
@@ -773,6 +799,18 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
         .await
         .unwrap();
     assert_eq!(export.headers()["x-inclusion-block"], "1");
+    assert_eq!(
+        history_headers(&export),
+        [
+            "x-executed-input-count",
+            "x-history-era",
+            "x-inclusion-block"
+        ]
+    );
+    assert_eq!(
+        export.headers()["x-history-era"].to_str().unwrap(),
+        claim.era_id.to_string()
+    );
     let export_dir = tempfile::tempdir().unwrap();
     tar::Archive::new(export.bytes().await.unwrap().as_ref())
         .unpack(export_dir.path())

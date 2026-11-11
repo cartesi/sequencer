@@ -117,8 +117,8 @@ These endpoints are operator-only and require network isolation:
   `info.toml`, `state`, and a generated `checkpoint.toml` acceptance receipt.
   The receipt supplies the accepted inclusion block and next batch nonce.
 
-Snapshot bodies carry `X-History-Era`, `X-Recovery-Generation`, and
-`X-Executed-Input-Count`. Acceptance endpoints also carry `X-Inclusion-Block`.
+Snapshot bodies carry `X-History-Era` and `X-Executed-Input-Count`.
+Acceptance endpoints also carry `X-Inclusion-Block`.
 The metadata and selected artifact come from one read, taken under the lease.
 Restoring `/latest_snapshot` and subscribing with its history claim gives the
 consumer a coherent snapshot-plus-suffix starting point.

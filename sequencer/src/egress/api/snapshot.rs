@@ -162,7 +162,7 @@ async fn finalized_state(
 
     let path = state_file_path(&state.snapshot, &leased.prefix);
     let l2_tx_count = leased.l2_tx_count.get();
-    let history = leased.history_version;
+    let era_id = leased.era_id;
     let LeasedDump { guard, .. } = leased;
 
     match comparison_io(File::open(&path).await, &path) {
@@ -172,11 +172,7 @@ async fn finalized_state(
             .header(header::ETAG, etag)
             .header("X-Inclusion-Block", inclusion_block.to_string())
             .header("X-Executed-Input-Count", l2_tx_count.to_string())
-            .header("X-History-Era", history.era_id.to_string())
-            .header(
-                "X-Recovery-Generation",
-                history.recovery_generation.get().to_string(),
-            )
+            .header("X-History-Era", era_id.to_string())
             .body(stream_body(file, guard, path))
             .expect("snapshot response headers are well-formed"),
         // `guard` is a local here; on this error path it drops → lease released.
@@ -224,7 +220,7 @@ fn archive_response(
     let LeasedDump {
         prefix,
         l2_tx_count,
-        history_version,
+        era_id,
         next_batch_nonce,
         guard,
     } = leased;
@@ -268,11 +264,7 @@ fn archive_response(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-tar")
-        .header("X-History-Era", history_version.era_id.to_string())
-        .header(
-            "X-Recovery-Generation",
-            history_version.recovery_generation.get().to_string(),
-        )
+        .header("X-History-Era", era_id.to_string())
         .header("X-Executed-Input-Count", l2_tx_count.get().to_string());
     if let Some(block) = inclusion_block {
         response = response.header("X-Inclusion-Block", block.to_string());

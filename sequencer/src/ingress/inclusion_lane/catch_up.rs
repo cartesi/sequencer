@@ -50,7 +50,7 @@ pub(super) fn catch_up_application_paged(
             source,
         })?;
     let mut claim = HistoryClaim {
-        version: bounds.version,
+        era_id: bounds.era_id,
         next_input: start,
     };
     loop {

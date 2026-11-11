@@ -44,17 +44,16 @@ fn append(storage: &mut Storage, safe_block: u64, inputs: &[IngestedSafeInput]) 
 }
 
 fn era(storage: &mut Storage) -> EraId {
-    storage.history_version().unwrap().era_id
+    storage.era().unwrap().id
 }
 
 #[test]
 fn genesis_metadata_is_unmoved_by_live_inputs() {
     let (_db, mut storage) = fixture("historical-genesis", 0, 0, 0);
     append(&mut storage, 20, &[input(10, SENDER_B, vec![1])]);
-    let info = storage.history_info(None, None).unwrap();
+    let info = storage.history_info(None).unwrap();
     assert_eq!(info.history.available_from, L2TxCount::ZERO);
     assert_eq!(info.history.head, L2TxCount::ZERO);
-    assert_eq!(info.compatibility, None);
     assert_eq!(
         info.baseline,
         HistoryBaseline {
@@ -83,7 +82,7 @@ fn genesis_metadata_is_unmoved_by_live_inputs() {
 }
 
 #[test]
-fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
+fn a_rebuilt_eras_baseline_survives_new_inputs() {
     let (_db, mut storage) = fixture("historical-rebuilt", 20, 41, 7);
     let inputs = [
         input(5, SENDER_B, vec![0xaa, 0xbb]),
@@ -92,7 +91,7 @@ fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
         input(21, SENDER_B, vec![0xcc]),
     ];
     append(&mut storage, 25, &inputs);
-    let info = storage.history_info(None, None).unwrap();
+    let info = storage.history_info(None).unwrap();
     assert_eq!(info.history.available_from, L2TxCount::new(41));
     assert_eq!(info.history.head, L2TxCount::new(41));
     assert_eq!(info.baseline.l1_stop_block, 20);
@@ -110,23 +109,25 @@ fn a_rebuilt_eras_baseline_survives_new_inputs_and_a_generation_change() {
     );
 
     append(&mut storage, 40, &[input(35, SENDER_B, vec![9])]);
-    let updated = storage
-        .history_info(Some(info.history.version.era_id), None)
-        .unwrap();
+    let updated = storage.history_info(Some(info.history.era_id)).unwrap();
     assert_eq!(updated.baseline, info.baseline);
 }
 
 #[test]
 fn metadata_refuses_another_era() {
     let (_db, mut storage) = fixture("historical-claim", 0, 0, 0);
-    let current = storage.history_version().unwrap();
+    let current = era(&mut storage);
     let other: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
-    assert_ne!(other, current.era_id);
+    assert_ne!(other, current);
     assert!(matches!(
-        storage.history_info(Some(other), None),
-        Err(HistoricalReadError::Policy(HistoryPolicyError::EraChanged { current: actual }))
-            if actual == current
+        storage.history_info(Some(other)),
+        Err(HistoricalReadError::Policy(HistoryPolicyError::EraChanged { era_id }))
+            if era_id == current
     ));
+    assert_eq!(
+        storage.history_info(Some(current)).unwrap().history.era_id,
+        current
+    );
 }
 
 #[test]
@@ -161,7 +162,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
     storage
         .collect_snapshots(&crate::storage::SnapshotLeases::default())
         .unwrap();
-    let info = storage.history_info(None, None).unwrap();
+    let info = storage.history_info(None).unwrap();
     assert_eq!(info.baseline.next_batch_nonce, 7);
     assert_eq!(info.baseline.l1_stop_block, 20);
     assert_eq!(info.baseline.l1_end_input_index, 0);
@@ -178,7 +179,7 @@ fn accepted_checkpoint_uses_the_exact_latest_snapshot_and_preserves_baseline() {
         .execute("DELETE FROM snapshots WHERE batch_nonce=8", [])
         .unwrap();
     assert!(matches!(
-        storage.history_info(None, None),
+        storage.history_info(None),
         Err(HistoricalReadError::Checkpoint(
             FinalizedSelectionError::Storage(rusqlite::Error::QueryReturnedNoRows)
         ))
@@ -197,7 +198,7 @@ fn canonical_divergence_cannot_be_advertised_as_an_accepted_receipt() {
         )
         .unwrap();
     assert!(matches!(
-        storage.history_info(None, None),
+        storage.history_info(None),
         Err(HistoricalReadError::Checkpoint(
             FinalizedSelectionError::CanonicalDivergence
         ))
@@ -209,38 +210,5 @@ fn canonical_divergence_cannot_be_advertised_as_an_accepted_receipt() {
 fn missing_baseline_is_not_reported_as_an_absent_accepted_checkpoint() {
     let (_db, mut storage) = fixture("historical-missing-baseline", 20, 41, 7);
     storage.conn.execute("DELETE FROM snapshots", []).unwrap();
-    let _ = storage.history_info(None, None);
-}
-
-#[test]
-fn compatibility_requires_an_era_and_rejects_future_generations_after_era_validation() {
-    let (_db, mut storage) = fixture("historical-generation-query", 0, 0, 0);
-    let current = era(&mut storage);
-    assert!(matches!(
-        storage.history_info(None, Some(RecoveryGeneration::new(0))),
-        Err(HistoricalReadError::BadRequest(_))
-    ));
-    for from in [1, u64::MAX] {
-        assert!(matches!(
-            storage.history_info(Some(current), Some(RecoveryGeneration::new(from))),
-            Err(HistoricalReadError::BadRequest(_))
-        ));
-    }
-    let other = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
-    assert!(matches!(
-        storage.history_info(Some(other), Some(RecoveryGeneration::new(u64::MAX))),
-        Err(HistoricalReadError::Policy(
-            HistoryPolicyError::EraChanged { .. }
-        ))
-    ));
-    let info = storage
-        .history_info(Some(current), Some(RecoveryGeneration::new(0)))
-        .unwrap();
-    assert_eq!(
-        info.compatibility,
-        Some(HistoryCompatibility {
-            from_generation: RecoveryGeneration::new(0),
-            preserved_input_count: L2TxCount::ZERO,
-        })
-    );
+    let _ = storage.history_info(None);
 }

@@ -1,17 +1,18 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! The era (one immutable row) and the preserved prefix at each recovery
-//! generation; the generation is the greatest cut.
+//! The era (one immutable row): the history's whole identity, and where its
+//! history starts and its live rows begin.
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, params, types::Type};
-use sequencer_core::history::{EraId, HistoryVersion, L2TxCount, RecoveryGeneration};
+use sequencer_core::history::{EraId, L2TxCount};
 
 use super::convert::{i64_to_u64, now_unix_ms, u64_to_i64};
 
 mod canonical;
 #[cfg(test)]
 pub(crate) use canonical::ApplicationInputRow;
+pub(super) use canonical::history_bounds_from;
 pub(crate) use canonical::{HistoryReadError, L2TxContext};
 
 /// The published era, as read. Immutable for the database's lifetime.
@@ -87,23 +88,6 @@ pub(super) fn find_era_in(conn: &Connection) -> Result<Option<Era>> {
     conn.query_row(ERA_SQL, [], decode_era).optional()
 }
 
-/// The era id and recovery generation, read in one statement. The generation
-/// is the greatest cut (0 with none): no other counter exists.
-pub(super) fn history_version_in(conn: &Connection) -> Result<HistoryVersion> {
-    conn.query_row(
-        "SELECT era_id,
-                (SELECT COALESCE(MAX(recovery_generation), 0) FROM history_generation_cuts)
-           FROM era WHERE singleton_id = 0",
-        [],
-        |row| {
-            Ok(HistoryVersion {
-                era_id: decode_era_id(row, 0)?,
-                recovery_generation: RecoveryGeneration::new(i64_to_u64(row.get(1)?)),
-            })
-        },
-    )
-}
-
 /// Insert the era under a fresh v4 era id, stamped now. The schema checks
 /// the counts against the executed rebuilt rows, seals them, and refuses a
 /// second era. Used by `publish_era` and the test fixture `open_with_era`.
@@ -152,36 +136,6 @@ pub(super) fn next_l2_tx_count_of(conn: &Connection, era: &Era) -> Result<L2TxCo
                 .expect("application input count overflow"),
         )
     }))
-}
-
-pub(super) fn preserved_input_count_in(
-    conn: &Connection,
-    from: RecoveryGeneration,
-    current: RecoveryGeneration,
-    head: L2TxCount,
-) -> Result<L2TxCount> {
-    assert!(
-        from <= current,
-        "compatibility starts after the current generation"
-    );
-    if from == current {
-        return Ok(head);
-    }
-    let (count, minimum): (i64, Option<i64>) = conn.query_row(
-        "SELECT COUNT(*), MIN(preserved_l2_tx_count) FROM history_generation_cuts \
-         WHERE recovery_generation > ?1 AND recovery_generation <= ?2",
-        params![u64_to_i64(from.get()), u64_to_i64(current.get())],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    // Unique integer generations plus the exact interval length prove that
-    // every intervening recovery contributed its cut, including empty batches.
-    assert_eq!(
-        i64_to_u64(count),
-        current.get() - from.get(),
-        "history generation lineage is incomplete"
-    );
-    let minimum = minimum.expect("a nonempty complete generation interval has a minimum");
-    Ok(head.min(L2TxCount::new(i64_to_u64(minimum))))
 }
 
 #[cfg(test)]
@@ -297,21 +251,4 @@ mod tests {
         assert_eq!(reopened.era().unwrap(), published);
         assert_eq!(reopened.next_l2_tx_count().unwrap().get(), 41);
     }
-
-    #[test]
-    fn a_cut_without_an_era_aborts() {
-        let db = temp_db("history-generation-no-era");
-        let storage = Storage::initialize_for_command(&db.path, LifecycleCommand::Setup).unwrap();
-        let error = storage
-            .conn
-            .execute("INSERT INTO history_generation_cuts VALUES (1, 0)", [])
-            .expect_err("no era");
-        assert_eq!(
-            error.to_string(),
-            "a cut advances the recovery generation by exactly one, within an era"
-        );
-    }
 }
-
-#[cfg(test)]
-mod generation_tests;

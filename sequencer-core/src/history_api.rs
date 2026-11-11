@@ -6,7 +6,7 @@
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 
-use crate::history::{HistoryBounds, HistoryClaim, L2TxCount, RecoveryGeneration};
+use crate::history::{HistoryBounds, HistoryClaim, L2TxCount};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,9 +44,8 @@ pub struct HistoryInfo {
     pub deployment: HistoryDeployment,
     pub history: HistoryBounds,
     pub baseline: HistoryBaseline,
-    /// The accepted boundary shares `history.version`; it does not certify client state.
+    /// The accepted boundary belongs to `history.era_id`; it does not certify client state.
     pub accepted_checkpoint: Option<AcceptedCheckpoint>,
-    pub compatibility: Option<HistoryCompatibility>,
 }
 
 impl HistoryInfo {
@@ -66,7 +65,7 @@ impl HistoryInfo {
             });
         }
         Ok(HistoryClaim {
-            version: self.history.version,
+            era_id: self.history.era_id,
             next_input: count,
         })
     }
@@ -84,17 +83,9 @@ pub enum AdoptError {
     PastRebuiltEnd { rebuilt_history_end: L2TxCount },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryCompatibility {
-    pub from_generation: RecoveryGeneration,
-    /// Checkpoint counts up to and including this boundary preserve their input prefix.
-    pub preserved_input_count: L2TxCount,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::HistoryVersion;
 
     fn info(base: u64, rebuilt_end: u64, head: u64) -> HistoryInfo {
         HistoryInfo {
@@ -106,10 +97,7 @@ mod tests {
                 batch_submitter_address: Address::repeat_byte(3),
             },
             history: HistoryBounds {
-                version: HistoryVersion {
-                    era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
-                    recovery_generation: RecoveryGeneration::new(2),
-                },
+                era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
                 available_from: L2TxCount::new(base),
                 head: L2TxCount::new(head),
             },
@@ -120,16 +108,15 @@ mod tests {
                 rebuilt_history_end: L2TxCount::new(rebuilt_end),
             },
             accepted_checkpoint: None,
-            compatibility: None,
         }
     }
 
     #[test]
-    fn a_count_from_the_base_through_the_rebuilt_end_adopts_the_current_version() {
+    fn a_count_from_the_base_through_the_rebuilt_end_adopts_the_current_era() {
         let info = info(41, 45, 60);
         for count in [41, 43, 45] {
             let claim = info.adopt_claim(L2TxCount::new(count)).unwrap();
-            assert_eq!(claim.version, info.history.version);
+            assert_eq!(claim.era_id, info.history.era_id);
             assert_eq!(claim.next_input, L2TxCount::new(count));
             assert_eq!(info.history.validate(claim), Ok(()));
         }

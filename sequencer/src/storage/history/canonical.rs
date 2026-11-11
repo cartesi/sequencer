@@ -1,23 +1,21 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Canonical application history: version-checked pages read with their
+//! Canonical application history: era-checked pages read with their
 //! boundaries in one transaction. The era's history is setup's rebuilt rows,
 //! every one executed, up to the rebuilt history's end, then the live rows; a
 //! page may span the seam. Native restart catch-up and the WS feed read it.
 
 use alloy_primitives::{Address, B256};
 use rusqlite::{Connection, Row, Transaction, params};
-use sequencer_core::history::{
-    HistoryBounds, HistoryClaim, HistoryPolicyError, HistoryVersion, L2TxCount,
-};
+use sequencer_core::history::{HistoryBounds, HistoryClaim, HistoryPolicyError, L2TxCount};
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 
 use crate::storage::Storage;
 use crate::storage::convert::{
     i64_to_u16, i64_to_u32, i64_to_u64, saturating_query_bound, u64_to_i64,
 };
-use crate::storage::history::{Era, era_in, history_version_in, next_l2_tx_count_of};
+use crate::storage::history::{Era, era_in, next_l2_tx_count_of};
 
 /// One executed history row: the record the executor ran, plus the batch
 /// coordinates the feed reports beside it.
@@ -83,7 +81,7 @@ pub(crate) struct CanonicalHistoryPage {
 impl CanonicalHistoryPage {
     pub(crate) fn next_claim(&self) -> HistoryClaim {
         HistoryClaim {
-            version: self.bounds.version,
+            era_id: self.bounds.era_id,
             next_input: self.next_input,
         }
     }
@@ -111,7 +109,7 @@ impl Storage {
     ) -> Result<CanonicalHistoryPage, HistoryReadError> {
         self.read(|tx| {
             let era = era_in(tx)?;
-            let bounds = history_bounds_from(tx, &era, history_version_in(tx)?)?;
+            let bounds = history_bounds_from(tx, &era)?;
             match bounds.validate(claim) {
                 Ok(()) => canonical_page_in(tx, &era, bounds, claim.next_input, limit).map(Ok),
                 Err(error) => Ok(Err(error)),
@@ -122,16 +120,15 @@ impl Storage {
 }
 
 fn history_bounds_in(conn: &Connection) -> rusqlite::Result<HistoryBounds> {
-    history_bounds_from(conn, &era_in(conn)?, history_version_in(conn)?)
+    history_bounds_from(conn, &era_in(conn)?)
 }
 
-fn history_bounds_from(
+pub(in crate::storage) fn history_bounds_from(
     conn: &Connection,
     era: &Era,
-    version: HistoryVersion,
 ) -> rusqlite::Result<HistoryBounds> {
     Ok(HistoryBounds {
-        version,
+        era_id: era.id,
         available_from: era.base,
         head: next_l2_tx_count_of(conn, era)?,
     })

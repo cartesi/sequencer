@@ -59,7 +59,7 @@ writers target the base tables.
 | inclusion lane | `batches` (insert + `sealed_at_ms`), `frames`, `user_ops`, `application_inputs`, `snapshots` (batch close) |
 | input reader | `safe_inputs`, `l1_safe_head`, `batches.accepted_input`, `canonical_divergence` (the divergence poison marker) |
 | `run`'s start | an open batch when none is open, which is how the era's first batch is created |
-| history metadata (setup) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish; `history_generation_cuts` — immutable preserved-prefix cuts whose greatest key is the recovery generation, which no operation writes |
+| history metadata (setup) | `era` — one immutable row (base count, stop block, rebuilt history end, first queued input, anchor nonce), written once by setup's publish |
 | batch submitter and mempool flusher | `wallet_nonce_watermark` — deliberately shared under one protocol: each raises it before its first broadcast (write-before-broadcast, I14) |
 | setup | `deployment_identity` (pinned once, the direct-payload cap with it), `rebuilt_history` (its only writer, and only before it publishes the era), the `era` row (whose existence is setup's completion), the baseline `snapshots` row (atomic with the era; no `batches` or `frames`), `batch_policy.log_gas_price` + `log_gas_price_updated_at_ms` (first write; Fixed and Uniswap) |
 | snapshot GC (the lane after reconciliation, `run`'s startup hygiene) | obsolete, unleased `snapshots` row deletion (`collect_snapshots`), including a superseded baseline artifact |
@@ -261,7 +261,7 @@ writers target the base tables.
 - **Enforced by:** integer primary key, contiguous insertion from `E`
   (`trg_application_inputs_contiguous`), contiguous rebuilt counts
   (`trg_rebuilt_history_insert`, `trg_era_fits`), coherent
-  versioned pages spanning the seam, and pre-execution catch-up count checks.
+  era-checked pages spanning the seam, and pre-execution catch-up count checks.
 - **Depended on by:** restart and replica resume without skipping or duplication.
 
 ### I11. Batch envelopes remain outside application history
@@ -452,11 +452,10 @@ writers target the base tables.
   baseline snapshot at `E` in one `IMMEDIATE` transaction (`publish_era`),
   with no batch in the database; the row's existence is setup's completion.
   The era row is absent before this boundary. Its fields remain immutable even
-  after baseline artifact GC. The recovery generation is
-  not stored: it is the greatest key of `history_generation_cuts` (0 with
-  none), and a cut cannot exist without an era. If the cut ledger is ever
-  retired, a log of generations must remain, because the generation has no
-  other home.
+  after baseline artifact GC. The era id is the history's whole identity:
+  inside an era the history only appends (I5), so a claim is an era id and a
+  count, every count from `K` to the head resumes, and a restart changes
+  nothing.
 - **Rebuilt history:** `rebuilt_history` gains one row per executed
   transaction, written once with its count, each count the last one plus one
   and each direct after every earlier direct in input order, only while the
@@ -466,23 +465,15 @@ writers target the base tables.
   count through `C`, and the live rows continue at `E`. A client of an older era
   adopts this one only at a count in `[K, E]`
   ([adopting a new era](protocol/application-history.md#adopting-a-new-era)).
-- **Generation:** no operation advances the generation or writes a cut, and
-  a restart changes neither token. Every intervening cut is required to
-  authorize reusing a checkpoint from an older generation.
 - **Enforced by:** `publish_era`, the era triggers (`trg_era_fits`,
   `trg_era_single_insert`, `trg_era_immutable`, `trg_era_not_deletable`), the
-  `history_generation_cuts` triggers (`trg_history_generation_cuts_contiguous`
-  admits only the next generation, and only within an era; the others make
-  cuts immutable and undeletable), the rebuilt-history triggers
-  (`trg_rebuilt_history_insert`, `trg_rebuilt_history_immutable`,
-  `trg_rebuilt_history_not_deletable`). `preserved_input_count_in` asserts that
-  every intervening generation has a cut before computing compatibility.
-- **Depended on by:** mandatory snapshot-derived WS claims, `/history`
-  checkpoint compatibility across generations, the adopt rule, and the
-  feed's pages across the rebuilt/live seam. Identity is validated
-  before the requested count, including for empty history. Cuts remain available
-  for the era's lifetime; their absence must never authorize a partial minimum.
-- **Breaks:** a client silently resumes a replaced suffix or inaccessible prefix.
+  rebuilt-history triggers (`trg_rebuilt_history_insert`,
+  `trg_rebuilt_history_immutable`, `trg_rebuilt_history_not_deletable`).
+- **Depended on by:** mandatory snapshot-derived WS claims, the adopt rule,
+  and the feed's pages across the rebuilt/live seam. Identity is validated
+  before the requested count, including for empty history.
+- **Breaks:** a client silently resumes another era's history or an
+  inaccessible prefix.
 - **Operational boundary:** setup refuses a data directory that holds anything
   but its lock file (exit 30) before writing anything, and runs every L1 check
   that can fail retryably first, so a retry finds the directory empty; a setup
@@ -504,7 +495,7 @@ writers target the base tables.
   successors after a successful hook. Admission purity and native-engine
   mutation remain self-trusted; the count does not need a Rust-side mirror.
 - **Depended on by:** the canonical runner, inclusion lane, catch-up, durable
-  execution attribution, and the versioned replica protocol.
+  execution attribution, and the era-checked replica protocol.
 - **Breaks:** a transaction can be applied without advancing history, an
   offset can advance twice, or an op can run at a nonce the canonical machine
   skips — silent application-history divergence.

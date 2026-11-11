@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use sequencer_core::history::{EraId, RecoveryGeneration};
+use sequencer_core::history::EraId;
 use serde::Deserialize;
 
 use crate::http::{ApiError, StorageTaskError, storage_task};
@@ -33,7 +33,6 @@ pub(super) fn router(db_path: String, shutdown: RuntimeScope) -> Router {
 #[serde(deny_unknown_fields)]
 struct HistoryQuery {
     era_id: Option<EraId>,
-    from_generation: Option<RecoveryGeneration>,
 }
 
 async fn history(
@@ -44,15 +43,12 @@ async fn history(
         Ok(query) => query,
         Err(error) => return ApiError::bad_request(error.body_text()).into_response(),
     };
-    if query.from_generation.is_some() && query.era_id.is_none() {
-        return ApiError::bad_request("from_generation requires era_id").into_response();
-    }
     if let Err(error) = crate::http::reject_if_shutting_down(&state.shutdown) {
         return error.into_response();
     }
     let db_path = state.db_path.clone();
     match storage_task(state.shutdown.clone(), "read history metadata", move |_| {
-        Ok(Storage::open_read_only(&db_path)?.history_info(query.era_id, query.from_generation)?)
+        Ok(Storage::open_read_only(&db_path)?.history_info(query.era_id)?)
     })
     .await
     {
@@ -62,14 +58,8 @@ async fn history(
 }
 
 fn read_error(error: StorageTaskError) -> Response {
-    match error.downcast_ref::<HistoricalReadError>() {
-        Some(HistoricalReadError::Policy(policy)) => {
-            return (StatusCode::CONFLICT, Json(*policy)).into_response();
-        }
-        Some(HistoricalReadError::BadRequest(message)) => {
-            return ApiError::bad_request(message.clone()).into_response();
-        }
-        _ => {}
+    if let Some(HistoricalReadError::Policy(policy)) = error.downcast_ref::<HistoricalReadError>() {
+        return (StatusCode::CONFLICT, Json(*policy)).into_response();
     }
     tracing::warn!(%error, "history read unavailable");
     ApiError::unavailable("history read unavailable").into_response()
@@ -91,9 +81,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_queries_return_bad_request_json_before_storage() {
         for query in [
+            "?era_id=invalid",
             "?from_generation=0",
-            &format!("?era_id={ERA}&from_generation=-1"),
-            &format!("?era_id={ERA}&from_generation=invalid"),
+            &format!("?era_id={ERA}&from_generation=0"),
             &format!("?era_id={ERA}&unrecognized=1"),
         ] {
             let uri = format!("/history{query}").parse().unwrap();
@@ -111,11 +101,7 @@ mod tests {
     async fn shutdown_refuses_before_opening_storage() {
         let state = state();
         state.shutdown.request_shutdown();
-        for query in [
-            "".to_owned(),
-            format!("?era_id={ERA}"),
-            format!("?era_id={ERA}&from_generation=0"),
-        ] {
+        for query in ["".to_owned(), format!("?era_id={ERA}")] {
             let uri = format!("/history{query}").parse().unwrap();
             let response = history(State(state.clone()), Query::try_from_uri(&uri)).await;
             assert_eq!(
@@ -134,14 +120,15 @@ mod tests {
         let mut storage =
             test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
         test_era::append_live_user_op(&mut storage, 2);
+        let era_id = storage.era().unwrap().id;
         drop(storage);
         let state = Arc::new(HistoryState {
             db_path: db.path.clone(),
             shutdown: RuntimeScope::default(),
         });
         let response = history(
-            State(state),
-            Query::try_from_uri(&"/history".parse().unwrap()),
+            State(state.clone()),
+            Query::try_from_uri(&format!("/history?era_id={era_id}").parse().unwrap()),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -149,10 +136,26 @@ mod tests {
             .await
             .unwrap();
         let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let keys: Vec<&str> = info
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["accepted_checkpoint", "baseline", "deployment", "history"]
+        );
         // The era starts at the base count; the head is past the queued
         // direct and the live op.
-        assert_eq!(info["history"]["available_from"], test_era::BASE);
-        assert_eq!(info["history"]["head"], test_era::REBUILT_END + 2);
+        assert_eq!(
+            info["history"],
+            serde_json::json!({
+                "era_id": era_id.to_string(),
+                "available_from": test_era::BASE,
+                "head": test_era::REBUILT_END + 2,
+            })
+        );
         assert_eq!(
             info["baseline"],
             serde_json::json!({
@@ -170,6 +173,33 @@ mod tests {
                 "executed_input_count": test_era::REBUILT_END,
                 "next_batch_nonce": test_era::NEXT_BATCH_NONCE,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn another_era_is_refused_with_the_current_era() {
+        use crate::egress::test_era;
+
+        let db = crate::test_support::temp_db("history-era-changed");
+        let mut storage =
+            test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
+        let era_id = storage.era().unwrap().id;
+        drop(storage);
+        assert_ne!(era_id.to_string(), ERA);
+        let state = Arc::new(HistoryState {
+            db_path: db.path.clone(),
+            shutdown: RuntimeScope::default(),
+        });
+        let uri = format!("/history?era_id={ERA}").parse().unwrap();
+        let response = history(State(state), Query::try_from_uri(&uri)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "code": "ERA_CHANGED", "era_id": era_id.to_string() })
         );
     }
 }

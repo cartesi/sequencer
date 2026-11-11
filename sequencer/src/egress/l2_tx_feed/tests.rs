@@ -15,7 +15,7 @@ use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{SENDER_A, set_up_storage};
 use crate::storage::{IngestedSafeInput, SafeInputRange, Storage};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
-use sequencer_core::history::{HistoryClaim, HistoryPolicyError, L2TxCount, RecoveryGeneration};
+use sequencer_core::history::{EraId, HistoryClaim, HistoryPolicyError, L2TxCount};
 use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
@@ -69,19 +69,19 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscription_refuses_ahead_and_stale_claims() {
+async fn subscription_refuses_ahead_and_other_era_claims() {
     let db = temp_db("subscription-claims");
     seed_ordered_txs(&db.path);
     let feed = test_feed(&db.path, RuntimeScope::default());
     assert!(matches!(feed.subscribe_from(claim(&db.path, 3)).await,
         Err(SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
-    let mut stale = claim(&db.path, 0);
-    stale.version.recovery_generation = RecoveryGeneration::new(1);
+    let current = claim(&db.path, 0);
+    let other_era: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
+    assert_ne!(other_era, current.era_id);
     assert!(matches!(
-        feed.subscribe_from(stale).await,
-        Err(SubscribeError::History(
-            HistoryPolicyError::StaleGeneration { .. }
-        ))
+        feed.subscribe_from(HistoryClaim { era_id: other_era, ..current }).await,
+        Err(SubscribeError::History(HistoryPolicyError::EraChanged { era_id }))
+            if era_id == current.era_id
     ));
 }
 
@@ -471,7 +471,7 @@ fn seed_ordered_txs(db_path: &str) {
 fn claim(db_path: &str, next: u64) -> HistoryClaim {
     let mut storage = Storage::open_read_only(db_path).unwrap();
     HistoryClaim {
-        version: storage.history_version().unwrap(),
+        era_id: storage.era().unwrap().id,
         next_input: L2TxCount::new(next),
     }
 }

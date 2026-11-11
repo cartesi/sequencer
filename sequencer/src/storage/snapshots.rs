@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, Result, Transaction, TransactionBehavior, params};
-use sequencer_core::history::{HistoryVersion, L2TxCount};
+use sequencer_core::history::{EraId, L2TxCount};
 
 use super::Storage;
 use super::convert::{i64_to_u64, u64_to_i64};
-use super::history::{era_in, history_version_in, next_l2_tx_count_in};
+use super::history::{era_in, next_l2_tx_count_in};
 
 /// One `snapshots` row: the artifact directory and the count it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +115,7 @@ impl SnapshotLeases {
 pub struct LeasedDump {
     pub prefix: PathBuf,
     pub l2_tx_count: L2TxCount,
-    pub history_version: HistoryVersion,
+    pub era_id: EraId,
     pub next_batch_nonce: u64,
     pub guard: LeaseGuard,
 }
@@ -177,21 +177,19 @@ impl Storage {
             let Some(finalized) = finalized_dump_in(tx)? else {
                 return Ok(None);
             };
-            let history_version = history_version_in(tx)?;
-            Ok(Some((finalized.snapshot.id, (finalized, history_version))))
+            let era_id = era_in(tx)?.id;
+            Ok(Some((finalized.snapshot.id, (finalized, era_id))))
         })?;
-        Ok(
-            leased.map(|((finalized, history_version), guard)| FinalizedLease {
-                inclusion_block: finalized.inclusion_block,
-                dump: LeasedDump {
-                    prefix: finalized.snapshot.prefix,
-                    l2_tx_count: finalized.snapshot.l2_tx_count,
-                    next_batch_nonce: finalized.next_batch_nonce,
-                    history_version,
-                    guard,
-                },
-            }),
-        )
+        Ok(leased.map(|((finalized, era_id), guard)| FinalizedLease {
+            inclusion_block: finalized.inclusion_block,
+            dump: LeasedDump {
+                prefix: finalized.snapshot.prefix,
+                l2_tx_count: finalized.snapshot.l2_tx_count,
+                next_batch_nonce: finalized.next_batch_nonce,
+                era_id,
+                guard,
+            },
+        }))
     }
 
     /// Lease the newest snapshot; egress calls it on a read-only handle.
@@ -203,22 +201,19 @@ impl Storage {
             let Some(snapshot) = latest_snapshot_in(tx)? else {
                 return Ok(None);
             };
-            let history_version = history_version_in(tx)?;
+            let era_id = era_in(tx)?.id;
             let next_batch_nonce = snapshot_next_nonce_in(tx, snapshot.id)?;
-            Ok(Some((
-                snapshot.id,
-                (snapshot, history_version, next_batch_nonce),
-            )))
+            Ok(Some((snapshot.id, (snapshot, era_id, next_batch_nonce))))
         })?;
-        Ok(leased.map(
-            |((snapshot, history_version, next_batch_nonce), guard)| LeasedDump {
+        Ok(
+            leased.map(|((snapshot, era_id, next_batch_nonce), guard)| LeasedDump {
                 prefix: snapshot.prefix,
                 l2_tx_count: snapshot.l2_tx_count,
-                history_version,
+                era_id,
                 next_batch_nonce,
                 guard,
-            },
-        ))
+            }),
+        )
     }
 
     pub fn list_snapshots(&mut self) -> Result<Vec<Snapshot>> {

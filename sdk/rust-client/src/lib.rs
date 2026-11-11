@@ -10,12 +10,10 @@ pub use errors::{
 };
 
 pub use sequencer_core::history::{
-    EraId, HistoryBounds, HistoryClaim, HistoryPolicyError, HistoryVersion, L2TxCount,
-    RecoveryGeneration,
+    EraId, HistoryBounds, HistoryClaim, HistoryPolicyError, L2TxCount,
 };
 pub use sequencer_core::history_api::{
-    AcceptedCheckpoint, AdoptError, HistoryBaseline, HistoryCompatibility, HistoryDeployment,
-    HistoryInfo,
+    AcceptedCheckpoint, AdoptError, HistoryBaseline, HistoryDeployment, HistoryInfo,
 };
 
 use alloy_primitives::Address;
@@ -203,20 +201,12 @@ impl SequencerClient {
                 SnapshotError::Metadata(error.to_string())
             },
         )?;
-        let generation: u64 = header("X-Recovery-Generation")?
-            .parse()
-            .map_err(|error: std::num::ParseIntError| SnapshotError::Metadata(error.to_string()))?;
         let count: u64 = header("X-Executed-Input-Count")?
             .parse()
             .map_err(|error: std::num::ParseIntError| SnapshotError::Metadata(error.to_string()))?;
         Ok(SnapshotResponse {
             claim: HistoryClaim {
-                version: HistoryVersion {
-                    era_id,
-                    recovery_generation: sequencer_core::history::RecoveryGeneration::new(
-                        generation,
-                    ),
-                },
+                era_id,
                 next_input: L2TxCount::new(count),
             },
             response,
@@ -290,9 +280,8 @@ fn with_history_claim(ws_subscribe_url: &str, claim: HistoryClaim) -> String {
         '?'
     };
     format!(
-        "{ws_subscribe_url}{separator}era_id={}&recovery_generation={}&next_input={}",
-        claim.version.era_id,
-        claim.version.recovery_generation.get(),
+        "{ws_subscribe_url}{separator}era_id={}&next_input={}",
+        claim.era_id,
         claim.next_input.get()
     )
 }
@@ -315,7 +304,7 @@ fn map_subscribe_error(error: tokio_tungstenite::tungstenite::Error) -> Subscrib
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sequencer_core::history::{EraId, RecoveryGeneration};
+    use sequencer_core::history::EraId;
 
     #[tokio::test]
     async fn fee_request_keeps_its_request_timeout() {
@@ -384,7 +373,7 @@ mod tests {
                 assert_ne!(count, 0, "complete request headers");
                 received += count;
             }
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-History-Era: 00112233-4455-4677-8899-aabbccddeeff\r\nX-Recovery-Generation: 0\r\nX-Executed-Input-Count: 7\r\n\r\n").await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-History-Era: 00112233-4455-4677-8899-aabbccddeeff\r\nX-Executed-Input-Count: 7\r\n\r\n").await.unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
             stream.write_all(b"dump").await.unwrap();
         });
@@ -394,7 +383,13 @@ mod tests {
         )
         .unwrap();
         let snapshot = client.latest_snapshot().await.unwrap();
-        assert_eq!(snapshot.claim.next_input.get(), 7);
+        assert_eq!(
+            snapshot.claim,
+            HistoryClaim {
+                era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
+                next_input: L2TxCount::new(7),
+            }
+        );
         assert_eq!(snapshot.response.bytes().await.unwrap().as_ref(), b"dump");
         server.await.unwrap();
     }
@@ -407,12 +402,9 @@ mod tests {
             .unwrap()
             .with_request_timeout(Duration::from_millis(100));
         let claim = HistoryClaim {
-            version: HistoryVersion {
-                era_id: "00112233-4455-4677-8899-aabbccddeeff"
-                    .parse::<EraId>()
-                    .unwrap(),
-                recovery_generation: RecoveryGeneration::new(0),
-            },
+            era_id: "00112233-4455-4677-8899-aabbccddeeff"
+                .parse::<EraId>()
+                .unwrap(),
             next_input: L2TxCount::new(0),
         };
         let stalled_server = async {
@@ -490,18 +482,15 @@ mod tests {
     #[test]
     fn subscription_url_carries_the_exact_resume_claim() {
         let claim = HistoryClaim {
-            version: HistoryVersion {
-                era_id: "00112233-4455-4677-8899-aabbccddeeff"
-                    .parse::<EraId>()
-                    .unwrap(),
-                recovery_generation: RecoveryGeneration::new(9),
-            },
+            era_id: "00112233-4455-4677-8899-aabbccddeeff"
+                .parse::<EraId>()
+                .unwrap(),
             next_input: L2TxCount::new(50_001),
         };
         let client = SequencerClient::new("http://localhost:8080").unwrap();
         assert_eq!(
             client.ws_subscribe_url(claim),
-            "ws://localhost:8080/ws/subscribe?era_id=00112233-4455-4677-8899-aabbccddeeff&recovery_generation=9&next_input=50001"
+            "ws://localhost:8080/ws/subscribe?era_id=00112233-4455-4677-8899-aabbccddeeff&next_input=50001"
         );
     }
 
@@ -543,10 +532,7 @@ mod tests {
         let client = SequencerClient::new(format!("http://{address}")).unwrap();
         let result = client
             .subscribe(HistoryClaim {
-                version: HistoryVersion {
-                    era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
-                    recovery_generation: RecoveryGeneration::new(0),
-                },
+                era_id: "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap(),
                 next_input: L2TxCount::new(40),
             })
             .await;

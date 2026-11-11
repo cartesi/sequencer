@@ -2,8 +2,8 @@
 
 Application history is the sequencer's current execution order: executed user
 operations and external direct inputs. It contains an optimistic suffix that
-recovery may replace. A stable offset identifies an input only together with
-its history version; receiving it does not establish L1 acceptance.
+a new era may revoke. A stable offset identifies an input only together with
+its era; receiving it does not establish L1 acceptance.
 
 This document owns history coordinates, recovery boundaries, and replica
 bootstrap. The [Application contract](application-contract.md) owns execution
@@ -52,57 +52,26 @@ shared executor.
 
 ## Identity and available history
 
-A `HistoryClaim` combines:
-
-- **Era**: a UUIDv4 created by setup, identifying one local history.
-- **Recovery generation**: a revision within that era. No operation advances
-  it.
-- **Next input**: the application's actual L2 tx count.
+A history's identity is its era: a UUIDv4 created by setup, identifying one
+local history. A `HistoryClaim` is an era id and a next input, the
+application's actual L2 tx count.
 
 If the era's base count is `K` and the current head is `H`, available entries
 occupy `[K, H)`. A claim at `H` waits for future entries; a claim below `K` or
-above `H` is refused. Identity is checked before position. Equal counts do not
-by themselves authorize resuming a different era or generation. Two lookups
-can rebind a saved state to the current version: the compatibility query
-below, within an era, and the [adopt rule](#adopting-a-new-era), across eras.
-WS itself requires exact identity.
+above `H` is refused. Identity is checked before position, and equal counts do
+not by themselves authorize resuming a different era.
 
-A batch is never replaced and no operation advances the generation, so a
-restart changes nothing; a history the scheduler can no longer accept ends
-the era
-([the void history](../recovery/README.md#the-void-history)).
-
-### Checkpoint compatibility across generations
-
-A cut is a generation advance: it records the application count that survives
-it, and the current generation is the greatest cut's (0 before any). The cut
-ledger and the formula below are on the wire, but no operation writes a cut,
-so `G = g` and `P = H` for every checkpoint of an era.
-
-For a checkpoint saved in generation `g`, `/history` returns the current version
-at generation `G`, head `H`, and preserved count:
-
-```text
-P = min(H, cut[g+1], ..., cut[G])
-```
-
-For `g = G`, `P = H`. Every cut is at or past the rebuilt history end. A
-checkpoint at count `X` is eligible to
-resume under the returned version exactly when `K <= X <= P`. Check each saved checkpoint using
-its own era and generation, then choose the newest eligible one. For cuts
-`0 -> 1: 3` and `1 -> 2: 5`, a generation-0 checkpoint at 4 is invalid, while a
-generation-1 checkpoint at 4 is eligible. Looking only at the latest cut would
-incorrectly reuse the former. Cuts and current history are read together; a
-missing intervening transition is an invariant failure, not permission to take
-the minimum over an incomplete ledger.
-
-The client owns checkpoint consistency: application state, projection, and claim
-must describe the same executed prefix. Once compatibility is established,
-persist the new version with the restored checkpoint before continuing. A
-stale response cannot weaken WS admission. The query proves prefix
-preservation under the sequencer's trusted local bookkeeping; it does not
-inspect client state or establish trust after a software bug. A new era is
-crossed by the [adopt rule](#adopting-a-new-era) instead.
+Inside an era the history only appends: a batch is never replaced, and a
+restart changes nothing. A state saved at any count from `K` to `H` therefore
+resumes under the same era id. The one event a client handles is a new era,
+which a cockroach recovery creates after the old one ends, for example on a
+history the scheduler can no longer accept
+([the void history](../recovery/README.md#the-void-history)). The
+[adopt rule](#adopting-a-new-era) rebinds a saved state to the new era, and
+the [client's playbook](../recovery/cockroach.md#the-clients-playbook) says
+what a client does around it. WS itself requires the exact era. The client
+owns checkpoint consistency: its application state, projection, and claim
+describe the same executed prefix.
 
 ### Era baseline
 
@@ -162,11 +131,11 @@ new era at that count when
 K <= X <= E
 ```
 
-and then subscribes with the current version and `next_input = X`.
+and then subscribes with the current era id and `next_input = X`.
 [`HistoryInfo::adopt_claim`](../../sequencer-core/src/history_api.rs) is the
 check, and the [Rust SDK](../../sdk/rust-client/src/history.rs)'s
 `adopt_current_era` reads `/history` and applies it. The server adds no check
-of its own: the adopted claim carries the current version, which the feed
+of its own: the adopted claim carries the current era id, which the feed
 admits like any other.
 
 | Refusal | Meaning | Remedy |
@@ -211,32 +180,28 @@ explains block-boundary comparison and rollback retention. The
 
 1. Download `GET /latest_snapshot`. The tar archive contains `info.toml` and
    the complete opaque application `state` file or directory.
-2. Retain its `X-History-Era`, `X-Recovery-Generation`, and
-   `X-Executed-Input-Count` headers with those bytes. Restore the application and
+2. Retain its `X-History-Era` and `X-Executed-Input-Count` headers with those
+   bytes. Restore the application and
    verify its count against that header. The archive alone does not carry the
    complete subscription claim.
-3. Subscribe with the matching era, generation, and next-input count. Snapshot
-   selection and headers share one read, taken under the lease; recovery during
-   the download can still invalidate the claim before subscription. If the server
-   refuses that old era, [adopt](#adopting-a-new-era) the new one at the
-   restored count, or rebootstrap; within the same era, a compatible saved
-   checkpoint can instead be selected through `/history`.
+3. Subscribe with the matching era and next-input count. Snapshot selection
+   and headers share one read, taken under the lease. If the server refuses
+   the era, because a new one started after the download, [adopt](#adopting-a-new-era)
+   the new one at the restored count, or rebootstrap.
 4. Require each entry's offset to equal the application's current count, then
    execute it through the shared execution boundary. Successful application
    advances the count by one. Persist the history identity with the replica's
    state so that a later resume cannot combine different histories.
 5. After an ordinary disconnect, reconnect with that saved identity and the
-   actual count. A generation mismatch permits the compatibility procedure
-   above, and an era mismatch the adopt rule. An unavailable prefix or lack of
-   a compatible checkpoint requires a current snapshot. A count ahead of the
-   server's head is an invalid claim to correct.
+   actual count. An era mismatch permits the adopt rule. An unavailable prefix
+   requires a current snapshot. A count ahead of the server's head is an
+   invalid claim to correct.
 
 The [Rust SDK](../../sdk/rust-client/src/lib.rs) returns a `HistoryClaim` with
 its snapshot response and requires an explicit claim for subscriptions. The
 consumer owns restore, persistence, and reconnect. Fetching fresh identity
-metadata alone cannot authorize old application state; an explicit compatibility
-result can authorize a saved prefix within the same era, and `adopt_current_era`
-one from an older era.
+metadata alone cannot authorize old application state; `adopt_current_era`
+authorizes one from an older era.
 
 One durable page reader handles both backlog and live delivery, so there is no
 separate cursor to switch at the live boundary. It serves the rebuilt rows in
@@ -247,11 +212,11 @@ fail loudly. Page size and send queues bound memory; available backlog
 has no total replay cap. The [API contract](../../README.md#api) owns exact
 resource limits and handshake errors.
 
-History replacement happens across a process boundary, after existing
-subscriptions end. A session's mandatory claim therefore binds all its events;
-there is no per-event generation or guaranteed farewell message. Revisit this
-assumption if history can change within an admitted process or multiple local
-writers become supported.
+The history never changes inside an era, and a new era lives in a new data
+directory served by a new process, after existing subscriptions end. A
+session's mandatory claim therefore binds all its events; there is no
+per-event identity or guaranteed farewell message. Revisit this assumption if
+multiple local writers become supported.
 
 ## Code and validation map
 
@@ -263,7 +228,6 @@ writers become supported.
 | Era adoption | [`history_api.rs`](../../sequencer-core/src/history_api.rs) — `adopt_claim` and its range; the [SDK](../../sdk/rust-client/src/history.rs)'s `adopt_current_era`. |
 | Replay followed by live delivery | [`l2_tx_feed`](../../sequencer/src/egress/l2_tx_feed/) — bounded deep replay, identity refusals, shutdown and persistent faults; [`catch_up.rs`](../../sequencer/src/ingress/inclusion_lane/catch_up.rs) for native replay. |
 | Artifact and claim association | [`snapshot_endpoints.rs`](../../sequencer/src/integration_tests/snapshot_endpoints.rs) — headers, restore, archive contents, and lease lifetime. |
-| Checkpoint compatibility | [`storage/history.rs`](../../sequencer/src/storage/history.rs) — the cut ledger's read and the preserved count. |
 
 The [integration validation record](../review/2026-09-16-track3-validation.md)
 records wallet replica and canonical-machine evidence. Remaining consumer and

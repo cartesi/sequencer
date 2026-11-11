@@ -1385,7 +1385,7 @@ mod tests {
         let replay = storage
             .canonical_history_page(
                 sequencer_core::history::HistoryClaim {
-                    version: bounds.version,
+                    era_id: bounds.era_id,
                     next_input: bounds.available_from,
                 },
                 100,

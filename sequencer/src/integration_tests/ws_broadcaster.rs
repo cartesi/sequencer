@@ -206,17 +206,45 @@ async fn ws_subscribe_requires_a_valid_history_claim_before_upgrade() {
     let runtime = start_test_server(&db.path).await;
     let client = SequencerClient::new(format!("http://{}", runtime.addr)).unwrap();
     let mut start = history_claim(&db.path, 3);
+    // A valid claim with any extra field, such as a revision the server does
+    // not check, is refused before the claim is read.
+    for extra in ["recovery_generation=0", "unrecognized=1"] {
+        let url = format!(
+            "ws://{}/ws/subscribe?era_id={}&next_input=0&{extra}",
+            runtime.addr, start.era_id
+        );
+        let refused = connect_async(url).await;
+        assert!(
+            matches!(&refused, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status().as_u16() == 400),
+            "{extra}: {refused:?}"
+        );
+    }
     assert!(matches!(client.subscribe(start).await,
         Err(sequencer_rust_client::SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
     start.next_input = L2TxCount::ZERO;
-    start.version.era_id =
+    let current_era = start.era_id;
+    start.era_id =
         EraId::from_bytes([0x11, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 1]).unwrap();
     assert!(matches!(
         client.subscribe(start).await,
         Err(sequencer_rust_client::SubscribeError::History(
-            HistoryPolicyError::EraChanged { .. }
-        ))
+            HistoryPolicyError::EraChanged { era_id }
+        )) if era_id == current_era
     ));
+    // The refusal's body and header carry the same exact JSON.
+    let refused = connect_async(format!(
+        "ws://{}/ws/subscribe?era_id={}&next_input=0",
+        runtime.addr, start.era_id
+    ))
+    .await;
+    let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = refused else {
+        panic!("expected an HTTP refusal, got {refused:?}");
+    };
+    assert_eq!(response.status().as_u16(), 409);
+    let expected = serde_json::json!({ "code": "ERA_CHANGED", "era_id": current_era.to_string() });
+    let header: serde_json::Value =
+        serde_json::from_slice(response.headers()["X-History-Error"].as_bytes()).unwrap();
+    assert_eq!(header, expected);
     let legacy = connect_async(format!("ws://{}/ws/subscribe?from_offset=0", runtime.addr)).await;
     assert!(
         matches!(legacy, Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status().as_u16() == 400)
@@ -236,7 +264,7 @@ async fn a_client_of_an_older_era_adopts_the_rebuilt_era_at_its_count_and_follow
     let runtime = start_test_server(&db.path).await;
     let client = SequencerClient::new(format!("http://{}", runtime.addr)).unwrap();
 
-    let info = client.history(None, None).await.unwrap();
+    let info = client.history(None).await.unwrap();
     assert_eq!(info.history.available_from.get(), test_era::BASE);
     assert_eq!(
         info.baseline.rebuilt_history_end.get(),
@@ -247,21 +275,18 @@ async fn a_client_of_an_older_era_adopts_the_rebuilt_era_at_its_count_and_follow
     // The client's state sits at count 43 of the era the recovery replaced.
     let count = L2TxCount::new(43);
     let old_era = HistoryClaim {
-        version: sequencer_core::history::HistoryVersion {
-            era_id: EraId::from_bytes([0x22, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2])
-                .unwrap(),
-            recovery_generation: sequencer_core::history::RecoveryGeneration::new(3),
-        },
+        era_id: EraId::from_bytes([0x22, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2])
+            .unwrap(),
         next_input: count,
     };
     assert!(matches!(
         client.subscribe(old_era).await,
         Err(sequencer_rust_client::SubscribeError::History(
-            HistoryPolicyError::EraChanged { current }
-        )) if current == info.history.version
+            HistoryPolicyError::EraChanged { era_id }
+        )) if era_id == info.history.era_id
     ));
     let claim = client.adopt_current_era(count).await.unwrap();
-    assert_eq!(claim.version, info.history.version);
+    assert_eq!(claim.era_id, info.history.era_id);
     assert_eq!(claim.next_input, count);
 
     // The feed crosses the seam from the rebuilt rows into the live ones,
@@ -616,10 +641,7 @@ fn assert_ws_message_matches_tx(
 
 fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
     HistoryClaim {
-        version: Storage::open_read_only(db_path)
-            .unwrap()
-            .history_version()
-            .unwrap(),
+        era_id: Storage::open_read_only(db_path).unwrap().era().unwrap().id,
         next_input: L2TxCount::new(next),
     }
 }
