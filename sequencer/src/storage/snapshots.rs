@@ -126,7 +126,7 @@ pub struct FinalizedLease {
 }
 
 impl Storage {
-    /// GC keeps the accepted rollback checkpoint, every snapshot beyond
+    /// GC keeps the accepted checkpoint, every snapshot beyond
     /// it (an intermediate optimistic snapshot may become the next accepted
     /// head) and every leased snapshot. Returns the collected prefixes, whose
     /// directories the caller deletes after this commit (I13).
@@ -164,8 +164,8 @@ impl Storage {
         self.read(|tx| latest_snapshot_in(tx))
     }
 
-    pub fn rollback_snapshot(&mut self) -> Result<Option<Snapshot>> {
-        self.read(|tx| rollback_snapshot_in(tx))
+    pub fn accepted_snapshot(&mut self) -> Result<Option<Snapshot>> {
+        self.read(|tx| accepted_snapshot_in(tx))
     }
 
     /// Lease the accepted checkpoint; egress calls it on a read-only handle.
@@ -229,8 +229,8 @@ impl Storage {
 /// Select the collectible snapshots, keep the leased ones, drop the registry's
 /// zero entries, and delete the remaining rows.
 fn collect_unleased_in(tx: &Transaction<'_>, registry: &mut LeaseCounters) -> Result<Vec<PathBuf>> {
-    let anchor_id = rollback_snapshot_in(tx)?.map(|snapshot| snapshot.id);
-    // Collectible: not the rollback snapshot, and either the baseline or an
+    let anchor_id = accepted_snapshot_in(tx)?.map(|snapshot| snapshot.id);
+    // Collectible: not the accepted snapshot, and either the baseline or an
     // accepted batch's.
     let candidates = {
         let mut stmt = tx.prepare(
@@ -311,13 +311,13 @@ fn insert_snapshot_in(
     Ok(tx.last_insert_rowid())
 }
 
-/// Whether a rollback-safe snapshot exists, read inside the caller's
+/// Whether a accepted snapshot exists, read inside the caller's
 /// transaction (the history metadata reads it).
-pub(super) fn has_rollback_safe_snapshot_in(conn: &Connection) -> Result<bool> {
-    Ok(rollback_snapshot_in(conn)?.is_some())
+pub(super) fn has_accepted_snapshot_in(conn: &Connection) -> Result<bool> {
+    Ok(accepted_snapshot_in(conn)?.is_some())
 }
 
-fn rollback_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
+fn accepted_snapshot_in(conn: &Connection) -> Result<Option<Snapshot>> {
     match latest_accepted_boundary_in(conn)? {
         Some((nonce, _)) => snapshot_for_batch_in(conn, nonce).map(Some),
         None => baseline_snapshot_in(conn),

@@ -13,7 +13,7 @@ use crate::storage::history::{era_in, history_bounds_from};
 use crate::storage::l1_inputs::query_deployment_identity;
 use crate::storage::queries::safe_input_count_through_block_in;
 use crate::storage::snapshots::{
-    FinalizedSelectionError, finalized_dump_in, has_rollback_safe_snapshot_in,
+    FinalizedSelectionError, finalized_dump_in, has_accepted_snapshot_in,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,8 +44,8 @@ impl Storage {
                 query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             if accepted.is_none() {
                 assert!(
-                    has_rollback_safe_snapshot_in(tx)?,
-                    "history has no rollback-safe snapshot"
+                    has_accepted_snapshot_in(tx)?,
+                    "history has no accepted snapshot"
                 );
             }
             Ok(Ok(HistoryInfo {

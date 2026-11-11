@@ -1,8 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Startup checks rollback checkpoint metadata, then collects obsolete snapshots
-//! and orphan directories before the listeners are bound or workers admitted.
+//! Startup checks the accepted checkpoint's metadata, then collects obsolete
+//! snapshots and orphan directories before the listeners are bound or the
+//! workers launched.
 
 use std::os::unix::fs::MetadataExt;
 
@@ -17,7 +18,7 @@ pub(super) fn run_snapshot_hygiene(
     data_dir: &str,
     dumps_dir: &std::path::Path,
 ) -> Result<(), CommandError> {
-    require_rollback_snapshot(storage, data_dir)?;
+    require_accepted_snapshot(storage, data_dir)?;
     let gc_removed = snapshot_gc_at_startup(storage, leases)?;
     let sweep_removed = sweep_orphan_dumps(storage, dumps_dir)?;
     tracing::debug!(
@@ -28,11 +29,11 @@ pub(super) fn run_snapshot_hygiene(
     Ok(())
 }
 
-fn require_rollback_snapshot(
+fn require_accepted_snapshot(
     storage: &mut crate::storage::Storage,
     data_dir: &str,
 ) -> Result<(), CommandError> {
-    let snapshot = storage.rollback_snapshot()?.ok_or_else(|| {
+    let snapshot = storage.accepted_snapshot()?.ok_or_else(|| {
         CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupNotComplete {
             data_dir: data_dir.to_string(),
         })
@@ -155,7 +156,7 @@ mod tests {
             .insert_baseline_snapshot(&missing, crate::storage::L2TxCount::ZERO)
             .expect("register missing fixture");
 
-        let err = require_rollback_snapshot(&mut storage, "/data")
+        let err = require_accepted_snapshot(&mut storage, "/data")
             .expect_err("a durable DB reference cannot point at a missing artifact");
 
         assert!(matches!(
@@ -178,7 +179,7 @@ mod tests {
             .insert_baseline_snapshot(&corrupt, crate::storage::L2TxCount::ZERO)
             .expect("register corrupt fixture");
 
-        let err = require_rollback_snapshot(&mut storage, "/data")
+        let err = require_accepted_snapshot(&mut storage, "/data")
             .expect_err("corrupt durable metadata cannot be retried as operational I/O");
 
         assert!(matches!(
@@ -482,11 +483,11 @@ mod tests {
         let dumps_dir = tempfile::tempdir().unwrap();
         let orphan = dumps_dir.path().join("orphan");
         create_structured_dump(&orphan);
-        let rollback = dumps_dir.path().join("rollback");
-        create_structured_dump(&rollback);
+        let accepted = dumps_dir.path().join("accepted");
+        create_structured_dump(&accepted);
         storage.insert_closed_batch_snapshot(&orphan).unwrap();
-        storage.insert_closed_batch_snapshot(&rollback).unwrap();
-        // With both batches accepted, the second's snapshot is the rollback
+        storage.insert_closed_batch_snapshot(&accepted).unwrap();
+        // With both batches accepted, the second's snapshot is the accepted
         // checkpoint; the baseline and the first batch's are collectible.
         seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0, 1]);
         let removed =
@@ -494,6 +495,6 @@ mod tests {
                 .unwrap();
         assert_eq!(removed, 2);
         assert!(!orphan.exists());
-        assert!(rollback.join("info.toml").is_file());
+        assert!(accepted.join("info.toml").is_file());
     }
 }

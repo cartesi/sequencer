@@ -206,7 +206,7 @@ fn canonical_divergence_cannot_be_advertised_as_an_accepted_receipt() {
 }
 
 #[test]
-#[should_panic(expected = "history has no rollback-safe snapshot")]
+#[should_panic(expected = "history has no accepted snapshot")]
 fn missing_baseline_is_not_reported_as_an_absent_accepted_checkpoint() {
     let (_db, mut storage) = fixture("historical-missing-baseline", 20, 41, 7);
     storage.conn.execute("DELETE FROM snapshots", []).unwrap();

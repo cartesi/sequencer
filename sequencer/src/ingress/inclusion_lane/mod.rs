@@ -53,9 +53,9 @@ impl<A: Application + 'static> InclusionLane<A> {
     /// It fails loudly with
     /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
     ///
-    /// Restore the newest surviving snapshot and replay from its exact
-    /// application count. Setup leaves a rollback-safe checkpoint, the era's
-    /// baseline, before `run` launches any worker.
+    /// Restore the newest snapshot and replay from its exact application
+    /// count. Setup leaves one, the era's baseline, before `run` launches any
+    /// worker.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane

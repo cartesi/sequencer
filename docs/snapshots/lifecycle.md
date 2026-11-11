@@ -180,7 +180,7 @@ the enclosing dump directories recursively. This filesystem operation disposes
 of all checkpoint resources. Filesystem deletion failure leaves a harmless
 orphan for the startup sweep. The reverse ordering would leave a durable row pointing at missing
 state and is forbidden. Startup, before the listeners are bound, checks the
-rollback checkpoint's `info.toml` and format version, collects obsolete rows,
+accepted checkpoint's `info.toml` and format version, collects obsolete rows,
 and sweeps orphan directories. The sweep matches
 artifacts by filesystem identity (device and inode), not by path, because setup
 and run can spell the same directory differently; it resolves every retained

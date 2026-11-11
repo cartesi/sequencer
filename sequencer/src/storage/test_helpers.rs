@@ -270,8 +270,8 @@ impl Storage {
         self.read(|tx| next_l2_tx_count_in(tx))
     }
 
-    pub(crate) fn has_rollback_safe_snapshot(&mut self) -> rusqlite::Result<bool> {
-        self.read(|tx| super::snapshots::has_rollback_safe_snapshot_in(tx))
+    pub(crate) fn has_accepted_snapshot(&mut self) -> rusqlite::Result<bool> {
+        self.read(|tx| super::snapshots::has_accepted_snapshot_in(tx))
     }
 
     /// [`Storage::read`]'s deferred transaction, for tests outside storage

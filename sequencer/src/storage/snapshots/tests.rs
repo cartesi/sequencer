@@ -86,7 +86,7 @@ fn missing_exact_accepted_snapshot_never_falls_back_or_collects() {
         storage.latest_snapshot(),
         Err(rusqlite::Error::QueryReturnedNoRows)
     ));
-    assert!(storage.has_rollback_safe_snapshot().is_err());
+    assert!(storage.has_accepted_snapshot().is_err());
     assert!(
         storage
             .collect_snapshots(&SnapshotLeases::default())
@@ -128,7 +128,7 @@ fn the_era_baseline_is_the_comparison_checkpoint_at_the_stop_block() {
         ),
         (100, 41, 7)
     );
-    assert!(storage.has_rollback_safe_snapshot().unwrap());
+    assert!(storage.has_accepted_snapshot().unwrap());
     assert!(
         storage
             .collect_snapshots(&SnapshotLeases::default())
