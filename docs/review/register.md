@@ -36,11 +36,14 @@ To settle with Bart:
 - The payload cap's value. A count bounds memory only if each entry's size
   is bounded too, and portals accept zero-value deposits with arbitrary extra
   data, up to the 64 KiB input cap; the cap is the longest payload the
-  application accepts.
-- A filter on a direct's sender and shape. Dropping a direct the application
-  would ignore before it joins keeps garbage out of the fridge. It must be a
-  function of the input alone: the scheduler reads no application state, the
-  lane mirrors the fridge, and a resume re-admits from the raw inputs.
+  application accepts. libdex accepts every user op as a direct, so its cap
+  is at least its largest price push, 6,971 bytes
+  ([libdex's sizes](2026-11-12-libdex-answers.md#ops-and-their-sizes)).
+- No filter on a direct's sender or shape. One would have to be a function of
+  the input alone, since the scheduler reads no application state, the lane
+  mirrors the fridge, and a resume re-admits from the raw inputs. libdex takes
+  any op from any sender as a direct, so the input shows nothing but its
+  length ([libdex's L1 inputs](2026-11-12-libdex-answers.md#l1-inputs)).
 - The count. Above what L1 can include within the backstop window, roughly
   2 million zero-value deposits at mainnet's 60M gas limit today (30-40k gas
   each when a contract batches them; measure it on the pinned contracts),
@@ -57,7 +60,9 @@ To settle with Bart:
   one input in 1.94 G cycles, 1/145,000 of the per-input budget, and four
   times the bound also completes
   ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#c-draining-a-full-fridge-in-one-input));
-  libdex's drain is its own to measure.
+  libdex's drain is its own to measure, and its worst direct is a price push
+  that advances a tick
+  ([libdex's cycles](2026-11-12-libdex-answers.md#machine-cycles)).
 
 Next: settle these values and measure libdex's headroom, then exercise a
 same-block overflow on devnet. An overflow changes the
@@ -260,10 +265,10 @@ unverified paths.
   with exit 30. The 2^36-cycle cap on each query (`QUERY_MCYCLE_BUDGET`) has at
   least 3,269 times headroom over the largest report that fits, so the report
   size binds first ([2026-11-10 measurement](2026-11-10-recovery-measurements.md#b-reading-a-base-machine)).
-  This is acceptable while no deployment's state approaches it; until then a
-  deployment past it can recover only from an older base or genesis. Add a
-  range read, and measure its queries against the cap, before a deployment's
-  application state can exceed 2 MiB, which libdex's likely will
+  This is acceptable for the wallet. libdex's state is a 512 MiB range
+  ([libdex's state](2026-11-12-libdex-answers.md#state)), so a libdex
+  deployment could recover only from genesis: add a range read, and measure
+  its queries against the cap, before libdex deploys
   ([state sources](../watchdog/README.md#state-sources)).
 - **Not every machine the watchdog stores is a base.** Setup loads only a
   machine waiting at an `RX_ACCEPTED` yield, and the
@@ -348,6 +353,28 @@ force.
 - **Wire format.** A fixed 65-byte signature field, with the
   [SSZ overhead](#batch-size-accounting-omits-ssz-overhead) fix; drain sealed
   batches before the switch.
+- **An over-long direct is dropped, deposits included.** A direct over
+  `max_direct_payload_bytes` never joins the fridge
+  ([the fridge](../protocol/scheduler-semantics.md#the-fridge)). A portal
+  deposit with long extra data is such a direct, and the portal has already
+  taken its tokens, so the drop loses them. Proposed: cut the payload to the
+  cap and let it join, handing the application the original length so it can
+  tell a cut input; libdex reads only a deposit's head
+  ([libdex's L1 inputs](2026-11-12-libdex-answers.md#l1-inputs)). The cut is
+  still a function of the input alone, so the lane and a resume agree.
+- **The nonce rule does not fit libdex.** The rule gives every address a
+  nonce from 0 that each executed op advances and nothing else changes; the
+  executor asserts it and `GET /nonce` relies on it
+  ([user nonces](../protocol/application-contract.md#user-nonces)). libdex
+  creates an account only on a deposit, bounds its account table, and deletes
+  session wallets with their nonces
+  ([libdex's accounts](2026-11-12-libdex-answers.md#accounts-and-nonces)). If
+  a posted batch carries an op from a signer without an account, the op has
+  no nonce to advance and the executor's assertion stops the rebuild. To
+  decide before the port: keep the counter, let the application answer "no
+  account", and require that a nonce never goes down; or move replay
+  protection into the scheduler in a form whose state can be dropped
+  ([deferred plan](../plans/2026-10-batch-scoped-replay-protection.md)).
 - **Riding the port's image:** the
   [fee table](../plans/2026-07-coordination-tracks.md#track-5--fee-exponentiation-lut),
   the [fridge bound and cap values](#bound-the-canonical-direct-input-fridge),

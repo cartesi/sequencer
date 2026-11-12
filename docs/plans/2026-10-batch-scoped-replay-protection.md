@@ -3,7 +3,9 @@
 **Status:** deferred design, not implemented. The current rule is the
 per-sender nonce in the [application contract](../protocol/application-contract.md#user-nonces).
 Revisit when replay state must become prunable, or when the fee moves from the
-frame to the batch.
+frame to the batch. The first holds for libdex, which deletes session wallets
+with their nonces, so the choice is open
+([register](../review/register.md#canonical-rules-open-for-the-c-port)).
 
 ## Why
 
@@ -132,6 +134,7 @@ This is one coordinated contract change, agreed with the engine owner:
 
 ## Why deferred
 
-The per-sender nonce works, and the engine owner no longer needs to prune
-replay state. The change spans signing, wire format, scheduler, ABI and API at
-once, so it waits for a concrete trigger.
+The change spans signing, wire format, scheduler, ABI and API at once, so it
+waits for a decision. The per-sender nonce works only for an application that
+keeps every signer's nonce forever, which libdex does not
+([libdex's accounts](../review/2026-11-12-libdex-answers.md#accounts-and-nonces)).

@@ -41,10 +41,18 @@ limits this work accepts and the paths it left unverified.
   reference export; package it so an author links their own archive in one
   command.
 - **A base machine's state through the range source.** Setup reads only the
-  `state` inspect report, which must fit 2 MiB; add the labeled-range read the
-  watchdog uses before a deployment's state can outgrow it, and measure its
-  queries against the loader's cycle cap
+  `state` inspect report, which must fit 2 MiB, and libdex's state is a 512 MiB
+  range, so setup cannot start from a libdex machine. Add the labeled-range
+  read the watchdog uses, and measure it against the loader's cycle cap
   ([register](../../review/register.md#sequencer-recovery-follow-ups)).
+- **Close a batch on its real size.** The lane closes a batch on its op count
+  times the largest op the application accepts. libdex's largest op is 6,971
+  bytes and its usual op under 50, so its batches would close at 2 ops where
+  about 110 fit ([issue 58](https://github.com/cartesi/sequencer/issues/58),
+  [libdex's sizes](../../review/2026-11-12-libdex-answers.md#ops-and-their-sizes)).
+  Count the encoded bytes instead: it is the lane's own choice and changes no
+  image. The fee still charges every op as 126 bytes; a per-byte price changes
+  what a signed op means, and waits.
 - **Drills that are not tests yet.** The round trips from genesis and from a
   stored machine run on the devnet for both hosts
   ([drills](../../watchdog/incident-runbook.md#drills)). No test clears a
@@ -97,61 +105,33 @@ operator's job.
 - **A backup procedure for machines.** Storing directory trees for a long time
   is a solved problem; pick a mature tool rather than building one.
 
+## libdex
+
+[libdex as its author describes it](../../review/2026-11-12-libdex-answers.md)
+records the answers to the first round of questions. They add two items to
+[build](#build), the state's range read and closing a batch on its real size.
+They also open two canonical rules in the
+[register](../../review/register.md#canonical-rules-open-for-the-c-port): what
+the scheduler does with an over-long deposit, and where the nonce lives.
+
 ## Questions for Bart
 
-The guest's duties are stated in [application](application.md#the-canonical-machine),
-and what an op pays is the application's choice, with charging what the sender
-has as the recommendation; neither is a question.
+What an op pays is the application's choice, with charging what the sender
+has as the recommendation, and admission's refusal by policy answers a
+redundant price push; neither is a question.
 
-To confirm:
-
-- Price pushes are the only large op: about 165 bytes with three markets,
-  sent every few minutes by wallets the operator runs, against about 32 bytes
-  for the rest. How many bytes does a market add, and how many markets are
-  planned?
-- Official pushers should pay nothing, and a redundant push should not be
-  included at all. `application_engine_execute_user_op` decides what an op
-  pays, and `application_engine_admit_user_op` can refuse one with
-  `APPLICATION_ENGINE_REFUSED_BY_POLICY`, which costs its sender no nonce and
-  no fee. Does that cover it? Is pushing open to anyone, or to a list?
-- Which revision of the sequencer, and which version of
-  `application-engine.h`, is libdex built against?
-
-Your scheduler in a recovery, which the sequencer runs natively through
-`scheduler.h`, apart from your engine:
-
-- Can your scheduler library implement
-  [`scheduler.h`](../../../bindings/c-scheduler/include/scheduler.h) as
-  written? What would you change?
-- Does your scheduler read anything from the engine's state?
-- Can it resume from five numbers and the L1 inputs still queued: the inputs
-  consumed, the next batch nonce, the clock, the index of the oldest queued
-  direct, and how many are queued? Does it keep any other state?
-- Have you ported `fee_to_linear` bit for bit? Would a checked-in table of
-  exact values be easier to match?
-
-libdex:
-
-- Which L1 inputs does libdex act on, by sender and by payload shape, and how
-  long is the longest valid one? The scheduler could drop every other direct
-  before it queues it.
-- How does an account come to exist: by a deposit only, or by a first user op
-  too? What happens to each when the account table is full?
-- What does libdex read as time: a direct's block or timestamp, a user op's
-  frame block, or the price pusher's own timestamp?
-- The state: its encoding, its size now and at full scale, whether the drive
-  holds only the flat buffer or a padding tail too, and whether the L2 tx
-  count is inside it.
-- How many machine cycles do a small op, a price push and a deposit take?
-
-Your client:
-
-- Which endpoints and headers does your indexer call, and what is missing or
-  awkward?
-- After a recovery the history can differ from what the indexer saw, from
-  some count on. Can it go back to an earlier count from its own backups
-  ([client backups](client-backups.md)), or does it rebuild from zero, and how
-  long does that take? Which SQLite version does it link?
+- When a deleted session wallet is registered again, where does its nonce
+  start? If it can start below where it stopped, what keeps the wallet's
+  earlier ops, which are public on L1, from running again?
+- What does `validate_user_op` check besides the nonce? Each of those checks
+  becomes part of execution, which always runs and always counts.
+- Does a client ever send several ops from one wallet without waiting for
+  each answer? Does anything need a wallet's ops to run with no gap between
+  them?
+- Does the native engine lay out the state range byte for byte as the guest
+  does? On which hosts has that been run?
+- When there are numbers: the machine cycles of an idle tick and of the worst
+  one.
 
 ## Measure
 
