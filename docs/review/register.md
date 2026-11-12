@@ -128,6 +128,18 @@ counts, then correct the estimate and check the separately configured
   generated client or documentation site comes to depend on the file, add a
   test that compares its paths with the routers and validates serialized wire
   types against its schemas.
+- **The `safe` tag's cadence depends on the L1 node** (web sources read
+  2026-11-12, nothing run). The sequencer takes its safe head from the `safe`
+  tag ([`l1/reader.rs`](../../sequencer/src/l1/reader.rs)). By default that is
+  the justified block: it moves one epoch at a time, 32 blocks, and trails the
+  head by an epoch or more. A consensus client that turns on the fast
+  confirmation rule, which needs no fork, reports a block a few behind the
+  head instead, and falls back to the finalized block when the rule stalls, so
+  the tag can move back. Providers enable it per network and some only by
+  opt-in. Before a deployment reads a node with the rule on, check that the
+  reader and the lane's frame clock tolerate a safe head that goes backwards,
+  and revisit the five-block frame tick
+  ([frame-clock policy](../protocol/scheduler-semantics.md#sequencer-frame-clock-policy)).
 
 ## Known optimizations
 
