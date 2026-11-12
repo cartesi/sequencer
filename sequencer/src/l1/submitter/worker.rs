@@ -3,8 +3,9 @@
 
 //! Batch submitter worker: stateless, at-least-once submission. Each tick reads
 //! the accepted frontier from SQLite, advances past batch nonces already seen on
-//! L1 above the safe block, and submits every remaining valid closed batch. It
-//! never observes danger; a cancelled tick's sends are found by the next scan.
+//! L1 above the safe block, and submits every remaining closed batch, a
+//! void one included, until the process stops. A cancelled tick's sends are
+//! found by the next scan.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,8 +68,9 @@ pub(crate) enum TickOutcome {
 /// observed nonce equal to the next expected one. The observed nonces are our own
 /// `InputAdded` events past the frontier's safe block up to latest, in event (so
 /// wallet-nonce, so submission) order; matching by equality advances once for a
-/// nonce repeated across recovery generations. A resubmission heuristic, not a
-/// scheduler mirror: it reads unsafe events and applies no staleness rule.
+/// nonce L1 carries twice, such as an earlier era's batch. A resubmission
+/// heuristic, not a scheduler mirror: it reads unsafe events and applies no
+/// staleness rule.
 fn decide_submit_start(frontier: SubmitterFrontier, recently_observed_nonces: &[u64]) -> u64 {
     let mut expected = frontier.accepted_next_nonce;
     for &nonce in recently_observed_nonces {
@@ -184,11 +186,10 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
     pub(crate) async fn tick_once(&self) -> Result<TickOutcome, BatchSubmitterError> {
         let frontier = self.load_frontier().await?;
 
-        // Must start scanning at `safe_block + 1`: after a danger-zone shutdown
-        // the flusher only returns once `Pending <= Safe`, so any wallet-nonce
-        // slots backed by blocks at or below the safe head are already
-        // resolved and folded into `accepted_next_nonce`. Re-scanning those
-        // blocks here would double-count the finalized prefix.
+        // Must start scanning at `safe_block + 1`: landings at or below the
+        // safe head are already judged and folded into `accepted_next_nonce`.
+        // Re-scanning those blocks here would double-count the accepted
+        // prefix.
         let scan_start = frontier
             .safe_block
             .checked_add(1)
@@ -206,8 +207,7 @@ impl<P: BatchPoster + 'static> BatchSubmitter<P> {
 
         for batch in &pending {
             debug!(
-                batch_index = batch.batch_index,
-                nonce = batch.nonce,
+                batch_nonce = batch.nonce,
                 "queueing batch for L1 submission"
             );
         }
@@ -299,15 +299,8 @@ mod tests {
     use crate::runtime::shutdown::RuntimeScope;
     use crate::storage::{SafeInputRange, Storage, StoredSafeInput, SubmitterFrontier};
     use crate::test_support::{TestDb, temp_db};
-    use sequencer_core::protocol::ProtocolTiming;
 
     const BATCH_SUBMITTER_ADDRESS: Address = Address::repeat_byte(0x11);
-
-    /// Protocol pinned to `BATCH_SUBMITTER_ADDRESS` — worker tests use that as
-    /// their test submitter, so populate sees the seeded safe_inputs.
-    fn submitter_test_protocol() -> ProtocolTiming {
-        crate::storage::test_helpers::default_protocol_timing()
-    }
 
     fn default_test_config() -> BatchSubmitterConfig {
         BatchSubmitterConfig {
@@ -318,20 +311,19 @@ mod tests {
     fn seed_two_closed_batches(db_path: &str) {
         let mut storage = Storage::open(db_path).expect("open storage");
         storage
-            .append_safe_inputs(0, &[], BATCH_SUBMITTER_ADDRESS, &submitter_test_protocol())
+            .append_safe_inputs(0, &[], BATCH_SUBMITTER_ADDRESS)
             .expect("record observed safe head");
         let mut head = storage
             .initialize_open_state(0, SafeInputRange::empty_at(0))
             .expect("initialize open state");
-        let next_safe = head.safe_block;
         storage
-            .close_frame_and_batch(&mut head, next_safe)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 0");
         storage
-            .close_frame_and_batch(&mut head, next_safe)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 1");
         storage
-            .close_frame_and_batch(&mut head, next_safe)
+            .close_frame_and_batch(&mut head)
             .expect("close batch 2");
     }
 
@@ -348,12 +340,7 @@ mod tests {
             })
             .collect();
         storage
-            .append_safe_inputs(
-                safe_block,
-                inputs.as_slice(),
-                BATCH_SUBMITTER_ADDRESS,
-                &submitter_test_protocol(),
-            )
+            .append_safe_inputs(safe_block, inputs.as_slice(), BATCH_SUBMITTER_ADDRESS)
             .expect("append safe submitted batches");
     }
 
@@ -651,16 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn decide_submit_start_advances_once_per_matching_nonce_across_recovery_generations() {
-        // Batch nonces repeat across recovery generations (a cascade reuses the
-        // last valid ancestor's `nonce + 1`), so the stream can carry one twice;
-        // only the occurrence that matches `expected` advances.
+    fn decide_submit_start_advances_once_per_matching_nonce_across_duplicates() {
+        // A batch nonce can land twice (a resubmission, or an older era's
+        // batch), so the stream can carry one twice; only the occurrence that
+        // matches `expected` advances.
         let from_nonce = decide_submit_start(
             SubmitterFrontier {
                 safe_block: 10,
                 accepted_next_nonce: 2,
             },
-            // Two events reporting nonce=2 (one per generation), then nonce=3.
+            // Two events reporting nonce=2, then nonce=3.
             &[2, 2, 3],
         );
         // 2 matches expected=2 → advance to 3. Second 2 doesn't match

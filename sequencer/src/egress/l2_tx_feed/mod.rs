@@ -219,29 +219,15 @@ fn run_subscription(
             }
 
             let offset = row.offset.get();
-            let event = match row.context {
-                L2TxContext::UserOp {
+            let event = match &row.context {
+                L2TxContext::UserOp { tx, batch_nonce } => {
+                    BroadcastTxMessage::from_user_op(offset, tx, *batch_nonce)
+                }
+                L2TxContext::Direct {
                     tx,
-                    nonce,
-                    safe_block,
                     batch_nonce,
-                    ..
-                } => BroadcastTxMessage::from_user_op(offset, tx, nonce, safe_block, batch_nonce),
-                L2TxContext::DirectInput {
-                    tx,
-                    input_index,
-                    batch_nonce,
-                    block_timestamp,
                     transaction_hash,
-                    ..
-                } => BroadcastTxMessage::from_direct_input(
-                    offset,
-                    tx,
-                    input_index,
-                    batch_nonce,
-                    block_timestamp,
-                    transaction_hash,
-                ),
+                } => BroadcastTxMessage::from_direct(offset, tx, *batch_nonce, *transaction_hash),
             };
             if events_tx.blocking_send(event).is_err() {
                 return Ok(());

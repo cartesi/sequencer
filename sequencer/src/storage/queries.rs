@@ -5,28 +5,70 @@
 //! they compose inside any writer's transaction; single-caller reads stay with the
 //! writer that owns them.
 
-use rusqlite::{Connection, OptionalExtension, Result, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Result, ToSql, Transaction, params};
 
-use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64};
+use super::convert::{from_unix_ms, i64_to_u16, i64_to_u32, i64_to_u64, u64_to_i64};
 use super::{BatchPolicy, WriteHead};
+
+/// Whether a safe input executes as a direct when its range drains: any input
+/// but the batch submitter's, unless its payload is over the application's
+/// cap. Every query that picks the directs to execute uses this one predicate,
+/// so the lane's executions and storage's derivation of them always agree.
+/// It binds `:batch_submitter` and `:max_direct_payload_bytes`, both from the
+/// pinned deployment identity through [`DirectOperands`]. `length` takes
+/// the bare column, so SQLite answers it from the record header without
+/// reading the payload; every writer stores the payload as a blob.
+pub(super) const DIRECT_EXECUTES_SQL: &str = "(sender != :batch_submitter \
+     AND length(payload) <= :max_direct_payload_bytes)";
+
+/// Both operands of [`DIRECT_EXECUTES_SQL`], read from the one pinned
+/// deployment identity. A statement that uses the predicate binds them
+/// together through [`DirectOperands::bind`], so neither is ever bound alone.
+pub(super) struct DirectOperands {
+    batch_submitter: Vec<u8>,
+    max_direct_payload_bytes: i64,
+}
+
+impl DirectOperands {
+    /// Fails with `QueryReturnedNoRows` when no identity is pinned.
+    pub(super) fn load(conn: &Connection) -> Result<Self> {
+        let identity = super::l1_inputs::query_deployment_identity(conn)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Ok(Self {
+            batch_submitter: identity.batch_submitter_address.to_vec(),
+            max_direct_payload_bytes: u64_to_i64(identity.max_direct_payload_bytes),
+        })
+    }
+
+    /// `params` followed by the predicate's two bindings.
+    pub(super) fn bind<'a>(
+        &'a self,
+        params: &[(&'a str, &'a dyn ToSql)],
+    ) -> Vec<(&'a str, &'a dyn ToSql)> {
+        let mut bound = params.to_vec();
+        bound.push((":batch_submitter", &self.batch_submitter));
+        bound.push((":max_direct_payload_bytes", &self.max_direct_payload_bytes));
+        bound
+    }
+}
 
 // ── Write-head loading ───────────────────────────────────────────────────
 //
-// Used by ingress (initialize/resume open state) and recovery (open recovery
-// batch after cascade). The WriteHead is the in-memory mirror of the latest
-// open batch/frame and must always match what's persisted in `batches` and
-// `frames`.
+// The only constructor of a `WriteHead` outside tests. Ingress loads the lane's
+// head with it and reloads it to compare at every frame rotation and batch
+// close. The head is the in-memory mirror of the latest open batch/frame and
+// must always match what's persisted in `batches` and `frames`.
 
 pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<WriteHead>> {
-    // The Tip is the single row in `valid_open_batch` (enforced by
-    // `ux_single_valid_tip`). Returns None if there's no Tip (fresh DB,
-    // or torn state between cascade and recovery-batch open).
+    // The Tip is the single row in `open_batch` (enforced by
+    // `ux_single_open_batch`). Returns None if there's no Tip (a fresh era,
+    // before `run` opens its first batch).
     let latest_batch = match tx.query_row(
         "SELECT
-            b.batch_index,
+            b.nonce,
             b.created_at_ms,
-            (SELECT COUNT(*) FROM user_ops u WHERE u.batch_index = b.batch_index) AS user_op_count
-         FROM valid_open_batch b",
+            (SELECT COUNT(*) FROM user_ops u WHERE u.batch_nonce = b.nonce) AS user_op_count
+         FROM open_batch b",
         [],
         |row| {
             Ok((
@@ -40,24 +82,24 @@ pub(super) fn load_current_write_head(tx: &Transaction<'_>) -> Result<Option<Wri
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
         Err(other) => return Err(other),
     };
-    let (batch_index_i64, batch_created_at_ms, batch_user_op_count_i64) = latest_batch;
+    let (batch_nonce_i64, batch_created_at_ms, batch_user_op_count_i64) = latest_batch;
 
     let (frame_in_batch_i64, frame_fee_i64, safe_block_i64): (i64, i64, i64) = tx.query_row(
         "SELECT frame_in_batch, fee, safe_block FROM frames \
-         WHERE batch_index = ?1 ORDER BY frame_in_batch DESC LIMIT 1",
-        params![batch_index_i64],
+         WHERE batch_nonce = ?1 ORDER BY frame_in_batch DESC LIMIT 1",
+        params![batch_nonce_i64],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
 
     let open_frame_user_op_count: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM user_ops WHERE batch_index = ?1 AND frame_in_batch = ?2",
-        params![batch_index_i64, frame_in_batch_i64],
+        "SELECT COUNT(*) FROM user_ops WHERE batch_nonce = ?1 AND frame_in_batch = ?2",
+        params![batch_nonce_i64, frame_in_batch_i64],
         |row| row.get(0),
     )?;
 
     let policy = query_batch_policy(tx)?;
     Ok(Some(WriteHead {
-        batch_index: i64_to_u64(batch_index_i64),
+        batch_nonce: i64_to_u64(batch_nonce_i64),
         batch_created_at: from_unix_ms(batch_created_at_ms),
         frame_fee: i64_to_u16(frame_fee_i64),
         safe_block: i64_to_u64(safe_block_i64),
@@ -83,6 +125,24 @@ pub(super) fn query_latest_safe_input_index_exclusive(conn: &Connection) -> Resu
     })
 }
 
+/// How many safe inputs lie at or below `block`: the exclusive index bound
+/// through it, since InputBox order never lowers the block.
+pub(super) fn safe_input_count_through_block_in(conn: &Connection, block: u64) -> Result<u64> {
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT safe_input_index FROM safe_inputs WHERE block_number <= ?1 \
+             ORDER BY block_number DESC, safe_input_index DESC LIMIT 1",
+            [super::convert::saturating_query_bound(block)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(last.map_or(0, |index| {
+        i64_to_u64(index)
+            .checked_add(1)
+            .expect("safe input index overflow")
+    }))
+}
+
 pub(super) fn current_safe_block(conn: &Connection) -> Result<Option<u64>> {
     let value: Option<i64> = conn
         .query_row(
@@ -95,9 +155,9 @@ pub(super) fn current_safe_block(conn: &Connection) -> Result<Option<u64>> {
 }
 
 /// Current safe block, or `QueryReturnedNoRows` if no observation has been
-/// recorded yet. Use from code paths that only run after preemptive recovery
-/// has produced a safe-head observation (submitter, lane, post-recovery
-/// open-batch helpers); callers that legitimately handle the "never synced"
+/// recorded yet. Use from code paths that only run once setup's sync has
+/// recorded a safe head (submitter, lane, the start batch's opening);
+/// callers that legitimately handle the "never synced"
 /// case should use [`current_safe_block`] instead.
 pub(super) fn current_safe_block_required(conn: &Connection) -> Result<u64> {
     current_safe_block(conn)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
@@ -109,19 +169,6 @@ pub(super) fn current_safe_block_timestamp(conn: &Connection) -> Result<Option<u
     let value: Option<i64> = conn
         .query_row(
             "SELECT block_timestamp FROM l1_safe_head WHERE singleton_id = 0 LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(value.map(i64_to_u64))
-}
-
-/// Wall-clock timestamp (Unix ms) of the last observed safe-head advance, or
-/// `None` if no real safe-head observation has occurred yet.
-pub(super) fn last_safe_progress_ms(conn: &Connection) -> Result<Option<u64>> {
-    let value: Option<i64> = conn
-        .query_row(
-            "SELECT synced_at_ms FROM l1_safe_head WHERE singleton_id = 0",
             [],
             |row| row.get(0),
         )
@@ -170,13 +217,51 @@ pub(super) fn query_batch_policy(conn: &Connection) -> Result<BatchPolicy> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::Storage;
+    use crate::storage::test_helpers::{SENDER_A, set_up_storage};
     use crate::test_support::temp_db;
+
+    /// The frame close derives its executions inside the write transaction;
+    /// measuring a payload must not load it, overflow pages included.
+    #[test]
+    fn the_direct_predicate_measures_payloads_without_reading_them() {
+        // SQLite's OP_Column flag for a column read only by length().
+        const OPFLAG_LENGTHARG: i64 = 0x40;
+        let db = temp_db("direct-predicate-plan");
+        let storage = set_up_storage(&db.path, SENDER_A);
+        let mut statement = storage
+            .conn
+            .prepare(&format!(
+                "EXPLAIN SELECT {} FROM safe_inputs",
+                super::DIRECT_EXECUTES_SQL
+            ))
+            .expect("explain the predicate");
+        let program: Vec<(String, i64)> = statement
+            .query_map(
+                rusqlite::named_params! {
+                    ":batch_submitter": [0_u8; 20].as_slice(),
+                    ":max_direct_payload_bytes": 1024_i64,
+                },
+                |row| Ok((row.get("opcode")?, row.get("p5")?)),
+            )
+            .expect("read the program")
+            .collect::<rusqlite::Result<_>>()
+            .expect("program rows");
+        assert!(
+            program.iter().all(|(opcode, _)| opcode != "Cast"),
+            "{program:?}"
+        );
+        assert!(
+            program
+                .iter()
+                .any(|(opcode, p5)| opcode == "Column" && p5 & OPFLAG_LENGTHARG != 0),
+            "{program:?}"
+        );
+    }
 
     #[test]
     fn negative_batch_size_target_floors_to_zero() {
         let db = temp_db("floor-batch-target");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // This row satisfies every schema constraint while deriving a negative
         // target: 1403 - 2000 - 419 = -1016.
@@ -199,7 +284,7 @@ mod tests {
     #[should_panic(expected = "batch policy derived recommended fee")]
     fn negative_recommended_fee_fails_loud() {
         let db = temp_db("negative-recommended-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // A negative derived fee is ruled out by the column constraints. Model
         // corruption/tampering that bypassed them and ensure the read cannot
@@ -219,7 +304,7 @@ mod tests {
     #[should_panic(expected = "batch policy derived batch size target")]
     fn oversized_batch_size_target_fails_loud() {
         let db = temp_db("oversized-batch-target");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // This is schema-valid: the derived target is 17984, which remains
         // below the row's configured log_max_batch_bytes of 20000. It is still

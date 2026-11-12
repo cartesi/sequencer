@@ -12,9 +12,10 @@ pub mod harness;
 pub mod http;
 pub mod ingress;
 pub mod l1;
-pub mod recovery;
+pub(crate) mod landing;
+pub mod machine;
 pub mod runtime;
-pub mod storage;
+pub(crate) mod storage;
 
 #[cfg(test)]
 extern crate self as sequencer;

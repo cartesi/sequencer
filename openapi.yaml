@@ -17,8 +17,7 @@ info:
     Address casing differs by route. `sender` in `POST /tx` and `GET /nonce`
     responses and WebSocket messages, and `verifyingContract` in
     `GET /domain`, use EIP-55 checksum casing. Address fields in `/history`
-    and `sender` in `/historical-l1-inputs` use lowercase hex. Compare decoded
-    20-byte addresses.
+    use lowercase hex. Compare decoded 20-byte addresses.
 
     All `u64` values are JSON numbers; clients must preserve integer
     precision. Integer formats are OpenAPI Format Registry names (`uint16`,
@@ -43,7 +42,7 @@ tags:
   - name: ingress
     description: Public routes for wallets and submitters.
   - name: history
-    description: Internal. Application-history subscription, metadata, and historical L1 inputs.
+    description: Internal. Application-history subscription and metadata.
   - name: snapshots
     description: Internal. Operator state and snapshot downloads for the watchdog and indexers.
   - name: health
@@ -107,10 +106,12 @@ paths:
               example: { ok: false, code: PAYLOAD_TOO_LARGE, message: request body too large }
         "422":
           description: |
-            The application rejected the op; no state changed and nothing was
-            persisted. Reasons: bad nonce, exhausted nonce, `max_fee` below
-            the open-frame fee, or insufficient balance for the fee. After a
-            bad-nonce rejection, query `GET /nonce` again.
+            The sequencer refused the op; no state changed and nothing was
+            persisted. Checked in order: `max_fee` below the open-frame fee,
+            bad nonce, exhausted nonce, then the application's admission
+            policy (insufficient balance for the fee, or another policy
+            reason, whose text is the message). After a bad-nonce rejection,
+            query `GET /nonce` again.
           content:
             application/json:
               schema:
@@ -170,8 +171,10 @@ paths:
       description: |
         `next_nonce` is one past the sender's latest included op, or 0 if it
         has none. It counts soft-confirmed ops. The value is a hint, not a
-        reservation: it can go down after automatic recovery, and after an
-        operator rebuild a sender with no surviving op reads 0.
+        reservation; it does not go down within an era. It reads only
+        the era's live ops, so after a setup a sender whose last op lies in
+        the rebuilt history or below the base count reads 0; the `422`
+        bad-nonce message names the expected nonce.
         `4294967295` means the account is exhausted.
 
         Keep one op in flight per sender: sign `next_nonce`, submit, and
@@ -262,20 +265,16 @@ paths:
         are not modelled as parameters.
 
         After the upgrade, the server sends JSON text frames shaped as
-        `BroadcastTxMessage`. The subscriber cap is 64. Shutdown or a feed
-        failure may disconnect without a Close frame; resume from the saved
-        claim.
+        `BroadcastTxMessage`. A direct input whose payload is over the
+        application's cap never executes and has no offset or message. The
+        subscriber cap is 64. Shutdown or a feed failure may disconnect
+        without a Close frame; resume from the saved claim.
       parameters:
         - name: era_id
           in: query
           required: true
           schema:
             $ref: "#/components/schemas/EraId"
-        - name: recovery_generation
-          in: query
-          required: true
-          schema:
-            $ref: "#/components/schemas/U64"
         - name: next_input
           in: query
           required: true
@@ -289,8 +288,9 @@ paths:
             `BroadcastTxMessage` JSON documents.
         "400":
           description: |
-            Missing or malformed query fields, or a missing or invalid
-            upgrade header. The body is plain text, not the JSON error shape.
+            Missing, malformed or unknown query fields, or a missing or
+            invalid upgrade header. The body is plain text, not the JSON
+            error shape.
           content:
             text/plain:
               schema:
@@ -313,10 +313,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/HistoryPolicyError"
               example:
-                code: STALE_GENERATION
-                current:
-                  era_id: 22222222-2222-4222-8222-222222222222
-                  recovery_generation: 1
+                code: ERA_CHANGED
+                era_id: 22222222-2222-4222-8222-222222222222
         "429":
           description: Subscriber limit reached.
           content:
@@ -337,12 +335,20 @@ paths:
     get:
       tags: [history]
       operationId: getHistory
-      summary: Deployment, history, baseline, and accepted-checkpoint metadata
+      summary: Deployment, history, era baseline, and accepted-checkpoint metadata
       description: |
-        One coherent view. `compatibility` is `null` unless `from_generation`
-        is supplied together with `era_id`. Unknown query fields are rejected.
-        An era mismatch (`409`) takes precedence over the `from_generation`
-        bound (`400`).
+        One coherent view. `history.available_from` is the era's base count;
+        the feed serves the rebuilt history from there up to
+        `baseline.rebuilt_history_end`, then the live rows. Inside an era
+        the history only appends, so a state saved at any count from
+        `available_from` to `head` resumes with its era id. An unknown query
+        parameter is `400`.
+
+        A client holding state from an older era at count `X` adopts this
+        era when `available_from <= X <= baseline.rebuilt_history_end`: it
+        subscribes with `history.era_id` and `next_input = X`. Below the
+        range the era's base is newer than its state; above it, its state
+        holds rows that never landed by the stop block.
       parameters:
         - name: era_id
           in: query
@@ -350,12 +356,6 @@ paths:
           description: Require this era; a mismatch returns `409 ERA_CHANGED`.
           schema:
             $ref: "#/components/schemas/EraId"
-        - name: from_generation
-          in: query
-          required: false
-          description: Requires `era_id`. A generation ahead of the current one is `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
       responses:
         "200":
           description: History metadata.
@@ -371,17 +371,18 @@ paths:
                   app_deployment_block: 1
                   batch_submitter_address: "0x3333333333333333333333333333333333333333"
                 history:
-                  version:
-                    era_id: 22222222-2222-4222-8222-222222222222
-                    recovery_generation: 0
+                  era_id: 22222222-2222-4222-8222-222222222222
                   available_from: 7
                   head: 7
                 baseline:
                   l1_stop_block: 1240
                   l1_end_input_index: 8
                   next_batch_nonce: 2
-                accepted_checkpoint: null
-                compatibility: null
+                  rebuilt_history_end: 7
+                accepted_checkpoint:
+                  inclusion_block: 1240
+                  executed_input_count: 7
+                  next_batch_nonce: 2
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
@@ -393,94 +394,6 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               example: { ok: false, code: UNAVAILABLE, message: history read unavailable }
-
-  /historical-l1-inputs:
-    servers:
-      - url: http://127.0.0.1:3001
-        description: Default internal listener (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`).
-    get:
-      tags: [history]
-      operationId: getHistoricalL1Inputs
-      summary: Page through the era's immutable L1 input prefix
-      description: |
-        Serves InputBox inputs `[0, end_input_index)` through the era's
-        `l1_stop_block`. Provide exactly one of `next_input_index` or
-        `after_block`; continue with the returned `next_input_index`. Only
-        `next_input_index == end_input_index` means EOF; a short page does
-        not. A page may split a block, so continue with `next_input_index`
-        rather than `after_block`. Pages target 1 MiB of raw payloads; a
-        larger first input is returned alone. At most eight responses are in
-        flight. An interrupted body is a failed page.
-
-        Malformed or unknown query fields and selector errors are `400`
-        first. An era mismatch (`409`) then precedes the limit-range and
-        position-bound checks (`400`). Recovery generation changes do not
-        invalidate pages; an era change does.
-      parameters:
-        - name: era_id
-          in: query
-          required: true
-          schema:
-            $ref: "#/components/schemas/EraId"
-        - name: next_input_index
-          in: query
-          required: false
-          description: |
-            Inclusive per-application InputBox index, starting at 0. At most
-            `end_input_index`: equal returns an empty completed page, larger
-            is `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
-        - name: after_block
-          in: query
-          required: false
-          description: |
-            Seek to the first input strictly after this L1 block. At most
-            `l1_stop_block`: equal returns an empty completed page, larger is
-            `400`.
-          schema:
-            $ref: "#/components/schemas/U64"
-        - name: limit
-          in: query
-          required: false
-          description: Out-of-range values are `400`, not clamped.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 256
-            default: 256
-      responses:
-        "200":
-          description: One page of historical inputs.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HistoricalL1InputsPage"
-              example:
-                era_id: 22222222-2222-4222-8222-222222222222
-                l1_stop_block: 1240
-                end_input_index: 8
-                next_input_index: 6
-                items:
-                  - input_index: 5
-                    sender: "0x3333333333333333333333333333333333333333"
-                    payload: "0x00"
-                    block_number: 1230
-                    block_timestamp: 1700014760
-                    transaction_hash: "0x4444444444444444444444444444444444444444444444444444444444444444"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "409":
-          $ref: "#/components/responses/HistoryConflict"
-        "429":
-          description: Historical response limit reached.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example: { ok: false, code: OVERLOADED, message: historical response limit reached }
-        "503":
-          $ref: "#/components/responses/Unavailable"
 
   /finalized_state/inclusion_block:
     servers:
@@ -495,7 +408,8 @@ paths:
         "200":
           description: |
             The accepted checkpoint's L1 inclusion block and executed
-            application input count. Block `0` is the genesis checkpoint.
+            application input count. Until a batch of the era is accepted,
+            it is the era baseline at the stop block.
           content:
             application/json:
               schema:
@@ -568,8 +482,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/octet-stream:
               schema:
@@ -593,7 +505,7 @@ paths:
       operationId: getLatestSnapshot
       summary: Download the newest restorable snapshot
       description: |
-        Streams a tar archive of the newest valid batch-close snapshot, or the
+        Streams a tar archive of the newest batch-close snapshot, or the
         era baseline: `info.toml` plus the application's opaque `state` file
         or directory. The snapshot may still be optimistic. Its headers supply
         the complete `/ws/subscribe` claim. The download holds a GC lease
@@ -608,8 +520,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/x-tar:
               schema:
@@ -631,7 +541,7 @@ paths:
       description: |
         Streams the accepted snapshot as a tar archive, adding a
         `checkpoint.toml` receipt with its L1 inclusion block and next batch
-        nonce for trusted recovery. The download holds a GC lease until the
+        nonce: an operator backup, which no command consumes. The download holds a GC lease until the
         response ends or the client disconnects. The body has no
         `Content-Length`; a failure after the headers aborts the transfer, so
         treat an incomplete body as a failed download.
@@ -645,8 +555,6 @@ paths:
               $ref: "#/components/headers/XExecutedInputCount"
             X-History-Era:
               $ref: "#/components/headers/XHistoryEra"
-            X-Recovery-Generation:
-              $ref: "#/components/headers/XRecoveryGeneration"
           content:
             application/x-tar:
               schema:
@@ -694,8 +602,10 @@ paths:
       operationId: healthz
       summary: Health report
       description: |
-        Same status as `/readyz`. Does not certify L1 freshness, submitter
-        balance, or canonical agreement.
+        Same status as `/readyz`. Reports the landing lag and the safe
+        head's age for monitoring, with no threshold of its own; they do not
+        change the status. Does not certify submitter balance or canonical
+        agreement.
       responses:
         "200":
           description: Healthy.
@@ -703,14 +613,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
-              example: { status: ok, inclusion_lane: ok }
+              example:
+                status: ok
+                inclusion_lane: ok
+                landing_lag_blocks: 40
+                max_wait_blocks: 7200
+                safe_head_age_seconds: 780
         "503":
           description: Degraded.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
-              example: { status: degraded, inclusion_lane: stopped }
+              example:
+                status: degraded
+                inclusion_lane: stopped
+                landing_lag_blocks: 40
+                max_wait_blocks: 7200
+                safe_head_age_seconds: 780
 
 components:
   headers:
@@ -723,7 +643,8 @@ components:
     XInclusionBlock:
       description: |
         L1 block whose end the accepted checkpoint represents: where its batch
-        was included, or `0` for the genesis checkpoint.
+        was included, or the era's stop block before the era's first accepted
+        batch.
       required: true
       schema:
         type: string
@@ -735,16 +656,10 @@ components:
         type: string
         pattern: "^[0-9]+$"
     XHistoryEra:
-      description: Era of the artifact's history version.
+      description: Era of the artifact's history; the `era_id` to subscribe with.
       required: true
       schema:
         $ref: "#/components/schemas/EraId"
-    XRecoveryGeneration:
-      description: Recovery generation of the artifact's history version.
-      required: true
-      schema:
-        type: string
-        pattern: "^[0-9]+$"
 
   responses:
     BadRequest:
@@ -784,17 +699,14 @@ components:
             message: canonical divergence prevents accepted checkpoint selection
     HistoryConflict:
       description: |
-        The requested era is not the current era. These routes refuse only
-        on era; a generation change does not invalidate their results.
+        The requested era is not the current era.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/HistoryEraChanged"
           example:
             code: ERA_CHANGED
-            current:
-              era_id: 22222222-2222-4222-8222-222222222222
-              recovery_generation: 0
+            era_id: 22222222-2222-4222-8222-222222222222
 
   schemas:
     U64:
@@ -822,7 +734,7 @@ components:
       format: uuid
       pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
       description: |
-        Hyphenated UUIDv4 identifying one setup/rebuild era. The server
+        Hyphenated UUIDv4 identifying the era one setup published. The server
         emits lowercase and accepts hex digits in either case.
 
     UserOp:
@@ -955,26 +867,18 @@ components:
         message:
           type: string
 
-    HistoryVersion:
-      type: object
-      required: [era_id, recovery_generation]
-      description: Identity of locally available application history; claim both fields when resuming.
-      properties:
-        era_id:
-          $ref: "#/components/schemas/EraId"
-        recovery_generation:
-          $ref: "#/components/schemas/U64"
-
     HistoryBounds:
       type: object
-      required: [version, available_from, head]
+      required: [era_id, available_from, head]
       properties:
-        version:
-          $ref: "#/components/schemas/HistoryVersion"
+        era_id:
+          allOf:
+            - $ref: "#/components/schemas/EraId"
+          description: The history's identity; claim it with the count when resuming.
         available_from:
           allOf:
             - $ref: "#/components/schemas/U64"
-          description: Baseline application count; entries `[available_from, head)` are available through WS.
+          description: The era's base count; entries `[available_from, head)` are available through WS.
         head:
           $ref: "#/components/schemas/U64"
 
@@ -1000,20 +904,37 @@ components:
 
     HistoryBaseline:
       type: object
-      required: [l1_stop_block, l1_end_input_index, next_batch_nonce]
+      required: [l1_stop_block, l1_end_input_index, next_batch_nonce, rebuilt_history_end]
+      description: |
+        Where setup's rebuild of the era ended. Fixed for the era's lifetime.
       properties:
         l1_stop_block:
-          $ref: "#/components/schemas/U64"
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: The safe block setup pinned after flushing the submitter's wallet; the rebuilt history ends with it.
         l1_end_input_index:
           allOf:
             - $ref: "#/components/schemas/U64"
           description: Exclusive end of the per-application InputBox prefix through the stop block.
         next_batch_nonce:
-          $ref: "#/components/schemas/U64"
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: The scheduler's next batch nonce at the end of the stop block; the era's first batch carries it.
+        rebuilt_history_end:
+          allOf:
+            - $ref: "#/components/schemas/U64"
+          description: |
+            The application count at the end of the stop block: the rebuilt
+            history covers `[available_from, rebuilt_history_end)` and the
+            live rows follow.
 
     AcceptedCheckpoint:
       type: object
       required: [inclusion_block, executed_input_count, next_batch_nonce]
+      description: |
+        The latest accepted batch's checkpoint. Until a batch of the era is
+        accepted, it is the era baseline: the stop block, the rebuilt
+        history end, and the baseline's next batch nonce.
       properties:
         inclusion_block:
           $ref: "#/components/schemas/U64"
@@ -1022,22 +943,9 @@ components:
         next_batch_nonce:
           $ref: "#/components/schemas/U64"
 
-    HistoryCompatibility:
-      type: object
-      required: [from_generation, preserved_input_count]
-      properties:
-        from_generation:
-          $ref: "#/components/schemas/U64"
-        preserved_input_count:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: |
-            Checkpoint counts up to and including this boundary preserve
-            their input prefix across every recovery since `from_generation`.
-
     HistoryInfo:
       type: object
-      required: [deployment, history, baseline, accepted_checkpoint, compatibility]
+      required: [deployment, history, baseline, accepted_checkpoint]
       properties:
         deployment:
           $ref: "#/components/schemas/HistoryDeployment"
@@ -1049,54 +957,37 @@ components:
           oneOf:
             - $ref: "#/components/schemas/AcceptedCheckpoint"
             - type: "null"
-        compatibility:
-          oneOf:
-            - $ref: "#/components/schemas/HistoryCompatibility"
-            - type: "null"
 
     HistoryPolicyError:
       description: Typed refusal of a history claim, discriminated by `code`.
       oneOf:
         - $ref: "#/components/schemas/HistoryEraChanged"
-        - $ref: "#/components/schemas/HistoryStaleGeneration"
         - $ref: "#/components/schemas/HistoryUnavailable"
         - $ref: "#/components/schemas/HistoryAheadOfHead"
       discriminator:
         propertyName: code
         mapping:
           ERA_CHANGED: "#/components/schemas/HistoryEraChanged"
-          STALE_GENERATION: "#/components/schemas/HistoryStaleGeneration"
           HISTORY_UNAVAILABLE: "#/components/schemas/HistoryUnavailable"
           AHEAD_OF_HEAD: "#/components/schemas/HistoryAheadOfHead"
 
     HistoryEraChanged:
       type: object
-      required: [code, current]
+      required: [code, era_id]
       description: |
-        The claimed era is not the current era. Old-era results cannot be
-        resumed or spliced into the new era: a replica rebootstraps from a
-        current snapshot, and a projection re-establishes correspondence with
-        the new baseline.
+        The claimed era is not the current era. A client holding state at
+        count `X` adopts the current era when
+        `available_from <= X <= baseline.rebuilt_history_end` (`GET /history`)
+        and subscribes with `era_id` at `X`. Otherwise it needs another
+        starting state: a replica rebootstraps from a current snapshot.
       properties:
         code:
           type: string
           const: ERA_CHANGED
-        current:
-          $ref: "#/components/schemas/HistoryVersion"
-
-    HistoryStaleGeneration:
-      type: object
-      required: [code, current]
-      description: |
-        Same era, different recovery generation (normally an older one).
-        Select a compatible saved checkpoint through
-        `GET /history?era_id=&from_generation=`, or rebootstrap.
-      properties:
-        code:
-          type: string
-          const: STALE_GENERATION
-        current:
-          $ref: "#/components/schemas/HistoryVersion"
+        era_id:
+          allOf:
+            - $ref: "#/components/schemas/EraId"
+          description: The server's current era.
 
     HistoryUnavailable:
       type: object
@@ -1119,55 +1010,6 @@ components:
           const: AHEAD_OF_HEAD
         head:
           $ref: "#/components/schemas/U64"
-
-    HistoricalL1Input:
-      type: object
-      required:
-        - input_index
-        - sender
-        - payload
-        - block_number
-        - block_timestamp
-        - transaction_hash
-      properties:
-        input_index:
-          $ref: "#/components/schemas/U64"
-        sender:
-          allOf:
-            - $ref: "#/components/schemas/Address"
-          description: Authenticated InputBox sender, lowercase hex.
-        payload:
-          allOf:
-            - $ref: "#/components/schemas/HexBytes"
-          description: Original inner payload, including malformed or rejected batches.
-        block_number:
-          $ref: "#/components/schemas/U64"
-        block_timestamp:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: Unix seconds.
-        transaction_hash:
-          $ref: "#/components/schemas/Hash32"
-
-    HistoricalL1InputsPage:
-      type: object
-      required: [era_id, l1_stop_block, end_input_index, next_input_index, items]
-      properties:
-        era_id:
-          $ref: "#/components/schemas/EraId"
-        l1_stop_block:
-          $ref: "#/components/schemas/U64"
-        end_input_index:
-          $ref: "#/components/schemas/U64"
-        next_input_index:
-          allOf:
-            - $ref: "#/components/schemas/U64"
-          description: Equality with `end_input_index` is the only EOF signal.
-        items:
-          type: array
-          maxItems: 256
-          items:
-            $ref: "#/components/schemas/HistoricalL1Input"
 
     InclusionBlockResponse:
       type: object
@@ -1193,11 +1035,31 @@ components:
 
     HealthStatus:
       type: object
-      required: [status, inclusion_lane]
+      required:
+        [status, inclusion_lane, landing_lag_blocks, max_wait_blocks, safe_head_age_seconds]
       properties:
         status:
           type: string
           enum: [ok, degraded]
+        landing_lag_blocks:
+          oneOf:
+            - $ref: "#/components/schemas/U64"
+            - type: "null"
+          description: |
+            `H + 1 - s` in L1 blocks: the age, at the block after the persisted
+            safe head, of the oldest batch L1 has not accepted, counted from
+            its first frame's safe block. The history is void when it reaches
+            `max_wait_blocks`. `null` until the first reading after start.
+        max_wait_blocks:
+          $ref: "#/components/schemas/U64"
+        safe_head_age_seconds:
+          oneOf:
+            - $ref: "#/components/schemas/U64"
+            - type: "null"
+          description: |
+            The wall clock less the safe block's L1 timestamp, at least 0.
+            It keeps growing while the provider is down, when the landing lag
+            freezes. `null` until the first reading after start.
         inclusion_lane:
           type: string
           enum: [ok, stopped]

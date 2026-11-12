@@ -11,7 +11,6 @@ use clap::{ArgGroup, Args};
 
 use crate::commands::error::BootstrapError;
 use crate::l1::SubmitterKey;
-use sequencer_core::protocol::{ProtocolTiming, ProtocolTimingError};
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_INTERNAL_HTTP_ADDR: &str = "127.0.0.1:3001";
@@ -19,7 +18,8 @@ const DEFAULT_DATA_DIR: &str = "sequencer-data";
 const DB_FILENAME: &str = "sequencer.db";
 
 /// Blocks a time-sealed batch needs after its open window to become
-/// safe-accepted before danger: its first frame trails the safe head by under
+/// safe-accepted inside the staleness window: its first frame trails the safe
+/// head by under
 /// one frame-clock interval (5), Ethereum's safe head trails inclusion by up to
 /// two epochs (64), and the rest covers submitter pickup, inclusion and the dump.
 const BATCH_SUBMISSION_MARGIN_BLOCKS: u64 = 100;
@@ -50,51 +50,14 @@ pub struct L1RpcArgs {
     pub allow_insecure_rpc: bool,
 }
 
-/// Protocol-timing tuning knobs shared by `setup` and `run`. `setup` needs a
-/// valid `ProtocolTiming` for the initial-sync writes (and validating it here
-/// fails fast at setup, not just at run).
+/// The L1 block-time estimate shared by `setup` and `run`.
 #[derive(Debug, Clone, Args)]
 pub struct TimingArgs {
-    /// Blocks before MAX_WAIT_BLOCKS to trigger preemptive recovery.
-    /// The danger threshold is MAX_WAIT_BLOCKS minus this margin.
-    /// Must be less than MAX_WAIT_BLOCKS (validated at startup).
-    ///
-    /// Default 300 gives ~1h of headroom before canonical expiry at 12s/block.
-    /// Detection starts recovery immediately; this is neither an operator
-    /// grace period nor a completion deadline. See `docs/recovery/README.md`.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS",
-        default_value = "300"
-    )]
-    pub preemptive_margin_blocks: u64,
-
-    /// Blocks of safe-head age after which the L1 read view is considered too
-    /// stale to trust. Independent of the preemptive margin. Must be strictly
-    /// less than the danger threshold (validated at startup).
-    ///
-    /// Default 600 (~2h at 12s/block).
-    #[arg(long, env = "CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS", default_value = "600", value_parser = clap::value_parser!(u64).range(1..))]
-    pub l1_read_stale_after_blocks: u64,
-
-    /// Assumed L1 block time in seconds. Used to estimate block progression
-    /// from wall-clock time when the L1 provider is unreachable.
+    /// Assumed L1 block time in seconds. Sets the flush's and the poster's
+    /// confirmation cadence, and converts `--max-batch-open-seconds` into
+    /// blocks for the batch-open check.
     #[arg(long, env = "CARTESI_SEQUENCER_SECONDS_PER_BLOCK", default_value = "12", value_parser = clap::value_parser!(u64).range(1..))]
     pub seconds_per_block: u64,
-}
-
-impl TimingArgs {
-    /// Build a validated [`ProtocolTiming`]. Pure derivation — no I/O.
-    /// `max_wait_blocks` is the shared scheduler constant; the rest are the
-    /// operator-tunable CLI args.
-    pub fn protocol_timing(&self) -> Result<ProtocolTiming, ProtocolTimingError> {
-        ProtocolTiming::try_new(
-            sequencer_core::MAX_WAIT_BLOCKS,
-            self.preemptive_margin_blocks,
-            self.l1_read_stale_after_blocks,
-            self.seconds_per_block,
-        )
-    }
 }
 
 /// L1 fee-oracle source selection. A fixed logarithmic price is intended for
@@ -218,8 +181,8 @@ impl FeeOracleArgs {
 }
 
 /// Batch-submitter signing-key source, shared by `run` and `flush-mempool`
-/// (both sign L1 transactions). `setup` does NOT use this — it takes the
-/// submitter address directly and never signs.
+/// (both sign L1 transactions). `setup` takes the same two sources through
+/// [`SetupKeyArgs`], where `--dry-run` may leave both out.
 #[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("batch_submitter_key_source")
@@ -254,32 +217,51 @@ impl KeyArgs {
             &self.batch_submitter_private_key,
             &self.batch_submitter_private_key_file,
         )
-        .map(|opt| opt.expect("batch submitter private key is required by CLI arg group"))
+        .map(|key| key.expect("batch submitter private key is required by CLI arg group"))
     }
 }
 
-/// Resolve a batch-submitter key from an inline value or a key file (first line).
-/// Returns `Ok(None)` when neither source is set — `KeyArgs` makes that
-/// impossible via its required arg group, but `setup --recovery` validates the
-/// "exactly one source" rule in code (the group can't be conditionally required
-/// at the clap level), so it needs the `None` case.
+/// `setup`'s signing-key source: the same arguments as [`KeyArgs`], required
+/// unless `--dry-run`, which flushes nothing.
+#[derive(Debug, Clone, Args)]
+pub struct SetupKeyArgs {
+    /// Hex-encoded private key for the batch submitter.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
+        hide_env_values = true,
+        conflicts_with = "batch_submitter_private_key_file",
+        required_unless_present_any = ["batch_submitter_private_key_file", "dry_run"],
+        value_parser = parse_submitter_key
+    )]
+    batch_submitter_private_key: Option<SubmitterKey>,
+    /// Path to a file whose first line contains the batch submitter private key.
+    #[arg(
+        long,
+        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
+        hide_env_values = true,
+        required_unless_present_any = ["batch_submitter_private_key", "dry_run"]
+    )]
+    batch_submitter_private_key_file: Option<String>,
+}
+
+/// The key from the file when one is named, otherwise the inline value. The
+/// error carries the path, never the contents: a key file's bytes must not
+/// reach a log line even when the read fails.
 fn resolve_key_source(
     inline: &Option<SubmitterKey>,
     file: &Option<String>,
 ) -> Result<Option<SubmitterKey>, BootstrapError> {
-    if let Some(file) = file {
-        // The error carries the path, never the contents: a key file's
-        // bytes must not reach a log line even when the read fails.
-        let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
-            path: std::path::PathBuf::from(file),
-            source,
-        })?;
-        Ok(Some(SubmitterKey::new(
-            contents.lines().next().unwrap_or("").trim().to_string(),
-        )))
-    } else {
-        Ok(inline.clone())
-    }
+    let Some(file) = file else {
+        return Ok(inline.clone());
+    };
+    let contents = std::fs::read_to_string(file).map_err(|source| BootstrapError::KeyFile {
+        path: std::path::PathBuf::from(file),
+        source,
+    })?;
+    Ok(Some(SubmitterKey::new(
+        contents.lines().next().unwrap_or("").trim().to_string(),
+    )))
 }
 
 /// Whether a key-file read failure is deterministic operator
@@ -308,57 +290,11 @@ pub(crate) fn key_file_io_is_terminal(source: &std::io::Error) -> bool {
     )
 }
 
-/// Batch-submitter signing-key source for a context where the key is
-/// *conditionally* required — `setup --recovery` needs it (to flush the wallet
-/// nonce), plain `setup` must not carry it. clap can't express a
-/// conditionally-required arg group, so unlike [`KeyArgs`] neither source is
-/// required at the clap level; the owner validates presence + exclusivity via
-/// [`is_present`](Self::is_present) / [`both_set`](Self::both_set).
-#[derive(Debug, Clone, Args)]
-pub struct OptionalKeyArgs {
-    /// Hex-encoded batch-submitter private key.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY",
-        hide_env_values = true,
-        value_parser = parse_submitter_key
-    )]
-    batch_submitter_private_key: Option<SubmitterKey>,
-    /// Path to a file whose first line is the batch-submitter private key.
-    #[arg(
-        long,
-        env = "CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE",
-        hide_env_values = true
-    )]
-    batch_submitter_private_key_file: Option<String>,
-}
-
-impl OptionalKeyArgs {
-    /// At least one source is set.
-    fn is_present(&self) -> bool {
-        self.batch_submitter_private_key.is_some()
-            || self.batch_submitter_private_key_file.is_some()
-    }
-
-    /// Both sources are set — the owner rejects this (at most one is allowed).
-    fn both_set(&self) -> bool {
-        self.batch_submitter_private_key.is_some()
-            && self.batch_submitter_private_key_file.is_some()
-    }
-
-    /// Resolve the key if either source is set; `Ok(None)` when neither is.
-    fn resolve_if_present(&self) -> Result<Option<SubmitterKey>, BootstrapError> {
-        resolve_key_source(
-            &self.batch_submitter_private_key,
-            &self.batch_submitter_private_key_file,
-        )
-    }
-}
-
-/// `setup` — establish the deployment's timeless state: pin identity, do the
-/// initial L1 sync, register the genesis finalized snapshot, and atomically
-/// complete setup. L1-read-only: takes the batch-submitter address, not the
-/// signing key.
+/// `setup` — start a new era in an empty data directory: pin identity, flush
+/// the submitter's wallet to pin the stop block, sync L1, rebuild the history
+/// from the base (genesis, or a stored canonical machine) through the stop
+/// block, and publish the era. `docs/recovery/cockroach.md` ("What setup does")
+/// has the procedure.
 #[derive(Debug, Clone, Args)]
 pub struct SetupConfig {
     #[arg(long, env = "CARTESI_SEQUENCER_DATA_DIR", default_value = DEFAULT_DATA_DIR, value_parser = parse_non_empty_string)]
@@ -371,38 +307,21 @@ pub struct SetupConfig {
     /// Application (EIP-712 verifying contract) address.
     #[arg(long, env = "CARTESI_SEQUENCER_APP_ADDRESS", value_parser = parse_address)]
     pub app_address: Address,
-    /// Address that submits batches. Pinned into the deployment identity.
-    /// `setup` never signs, so it takes the address (derivable from the key
-    /// without the secret) rather than the key itself.
+    /// Address that submits batches, pinned into the deployment identity.
+    /// The key must sign for it: setup's flush settles this account.
     #[arg(long, env = "CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS", value_parser = parse_address)]
     pub batch_submitter_address: Address,
-    /// L1 inclusion block `B` of the trusted checkpoint this setup boots from;
-    /// `0` is genesis. Plain `setup` uses `B` only as the lower bound of its
-    /// read-only detection scan: work a previous instance left past `B`, or an
-    /// unsettled wallet nonce, refuses with exit 40. `setup --recovery` loads the
-    /// checkpoint itself (`docs/recovery/cockroach.md`).
-    #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_BLOCK", default_value_t = 0)]
-    pub checkpoint_block: u64,
-    /// Recovery mode (cockroach recovery): rebuild this freshly-wiped DB from a
-    /// trusted checkpoint at `--checkpoint-block` instead of genesis bootstrap.
-    /// Requires `--checkpoint-dump-dir` and the
-    /// batch-submitter signing key (recovery flushes the wallet nonce, which
-    /// signs L1 no-ops). Plain `setup` stays L1-read-only and key-less.
-    #[arg(long, env = "CARTESI_SEQUENCER_RECOVERY", default_value_t = false)]
-    pub recovery: bool,
-    /// Directory of the trusted checkpoint dump (a finalized `dumps/<id>/` with
-    /// `state/` + `info.toml`) that `setup --recovery` boots the machine `S`
-    /// from. Required with `--recovery`; rejected without it. This is a
-    /// **sequencer** dump from `$CARTESI_SEQUENCER_DATA_DIR/dumps/`, not a
-    /// watchdog CM checkpoint under `.../checkpoints/<block>/`.
-    #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR", value_parser = parse_non_empty_string)]
-    pub checkpoint_dump_dir: Option<String>,
-    /// Batch-submitter signing key, recovery-only (for the wallet-nonce flush).
-    /// Conditionally required: present iff `--recovery`. The two sources are
-    /// mutually exclusive and rejected on a non-recovery `setup` — see
-    /// [`SetupConfig::validate`].
+    /// A stored canonical machine of the deployment's template, stopped
+    /// between inputs, to rebuild from. Without it the base is genesis.
+    #[arg(long, value_name = "MACHINE_DIR")]
+    pub base: Option<std::path::PathBuf>,
+    /// Report the base's counts, the submitter's activity past it and the
+    /// rebuild's size, then exit. Needs no key and never touches the data
+    /// directory.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
     #[command(flatten)]
-    key: OptionalKeyArgs,
+    key: SetupKeyArgs,
     #[command(flatten)]
     pub timing: TimingArgs,
     #[command(flatten)]
@@ -414,50 +333,14 @@ impl SetupConfig {
         db_path_in(&self.data_dir)
     }
 
-    /// Validate the cross-field recovery constraints clap can't express (a
-    /// conditionally-required arg group). Returns the first violation as a
-    /// human-readable message; the caller maps it to a terminal bootstrap error.
-    ///
-    /// Recovery requires an exported checkpoint (a matching block + dump
-    /// dir) and the signing key; a plain `setup` must carry none of the
-    /// recovery-only inputs (key, dump dir).
-    pub fn validate(&self) -> Result<(), String> {
-        let key_present = self.key.is_present();
-        if self.key.both_set() {
-            return Err(
-                "--batch-submitter-private-key and --batch-submitter-private-key-file \
-                        are mutually exclusive"
-                    .to_string(),
-            );
-        }
-        if self.recovery {
-            if self.checkpoint_dump_dir.is_none() {
-                return Err("--recovery requires --checkpoint-dump-dir".to_string());
-            }
-            if !key_present {
-                return Err("--recovery requires the batch-submitter signing key \
-                            (--batch-submitter-private-key[-file]) to flush the wallet nonce"
-                    .to_string());
-            }
-        } else {
-            if self.checkpoint_dump_dir.is_some() {
-                return Err("--checkpoint-dump-dir is only valid with --recovery".to_string());
-            }
-            if key_present {
-                return Err("plain `setup` is L1-read-only and takes no signing key; \
-                            pass the batch-submitter address, or use --recovery"
-                    .to_string());
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve the recovery signing key. Precondition: [`SetupConfig::validate`]
-    /// passed with `recovery == true` (so exactly one source is set).
-    pub fn resolve_recovery_key(&self) -> Result<SubmitterKey, BootstrapError> {
-        self.key
-            .resolve_if_present()
-            .map(|opt| opt.expect("recovery key presence is validated before resolve"))
+    /// The submitter key. Clap requires one unless `--dry-run`, which never
+    /// asks for it.
+    pub fn resolve_private_key(&self) -> Result<SubmitterKey, BootstrapError> {
+        resolve_key_source(
+            &self.key.batch_submitter_private_key,
+            &self.key.batch_submitter_private_key_file,
+        )
+        .map(|key| key.expect("setup requires a batch submitter key unless --dry-run"))
     }
 }
 
@@ -503,7 +386,8 @@ pub struct RunConfig {
     /// for a low-traffic deployment. Default 7200 (2h); operators trade latency
     /// against L1 cost, and tests set it small to seal batches promptly.
     /// Rounded up to blocks at `--seconds-per-block`, it must leave a
-    /// submission margin below the danger threshold (validated at startup).
+    /// submission margin below the application's staleness window
+    /// (validated at startup).
     #[arg(
         long,
         env = "CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS",
@@ -530,26 +414,22 @@ impl RunConfig {
         std::time::Duration::from_secs(self.max_batch_open_seconds)
     }
 
-    /// Build a validated [`ProtocolTiming`] and refuse a batch-open window that
-    /// would carry a low-volume Tip into danger before it can be sealed,
-    /// submitted and safe-accepted.
-    pub fn protocol_timing(&self) -> Result<ProtocolTiming, BootstrapError> {
-        let timing = self.timing.protocol_timing()?;
+    /// Refuse a batch-open window that would seal a low-volume batch too late
+    /// to land inside the application's staleness window `max_wait_blocks`.
+    pub fn check_batch_open_window(&self, max_wait_blocks: u64) -> Result<(), BootstrapError> {
+        let seconds_per_block = self.timing.seconds_per_block;
         // Rounding up counts a partial block against the operator.
-        let open_blocks = self
-            .max_batch_open_seconds
-            .div_ceil(timing.seconds_per_block());
-        let danger_threshold = timing.danger_threshold();
-        if open_blocks > danger_threshold.saturating_sub(BATCH_SUBMISSION_MARGIN_BLOCKS) {
-            return Err(BootstrapError::BatchOpenPastDanger {
+        let open_blocks = self.max_batch_open_seconds.div_ceil(seconds_per_block);
+        if open_blocks > max_wait_blocks.saturating_sub(BATCH_SUBMISSION_MARGIN_BLOCKS) {
+            return Err(BootstrapError::BatchOpenPastWindow {
                 max_batch_open_seconds: self.max_batch_open_seconds,
-                seconds_per_block: timing.seconds_per_block(),
+                seconds_per_block,
                 open_blocks,
-                danger_threshold,
+                max_wait_blocks,
                 margin_blocks: BATCH_SUBMISSION_MARGIN_BLOCKS,
             });
         }
-        Ok(timing)
+        Ok(())
     }
 
     /// Resolve the batch submitter private key from either the inline value or a key file.
@@ -620,7 +500,7 @@ mod tests {
 
     // Parse a full subcommand line through the top-level `Cli`, since the
     // per-subcommand configs derive `Args` (embeddable) not `Parser`.
-    const SETUP_ARGS: [&str; 10] = [
+    const SETUP_ARGS_WITHOUT_KEY: [&str; 10] = [
         "sequencer",
         "setup",
         "--eth-rpc-url",
@@ -632,6 +512,12 @@ mod tests {
         "--batch-submitter-address",
         "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
     ];
+
+    fn setup_args() -> Vec<&'static str> {
+        let mut args = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        args.extend(["--batch-submitter-private-key", TEST_KEY]);
+        args
+    }
 
     const RUN_ARGS: [&str; 5] = [
         "sequencer",
@@ -658,7 +544,7 @@ mod tests {
     }
 
     fn setup_config_from(extra: &[&str]) -> SetupConfig {
-        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
+        let mut args = setup_args();
         args.extend_from_slice(extra);
         match Cli::try_parse_from(args).expect("parse setup").command {
             crate::harness::Command::Setup(c) => *c,
@@ -667,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_requires_address_not_key() {
+    fn setup_takes_the_address_and_the_key() {
         let cfg = setup_config();
         assert_eq!(cfg.chain_id, 31337);
         assert_eq!(
@@ -676,124 +562,93 @@ mod tests {
                 .parse::<Address>()
                 .unwrap()
         );
+        assert_eq!(cfg.resolve_private_key().unwrap().expose_secret(), TEST_KEY);
+        assert_eq!(cfg.base, None);
+        assert!(!cfg.dry_run);
         // The default db path lives under the default data dir.
         assert!(cfg.db_path().ends_with("sequencer.db"));
     }
 
+    /// Setup flushes with the key, so it needs one; the dry run flushes
+    /// nothing and needs none. Both sources together are refused.
     #[test]
-    fn setup_checkpoint_block_defaults_to_genesis_and_parses() {
-        // Default = 0 (genesis bootstrap) when the flag is absent.
-        assert_eq!(setup_config().checkpoint_block, 0);
-        // Explicit value parses.
-        let mut args: Vec<&str> = SETUP_ARGS.to_vec();
-        args.push("--checkpoint-block");
-        args.push("4200");
-        let cfg = match Cli::try_parse_from(args).expect("parse setup").command {
-            crate::harness::Command::Setup(c) => *c,
-            other => panic!("expected setup subcommand, got {other:?}"),
+    fn setup_requires_the_key_unless_dry_run() {
+        assert!(
+            Cli::try_parse_from(SETUP_ARGS_WITHOUT_KEY).is_err(),
+            "setup without a key must not parse"
+        );
+        let mut dry_run = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        dry_run.push("--dry-run");
+        let crate::harness::Command::Setup(cfg) = Cli::try_parse_from(dry_run)
+            .expect("a dry run needs no key")
+            .command
+        else {
+            panic!("expected setup subcommand");
         };
-        assert_eq!(cfg.checkpoint_block, 4200);
-    }
+        assert!(cfg.dry_run);
 
-    #[test]
-    fn plain_setup_passes_validation_and_is_not_recovery() {
-        let cfg = setup_config();
-        assert!(!cfg.recovery);
-        assert!(cfg.checkpoint_dump_dir.is_none());
-        cfg.validate().expect("plain setup is a valid config");
-    }
-
-    #[test]
-    fn setup_rejects_a_signing_key_without_recovery() {
-        // The key now parses (recovery needs it), but a non-recovery `setup`
-        // carrying one is rejected by cross-field validation, not at parse time.
-        let cfg = setup_config_from(&["--batch-submitter-private-key", TEST_KEY]);
-        let err = cfg.validate().expect_err("plain setup must reject a key");
+        let mut both = setup_args();
+        both.extend(["--batch-submitter-private-key-file", "/run/secrets/key"]);
         assert!(
-            err.contains("key-less") || err.contains("L1-read-only"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn setup_rejects_dump_dir_without_recovery() {
-        let cfg = setup_config_from(&["--checkpoint-dump-dir", "/tmp/ckpt"]);
-        let err = cfg
-            .validate()
-            .expect_err("dump dir without --recovery must fail");
-        assert!(err.contains("--checkpoint-dump-dir"), "got: {err}");
-    }
-
-    #[test]
-    fn recovery_requires_dump_dir_and_key() {
-        // --recovery alone (no dump dir / block / key) is invalid; each missing
-        // input is reported.
-        let bare = setup_config_from(&["--recovery"]);
-        assert!(
-            bare.validate()
-                .unwrap_err()
-                .contains("--checkpoint-dump-dir")
+            Cli::try_parse_from(both).is_err(),
+            "two key sources must not parse"
         );
 
-        let genesis = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-        ]);
-        genesis
-            .validate()
-            .expect("genesis checkpoint is a valid recovery source");
-        assert_eq!(genesis.checkpoint_block, 0);
-
-        let no_key = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-        ]);
-        assert!(no_key.validate().unwrap_err().contains("signing key"));
+        let key_file = tempfile::NamedTempFile::new().expect("key file");
+        std::fs::write(key_file.path(), format!("{TEST_KEY}\n")).expect("write key");
+        let mut from_file = SETUP_ARGS_WITHOUT_KEY.to_vec();
+        let path = key_file.path().to_str().expect("utf8 path");
+        from_file.extend(["--batch-submitter-private-key-file", path]);
+        let crate::harness::Command::Setup(cfg) = Cli::try_parse_from(from_file)
+            .expect("a key file parses")
+            .command
+        else {
+            panic!("expected setup subcommand");
+        };
+        assert_eq!(cfg.resolve_private_key().unwrap().expose_secret(), TEST_KEY);
     }
 
     #[test]
-    fn recovery_full_config_validates_and_resolves_key() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-        ]);
-        cfg.validate().expect("full recovery config is valid");
-        assert!(cfg.recovery);
-        assert_eq!(cfg.checkpoint_block, 1200);
-        assert_eq!(cfg.checkpoint_dump_dir.as_deref(), Some("/tmp/ckpt"));
+    fn setup_parses_a_base_machine() {
+        let cfg = setup_config_from(&["--base", "/machines/epoch-41", "--dry-run"]);
         assert_eq!(
-            cfg.resolve_recovery_key()
-                .expect("resolve key")
-                .expose_secret(),
-            TEST_KEY
+            cfg.base.as_deref(),
+            Some(std::path::Path::new("/machines/epoch-41"))
         );
+        assert!(cfg.dry_run);
+    }
+
+    /// The checkpoint options of the removed recovery mode are gone: the base
+    /// machine names the position.
+    #[test]
+    fn setup_has_no_checkpoint_options() {
+        for extra in [
+            &["--recovery"][..],
+            &["--checkpoint-dump-dir", "/tmp/dump"][..],
+            &["--checkpoint-block", "4200"][..],
+        ] {
+            let mut args = setup_args();
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args).expect_err("a removed option must not parse");
+        }
     }
 
     #[test]
     fn missing_key_file_is_terminal_and_names_the_path_not_the_contents() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
+        let args = [
+            "sequencer",
+            "run",
+            "--eth-rpc-url",
+            "http://127.0.0.1:8545",
             "--batch-submitter-private-key-file",
             "/nonexistent/dir/submitter.key",
-        ]);
-        cfg.validate().expect("one key source is valid");
+        ];
+        let cfg = match Cli::try_parse_from(args).expect("parse run").command {
+            crate::harness::Command::Run(c) => *c,
+            other => panic!("expected run subcommand, got {other:?}"),
+        };
         let err = cfg
-            .resolve_recovery_key()
+            .resolve_private_key()
             .expect_err("a missing key file must not resolve");
         assert!(
             matches!(&err, BootstrapError::KeyFile { path, source }
@@ -808,22 +663,6 @@ mod tests {
             crate::commands::error::CommandError::from(err).exit_code(),
             crate::commands::error::EXIT_TERMINAL
         );
-    }
-
-    #[test]
-    fn recovery_rejects_both_key_sources() {
-        let cfg = setup_config_from(&[
-            "--recovery",
-            "--checkpoint-dump-dir",
-            "/tmp/ckpt",
-            "--checkpoint-block",
-            "1200",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-            "--batch-submitter-private-key-file",
-            "/tmp/key",
-        ]);
-        assert!(cfg.validate().unwrap_err().contains("mutually exclusive"));
     }
 
     #[test]
@@ -986,42 +825,52 @@ mod tests {
         assert_eq!(run_config_from(&[]).timing.seconds_per_block, 12);
     }
 
+    /// The repair's tuning flags are gone with it.
     #[test]
-    fn run_default_l1_read_stale_after_blocks_is_600() {
-        assert_eq!(run_config_from(&[]).timing.l1_read_stale_after_blocks, 600);
+    fn run_and_setup_have_no_repair_flags() {
+        for flag in ["--preemptive-margin-blocks", "--l1-read-stale-after-blocks"] {
+            let mut run = RUN_ARGS.to_vec();
+            run.extend([TEST_KEY, flag, "300"]);
+            Cli::try_parse_from(run).expect_err("a removed run flag must not parse");
+            let mut setup = setup_args();
+            setup.extend([flag, "300"]);
+            Cli::try_parse_from(setup).expect_err("a removed setup flag must not parse");
+        }
     }
 
-    const _: () = assert!(
-        sequencer_core::MAX_WAIT_BLOCKS == 1200,
-        "batch-open window fixtures below assume the 1200-block window"
-    );
+    /// The staleness window the fixtures below assume.
+    const WINDOW: u64 = 1200;
 
     #[test]
-    fn run_bounds_batch_open_window_by_danger_threshold_less_submission_margin() {
-        // Defaults: danger_threshold MAX_WAIT_BLOCKS (1200) - 300 = 900; budget 800 blocks =
-        // 9600 s at 12 s.
+    fn run_bounds_batch_open_window_by_the_window_less_submission_margin() {
+        // The window (1200) less the margin (100) leaves 1100 blocks = 13200 s
+        // at 12 s.
         run_config_from(&[])
-            .protocol_timing()
+            .check_batch_open_window(WINDOW)
             .expect("default window fits");
-        run_config_from(&["--max-batch-open-seconds", "9600"])
-            .protocol_timing()
+        run_config_from(&["--max-batch-open-seconds", "13200"])
+            .check_batch_open_window(WINDOW)
             .expect("boundary window fits");
-        // 9601 s is 800.08 blocks; rounding up must refuse it.
-        let err = run_config_from(&["--max-batch-open-seconds", "9601"])
-            .protocol_timing()
+        // 13201 s is 1100.08 blocks; rounding up must refuse it.
+        let err = run_config_from(&["--max-batch-open-seconds", "13201"])
+            .check_batch_open_window(WINDOW)
             .expect_err("one second past the budget must be refused");
         assert!(
             matches!(
                 err,
-                BootstrapError::BatchOpenPastDanger {
-                    max_batch_open_seconds: 9601,
+                BootstrapError::BatchOpenPastWindow {
+                    max_batch_open_seconds: 13201,
                     seconds_per_block: 12,
-                    open_blocks: 801,
-                    danger_threshold: 900,
+                    open_blocks: 1101,
+                    max_wait_blocks: WINDOW,
                     margin_blocks: 100,
                 }
             ),
             "{err:?}"
+        );
+        assert_eq!(
+            crate::commands::error::CommandError::from(err).exit_code(),
+            crate::commands::error::EXIT_TERMINAL
         );
         let err = run_config_from(&[
             "--max-batch-open-seconds",
@@ -1029,34 +878,25 @@ mod tests {
             "--seconds-per-block",
             "1",
         ])
-        .protocol_timing()
+        .check_batch_open_window(WINDOW)
         .expect_err("an unbounded window must be refused without overflow");
         assert!(
-            matches!(err, BootstrapError::BatchOpenPastDanger { .. }),
+            matches!(err, BootstrapError::BatchOpenPastWindow { .. }),
             "{err:?}"
         );
     }
 
     #[test]
-    fn run_refuses_every_batch_open_window_when_danger_threshold_is_below_the_margin() {
-        // danger_threshold MAX_WAIT_BLOCKS (1200) - 1150 = 50 < 100: no window can land before
-        // danger.
-        let err = run_config_from(&[
-            "--preemptive-margin-blocks",
-            "1150",
-            "--l1-read-stale-after-blocks",
-            "10",
-            "--max-batch-open-seconds",
-            "1",
-        ])
-        .protocol_timing()
-        .expect_err("no budget remains");
+    fn run_refuses_every_batch_open_window_when_the_window_is_below_the_margin() {
+        let err = run_config_from(&["--max-batch-open-seconds", "1"])
+            .check_batch_open_window(50)
+            .expect_err("no budget remains");
         assert!(
             matches!(
                 err,
-                BootstrapError::BatchOpenPastDanger {
+                BootstrapError::BatchOpenPastWindow {
                     open_blocks: 1,
-                    danger_threshold: 50,
+                    max_wait_blocks: 50,
                     ..
                 }
             ),
@@ -1064,19 +904,30 @@ mod tests {
         );
     }
 
+    /// At the boundary window a low-volume batch, sealed by time, still has
+    /// the submission margin less the frame lag to land before its history
+    /// turns void. The database pins the wallet's window, so the boundary is
+    /// derived from it.
     #[test]
-    fn boundary_batch_open_window_seals_a_low_volume_tip_before_danger() {
+    fn boundary_batch_open_window_seals_a_low_volume_batch_inside_the_window() {
         use crate::storage::test_helpers::{SENDER_A, temp_db_with_default_deployment_identity};
-        use crate::storage::{DangerStatus, SafeInputRange, Storage};
+        use crate::storage::{SafeInputRange, Storage};
+        use sequencer_core::protocol::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS;
 
-        let config = run_config_from(&["--max-batch-open-seconds", "9600"]);
-        let timing = config.protocol_timing().expect("boundary window fits");
+        let window = app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks;
+        let boundary_seconds = ((window - BATCH_SUBMISSION_MARGIN_BLOCKS)
+            * run_config_from(&[]).timing.seconds_per_block)
+            .to_string();
+        let config = run_config_from(&["--max-batch-open-seconds", &boundary_seconds]);
+        config
+            .check_batch_open_window(window)
+            .expect("boundary window fits");
         let open_blocks = config
             .max_batch_open_seconds
-            .div_ceil(timing.seconds_per_block());
+            .div_ceil(config.timing.seconds_per_block);
         // Worst case: the first frame trails the safe head by one block less
         // than the frame-clock interval.
-        let frame_lag = ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS - 1;
+        let frame_lag = FRAME_CLOCK_INTERVAL_SAFE_BLOCKS - 1;
         let first_frame = 10;
         let seal_safe_block = first_frame + frame_lag + open_blocks;
 
@@ -1085,51 +936,29 @@ mod tests {
         let mut head = storage
             .initialize_open_state(first_frame, SafeInputRange::empty_at(0))
             .expect("open Tip");
-        let status_at = |storage: &mut Storage, safe_block: u64| {
+        let void_at = |storage: &mut Storage, safe_block: u64| {
             storage
-                .append_safe_inputs(safe_block, &[], SENDER_A, &timing)
+                .append_safe_inputs(safe_block, &[], SENDER_A)
                 .expect("advance safe head");
-            storage
-                .check_danger(&timing, crate::clock::unix_now_ms())
-                .expect("check danger")
+            storage.terminal_fact().expect("terminal fact").is_some()
         };
 
-        // Low volume: only the deadline seals the Tip, and it is not in danger yet.
-        assert_eq!(status_at(&mut storage, seal_safe_block), DangerStatus::Safe);
-        // Closure keeps the frame clock; the batch still ages from first_frame.
+        // Low volume: only the deadline seals the batch, and it can still land.
+        assert!(!void_at(&mut storage, seal_safe_block));
         storage
-            .close_frame_and_batch(&mut head, first_frame)
+            .close_frame_and_batch(&mut head)
             .expect("seal by time");
 
-        // The sealed batch keeps the margin, less the frame lag, to become accepted.
-        let last_safe = first_frame + timing.danger_threshold() - 1;
-        assert_eq!(last_safe - seal_safe_block, 100 - frame_lag - 1);
-        assert_eq!(status_at(&mut storage, last_safe), DangerStatus::Safe);
+        // The sealed batch keeps the margin, less the frame lag, to be accepted:
+        // the last safe head at which a later block can still accept it is
+        // `first_frame + window - 2`.
+        let last_live = first_frame + window - 2;
         assert_eq!(
-            status_at(&mut storage, last_safe + 1),
-            DangerStatus::ClosedBatchInDanger(0)
+            last_live - seal_safe_block,
+            BATCH_SUBMISSION_MARGIN_BLOCKS - frame_lag - 2
         );
-    }
-
-    #[test]
-    fn timing_args_reject_zero_l1_read_stale_after_blocks() {
-        let err = Cli::try_parse_from([
-            "sequencer",
-            "run",
-            "--eth-rpc-url",
-            "http://x",
-            "--batch-submitter-private-key",
-            TEST_KEY,
-            "--l1-read-stale-after-blocks",
-            "0",
-        ])
-        .expect_err("l1_read_stale_after_blocks=0 must be rejected");
-        let message = err.to_string();
-        assert!(
-            message.contains("--l1-read-stale-after-blocks")
-                || message.contains("l1_read_stale_after_blocks"),
-            "error must name the offending field, got: {message}"
-        );
+        assert!(!void_at(&mut storage, last_live));
+        assert!(void_at(&mut storage, last_live + 1));
     }
 
     /// Render `--help` for `subcmd` inside a child process whose env carries
@@ -1210,9 +1039,10 @@ mod tests {
                 !help.contains("SECRET_TOKEN_XYZ"),
                 "{subcmd} --help must not print the RPC URL (may contain API tokens)"
             );
+            // Every command signs, setup's flush included, so each names the key.
             assert!(
                 help.contains("CARTESI_SEQUENCER_AUTH_PRIVATE_KEY"),
-                "{subcmd} --help should still mention the env var name"
+                "{subcmd} --help names the key env var"
             );
         }
     }

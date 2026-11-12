@@ -6,8 +6,7 @@
 
 use std::time::{Duration, SystemTime};
 
-/// Current wall-clock time as Unix-ms. Passed into
-/// [`crate::storage::Storage::check_danger`] and friends.
+/// Current wall-clock time as Unix-ms.
 pub fn unix_now_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

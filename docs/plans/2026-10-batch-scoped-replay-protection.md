@@ -3,7 +3,9 @@
 **Status:** deferred design, not implemented. The current rule is the
 per-sender nonce in the [application contract](../protocol/application-contract.md#user-nonces).
 Revisit when replay state must become prunable, or when the fee moves from the
-frame to the batch.
+frame to the batch. The first holds for libdex, which deletes session wallets
+with their nonces, so the choice is open
+([register](../review/register.md#canonical-rules-open-for-the-c-port)).
 
 ## Why
 
@@ -20,7 +22,7 @@ batch-scoped design fixes that race too.
 **Signed coordinates.** The user signs `(b, i)` in place of a nonce:
 
 - `b` is the scheduler batch nonce the op targets: the canonical batch sequence
-  number, not the sequencer's local `batch_index`.
+  number.
 - `i` orders the sender's ops within `b`.
 
 **Look-back.** The sequencer adds an unsigned field `k` (2 bits, so `k` ∈ 0..=3)
@@ -75,14 +77,14 @@ The per-sender `(b, i)` entry rejects the second inclusion.
 
 ## Recovery and invalidation
 
-A stale batch does not consume its nonce, so a cascade rolls the open batch
-back and replacements reuse the nonces. An op from an invalidated batch never
-executed, but its signature stays executable while canonical `c <= b + 3`,
-including when its `b` is above the rolled-back open batch. That breaks
-re-signing, which today's nonce makes safe:
+A stale batch does not consume its nonce, so a cockroach rebuild whose stop
+block falls past it starts a new era whose batches reuse the nonces after it.
+An op from a batch the rebuild revoked never executed, but its signature stays
+executable while canonical `c <= b + 3`, including when its `b` is above the
+new era's open batch. That breaks re-signing, which today's nonce makes safe:
 
 ```
-user signs X with (15, 0); batches 10..15 are invalidated; open batch is 10
+user signs X with (15, 0); batches 10..15 never land; the new era opens batch 10
 user re-signs X' with (10, 0); it executes and stores (10, 0)
 canonical c reaches 15: X arrives with k=0, (15, 0) > (10, 0), accepted again
 ```
@@ -132,6 +134,7 @@ This is one coordinated contract change, agreed with the engine owner:
 
 ## Why deferred
 
-The per-sender nonce works, and the engine owner no longer needs to prune
-replay state. The change spans signing, wire format, scheduler, ABI and API at
-once, so it waits for a concrete trigger.
+The change spans signing, wire format, scheduler, ABI and API at once, so it
+waits for a decision. The per-sender nonce works only for an application that
+keeps every signer's nonce forever, which libdex does not
+([libdex's accounts](../review/2026-11-12-libdex-answers.md#accounts-and-nonces)).

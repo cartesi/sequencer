@@ -4,8 +4,9 @@
 //! SQLite storage. [`Storage`] is the single entry point; each writer role's
 //! methods live in its own sibling file (writer table: `docs/invariants.md`),
 //! shared reads in `queries` and shared writes in `mutations`. The schema and
-//! `valid_*` views live in `migrations/0001_schema.sql`.
+//! its views live in `migrations/0001_schema.sql`.
 
+mod acceptance;
 mod convert;
 mod egress;
 mod fee_oracle;
@@ -13,53 +14,41 @@ mod history;
 mod ingress;
 mod l1_inputs;
 mod l1_submission;
+mod landing;
 mod lifecycle;
 mod mutations;
 mod open;
 mod queries;
-mod recovery;
-mod safe_accepted_batches;
-mod snapshot_dumps;
+mod rebuilt_history;
+mod snapshots;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+#[cfg(test)]
+pub(crate) use test_helpers::StoredSafeInput;
 
 pub(crate) use convert::is_persistent_storage_error;
 
 use std::time::SystemTime;
 use thiserror::Error;
 
+#[cfg(test)]
+pub(crate) use acceptance::Divergence;
 pub(crate) use egress::HistoricalReadError;
 #[cfg(test)]
 pub(crate) use history::ApplicationInputRow;
-pub use history::{DirectInputExecution, HistoryState};
+pub use history::{DirectInputExecution, NewEra};
 pub(crate) use history::{HistoryReadError, L2TxContext};
-pub use lifecycle::{LifecycleCommand, LifecycleError, TerminalFault};
+pub(crate) use ingress::ExecutedUserOp;
+pub use ingress::FeeQuote;
+pub(crate) use landing::OpenBatchError;
+pub use landing::{LandingLag, TerminalFact};
+pub use lifecycle::{LifecycleCommand, LifecycleError};
 pub use open::Storage;
-pub use recovery::DangerStatus;
-pub(crate) use recovery::{RecoveryInspection, RecoveryMutationError};
-pub use sequencer_core::history::{EraId, ExecutedInputCount, HistoryVersion, RecoveryGeneration};
-pub use snapshot_dumps::{
-    DumpRow, FinalizedDump, FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump,
-    PersistentReleaseFailureReporter, ReleaseScheduler, Snapshot,
+pub use sequencer_core::history::L2TxCount;
+pub use snapshots::{
+    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, Snapshot, SnapshotLeases,
 };
-
-/// One safe input as stored on the L1 InputBox: sender, opaque payload, and
-/// the L1 block where it was included.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredSafeInput {
-    pub sender: alloy_primitives::Address,
-    pub payload: Vec<u8>,
-    /// Chain block number where this input was included (e.g. InputAdded event block).
-    pub block_number: u64,
-}
-
-/// A sender-classified L1 direct input ready for application execution.
-#[derive(Debug, Clone)]
-pub(crate) struct StoredDirectInput {
-    pub safe_input_index: u64,
-    pub input: sequencer_core::l2_tx::DirectInput,
-}
 
 /// One InputBox event with the L1 provenance persisted for feed consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,24 +58,6 @@ pub(crate) struct IngestedSafeInput {
     pub block_number: u64,
     pub block_timestamp: u64,
     pub transaction_hash: alloy_primitives::B256,
-}
-
-/// Whether a sync also maintains the scheduler-accepted gold frontier
-/// (`safe_accepted_batches`).
-///
-/// Every normal sync uses [`FrontierMode::Populate`]. `setup --recovery` uses
-/// [`FrontierMode::DeferUntilAnchorSet`] for its interim syncs: the local batch
-/// tree is rebuilt from the checkpoint *after* the sync, so populating the
-/// frontier against the empty tree would mark every L1 batch `Foreign` and
-/// falsely freeze it. `run`'s first sync populates it once the anchor is `N'`.
-/// See `docs/recovery/cockroach.md` and the anchor-aware-frontier note on I15.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrontierMode {
-    /// Maintain `safe_accepted_batches` as part of the sync (the default).
-    Populate,
-    /// Skip frontier maintenance — the tree is rebuilt and the anchor set
-    /// afterwards, and the next normal sync will populate it correctly.
-    DeferUntilAnchorSet,
 }
 
 /// Half-open range `[start, end)` over `safe_input_index` values. Used to
@@ -111,11 +82,6 @@ impl SafeInputRange {
             start_inclusive,
             end_exclusive,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn empty_at(index: u64) -> Self {
-        Self::new(index, index)
     }
 
     pub fn start(self) -> u64 {
@@ -198,10 +164,9 @@ pub struct FrameHeader {
     pub safe_block: u64,
 }
 
-/// A batch ready for L1 submission: its local index, assigned nonce, and SSZ-encoded payload.
+/// A batch ready for L1 submission: its nonce and SSZ-encoded payload.
 #[derive(Debug)]
 pub struct PendingBatch {
-    pub batch_index: u64,
     pub nonce: u64,
     pub encoded: Vec<u8>,
 }
@@ -209,7 +174,8 @@ pub struct PendingBatch {
 /// Deployment identity the database is bound to.
 ///
 /// The persisted sequencer state is not portable across these fields:
-/// historical safe inputs are classified using the batch-submitter address,
+/// historical safe inputs are classified using the batch-submitter address
+/// and the direct-payload cap,
 /// user-op signatures use the app/domain identity, and recovery/frontier logic
 /// depends on the app's InputBox stream, which is empty before
 /// `app_deployment_block` (the v3 InputBox refuses inputs for apps that do
@@ -221,6 +187,12 @@ pub struct DeploymentIdentity {
     pub input_box_address: alloy_primitives::Address,
     pub app_deployment_block: u64,
     pub batch_submitter_address: alloy_primitives::Address,
+    /// The application's `scheduler_limits().max_direct_payload_bytes`: with
+    /// the batch submitter, it decides which safe inputs execute as directs.
+    pub max_direct_payload_bytes: u64,
+    /// The application's `scheduler_limits().max_wait_blocks`: the staleness
+    /// window that decides whether a landed batch was accepted.
+    pub max_wait_blocks: u64,
     pub fee_oracle: FeeOracleIdentity,
 }
 
@@ -247,9 +219,9 @@ pub enum StorageOpenError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Migration(#[from] rusqlite_migration::Error),
-    /// No database file at the given path. Databases are only created by an
-    /// owning command (`setup` / `rebuild`); a missing file at `open` time is
-    /// a deployment mistake, never a cue to create one.
+    /// No database file at the given path. Databases are only created by the
+    /// owning command, `setup`; a missing file at `open` time is a deployment
+    /// mistake, never a cue to create one.
     #[error(
         "no database at {path} — this data directory was never initialized; run `setup` (or check --data-dir)"
     )]
@@ -282,26 +254,59 @@ pub struct BatchPolicy {
 }
 
 /// Trusted, reconstructible in-memory cache of the latest durable open batch +
-/// frame. Mutated by `Storage` methods that change the open state
-/// (`append_executed_user_ops_chunk`, attributed `close_*`). The sole-writer
-/// lane loads one from SQLite and threads it through every call; failed
-/// writes/restarts discard it. Physical-only siblings are test fixtures.
-#[derive(Debug, Clone, Copy)]
+/// frame. Opaque outside storage: only the loader (`queries::load_current_write_head`)
+/// builds one, and only the `Storage` methods that change the open state
+/// (`append_executed_user_ops_chunk`, attributed `close_*`) advance it, after
+/// their commit. Storage reloads the Tip and compares it at every frame
+/// rotation and batch close. Failed writes and restarts discard it.
+#[derive(Debug)]
 pub struct WriteHead {
-    pub batch_index: u64,
-    pub batch_created_at: SystemTime,
+    /// The open batch's nonce, its key.
+    batch_nonce: u64,
+    batch_created_at: SystemTime,
     /// Log-space fee exponent (base 129/128) committed for this open frame.
-    pub frame_fee: u16,
-    pub safe_block: u64,
-    pub batch_user_op_count: u64,
-    pub open_frame_user_op_count: u32,
-    pub frame_in_batch: u32,
+    frame_fee: u16,
+    safe_block: u64,
+    batch_user_op_count: u64,
+    open_frame_user_op_count: u32,
+    frame_in_batch: u32,
     // Soft batch size threshold read from batch_policy at each frame/batch transition.
-    pub max_batch_user_op_bytes: u64,
+    max_batch_user_op_bytes: u64,
 }
 
 impl WriteHead {
-    pub fn increment_batch_user_op_count(&mut self, count: usize) {
+    pub(crate) fn batch_nonce(&self) -> u64 {
+        self.batch_nonce
+    }
+
+    pub(crate) fn batch_created_at(&self) -> SystemTime {
+        self.batch_created_at
+    }
+
+    /// Log-space fee exponent (base 129/128) committed for the open frame.
+    pub(crate) fn frame_fee(&self) -> u16 {
+        self.frame_fee
+    }
+
+    pub(crate) fn safe_block(&self) -> u64 {
+        self.safe_block
+    }
+
+    pub(crate) fn batch_user_op_count(&self) -> u64 {
+        self.batch_user_op_count
+    }
+
+    pub(crate) fn max_batch_user_op_bytes(&self) -> u64 {
+        self.max_batch_user_op_bytes
+    }
+
+    /// A private copy, so a counter advance is validated before the
+    /// transaction that commits it.
+    fn duplicate(&self) -> Self {
+        Self { ..*self }
+    }
+
+    fn increment_batch_user_op_count(&mut self, count: usize) {
         let count_u64 =
             u64::try_from(count).expect("user-op chunk length exceeds u64: contract-impossible");
         let count_u32 =
@@ -318,7 +323,7 @@ impl WriteHead {
         self.open_frame_user_op_count = next_frame_count;
     }
 
-    pub fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
+    fn advance_frame(&mut self, policy: BatchPolicy, safe_block: u64) {
         self.frame_in_batch = self
             .frame_in_batch
             .checked_add(1)
@@ -329,17 +334,15 @@ impl WriteHead {
         self.max_batch_user_op_bytes = batch_size_target_bytes(policy);
     }
 
-    pub fn move_to_next_batch(
+    fn move_to_next_batch(
         &mut self,
-        batch_index: u64,
+        batch_nonce: u64,
         batch_created_at: SystemTime,
         policy: BatchPolicy,
-        safe_block: u64,
     ) {
-        self.batch_index = batch_index;
+        self.batch_nonce = batch_nonce;
         self.batch_created_at = batch_created_at;
         self.frame_fee = policy.recommended_fee;
-        self.safe_block = safe_block;
         self.batch_user_op_count = 0;
         self.open_frame_user_op_count = 0;
         self.frame_in_batch = 0;
@@ -360,44 +363,40 @@ fn batch_size_target_bytes(policy: BatchPolicy) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::WriteHeadParts;
     use super::*;
     use alloy_primitives::U256;
-    use std::time::UNIX_EPOCH;
-
-    fn write_head() -> WriteHead {
-        WriteHead {
-            batch_index: 0,
-            batch_created_at: UNIX_EPOCH,
-            frame_fee: 0,
-            safe_block: 0,
-            batch_user_op_count: 0,
-            open_frame_user_op_count: 0,
-            frame_in_batch: 0,
-            max_batch_user_op_bytes: 1,
-        }
-    }
 
     #[test]
     #[should_panic(expected = "batch user-op count overflow: contract-impossible")]
     fn write_head_batch_count_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.batch_user_op_count = u64::MAX;
+        let mut head = WriteHeadParts {
+            batch_user_op_count: u64::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.increment_batch_user_op_count(1);
     }
 
     #[test]
     #[should_panic(expected = "frame user-op count overflow: contract-impossible")]
     fn write_head_frame_count_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.open_frame_user_op_count = u32::MAX;
+        let mut head = WriteHeadParts {
+            open_frame_user_op_count: u32::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.increment_batch_user_op_count(1);
     }
 
     #[test]
     #[should_panic(expected = "frame index overflow: contract-impossible")]
     fn write_head_frame_index_fails_loud_on_overflow() {
-        let mut head = write_head();
-        head.frame_in_batch = u32::MAX;
+        let mut head = WriteHeadParts {
+            frame_in_batch: u32::MAX,
+            ..WriteHeadParts::ZERO
+        }
+        .build();
         head.advance_frame(
             BatchPolicy {
                 recommended_fee: 0,

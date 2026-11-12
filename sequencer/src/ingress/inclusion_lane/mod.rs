@@ -28,11 +28,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{SafeFrontierState, SafeInputRange, Storage, StoredDirectInput, WriteHead};
-use sequencer_core::application::{
-    Application, ExecutionOutcome, execute_direct_input, validate_and_execute_user_op,
-};
-use sequencer_core::history::ExecutedInputCount;
+use crate::storage::{SafeFrontierState, SafeInputRange, Storage, WriteHead};
+use sequencer_core::application::{Application, Executed, check_live_user_op, execute};
+use sequencer_core::history::L2TxCount;
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::SignedUserOp;
 
 use catch_up::{catch_up_application, catch_up_snapshot};
@@ -48,14 +47,15 @@ pub struct InclusionLane<A: Application + 'static> {
 }
 
 impl<A: Application + 'static> InclusionLane<A> {
-    /// Spawn the lane on a blocking thread. Startup recovery establishes the
-    /// open Tip, so the lane loads its resume state and never initializes a Tip.
+    /// Spawn the lane on a blocking thread. `run`'s startup opens the Tip if
+    /// none is open, so the lane loads its resume state and never initializes
+    /// a Tip.
     /// It fails loudly with
     /// [`InclusionLaneError::NoOpenTip`] if the invariant was somehow violated.
     ///
-    /// Restore the newest surviving snapshot and replay from its exact
-    /// application count. Startup preserves a rollback-safe checkpoint before
-    /// admitting any runtime work.
+    /// Restore the newest snapshot and replay from its exact application
+    /// count. Setup leaves one, the era's baseline, before `run` launches any
+    /// worker.
     ///
     /// Returns the input MPSC sender (for the API to enqueue user
     /// ops) and the join handle (for the runtime to observe lane
@@ -79,7 +79,7 @@ impl<A: Application + 'static> InclusionLane<A> {
             // can never drift apart.
             let checkpoint = catch_up_snapshot(&mut storage)
                 .map_err(|source| InclusionLaneError::CatchUp { source })?;
-            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.dump.prefix))
+            let app = A::from_dump(&dump_info::app_prefix(&checkpoint.prefix))
                 .map_err(InclusionLaneError::LoadFromDump)?;
             let mut lane = Self {
                 rx,
@@ -88,20 +88,20 @@ impl<A: Application + 'static> InclusionLane<A> {
                 storage,
                 config,
             };
-            lane.run_forever(checkpoint.executed_input_count)
+            lane.run_forever(checkpoint.l2_tx_count)
         });
         (tx, handle)
     }
 
-    fn run_forever(&mut self, catch_up_from: ExecutedInputCount) -> Result<(), InclusionLaneError> {
+    fn run_forever(&mut self, catch_up_from: L2TxCount) -> Result<(), InclusionLaneError> {
         self.run_catch_up(catch_up_from)?;
         let mut included = Vec::with_capacity(self.config.max_user_ops_per_chunk.max(1));
         let mut safe_inputs = Vec::with_capacity(self.config.safe_input_buffer_capacity.max(1));
-        // Startup recovery established the Tip before runtime admission.
+        // `run`'s startup opened the Tip before launching the workers.
         // Read the open frame (fail-loud if absent) and the drain
         // cursor together from storage, so both come from the same place. Any
-        // leading range already sequenced into the Tip's frames (genesis or a
-        // recovery batch) was replayed into the app by `run_catch_up` above,
+        // leading range already sequenced into the Tip's frames (an era's
+        // first batch included) was replayed into the app by `run_catch_up` above,
         // so there is no cold-start drain here.
         let head = self
             .storage
@@ -129,7 +129,6 @@ impl<A: Application + 'static> InclusionLane<A> {
 
             if turn.hit_batch_target() || should_close_batch_by_time(&lane_state.head, &self.config)
             {
-                let next_safe_block = lane_state.head.safe_block;
                 // Atomic close: dump the app state, then seal the batch
                 // and register its snapshot in one transaction.
                 // A create_dump failure leaves the batch open for retry;
@@ -139,7 +138,6 @@ impl<A: Application + 'static> InclusionLane<A> {
                     &mut self.app,
                     &mut self.storage,
                     &mut lane_state.head,
-                    next_safe_block,
                     &self.config.dumps_dir,
                 )
                 .map_err(InclusionLaneError::Snapshot)?;
@@ -150,7 +148,7 @@ impl<A: Application + 'static> InclusionLane<A> {
         }
     }
 
-    fn run_catch_up(&mut self, start_offset: ExecutedInputCount) -> Result<(), InclusionLaneError> {
+    fn run_catch_up(&mut self, start_offset: L2TxCount) -> Result<(), InclusionLaneError> {
         catch_up_application(&mut self.app, &mut self.storage, start_offset)
             .map_err(|source| InclusionLaneError::CatchUp { source })
     }
@@ -189,7 +187,7 @@ impl<A: Application + 'static> InclusionLane<A> {
     fn maybe_advance_safe_frontier(
         &mut self,
         lane_state: &mut LaneState,
-        safe_inputs: &mut Vec<StoredDirectInput>,
+        safe_inputs: &mut Vec<Direct>,
     ) -> Result<(), InclusionLaneError> {
         if !lane_state.frontier_check_due(self.config.frontier_min_interval) {
             return Ok(());
@@ -216,13 +214,13 @@ impl<A: Application + 'static> InclusionLane<A> {
             lane_state.next_safe_input_index
         );
         assert!(
-            frontier.safe_block >= lane_state.head.safe_block,
+            frontier.safe_block >= lane_state.head.safe_block(),
             "safe-block frontier regressed: observed={}, frame={}",
             frontier.safe_block,
-            lane_state.head.safe_block,
+            lane_state.head.safe_block(),
         );
-        if frontier.safe_block - lane_state.head.safe_block
-            < sequencer_core::protocol::ProtocolTiming::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS
+        if frontier.safe_block - lane_state.head.safe_block()
+            < sequencer_core::protocol::FRAME_CLOCK_INTERVAL_SAFE_BLOCKS
         {
             return Ok(());
         }
@@ -240,27 +238,37 @@ impl<A: Application + 'static> InclusionLane<A> {
 
         // Acceptance can advance independently of application inputs. A bounded
         // reconciliation cadence reclaims retired artifacts even under load.
-        let removed = snapshot::run_gc(&mut self.storage)?;
+        let removed = snapshot::run_gc(&mut self.storage, &self.config.snapshot_leases)?;
         if removed > 0 {
             tracing::debug!(removed, "snapshot garbage collection removed artifacts");
         }
         Ok(())
     }
 
+    /// Execute the directs `range` drains. Storage hands out only those that
+    /// execute: no batch-submitter input and none over the pinned payload
+    /// cap, which therefore get no execution row.
     fn execute_direct_range(
         &mut self,
         range: SafeInputRange,
-        chunk: &mut Vec<StoredDirectInput>,
+        chunk: &mut Vec<Direct>,
     ) -> Result<Vec<crate::storage::DirectInputExecution>, InclusionLaneError> {
         let mut executions = Vec::new();
         for chunk_range in range.chunks(self.config.safe_input_buffer_capacity.max(1) as u64) {
             self.storage.fill_direct_inputs(chunk_range, chunk)?;
-            for input in chunk.iter() {
-                let receipt = execute_direct_input(&mut self.app, &input.input)
-                    .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?;
+            for direct in chunk.drain(..) {
+                let safe_input_index = direct.input_index;
+                let l2_tx_index = match execute(&mut self.app, &L2Tx::Direct(direct))
+                    .map_err(|source| InclusionLaneError::ExecuteDirectInput { source })?
+                {
+                    Executed::Done { index, .. } => index,
+                    Executed::Skipped(reason) => {
+                        unreachable!("the executor never skips a direct, got {reason}")
+                    }
+                };
                 executions.push(crate::storage::DirectInputExecution {
-                    safe_input_index: input.safe_input_index,
-                    executed_input_offset: receipt.offset,
+                    safe_input_index,
+                    l2_tx_index,
                 });
             }
         }
@@ -294,7 +302,7 @@ fn persist_included_user_ops(
     included: &mut Vec<IncludedUserOp>,
 ) -> Result<(), InclusionLaneError> {
     storage
-        .append_executed_user_ops_chunk(head, included.as_slice())
+        .append_executed_user_ops_chunk(head, included.iter().map(IncludedUserOp::executed))
         .map_err(|err| {
             for item in included.drain(..) {
                 let _ = item.pending.respond_to.send(Err(SequencerError::internal(
@@ -336,14 +344,19 @@ impl TurnOutcome {
 fn should_close_batch_by_time(head: &WriteHead, config: &InclusionLaneConfig) -> bool {
     // A backwards clock step makes `duration_since` err; `unwrap_or_default`
     // then reads as age 0, silently stalling the time-based close trigger
-    // until the clock catches up. Acceptable: the size trigger
-    // is unaffected, and a wedge here is liveness-only, never correctness.
+    // until the clock catches up. The size trigger is unaffected, but a batch
+    // that is never sealed keeps aging toward the staleness window, and once
+    // it cannot land the history is void and the era ends. A backwards step
+    // longer than the window is therefore not only a liveness problem.
     let age = SystemTime::now()
-        .duration_since(head.batch_created_at)
+        .duration_since(head.batch_created_at())
         .unwrap_or_default();
     age >= config.max_batch_open
 }
 
+/// Refuse the op with its 422 text, or execute it in the open frame at the
+/// frame's price and safe block. The pre-check runs the executor's own nonce
+/// rule, so an admitted op that `execute` skips is a terminal lane fault.
 fn execute_user_op(
     app: &mut impl Application,
     item: PendingUserOp,
@@ -351,43 +364,67 @@ fn execute_user_op(
     frame_safe_block: u64,
     included: &mut Vec<IncludedUserOp>,
 ) -> Result<(), InclusionLaneError> {
-    match validate_and_execute_user_op(
-        app,
-        item.signed.sender,
-        &item.signed.user_op,
-        current_frame_fee,
-        frame_safe_block,
-    ) {
-        Ok(ExecutionOutcome::Included(receipt)) => included.push(IncludedUserOp {
-            pending: item,
-            executed_input_offset: receipt.offset,
-        }),
-        Ok(ExecutionOutcome::Invalid(reason)) => {
+    let sender = item.signed.sender;
+    let op = &item.signed.user_op;
+    match check_live_user_op(app, sender, op, current_frame_fee) {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
             let _ = item
                 .respond_to
-                .send(Err(SequencerError::invalid(reason.to_string())));
+                .send(Err(SequencerError::invalid(refusal.to_string())));
+            return Ok(());
         }
-        // An application error has no canonical successor. Discard the
-        // application-owned state; this op is never persisted or acknowledged.
-        Err(err) => {
-            // The client gets a fixed message: the application's reason and
-            // any I/O detail travel on the lane error and the log, never
-            // into the public 500 body.
-            let _ = item.respond_to.send(Err(SequencerError::internal(
-                "application internal error".to_string(),
-            )));
-            return Err(InclusionLaneError::ExecuteUserOp { source: err });
+        Err(source) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::ExecuteUserOp { source },
+            ));
+        }
+    }
+    let tx = L2Tx::UserOp(UserOpTx::new(
+        sender,
+        op,
+        current_frame_fee,
+        frame_safe_block,
+    ));
+    match execute(app, &tx) {
+        Ok(Executed::Done { index, .. }) => included.push(IncludedUserOp {
+            pending: item,
+            l2_tx_index: index,
+        }),
+        Ok(Executed::Skipped(reason)) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::AdmittedOpSkipped { reason },
+            ));
+        }
+        Err(source) => {
+            return Err(fail_user_op(
+                item,
+                InclusionLaneError::ExecuteUserOp { source },
+            ));
         }
     }
     Ok(())
 }
 
+/// An op whose execution failed has no canonical successor, so the lane stops
+/// and the op is never persisted or acknowledged. The client gets a fixed
+/// message: the cause travels on the lane error and the log, never into the
+/// public 500 body.
+fn fail_user_op(item: PendingUserOp, error: InclusionLaneError) -> InclusionLaneError {
+    let _ = item.respond_to.send(Err(SequencerError::internal(
+        "application internal error".to_string(),
+    )));
+    error
+}
+
 /// Dequeue and execute up to `max_chunk` user ops, stopping early if the batch
 /// would cross its size target. Returns the outcome that drove the stop.
 ///
-/// `head.batch_user_op_count` reflects already-persisted ops; `included.len()`
+/// `head.batch_user_op_count()` reflects already-persisted ops; `included.len()`
 /// is the count we'd add by persisting now. When their sum's bytes equal or
-/// exceed `head.max_batch_user_op_bytes`, we stop and the caller closes the
+/// exceed `head.max_batch_user_op_bytes()`, we stop and the caller closes the
 /// batch.
 fn dequeue_and_execute_user_op_chunk<A: Application>(
     rx: &mut mpsc::Receiver<PendingUserOp>,
@@ -401,16 +438,16 @@ fn dequeue_and_execute_user_op_chunk<A: Application>(
     while attempted < max_chunk {
         match rx.try_recv() {
             Ok(item) => {
-                execute_user_op(app, item, head.frame_fee, head.safe_block, included)?;
+                execute_user_op(app, item, head.frame_fee(), head.safe_block(), included)?;
                 attempted += 1;
 
                 let included_count =
                     u64::try_from(included.len()).expect("in-memory chunk length must fit in u64");
                 let projected = head
-                    .batch_user_op_count
+                    .batch_user_op_count()
                     .checked_add(included_count)
                     .expect("batch user-op count overflow: contract-impossible");
-                if user_op_count_to_bytes::<A>(projected) >= head.max_batch_user_op_bytes {
+                if user_op_count_to_bytes::<A>(projected) >= head.max_batch_user_op_bytes() {
                     return Ok(TurnOutcome::HitBatchTarget);
                 }
             }
@@ -446,7 +483,7 @@ fn user_op_count_to_bytes<A: Application>(user_op_count: u64) -> u64 {
 /// Lane-local state threaded through every loop iteration.
 ///
 /// `head` and `next_safe_input_index` stay in lockstep — every safe-frontier
-/// advance updates both `head.safe_block` (persisted in the open frame) and
+/// advance updates both the head's safe block (persisted in the open frame) and
 /// `next_safe_input_index` (in-memory drain cursor).
 ///
 /// `last_frontier_check` is the time gate's bookkeeping; `None` initially so

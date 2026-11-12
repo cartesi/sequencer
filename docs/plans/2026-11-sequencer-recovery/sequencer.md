@@ -1,0 +1,24 @@
+# Inside the sequencer: what remains
+
+The sequencer's side of this plan is built: loading a machine, the rebuild
+with the free-standing scheduler, the rebuilt history table, the era, the feed across
+the rebuilt and live rows, and the lane draining from the first queued input.
+[Cockroach recovery](../../recovery/cockroach.md) describes them, with a code
+map. This page keeps only what is not built yet.
+
+- **A large application state.** Setup reads the base's state as one `state`
+  inspect report, which holds at most 2 MiB: 27,593 wallet accounts that hold
+  a balance and a nonce, or 40,328 that hold only a balance. That size, not the loader's
+  2^36-cycle bound per query, is the limit that binds
+  ([measurements](../../review/2026-11-10-recovery-measurements.md#b-reading-a-base-machine)).
+  A larger state needs another state source, such as a labeled memory range,
+  or a guest that splits its answer
+  ([the loader's limits](../../cartesi-machine.md#reading-a-stored-machines-export)).
+- **A foreign scheduler.** `bindings/c-scheduler` exports the Rust scheduler
+  through `scheduler.h`, and an application's author may implement that header
+  with their own. Setup still calls the Rust scheduler directly: the trait and
+  the adapter that would link a foreign one are not built
+  ([todo](todo.md#build)).
+- **Names.** The storage columns call the L2 tx count `l2_tx_count`; the HTTP
+  API still calls it `executed_input_count`, which changes with the
+  [egress redesign](todo.md#redesign-the-egress-api).

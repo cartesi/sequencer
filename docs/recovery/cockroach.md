@@ -1,303 +1,381 @@
-# Cockroach recovery: rebuild from L1
+# Cockroach recovery
 
-Cockroach recovery (`setup --recovery`) creates a fresh sequencer starting state
-from a trusted application checkpoint and historical L1 inputs. Use it when the
-local database is lost or cannot be trusted, including after a sequencer bug has
-corrupted its state or produced malformed batches. **Find and fix the bug before
-rebuilding.** The operator initiates recovery; the command automates the rebuild.
+Cockroach recovery starts a new sequencer when the old one is gone or cannot be
+trusted: it had a bug, it served transactions that never landed, its SQLite is
+corrupt, or its disk failed. The watchdog reports most of these as a divergence
+([incident runbook](../watchdog/incident-runbook.md)). It is the sequencer's
+only recovery: a void history and a recorded divergence both stop the
+sequencer for good and send the operator here
+([batch landing and outages](README.md)).
 
-The procedure is **flush → fold → fill**:
+The operator starts a recovery and one command does the work: `setup`, the
+same command that starts a new deployment. Every setup starts from a **base**
+and rebuilds the history from L1; a recovery is a setup on a chain that
+already has history, usually from a stored canonical machine.
 
-1. **Flush** outstanding submitter transactions and choose a fixed safe L1
-   stopping block at or after the trusted checkpoint's inclusion block.
-2. **Fold** the input history through the canonical scheduler, starting from the
-   trusted checkpoint. Every input receives its normal scheduler treatment:
-   accepted batches execute, malformed or rejected batches are skipped, and
-   direct inputs are queued and drained. Finally, drain every remaining direct
-   input through the stopping block.
-3. **Fill** a fresh database with the recovered application state and next batch
-   nonce, ready for `run`.
+**Find and fix the bug before rebuilding.** The canonical image keeps its own
+bugs: a fix to code the image shares makes the sequencer diverge from it, and
+nothing but the watchdog's next comparison would notice.
 
-The result has accounted for the whole input prefix and carries no inherited
-speculative user-operation suffix. It does not need to reach the moving tip:
-normal operation handles inputs after the stopping block.
+## One setup, from any base
 
-This is a **resume baseline**. The final drain can execute young direct inputs
-that the canonical scheduler still has queued at that block. The resumed frame
-covers them before new user operations; the baseline itself is not a canonical
-comparison checkpoint at that block.
+```text
+wallet-sequencer setup [--base <MACHINE_DIR>] [--dry-run]
+```
 
-[Standard recovery](README.md) instead uses the existing database to repair an
-optimistic suffix automatically. It assumes the local bookkeeping is trustworthy.
+Every application binary takes these arguments; `wallet-sequencer` is the
+reference. A base is a stored machine of the deployment's template, stopped
+between inputs. Without `--base`, the base is genesis: L2 tx count zero, the
+scheduler's genesis state, and the binary's genesis application. Setup rebuilds
+the history from the base through a **stop block**, a safe L1 block it pins
+after flushing the submitter's wallet, and publishes a new **era**: a history
+that starts at the base's L2 tx count, holds the rebuilt history through the
+stop block, then the rows `run` sequences.
+
+**Recovery is needed exactly when L1 shows the old submitter's activity past
+the base**: a submitter input after the base's last input, or unsettled
+transactions in the submitter's wallet. Without that activity the rebuild only
+moves directs. With it, the rebuild re-judges the old instance's batches by the
+canonical scheduler's rules. Setup does the same either way, and its summary
+says which case it found. Which base to use is the operator's call: any base
+works, genesis included, though a rebuild from genesis takes longer as the
+deployment ages.
+
+What the old instance served and never landed by the stop block is gone. Its
+user ops are revoked, not cancelled: they carry no expiry, so anyone holding
+one can resubmit it while its sender's nonce is unused.
+
+### Inputs
+
+| Input | Notes |
+|---|---|
+| A base machine | `--base <MACHINE_DIR>`, optional; setup trusts it, and the operator checks it ([before anything](#before-anything)). |
+| The submitter key | `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`, as for `run`; it must sign for the submitter address, and `--dry-run` takes none. |
+| An empty data directory | Absent, empty, or holding only `sequencer.lock`; setup refuses anything else. |
+| The setup configuration | The RPC endpoint, chain id, application address, submitter address and fee source ([Running](../../README.md#running)). |
+
+Setup takes no client count; each client checks its own
+([the client's playbook](#the-clients-playbook)).
+
+### Outputs
+
+Setup and its dry run print the same summary:
+
+```text
+base: <inputs> L1 inputs, L2 tx count <count>
+submitter inputs past the base: <n>
+unsettled submitter transactions: <n>
+inputs the rebuild replays: <n> (through block <block>)
+<whether the rebuild re-judges the old instance's batches>
+```
+
+Setup's block is the stop block, and it adds the stop block and the L2 tx count
+at its end. The dry run's block is the safe head it synced to.
+
+**The dry run** reads the base, syncs L1 into a scratch directory under the
+system's temporary directory, and runs the export check (step 4) there. It
+takes no key, flushes nothing and never touches the data directory, and it
+reports the escape facts rather than refusing on them. It syncs every input
+from the deployment block, so it costs as much time and temporary disk as
+setup's own sync.
+
+**Setup** publishes the new era:
+
+| Field | Value |
+|---|---|
+| Base count | The base's L2 tx count, where the era's history starts. |
+| Stop block | The safe block pinned after the flush, stored as `stop_block`. |
+| Rebuilt history end | The L2 tx count at the end of the stop block, where the live rows start. |
+| First queued input | The InputBox index of the oldest direct still queued at the end of the stop block, or the input count through it when none is. |
+| Anchor batch nonce | The scheduler's next batch nonce at the end of the stop block. |
+| Baseline | A snapshot of the application at the end of the stop block, registered at the rebuilt history end. |
+
+`/history` reports the base count as `history.available_from`, and the stop
+block, its input count, the anchor and the rebuilt history end under
+`baseline` ([history metadata](../../README.md#history-metadata-internal-only)).
+The first queued input stays off the wire.
+
+### What setup does
+
+**Before writing anything**, setup runs every check that can fail and be
+retried: the RPC's chain id, a safe head sampled before discovery, and the
+application's deployment block at or below that safe head. It also prepares
+the fee source (a fixed price is held to the fee floor here), checks that the
+key signs for the submitter address, and reads the base (step 1), whose state
+bytes go to a scratch directory under the system's temporary directory. A
+failure here, or a kill while a large machine loads, leaves the directory
+empty but for the lock file, so retrying in the same directory is safe.
+
+1. **Reads the base.** For a machine, setup loads it privately and answers two
+   inspect queries ([reading a stored machine's export](../cartesi-machine.md#reading-a-stored-machines-export)):
+   `scheduler`, the 48-byte scheduler export, and `state`, the application's
+   canonical state bytes ([state export](../protocol/scheduler-semantics.md#state-export)).
+   It builds the application with `Application::from_canonical_state` at the
+   export's L2 tx count and refuses one that reports another count. For
+   genesis, it builds the binary's genesis application, which must start at
+   count zero.
+2. **Flushes and pins the stop block.** From here setup writes: it pins the
+   deployment identity (the application's staleness window and direct-payload
+   cap with it) and the
+   first fee quote, then replaces whatever the provider's pool holds for the
+   submitter account and waits until that is safe
+   ([the flush and the stop block](#the-flush-and-the-stop-block)). The stop
+   block is a safe block observed after it.
+3. **Fills the input table and checks for an escape.** It syncs every L1 input
+   from the deployment block to a safe head at or past the stop block. Then it
+   refuses, with exit 40, if the wallet is still unsettled or a submitter
+   input lies past the stop block. Either means a transaction escaped the
+   flush or the old instance still runs. This is setup's one check on the old
+   instance.
+4. **Checks the base's export against L1.** Among the inputs the base
+   consumed, the admitted directs above its clock (not from the submitter,
+   payload within the application's cap) must number exactly the export's
+   queue length and start at its first queued input
+   ([the invariant](../protocol/scheduler-semantics.md#the-invariant)). The
+   base must also lie at or below the stop block, and the scheduler must
+   resume from the export over its queued inputs, with its clock at or below
+   the stop block. A mismatch means the machine is not canonical, or its
+   scheduler drained wrongly.
+5. **Rebuilds the history with the scheduler.** It resumes the scheduler from
+   the export, re-supplying the inputs from the first queued input up to the
+   base's position, then feeds it every later input through the stop block,
+   never the sync's overshoot. The scheduler never reads the application:
+   what it hands out depends only on its state and the inputs. After the last
+   input its clock must lie at or below the stop block.
+6. **Executes each transaction as it is handed out.** The application runs it
+   at once through `sequencer_core::application::execute`, the boundary the
+   lane and the guest share. A direct always executes; a user op executes or
+   is skipped ([a user op's fate](../protocol/scheduler-semantics.md#a-user-ops-fate)).
+   An executed transaction is stored in the `rebuilt_history` table with its
+   L2 tx count; a skipped user op is not stored. An application error stops
+   setup naming the input, the transaction's position among those the input
+   released, and the transaction. At the end, the directs executed must number
+   the admitted directs the scheduler drained, counted in the input table.
+7. **Publishes the new era.** It writes the baseline dump, then one transaction
+   inserts the era row, which carries the batches' anchor nonce and whose
+   existence marks setup complete, and registers the baseline. Setup opens no
+   root frame and no Tip.
+
+The rebuild reads inputs and writes rows in pages of 1024, so memory stays
+bounded however long the rebuilt range is. Nothing is published until step 7.
+A setup that fails after writes begin leaves a directory to discard, whatever
+its exit code: another setup there exits 30.
+
+### The flush and the stop block
+
+Setup's database is new, so it has no wallet-nonce watermark from the old
+instance, even when the old directory survives: a lost database takes its
+watermark with it. The flush is therefore best effort. It sends no-ops for the
+wallet slots the provider's pool knows about, which normally holds the
+transactions in flight when the old instance stopped; on a settled wallet it
+returns at once. A transaction dropped from that pool but alive elsewhere can
+escape it. If it lands before setup's sync, the escape check refuses; if it
+lands later, the new era's content-identity check sees a foreign landing,
+freezes the accepted frontier, and the deployment needs another recovery. The
+provider is trusted fail-stop, as the
+[threat model](../threat-model/README.md#rpc-endpoint) specifies.
+
+The stop block is fixed by the flush. The sync may run past it, but the rebuild
+stops there, and a sync that ends below it refuses. In the new era, acceptance
+scans only blocks after the stop block, starting at the anchor nonce, so no
+landing in the rebuilt prefix is reinterpreted. Inputs past the stop block wait
+in the input table for `run`.
+
+## After setup
+
+- **`run` opens the era's first batch** at its own safe head: its start opens
+  a batch when none is open ([what the sequencer does](README.md#what-the-sequencer-does)).
+  That batch's root frame first drains the directs still queued at the stop
+  block, from the first queued input on, as the canonical scheduler's first
+  frame does; submitter and over-cap inputs never execute.
+- **The watchdog compares the baseline.** The application's state at the end
+  of the stop block is the canonical machine's state there, so until a batch of
+  the era is accepted the sequencer serves the baseline as its comparison
+  checkpoint at the stop block, for a genesis base too
+  ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
+  The watchdog compares it on its next tick, once no latch holds it; a mismatch
+  there means the base machine was not canonical.
+- **The feed serves the new era from the base count**: the rebuilt rows up
+  to the rebuilt history end, then the live rows, in one read
+  transaction. A direct's row takes its sender, payload, block, timestamp and
+  transaction hash from the input table. A claim from an older era is refused
+  with `ERA_CHANGED`; its client adopts the new era
+  ([the client's playbook](#the-clients-playbook)).
+- **`GET /nonce` counts only the live rows.** For a sender whose last op lies
+  in the rebuilt history it reads low until that sender's next op is sequenced.
+  A wallet that signs at the nonce its own state holds is unaffected, and a
+  `422` bad-nonce rejection names the expected nonce.
+- **The rebuilt history is permanent.** Its rows come from safe blocks, so they
+  never change: nothing removes rows inside an era, and storage triggers
+  refuse an update or a deletion.
+
+## How long a recovery takes
+
+Setup's time has three parts, and the base decides the largest one. The
+[recovery measurements](../review/2026-11-10-recovery-measurements.md) hold
+the numbers for the reference wallet.
+
+- **The sync** reads every input from the deployment block, so the RPC
+  provider bounds it; its database writes are a small part. The dry run syncs
+  the same inputs, so it takes as long. A sync through a deployment's provider
+  is not measured yet.
+- **The flush** returns at once on a settled wallet, and otherwise waits until
+  its no-ops are safe.
+- **The rebuild** recovers each user op's signature, one op after another on
+  one core, and that is almost all of its time; executing the transactions,
+  writing the rows and publishing take the rest. Its time therefore follows the user ops
+  past the base, not the length of the history: a recent base keeps a
+  recovery short, and genesis costs the whole history. The dry run prints how
+  many inputs the rebuild replays; the measured rate per user op turns the ops
+  among them into a time. Execution is the application's own cost, so measure
+  a native engine's with it.
+
+Reading the base machine is never the slow step. Memory stayed bounded in the
+measurements, as the paging in [what setup does](#what-setup-does) intends,
+but one reading is unexplained
+([register](../review/register.md#sequencer-recovery-follow-ups)). On disk,
+the rebuilt history about doubles the database. When the new era's first
+batch lands, the canonical machine drains every direct still queued in that
+one input; for the wallet, a fridge full to its bound drains well inside the
+guest's budget for one input.
+
+## Before anything
+
+- **The old instance stays down.** The new data directory is pinned to the
+  same submitter address, and the process lock guards one directory, not two.
+  The flush settles transactions, not processes, so no command that signs with
+  the key may run against the old directory again
+  ([restart policy](../watchdog/operator-deployment.md#sequencer-restart-policy)).
+  Setup's escape check catches an old instance that is mid-flight when it
+  looks, not one started afterwards.
+- **The base machine must be canonical.** Setup trusts it. The export check
+  catches a machine whose queued directs disagree with L1, but nothing in setup
+  checks the application state; the watchdog's first comparison of the new era
+  does. The operator checks where the machine came from: a watchdog checkpoint,
+  `incident/canonical`, or `sequencer-watchdog replay --out` were derived from
+  L1 independently of the sequencer, and a machine from a validator node at a
+  settled epoch can be checked against the root on chain.
+- **The base must load.** It must be a machine of the deployment's template,
+  stored by the Cartesi Machine version the sequencer links
+  ([versions](../cartesi-machine.md#versions-are-all-or-nothing)), and stopped
+  between inputs, waiting at an `RX_ACCEPTED` yield. Not every machine the
+  watchdog stores does
+  ([which ones](../watchdog/README.md#machines-a-recovery-can-start-from)).
+  Setup refuses a halted machine, so a canonical machine that halted cannot be
+  recovered: the application is dead on chain.
+- **Recovery repairs only the sequencer.** What the canonical machine executed
+  stays executed, a faulty sequencer's accepted batches included.
+- **Preserve the evidence first.** Keep the old data directory, its logs, and
+  the watchdog's `incident/` before anything is rebuilt; affected client
+  databases are preserved separately.
 
 ## Recovery readiness before deployment
 
-Canonical-to-native recovery is a required
-[application integration capability](../protocol/application-contract.md#7-canonical-recovery-integration).
-Each production deployment must have a release-matched export command, a
-completed application-specific runbook, and a successful recovery rehearsal.
-An incident is an execution of that prepared procedure, not the first attempt
-to determine a state layout or assemble recovery metadata.
+A recovery runs once in a deployment's life, so it must be ready before it is
+needed:
 
-The application runbook must name:
+- **The application rebuilds from a machine.** It implements
+  `from_canonical_state`, and its template answers the `scheduler` and `state`
+  queries ([canonical recovery integration](../protocol/application-contract.md#7-canonical-recovery-integration)).
+  The `state` answer must fit one 2 MiB report; a larger state needs another
+  state source ([the loader's limits](../cartesi-machine.md#reading-a-stored-machines-export)).
+  The [measurements](../review/2026-11-10-recovery-measurements.md#b-reading-a-base-machine)
+  give how many wallet accounts fit; measure the application's own `state`
+  size against it, since until setup has a range read a machine whose state
+  has outgrown it cannot be a base.
+- **The operator can find a trusted machine** at or below a given L2 tx count,
+  and keeps machines backed up. The watchdog's checkpoints are one source
+  ([backups](../watchdog/operator-deployment.md#checkpoint-disk-usage-and-backups));
+  sourcing from a validator node is
+  [open work](../plans/2026-11-sequencer-recovery/todo.md#machine-sourcing).
+- **Each client keeps backups it can restore at a count it trusts**
+  ([client backups](../plans/2026-11-sequencer-recovery/client-backups.md)).
+- **The operators have run the drill.** The
+  [incident runbook's drills](../watchdog/incident-runbook.md#drills) say which
+  parts exist as tests.
 
-- The canonical image, native engine, state layout, exporter, and tool versions.
-- How to select and preserve a trusted CM checkpoint and its exact L1 boundary.
-- The command extracting the application state, count/clock, and next scheduler
-  nonce into the bundle accepted by `setup --recovery`, including supported
-  checkpoint boundaries and verification of the
-  [pending-direct eligibility condition](#checkpoint-eligibility) below.
-- Artifact locations, access/backup procedures, validation commands, and the
-  commands to rebuild, restart, compare, and resume affected readers.
-- A rehearsed fallback to an earlier trusted checkpoint or genesis if the
-  preferred artifact is unavailable, with measured replay time and disk needs.
+## The operator's playbook
 
-The qualifying drill starts with a **non-genesis canonical machine checkpoint**,
-pinned deployment data, and L1 access, while the old native database and dumps
-are unavailable. Run the actual exporter and restore its output; check the
-native application bytes/progress and scheduler nonce against the canonical
-source. Exercise directs pending at the checkpoint and inputs arriving after it.
-The exporter must refuse a checkpoint with a pending direct at or below its
-application clock, even when `A < B`; rehearse the earlier-checkpoint/genesis
-fallback. Also cover an eligible nonempty queue whose directs are all above `A`.
-Run `setup --recovery` in a fresh directory, resume sequencing, and compare
-against independent canonical execution after a new batch is accepted. The
-terminal-drained baseline itself need not equal canonical state at `C`.
+1. **Stop the old instance**, keep it down, and preserve its evidence
+   ([before anything](#before-anything)).
+2. **Fix the cause** when a bug caused the incident.
+3. **Ask each client for a state it trusts**, as an L2 tx count.
+4. **Pick a base** at or below every client's count: a machine, or genesis.
+   `setup --base <machine> --dry-run` prints its L2 tx count and the old
+   instance's activity past it.
+5. **Run `setup --base <machine>`** with the submitter key, in an empty data
+   directory.
+6. **Run `run`** on that directory.
+7. **Tell each client to realign** at its own count.
+8. **Clear the watchdog's latch, then watch its next comparison.** If a
+   divergence latched it, clear it once `run` has started
+   ([incident runbook](../watchdog/incident-runbook.md#3-resolve)). The next
+   tick compares the new era's baseline at the stop block.
 
-Automate this integration check where the artifacts are available, and require
-passing evidence for the supported release before production deployment. Record
-artifact versions, commands, checks, and timings; repeat when the state mapping,
-checkpoint/recovery behavior, or relevant release artifacts change. A native
-dump round-trip or a test using shared scheduler fixtures alone does not exercise
-the canonical-machine export boundary. The
-[Track 6 integration plan](../plans/2026-07-coordination-tracks.md#track-6--dump--application-api-redesign)
-tracks the remaining tooling and validation work; this requirement is not an
-implemented deployment gate.
+## The client's playbook
 
-## Incident playbook
+A client of the old era holds state at some L2 tx count `X`. It realigns on the
+feed it already uses, with no file and no separate tool:
 
-The objective is a usable, independently trusted starting state. A newer sound
-checkpoint reduces replay work; finding the exact first bad execution or the
-latest possible sound checkpoint is not a prerequisite for recovery.
+1. **Restore a trusted state** at its count `X`.
+2. **Read `/history`** for the new era's identity, its base count
+   (`history.available_from`) and its rebuilt history end
+   (`baseline.rebuilt_history_end`).
+3. **Check `X` against that range** and take the claim to resume with:
+   `HistoryInfo::adopt_claim(X)` in `sequencer-core`, or
+   `SequencerClient::adopt_current_era(X)` in the Rust SDK. Below the base
+   count (`BelowBase`), the base is newer than the client's state, so the
+   operator must recover from an older machine. Past the rebuilt history end
+   (`PastRebuiltEnd`), the state holds rows the old instance served that never
+   landed by the stop block: restore an older state.
+4. **Optionally check its rows.** Subscribe from the base count and compare
+   each row up to `X` with the row it stored. Any difference means its state is
+   not canonical.
+5. **Subscribe with the adopted claim** and follow the feed as always. The
+   claim carries the new era's id, and the server checks it like any
+   other; it does not check the rebuilt history end itself, so step 3 is the
+   client's to do.
 
-1. **Stop and preserve.** Stop the sequencer and prevent automatic restarts.
-   Preserve its data directory, logs, and available archives before rebuilding.
-   Copy the watchdog state directory's `config.json`, its head under
-   `checkpoints/`, and its `incident/` evidence once `status` no longer shows
-   the evidence collection `running`; a latched watchdog does no other work,
-   so this needs no pause. Preserve affected client databases and their
-   checkpoint metadata separately.
-2. **Establish the cause and reference.** Check deployment identity, canonical
-   machine image, bootstrap boundary, and the reported comparison boundary.
-   A configuration mismatch is different from faulty execution. Fix the cause
-   before running the replacement sequencer; retain an independently trusted
-   canonical machine or earlier checkpoint as the reference.
-3. **Select a sound application checkpoint.** The watchdog's durable head is
-   its last successful comparison checkpoint, or its operator-trusted initial
-   checkpoint if no comparison succeeded. A failed comparison does not replace
-   it; initialization and idle ticks are not successful comparisons. A latched
-   `state_mismatch` usually also keeps `incident/canonical` (its evidence
-   lists it), the canonical machine at the latched block, derived
-   independently of the sequencer, and
-   `sequencer-watchdog replay` re-derives one at any block from a trusted
-   machine ([incident runbook](../watchdog/incident-runbook.md)). Use that
-   canonical state, or independently validate a retained candidate at the same
-   exact L1 boundary. Current-state equality can establish a usable application
-   state without establishing that all earlier executions were correct.
-4. **Prepare a restorable native bundle.** Validate the candidate's restored
-   application state, embedded count/clock, and next batch nonce against the
-   canonical reference at block `B`. Verify its pending-direct queue meets
-   [checkpoint eligibility](#checkpoint-eligibility); otherwise choose an
-   eligible earlier checkpoint or genesis. Keep the artifact and its boundary
-   metadata together and record how its trust was established. The receipt alone
-   is not evidence that a faulty sequencer executed correctly.
-5. **Rebuild in a fresh directory.** Use the invocation below. Recovery chooses
-   its post-flush stopping block `C`, replays from the trusted checkpoint, and
-   publishes a new era. Preserve that baseline artifact and its metadata for
-   client alignment before resumed operation can collect it. Resume independent
-   watchdog comparison when a new accepted comparison checkpoint is available.
+A reader that owns more state than the application, such as an indexer of
+transfers or orders, restores a checkpoint of that state too, at the same
+count; matching current balances does not validate historical records. A
+reader with no checkpoint it trusts can rebuild from the feed only when the
+era's base is genesis: the feed starts at the base count, and the rows below
+it exist only on L1.
 
-### Obtaining the recovery artifact
+## What can go wrong
 
-The watchdog stores a whole CM, including scheduler state; it does not save a
-native `/finalized_snapshot` archive. Use the application's rehearsed canonical
-export command to obtain the native bundle, or a retained native archive whose
-state and resume metadata can be validated against the canonical reference.
-The mapping is required even when it is a direct extraction of the labeled
-state range. The generic watchdog does not implement that application-specific command.
-A comparison file alone need not contain everything an engine requires to restore.
-
-Retain verified native archives outside sequencer GC if they are the intended
-recovery source. The watchdog normally prunes its previous CM checkpoint, and
-sequencer GC may remove the native artifact from the last passing comparison
-after a newer batch is accepted. Downloading `/finalized_snapshot` after an
-alarm can return the faulty newer state. The
-[backup guide](../watchdog/operator-deployment.md#checkpoint-disk-usage-and-backups)
-describes retention; the application runbook supplies the tested conversion.
-Use its rehearsed earlier-checkpoint/genesis fallback when the preferred source
-is unavailable.
-
-### Application-specific reader state
-
-A reader such as Bart's indexer owns more state than the sequencer application.
-Choose its latest checkpoint whose execution provenance and indexing behavior
-remain trustworthy after diagnosing the incident. Its boundary may differ from
-the sequencer's chosen checkpoint. Compare against an independent reconstruction
-of the required projection when needed; matching current balances or positions
-does not validate historical transfers, deals, or portfolio records.
-
-Restore that complete client checkpoint and its scheduler continuation metadata,
-then replay canonical L1 inputs through the replacement era's `C` and perform
-the terminal drain. Establish agreement with the replacement application
-baseline, including count `K`, before binding the reader to the new history
-claim. If no client checkpoint can be trusted, rebuild its projection from a
-trusted origin. A current application snapshot cannot supply omitted history.
-
-The [projection replay contract](../protocol/projection-replay.md) describes the
-historical-input API, checkpoint preparation, and handoff metadata. Its reference
-test exercises a trusted client checkpoint; the application-specific backup and
-incident validation remain integration work. This manual procedure does not
-require automated cross-era checkpoint matching.
-
-## Run a rebuild
-
-Select and prepare the trusted checkpoint using the incident playbook above.
-
-The loader requires an application artifact, `info.toml`, and `checkpoint.toml`.
-The [recovery export workflow](../snapshots/lifecycle.md#http-and-recovery-exports)
-describes this bundle. An export receipt checks metadata agreement; it does not
-prove the checkpoint correct. An ordinary optimistic snapshot, a subscriber's
-dump, or a bare local `dumps/<id>/` directory is insufficient.
-
-With the deployment's [setup configuration](../../README.md#running) and
-batch-submitter signing key configured, use a fresh data directory:
-
-```sh
-cargo run -p wallet-sequencer -- setup --recovery \
-  --data-dir <fresh-data-dir> \
-  --checkpoint-block <block-from-receipt> \
-  --checkpoint-dump-dir <extracted-checkpoint>
-```
-
-Recovery signs L1 transactions, so the key must match the configured submitter.
-After success, start `run` with that same data directory. A completed rebuild
-refuses another `setup --recovery`; failures before completion publish no partial
-baseline. If the RPC node has not reached the checkpoint, recovery exits with
-retryable code 20. Synchronize that node and retry with the same checkpoint and
-incomplete data directory.
-
-## Implementation contract
-
-Read this section when changing checkpoint loading, replay, or baseline
-publication. The [scheduler contract](../protocol/scheduler-semantics.md) owns
-input interpretation; recovery uses that same scheduler implementation.
-
-### Data dictionary
-
-The replay boundaries are:
-
-| Value | Meaning |
-|---|---|
-| `S`, `B`, `N` | Trusted checkpoint state, inclusion block, and next batch nonce. |
-| `A` | Last executed application safe block reported by `S`. |
-| `C` | Fixed post-flush safe stopping block. |
-| `S'`, `N'` | Recovered state and next batch nonce. |
-| `K` | Application count in `S'`; the first later application input has offset `K`. |
-
-### Checkpoint eligibility
-
-At the exact end-of-block boundary `B`, the canonical scheduler must have **no
-pending direct with inclusion block `<= A`**. The checkpoint therefore already
-accounts for every direct through `A`; all remaining directs are reconstructed
-from `(A, B]`. The exporter must inspect the canonical queue to establish this
-condition, including when validating a retained native artifact against the CM.
-If it fails, refuse the export and select an eligible earlier checkpoint or
-genesis.
-
-Honest live sequencing establishes this condition: a frame's safe block precedes
-its L1 inclusion, so all directs it covers have already arrived. The overdue-direct
-backstop preserves it too: by the time a block's directs are overdue, that whole
-block has been observed. The FIFO drain executes all equally aged directs from
-that block and all older ones, so advancing `A` leaves none of them pending.
-
-The canonical scheduler also accepts equality. After faulty sequencing, a batch at
-block 10 can execute at clock 10 before another direct in that block arrives.
-An empty batch at block 11 advances the nonce without draining that direct.
-The truthful checkpoint has `A=10 < B=11`, yet seeding `(A,B]` would omit it.
-Application-state equality and `A < B` alone cannot establish eligibility.
-
-Loading checks the receipt's block against configured `B` and its nonce against
-`info.toml`. It requires `A < B`, except for known empty genesis (`B`, nonce, and
-application count all zero). At non-genesis `A = B`, a direct arriving after the
-accepted batch in block `B` could still be pending but disappear from the seed
-range. The bundle contains no scheduler queue evidence, so the loader cannot
-verify the pending-direct condition. Eligibility, checkpoint state, and nonce
-remain operator-trusted; the later content-identity check does not verify this
-prefix. Exporter enforcement belongs to the application's required recovery
-integration, not the generic loader.
-
-The complete ordering is `A < B <= C`, with `A = B = 0` allowed for empty
-genesis. Before sourcing or executing the fold, recovery requires `B <= C`.
-Otherwise publishing the checkpoint state at an earlier baseline block could
-make normal reconciliation execute already-accounted direct inputs again.
-
-### Flush and stopping block
-
-Recovery reads the wallet-nonce watermark from the fresh data directory, so the
-previous database's watermark is not used, even when that database survives.
-Flushing therefore depends on the provider's pool view. A transaction dropped there but
-alive elsewhere may escape; a later accepted foreign or mismatched landing
-freezes the rebuilt instance and requires another rebuild. The provider is
-trusted fail-stop, as specified in the [threat model](../threat-model/README.md).
-
-After flushing, raw L1 ingestion must reach at least `C`. It may advance farther,
-but the fold stops at `C`. Accepted-batch projection is deferred until the new
-baseline and batch tree exist.
-
-A trusted checkpoint can be ahead of an honest replacement node that is still
-synchronizing. A successful flush only settles the wallet slots known to that
-node; it does not establish `C >= B`. If `C < B`, recovery refuses with retryable
-exit 20, even when the later re-sync head has reached `B`: that newer observation
-does not replace the fixed stopping block. It publishes no baseline and must be
-retried after the node catches up.
-
-### Replay boundaries
-
-Seed the scheduler's pending-direct queue from `(A, B]`, excluding inputs sent by
-the batch submitter. Then replay **all raw inputs** in `(B, C]` in L1 order with
-expected nonce `N`. Drain the remaining directs through `C` to obtain `(S', N')`.
-For an [eligible checkpoint](#checkpoint-eligibility), the disjoint ranges
-preserve pending directs without executing its accepted batches again.
-
-On the first `run` sync, acceptance starts at nonce `N'` and scans only blocks
-**strictly after `C`**. Nonce filtering alone would let a previously rejected
-future-nonce batch in the old prefix be reinterpreted as accepted. Raw inputs
-ingested beyond `C` remain for normal reconciliation. Newly executed application
-inputs are recorded beginning at `K`; raw L1 indices and application offsets are
-separate coordinates.
-
-### Publish the baseline
-
-Write and durably sync the immutable application dump first. One SQLite
-transaction then registers a fresh UUIDv4 era at generation zero, count `K`,
-boundary `C`, anchor nonce `N'`, a parentless root frame at `C`, the snapshot, and
-`setup_complete`. The collapsed prefix creates no application-input rows.
-
-Artifact failure leaves setup incomplete; transaction failure leaves at most an
-orphan artifact. Identity pinning and raw L1 ingestion may survive an incomplete
-attempt, but the lock and setup admission prevent serving a partial baseline.
-
-`C` remains the fallback reconciliation boundary if standard recovery invalidates
-the root. The [history contract](../protocol/application-history.md#era-baseline)
-owns these immutable coordinates; [snapshot lifecycle](../snapshots/lifecycle.md)
-owns restore selection, rollback-safe retention, and eventual baseline disposal.
+| Problem | Seen where | Remedy |
+|---|---|---|
+| The data directory holds anything | Setup refuses it untouched, exit 30 | Run setup in an empty directory. |
+| L1 is unreachable, or the deployment block is not yet safe | Setup's checks before writing, exit 20 | Retry in the same directory. |
+| The key does not sign for the submitter address | Setup's identity check before writing, exit 30 | Configure the pinned submitter's key. |
+| The base machine cannot be loaded, is not between inputs, or does not answer | Setup's step 1, exit 30 | Pick another machine ([which watchdog machines qualify](../watchdog/README.md#machines-a-recovery-can-start-from)). |
+| The base's `state` report is over 2 MiB | Setup's step 1, exit 30: the machine did not answer the `state` query, because it halted | Recover from an older machine whose state fits, or from genesis. |
+| The application cannot be built from the machine's state | Setup's step 1, exit 30 | A guest that fails to encode its state still answers `state`, with its error text (`inspect failed: ...`) as the report, so a decode error here may mean the guest's encoder failed: query the machine's `state` and read the report. |
+| A transaction escaped the flush, or the old instance runs | Setup's escape check, exit 40 | Stop the old instance, discard the directory, run setup again. |
+| The RPC node lags the base, so the base lies past the stop block | Setup's export check, exit 30 | Let the node catch up, discard the directory, run setup again. |
+| The base's export disagrees with L1 | Setup's export check, exit 30 | Recover from a trusted machine; if this one is canonical, its scheduler drained wrongly. |
+| A failure after writes began, retryable or not | Setup's exit code, then exit 30 on any retry in place | Discard the directory and run setup again. |
+| The application fails on a rebuilt transaction | Setup stops naming the input index, the position and the transaction, exit 30 | Replay a trusted machine to that input: if it halts there too, the application is dead; if not, fix the native engine or its projection. |
+| The base machine is not canonical | The new era's first watchdog comparison | Recover from a trusted machine. |
+| The base is newer than a client's state | The client's `BelowBase`, or `HISTORY_UNAVAILABLE` on subscribe | Recover again from an older machine. |
+| A client's state holds rows that never landed | The client's `PastRebuiltEnd` | The client restores an older state. |
+| A client's state is wrong below its count | Only the client's own checks, such as the row comparison | The client restores an older state. |
 
 ## Code map
 
-| Responsibility | Code |
+| Concern | Code and tests |
 |---|---|
-| Load, flush, sync, fold | [`commands/setup/mod.rs`](../../sequencer/src/commands/setup/mod.rs) |
-| Durable baseline artifact | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs) |
-| Atomic baseline completion | [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs) |
-| Scheduler fold | [`scheduler/fold.rs`](../../sequencer-core/src/scheduler/fold.rs) |
-| Accepted-prefix boundary | [`storage/safe_accepted_batches.rs`](../../sequencer/src/storage/safe_accepted_batches.rs) |
+| Arguments and the key | [`commands/config.rs`](../../sequencer/src/commands/config.rs) `SetupConfig`; its `setup_*` tests. |
+| The procedure, the empty-directory rule, the dry run and the escape check | [`commands/setup/mod.rs`](../../sequencer/src/commands/setup/mod.rs); [`chain_tests.rs`](../../sequencer/src/commands/setup/chain_tests.rs) runs setup against Anvil on a chain with history and compares it with `CanonicalRunner`. |
+| The base, and the seam tests use instead of an emulator | [`commands/setup/base.rs`](../../sequencer/src/commands/setup/base.rs) `ReadMachineExport`; [`machine.rs`](../../sequencer/src/machine.rs) `read_machine_export`, whose unit tests drive every failure arm through a scripted emulator, and `canonical-test`'s `export` cases run on the built image. |
+| Export check, and the rebuild executing as it goes | [`commands/setup/rebuild.rs`](../../sequencer/src/commands/setup/rebuild.rs); `Scheduler::resume` in [`sequencer-core`](../../sequencer-core/src/scheduler/mod.rs); `admitted_directs_in` in [`storage/l1_inputs.rs`](../../sequencer/src/storage/l1_inputs.rs) for the closing direct count. |
+| Publication | [`commands/setup/fill.rs`](../../sequencer/src/commands/setup/fill.rs); `publish_era` in [`storage/lifecycle.rs`](../../sequencer/src/storage/lifecycle.rs). |
+| The rebuilt history table and the `era` row | [`storage/rebuilt_history.rs`](../../sequencer/src/storage/rebuilt_history.rs), [`storage/history.rs`](../../sequencer/src/storage/history.rs) (`Era`, `NewEra`, `era_in`), and their triggers in [`0001_schema.sql`](../../sequencer/src/storage/migrations/0001_schema.sql). |
+| The root frame's drain from the first queued input | `next_undrained_safe_input_index_in` in [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs). |
+| The baseline as the first comparison checkpoint | `finalized_dump_in` in [`storage/snapshots.rs`](../../sequencer/src/storage/snapshots.rs). |
+| The feed across the rebuilt and live rows | [`storage/history/canonical.rs`](../../sequencer/src/storage/history/canonical.rs). |
+| Adoption | `HistoryInfo::adopt_claim` in [`history_api.rs`](../../sequencer-core/src/history_api.rs); `adopt_current_era` in [`sdk/rust-client`](../../sdk/rust-client/src/history.rs). |
+| The flush | [`l1/flusher.rs`](../../sequencer/src/l1/flusher.rs) `flush_to_safe`. |
+| End to end on the devnet | [`tests/e2e/src/recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs): the round trips from genesis and from a stored machine, and setup's refusal of a set-up directory, each for the Rust and C hosts ([drills](../watchdog/incident-runbook.md#drills)). |

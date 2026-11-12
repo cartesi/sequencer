@@ -3,7 +3,7 @@
 
 //! Operator commands. Each child is one bracket: take the process lock, preflight
 //! the admission facts, run the body, and best-effort record a terminal cause.
-//! Mechanisms live in `crate::recovery` and `crate::runtime`; this module holds
+//! Mechanisms live in `crate::landing` and `crate::runtime`; this module holds
 //! the helpers shared by brackets, and [`crate::harness`] dispatches them.
 
 pub mod config;
@@ -12,9 +12,7 @@ pub mod flush;
 pub mod run;
 pub mod setup;
 
-pub use error::{
-    BootstrapError, CommandError, IdentityError, SetupRecoveryError, SetupRefuse, WorkerExit,
-};
+pub use error::{BootstrapError, CommandError, IdentityError, SetupError, SetupRefuse, WorkerExit};
 
 use std::time::Duration;
 
@@ -82,13 +80,28 @@ fn preflight_lifecycle_command(
 /// still carry it. Failures raised before a command's bracket (the
 /// admission preflight, identity, the key file) return before this write
 /// and leave only the exit code and logs.
+///
+/// The black box keeps causes that would otherwise be lost. A terminal fact,
+/// a recorded divergence or a void history, is never lost: the database holds
+/// it and every `run` states it, so it is not copied, wherever the command
+/// met it.
 pub(crate) fn record_terminal_fault_best_effort(
     db_path: &str,
     command: LifecycleCommand,
     result: &Result<(), CommandError>,
 ) {
-    let Err(error) = result else { return };
-    if !error.failure_verdict().is_terminal() {
+    if let Err(error) = result {
+        record_terminal_error_best_effort(db_path, command, error);
+    }
+}
+
+/// [`record_terminal_fault_best_effort`] for an error the caller still owns.
+pub(crate) fn record_terminal_error_best_effort(
+    db_path: &str,
+    command: LifecycleCommand,
+    error: &CommandError,
+) {
+    if !error.failure_verdict().is_terminal() || error.is_terminal_fact() {
         return;
     }
     let cause = error.to_string();
@@ -108,14 +121,6 @@ pub(crate) fn record_terminal_fault_best_effort(
     }
 }
 
-/// A setup that completed after a fault proves the fault resolved; any fault
-/// at or after the last completion is still news. The order is by wall clock,
-/// so a backward step larger than the gap between completion and a later
-/// fault demotes that fault to debug; the black box keeps it either way.
-fn fault_is_news(fault: &storage::TerminalFault, setup_completed_at_ms: Option<u64>) -> bool {
-    setup_completed_at_ms.is_none_or(|completed| fault.recorded_at_ms >= completed)
-}
-
 /// Verdict-neutral startup read of the black box: if a previous command on
 /// this data directory died terminal, say so once at boot, so the cause is in
 /// this process's log even when the last process's final lines were lost.
@@ -124,39 +129,26 @@ fn fault_is_news(fault: &storage::TerminalFault, setup_completed_at_ms: Option<u
 /// a controller panic, SIGKILL) left no row, so there is nothing to report. It runs
 /// ahead of the admission preflight so that a
 /// boot the preflight refuses still logs why the last one died; a data
-/// directory with no database yet is the ordinary case, not a warning. A
-/// fault recorded before the last completed setup was resolved by it and
-/// logs at debug.
+/// directory with no database yet is the ordinary case, not a warning. Every
+/// row in a set-up database was recorded after its setup completed, since
+/// setup runs once, in an empty directory, so the latest row is always news.
 pub(crate) fn warn_on_previous_terminal_fault(db_path: &str) {
     let read = storage::Storage::open_read_only(db_path)
         .map_err(|open_error| open_error.to_string())
         .and_then(|storage| {
-            let fault = storage
+            storage
                 .latest_terminal_fault()
-                .map_err(|read_error| read_error.to_string())?;
-            // An unreadable completion fact keeps the warning.
-            let setup_completed_at_ms = storage.setup_completed_at_ms().ok().flatten();
-            Ok((fault, setup_completed_at_ms))
+                .map_err(|read_error| read_error.to_string())
         });
     match read {
-        Ok((Some(fault), setup_completed_at_ms))
-            if fault_is_news(&fault, setup_completed_at_ms) =>
-        {
-            tracing::warn!(
-                command = %fault.command,
-                cause = %fault.cause,
-                recorded_at_ms = fault.recorded_at_ms,
-                age_secs = crate::clock::unix_now_ms().saturating_sub(fault.recorded_at_ms) / 1000,
-                "a previous command on this data directory ended in a terminal fault"
-            )
-        }
-        Ok((Some(fault), _)) => tracing::debug!(
+        Ok(Some(fault)) => tracing::warn!(
             command = %fault.command,
             cause = %fault.cause,
             recorded_at_ms = fault.recorded_at_ms,
-            "latest terminal fault predates the completed setup, which resolved it"
+            age_secs = crate::clock::unix_now_ms().saturating_sub(fault.recorded_at_ms) / 1000,
+            "a previous command on this data directory ended in a terminal fault"
         ),
-        Ok((None, _)) => {}
+        Ok(None) => {}
         Err(error) => tracing::debug!(
             error = %error,
             "no readable black box at startup (fresh data directory, or the \
@@ -183,7 +175,7 @@ pub(crate) fn batch_submitter_address_from_private_key(
 }
 
 /// Gate `run`/`flush` on a completed `setup` and return the pinned identity.
-/// A missing completion fact — or a completion fact without an identity (a
+/// A missing era — or an era without an identity (a
 /// corrupt/incomplete setup) — is a terminal `SetupNotComplete`: the operator must
 /// (re-)run `setup`, not retry `run`.
 pub(crate) fn load_setup_identity(data_dir: &str) -> Result<DeploymentIdentity, CommandError> {
@@ -244,21 +236,6 @@ pub(crate) async fn validate_rpc_chain_id(
     }
 }
 
-pub(crate) fn ensure_deployment_identity(
-    db_path: &str,
-    expected: DeploymentIdentity,
-) -> Result<(), CommandError> {
-    let mut storage = storage::Storage::open(db_path)?;
-    if let Some(stored) = storage.deployment_identity()? {
-        return require_deployment_identity_match(stored, expected);
-    }
-    if storage.has_persisted_deployment_state()? {
-        return Err(IdentityError::OrphanedState.into());
-    }
-    let stored = storage.load_or_insert_deployment_identity(expected)?;
-    require_deployment_identity_match(stored, expected)
-}
-
 fn require_deployment_identity_match(
     stored: DeploymentIdentity,
     expected: DeploymentIdentity,
@@ -295,6 +272,25 @@ pub(crate) fn verify_submitter_key(
     Ok(key)
 }
 
+/// `run`'s check that the binary's scheduler limits are the ones `setup`
+/// pinned. Storage classifies directs by the pinned cap while the lane's
+/// application executes under the binary's, and acceptance is judged by the
+/// staleness window. A different value is an identity mismatch, so a new
+/// limit needs a new `setup`.
+pub(crate) fn require_pinned_scheduler_limits(
+    identity: &DeploymentIdentity,
+    binary: sequencer_core::application::SchedulerLimits,
+) -> Result<(), CommandError> {
+    require_deployment_identity_match(
+        *identity,
+        DeploymentIdentity {
+            max_direct_payload_bytes: binary.max_direct_payload_bytes,
+            max_wait_blocks: binary.max_wait_blocks,
+            ..*identity
+        },
+    )
+}
+
 fn deployment_identity_mismatch_fields(
     stored: DeploymentIdentity,
     expected: DeploymentIdentity,
@@ -315,6 +311,12 @@ fn deployment_identity_mismatch_fields(
     if stored.batch_submitter_address != expected.batch_submitter_address {
         fields.push("batch_submitter_address");
     }
+    if stored.max_direct_payload_bytes != expected.max_direct_payload_bytes {
+        fields.push("max_direct_payload_bytes");
+    }
+    if stored.max_wait_blocks != expected.max_wait_blocks {
+        fields.push("max_wait_blocks");
+    }
     if stored.fee_oracle != expected.fee_oracle {
         fields.push("fee_oracle");
     }
@@ -325,21 +327,16 @@ fn deployment_identity_mismatch_fields(
 mod tests {
     use super::{
         BootstrapError, CommandError, IdentityError, batch_submitter_address_from_private_key,
-        deployment_identity_mismatch_fields, ensure_deployment_identity,
-        preflight_lifecycle_command, require_data_dir, require_deployment_identity_match,
+        deployment_identity_mismatch_fields, preflight_lifecycle_command, require_data_dir,
+        require_deployment_identity_match, require_pinned_scheduler_limits,
     };
-    use crate::recovery::{RecoveryError, RecoveryRetryReason};
-    use crate::storage::test_helpers::{SENDER_A, default_protocol_timing};
     use crate::storage::{DeploymentIdentity, LifecycleCommand, Storage};
     use crate::test_support::temp_db;
     use alloy_primitives::Address;
-    use sequencer_core::protocol::ProtocolTimingError;
 
-    // Margin/stale-boundary validation is exercised directly in
-    // `sequencer-core/src/protocol.rs`. The runtime tests below only cover
-    // the typed `From` conversions into `CommandError` and the bootstrap-time
-    // identity guards. Worker `From<JoinResult>` conversions live in
-    // `run::workers`.
+    // The runtime tests below cover the typed `From` conversions into
+    // `CommandError` and the bootstrap-time identity guards. Worker
+    // `From<JoinResult>` conversions live in `run::workers`.
 
     #[test]
     fn previous_terminal_fault_read_is_verdict_neutral() {
@@ -365,7 +362,9 @@ mod tests {
     #[test]
     fn settlement_write_records_terminal_verdicts_only() {
         use super::record_terminal_fault_best_effort;
-        use crate::storage::LifecycleCommand;
+        use crate::storage::{
+            Divergence, LandingLag, LifecycleCommand, LifecycleError, TerminalFact,
+        };
 
         let db = temp_db("settlement-write");
         let storage =
@@ -386,8 +385,37 @@ mod tests {
             None
         );
 
-        // A terminal startup verdict lands as one row carrying the error's
-        // Display form. Runtime faults abort before settlement.
+        // A terminal fact is terminal and leaves the black box empty too: the
+        // database holds the fact itself.
+        let facts = [
+            CommandError::from(TerminalFact::VoidHistory {
+                lag: LandingLag {
+                    batch_nonce: 3,
+                    first_frame_safe_block: 10,
+                    safe_block: 1209,
+                },
+                max_wait_blocks: 1200,
+            }),
+            CommandError::from(TerminalFact::Divergence(Divergence {
+                nonce: 0,
+                safe_input_index: 4,
+            })),
+            CommandError::Lifecycle(LifecycleError::CanonicalDivergence { nonce: 0 }),
+        ];
+        for fact in facts {
+            assert_eq!(fact.exit_code(), crate::commands::error::EXIT_TERMINAL);
+            record_terminal_fault_best_effort(&db.path, LifecycleCommand::Run, &Err(fact));
+            assert_eq!(
+                Storage::open_read_only(&db.path)
+                    .expect("reopen")
+                    .latest_terminal_fault()
+                    .expect("read"),
+                None
+            );
+        }
+
+        // Any other terminal startup verdict lands as one row carrying the
+        // error's Display form. Runtime faults abort before settlement.
         let error = CommandError::Storage(rusqlite::Error::InvalidQuery);
         let expected_cause = error.to_string();
         let terminal = Err(error);
@@ -402,24 +430,20 @@ mod tests {
     }
 
     #[test]
-    fn invalid_protocol_config_propagates_through_run_error() {
-        let err: CommandError = ProtocolTimingError::MarginNotLessThanMaxWait {
-            margin: sequencer_core::MAX_WAIT_BLOCKS,
-            max_wait: sequencer_core::MAX_WAIT_BLOCKS,
-        }
-        .into();
+    fn startup_terminal_fact_propagates_as_a_bootstrap_refusal() {
+        use crate::storage::{LandingLag, TerminalFact};
+        let fact = TerminalFact::VoidHistory {
+            lag: LandingLag {
+                batch_nonce: 0,
+                first_frame_safe_block: 0,
+                safe_block: 1199,
+            },
+            max_wait_blocks: 1200,
+        };
+        let err: CommandError = fact.into();
         assert!(matches!(
             err,
-            CommandError::Bootstrap(BootstrapError::InvalidProtocolTiming(_))
-        ));
-    }
-
-    #[test]
-    fn startup_recovery_error_preserves_recovery_category() {
-        let err: CommandError = RecoveryError::retry(RecoveryRetryReason::L1ViewStale).into();
-        assert!(matches!(
-            err,
-            CommandError::Bootstrap(BootstrapError::Recovery(RecoveryError::Retry(_)))
+            CommandError::Bootstrap(BootstrapError::TerminalFact(inner)) if inner == fact
         ));
     }
 
@@ -430,7 +454,47 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: Address::repeat_byte(0x33),
+            max_direct_payload_bytes: 1024,
+            max_wait_blocks: 1200,
             fee_oracle: crate::storage::FeeOracleIdentity::Fixed { log_gas_price: 0 },
+        }
+    }
+
+    #[test]
+    fn run_refuses_scheduler_limits_other_than_the_pinned_ones() {
+        use sequencer_core::application::SchedulerLimits;
+        let pinned = identity();
+        // The fridge bound is not pinned: only setup's rebuild reads it.
+        let binary = SchedulerLimits {
+            max_wait_blocks: 1200,
+            fridge_bound: 7,
+            max_direct_payload_bytes: 1024,
+        };
+        require_pinned_scheduler_limits(&pinned, binary).expect("the pinned limits match");
+        for (changed, field) in [
+            (
+                SchedulerLimits {
+                    max_direct_payload_bytes: 2048,
+                    ..binary
+                },
+                "max_direct_payload_bytes",
+            ),
+            (
+                SchedulerLimits {
+                    max_wait_blocks: 7200,
+                    ..binary
+                },
+                "max_wait_blocks",
+            ),
+        ] {
+            let err = require_pinned_scheduler_limits(&pinned, changed)
+                .expect_err("a different limit refuses startup");
+            assert_eq!(err.exit_code(), crate::commands::error::EXIT_TERMINAL);
+            assert!(matches!(
+                err,
+                CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
+                    if fields == field
+            ));
         }
     }
 
@@ -460,24 +524,6 @@ mod tests {
             err,
             CommandError::Bootstrap(BootstrapError::Identity(IdentityError::Mismatch { fields, .. }))
                 if fields == "chain_id, app_address, batch_submitter_address"
-        ));
-    }
-
-    #[test]
-    fn deployment_identity_refuses_non_empty_unpinned_db() {
-        let db = temp_db("runtime-unpinned-deployment-state");
-        {
-            let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-            storage
-                .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
-                .expect("seed deployment-bound state");
-        }
-
-        let err = ensure_deployment_identity(db.path.as_str(), identity())
-            .expect_err("non-empty unpinned DB must refuse");
-        assert!(matches!(
-            err,
-            CommandError::Bootstrap(BootstrapError::Identity(IdentityError::OrphanedState))
         ));
     }
 
@@ -541,18 +587,5 @@ mod tests {
 
         assert!(matches!(err, CommandError::Io(_)), "{err:?}");
         assert!(err.to_string().contains(&db_path), "{err}");
-    }
-
-    #[test]
-    fn fault_is_news_only_at_or_after_the_last_completed_setup() {
-        let fault = crate::storage::TerminalFault {
-            command: LifecycleCommand::Setup,
-            cause: "prior terminal death".to_string(),
-            recorded_at_ms: 100,
-        };
-        assert!(super::fault_is_news(&fault, None));
-        assert!(!super::fault_is_news(&fault, Some(200)));
-        assert!(super::fault_is_news(&fault, Some(100)));
-        assert!(super::fault_is_news(&fault, Some(50)));
     }
 }

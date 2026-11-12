@@ -117,6 +117,11 @@ clippy:
 
 verify: fmt-check check test clippy
 
+# Setup refuses a directory that holds anything, hence the rm. The rest of the
+# configuration (RPC, chain id, addresses, submitter key) comes from the
+# CARTESI_SEQUENCER_* variables.
+# Set up a new data directory from genesis, then run.
 run addr="127.0.0.1:3000" data_dir="sequencer-data":
     rm -rf {{data_dir}}
-    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release
+    CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release -- setup
+    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release -- run

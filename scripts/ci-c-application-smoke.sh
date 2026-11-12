@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Link an external engine into the generic host and an independent Cargo consumer.
+# Both link the emulator through the LIBCARTESI_PATH / INCLUDECARTESI_PATH that the
+# dev shell or CI's install-cartesi-machine action exports; the offline consumer
+# build finds the emulator bindings' git checkout in the Cargo home the workspace
+# build filled.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

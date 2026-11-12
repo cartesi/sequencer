@@ -1,8 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Startup clears stale leases, checks rollback checkpoint metadata, then collects
-//! obsolete snapshots and orphan directories before workers are admitted.
+//! Startup checks the accepted checkpoint's metadata, then collects obsolete
+//! snapshots and orphan directories before the listeners are bound or the
+//! workers launched.
 
 use std::os::unix::fs::MetadataExt;
 
@@ -10,14 +11,15 @@ use crate::commands::error::CommandError;
 use crate::ingress::inclusion_lane::dump_info::{self, delete_dump_dir};
 
 /// Repair interrupted artifact creation/collection before starting workers.
+/// Nothing serves yet, so `leases` is empty.
 pub(super) fn run_snapshot_hygiene(
     storage: &mut crate::storage::Storage,
+    leases: &crate::storage::SnapshotLeases,
     data_dir: &str,
     dumps_dir: &std::path::Path,
 ) -> Result<(), CommandError> {
-    storage.reset_dump_leases()?;
-    require_rollback_snapshot(storage, data_dir)?;
-    let gc_removed = snapshot_gc_at_startup(storage)?;
+    require_accepted_snapshot(storage, data_dir)?;
+    let gc_removed = snapshot_gc_at_startup(storage, leases)?;
     let sweep_removed = sweep_orphan_dumps(storage, dumps_dir)?;
     tracing::debug!(
         gc_removed,
@@ -27,18 +29,18 @@ pub(super) fn run_snapshot_hygiene(
     Ok(())
 }
 
-fn require_rollback_snapshot(
+fn require_accepted_snapshot(
     storage: &mut crate::storage::Storage,
     data_dir: &str,
 ) -> Result<(), CommandError> {
-    let snapshot = storage.rollback_snapshot()?.ok_or_else(|| {
+    let snapshot = storage.accepted_snapshot()?.ok_or_else(|| {
         CommandError::Bootstrap(crate::commands::error::BootstrapError::SetupNotComplete {
             data_dir: data_dir.to_string(),
         })
     })?;
-    dump_info::read_info(&snapshot.dump.prefix).map_err(|source| {
+    dump_info::read_info(&snapshot.prefix).map_err(|source| {
         CommandError::ReferencedSnapshotArtifact {
-            path: snapshot.dump.prefix,
+            path: snapshot.prefix,
             source,
         }
     })?;
@@ -46,13 +48,16 @@ fn require_rollback_snapshot(
 }
 
 /// Delete obsolete rows before their files; the sweep retries leftover files.
-fn snapshot_gc_at_startup(storage: &mut crate::storage::Storage) -> Result<usize, CommandError> {
-    let removed = storage.gc_unreferenced_dumps()?;
-    for row in &removed {
-        if let Err(err) = delete_dump_dir(&row.prefix) {
+fn snapshot_gc_at_startup(
+    storage: &mut crate::storage::Storage,
+    leases: &crate::storage::SnapshotLeases,
+) -> Result<usize, CommandError> {
+    let removed = storage.collect_snapshots(leases)?;
+    for prefix in &removed {
+        if let Err(err) = delete_dump_dir(prefix) {
             tracing::warn!(
                 error = %err,
-                prefix = ?row.prefix,
+                ?prefix,
                 "startup GC: filesystem delete failed; orphan left for sweep",
             );
         }
@@ -60,8 +65,8 @@ fn snapshot_gc_at_startup(storage: &mut crate::storage::Storage) -> Result<usize
     Ok(removed.len())
 }
 
-/// Walk `dumps_dir` and delete any dump directory that isn't in
-/// `Storage::list_dump_rows`. Catches:
+/// Walk `dumps_dir` and delete any dump directory that no snapshot row
+/// references (`Storage::list_snapshots`). Catches:
 ///
 /// - **crash-during-create**: a dump dir exists on disk (possibly
 ///   without its app subtree or `info.toml`) but no SQLite row was
@@ -78,12 +83,14 @@ fn sweep_orphan_dumps(
     dumps_dir: &std::path::Path,
 ) -> Result<usize, CommandError> {
     let known = storage
-        .list_dump_rows()?
+        .list_snapshots()?
         .into_iter()
-        .map(|row| {
-            dump_identity(&row.prefix).map_err(|source| CommandError::ReferencedSnapshotArtifact {
-                path: row.prefix,
-                source,
+        .map(|snapshot| {
+            dump_identity(&snapshot.prefix).map_err(|source| {
+                CommandError::ReferencedSnapshotArtifact {
+                    path: snapshot.prefix,
+                    source,
+                }
             })
         })
         .collect::<Result<std::collections::HashSet<_>, _>>()?;
@@ -133,6 +140,9 @@ fn dump_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::storage::Storage;
+    use crate::storage::test_helpers::{
+        SENDER_A, seed_safe_inputs_with_batch_nonces, set_up_storage,
+    };
     use crate::test_support::create_structured_dump;
     use crate::test_support::temp_db;
 
@@ -143,10 +153,10 @@ mod tests {
         let root = tempfile::tempdir().expect("snapshot parent");
         let missing = root.path().join("missing");
         storage
-            .insert_baseline_snapshot(&missing, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&missing, crate::storage::L2TxCount::ZERO)
             .expect("register missing fixture");
 
-        let err = require_rollback_snapshot(&mut storage, "/data")
+        let err = require_accepted_snapshot(&mut storage, "/data")
             .expect_err("a durable DB reference cannot point at a missing artifact");
 
         assert!(matches!(
@@ -166,10 +176,10 @@ mod tests {
         std::fs::write(corrupt.join("info.toml"), "not = valid = toml")
             .expect("write corrupt metadata");
         storage
-            .insert_baseline_snapshot(&corrupt, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&corrupt, crate::storage::L2TxCount::ZERO)
             .expect("register corrupt fixture");
 
-        let err = require_rollback_snapshot(&mut storage, "/data")
+        let err = require_accepted_snapshot(&mut storage, "/data")
             .expect_err("corrupt durable metadata cannot be retried as operational I/O");
 
         assert!(matches!(
@@ -189,7 +199,7 @@ mod tests {
         let tracked = dumps_dir.path().join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .expect("register tracked");
 
         // Two orphans (NOT in SQLite). One is fully formed; the other
@@ -244,19 +254,14 @@ mod tests {
             storage
                 .insert_baseline_snapshot(
                     &stored_dir.join("tracked"),
-                    crate::storage::ExecutedInputCount::ZERO,
+                    crate::storage::L2TxCount::ZERO,
                 )
                 .unwrap();
             // A literal match must not hide the other row's aliased spelling.
             let literal_match = sweep_dir.join("literal-match");
             create_structured_dump(&literal_match);
             storage
-                .write(|tx| {
-                    tx.execute(
-                        "INSERT INTO dumps(prefix) VALUES (?1)",
-                        [literal_match.to_str().unwrap()],
-                    )
-                })
+                .insert_closed_batch_snapshot(&literal_match)
                 .unwrap();
             let orphan = absolute.join("orphan");
             create_structured_dump(&orphan);
@@ -270,7 +275,7 @@ mod tests {
             assert!(tracked.join("info.toml").is_file(), "{spelling}");
             assert!(literal_match.join("info.toml").is_file(), "{spelling}");
             assert!(!orphan.exists(), "{spelling}");
-            assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+            assert_eq!(storage.list_snapshots().unwrap().len(), 2);
         }
     }
 
@@ -295,7 +300,7 @@ mod tests {
                 tracked.clone()
             };
             storage
-                .insert_baseline_snapshot(&stored, crate::storage::ExecutedInputCount::ZERO)
+                .insert_baseline_snapshot(&stored, crate::storage::L2TxCount::ZERO)
                 .unwrap();
             let orphan = dumps.join("orphan");
             create_structured_dump(&orphan);
@@ -327,7 +332,7 @@ mod tests {
         let tracked = dumps.join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .unwrap();
 
         // This alias survives realpath resolution, unlike an ordinary symlink.
@@ -347,12 +352,7 @@ mod tests {
         let literal_match = alias.join("literal-match");
         create_structured_dump(&literal_match);
         storage
-            .write(|tx| {
-                tx.execute(
-                    "INSERT INTO dumps(prefix) VALUES (?1)",
-                    [literal_match.to_str().unwrap()],
-                )
-            })
+            .insert_closed_batch_snapshot(&literal_match)
             .unwrap();
         let orphan = dumps.join("orphan");
         create_structured_dump(&orphan);
@@ -366,7 +366,7 @@ mod tests {
         assert!(literal_match.join("info.toml").is_file());
         assert!(!orphan.exists());
         assert_eq!(removed, 1);
-        assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+        assert_eq!(storage.list_snapshots().unwrap().len(), 2);
     }
 
     #[test]
@@ -379,18 +379,11 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 &dumps.path().join(".").join("tracked"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .unwrap();
         let missing = dumps.path().join("missing");
-        storage
-            .write(|tx| {
-                tx.execute(
-                    "INSERT INTO dumps(prefix) VALUES (?1)",
-                    [missing.to_str().unwrap()],
-                )
-            })
-            .unwrap();
+        storage.insert_closed_batch_snapshot(&missing).unwrap();
         let orphan = dumps.path().join("orphan");
         create_structured_dump(&orphan);
 
@@ -407,7 +400,7 @@ mod tests {
             orphan.join("info.toml").is_file(),
             "resolution precedes deletion"
         );
-        assert_eq!(storage.list_dump_rows().unwrap().len(), 2);
+        assert_eq!(storage.list_snapshots().unwrap().len(), 2);
     }
 
     #[test]
@@ -458,7 +451,7 @@ mod tests {
         let tracked = dumps.join("tracked");
         create_structured_dump(&tracked);
         storage
-            .insert_baseline_snapshot(&tracked, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&tracked, crate::storage::L2TxCount::ZERO)
             .unwrap();
         let outside = root.path().join("outside");
         create_structured_dump(&outside);
@@ -480,72 +473,28 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(remaining, vec![std::ffi::OsString::from("tracked")]);
-        assert_eq!(storage.list_dump_rows().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn startup_resets_persisted_crash_leases_before_collecting_artifacts() {
-        let db = temp_db("startup-crash-leases");
-        let mut storage = Storage::open(&db.path).unwrap();
-        let dumps = tempfile::tempdir().unwrap();
-        let baseline = dumps.path().join("baseline");
-        create_structured_dump(&baseline);
-        let baseline_id = storage
-            .insert_baseline_snapshot(&baseline, crate::storage::ExecutedInputCount::ZERO)
-            .unwrap();
-        let obsolete = dumps.path().join("obsolete");
-        create_structured_dump(&obsolete);
-        let obsolete_id = storage
-            .write(|tx| {
-                tx.execute(
-                    "UPDATE dumps SET lease_count = 1 WHERE id = ?1",
-                    [baseline_id],
-                )?;
-                tx.execute(
-                    "INSERT INTO dumps(prefix, lease_count) VALUES (?1, 1)",
-                    [obsolete.to_str().unwrap()],
-                )?;
-                Ok(tx.last_insert_rowid())
-            })
-            .unwrap();
-        drop(storage);
-
-        let mut storage = Storage::open(&db.path).unwrap();
-        assert_eq!(storage.dump_lease_count(obsolete_id).unwrap(), Some(1));
-        assert!(storage.gc_unreferenced_dumps().unwrap().is_empty());
-        assert!(obsolete.exists(), "the persisted lease blocks ordinary GC");
-
-        run_snapshot_hygiene(&mut storage, "/data", dumps.path()).unwrap();
-
-        assert_eq!(storage.dump_lease_count(baseline_id).unwrap(), Some(0));
-        assert_eq!(storage.dump_lease_count(obsolete_id).unwrap(), None);
-        assert!(
-            baseline.exists(),
-            "the rollback baseline survives startup GC"
-        );
-        assert!(
-            !obsolete.exists(),
-            "startup collects the abandoned leased artifact"
-        );
+        assert_eq!(storage.list_snapshots().unwrap().len(), 1);
     }
 
     #[test]
     fn snapshot_gc_at_startup_removes_unreferenced_rows() {
         let db = temp_db("gc-startup");
-        let mut storage = Storage::open(db.path.as_str()).unwrap();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let dumps_dir = tempfile::tempdir().unwrap();
         let orphan = dumps_dir.path().join("orphan");
         create_structured_dump(&orphan);
-        storage
-            .write(|tx| {
-                tx.execute(
-                    "INSERT INTO dumps(prefix) VALUES (?1)",
-                    [orphan.to_str().unwrap()],
-                )
-            })
-            .unwrap();
-        let removed = snapshot_gc_at_startup(&mut storage).unwrap();
-        assert_eq!(removed, 1);
+        let accepted = dumps_dir.path().join("accepted");
+        create_structured_dump(&accepted);
+        storage.insert_closed_batch_snapshot(&orphan).unwrap();
+        storage.insert_closed_batch_snapshot(&accepted).unwrap();
+        // With both batches accepted, the second's snapshot is the accepted
+        // checkpoint; the baseline and the first batch's are collectible.
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0, 1]);
+        let removed =
+            snapshot_gc_at_startup(&mut storage, &crate::storage::SnapshotLeases::default())
+                .unwrap();
+        assert_eq!(removed, 2);
         assert!(!orphan.exists());
+        assert!(accepted.join("info.toml").is_file());
     }
 }

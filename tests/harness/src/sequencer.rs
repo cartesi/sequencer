@@ -1,14 +1,16 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
+use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolEvent;
 use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
 use sequencer_rust_client::SequencerClient;
@@ -20,32 +22,51 @@ use crate::default_private_keys;
 use crate::paths;
 use crate::rollups::{DEVNET_CHAIN_ID, DEVNET_SECONDS_PER_BLOCK, DevnetRollupsStack};
 use crate::util::{
-    build_local_endpoint, io_other, path_as_str, send_graceful_terminate, timestamped_log_path,
-    wait_for_http_readiness,
+    Readiness, build_local_endpoint, io_other, path_as_str, send_graceful_terminate,
+    timestamped_log_path, wait_for_http_readiness,
 };
 use crate::wallet::{TestSigner, WalletL1Client, WalletL2Client};
 use crate::ws::WsClient;
 
+/// A path under the data directory, with a file's length and keccak256, or
+/// `None` for a directory.
+pub type DataDirEntry = (String, Option<(u64, B256)>);
+
 const DEFAULT_SEQUENCER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-/// Cadence at which the harness mines an L1 block during a recovery boot's
-/// readiness wait when [`ManagedSequencer::set_mine_l1_during_boot`] is on.
-/// One block per wall-clock second keeps the ordinary live-chain timestamp
-/// coupled while still advancing Anvil's `safe` tag well within the recovery
-/// readiness window.
-const BOOT_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
-/// Readiness budget for a *recovery* boot (mining-during-boot enabled). The startup
-/// mempool flush polls `get_transaction_count(Safe)` once per L1 block time
-/// (`safe_poll_interval = seconds_per_block`, 12 s here), so it cannot resolve
-/// the stranded slot in under one poll cycle — well past the 10 s normal-boot
-/// budget. Allow several cycles of slack so a recovery boot has room to flush,
-/// cascade, and come up. Recovery boots are legitimately slow (exit-code class
-/// 10: restart and expect recovery); this is the harness counterpart to that.
-const RECOVERY_BOOT_START_TIMEOUT: Duration = Duration::from_secs(45);
+/// Cadence at which the harness mines an L1 block while a setup runs when
+/// [`ManagedSequencer::set_mine_l1_during_setup`] is on. One block per
+/// wall-clock second keeps the live-chain timestamp coupled while still
+/// advancing Anvil's `safe` tag well within [`FLUSHING_SETUP_TIMEOUT`].
+const SETUP_L1_MINE_INTERVAL: Duration = Duration::from_secs(1);
+/// Budget for a setup that flushes stranded transactions: the flush polls
+/// `get_transaction_count(Safe)` once per L1 block time (12 s here), so it
+/// needs several poll cycles of slack.
+const FLUSHING_SETUP_TIMEOUT: Duration = Duration::from_secs(45);
+/// Budget for a setup from genesis: it syncs the chain and rebuilds the
+/// history from its start, which on an aged devnet is hundreds of rows.
+const GENESIS_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for a setup from a stored machine: it loads the machine into the
+/// emulator and answers two inspect queries before it rebuilds the history.
+const BASE_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_SEQUENCER_RUST_LOG: &str = "info";
-/// Passed to `setup` and `run` as `--preemptive-margin-blocks`, so the e2e
-/// zone math owns the value.
-pub const DEVNET_PREEMPTIVE_MARGIN_BLOCKS: u64 = 300;
+/// The data directory's name under the harness's root directory; each
+/// [`ManagedSequencer::discard_data_dir`] moves on to the next numbered one.
+const DATA_DIR_NAME: &str = "data";
+/// Anvil account the batch submitter signs with (NOT the deployer/funder,
+/// account 0). Setup's escape check refuses while the submitter's wallet is
+/// unsettled, so the submitter must not share a key with the deployer or with
+/// an e2e wallet whose transactions are in flight. Must match
+/// `DEVNET_SEQUENCER_ADDRESS` (app-core), which every spawn asserts. Account 9
+/// is the highest standard funded account, clear of the e2e wallets (0-3) and
+/// the bench workload (indices 0..concurrency).
+const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
+/// The exit code of a command that must not be restarted (README "Running"):
+/// among others, every start of `run` while a terminal fact holds.
+pub const EXIT_TERMINAL: i32 = 30;
+/// The signal a running sequencer raises on a terminal runtime fault, a
+/// terminal fact included: it aborts instead of draining.
+const SIGABRT: i32 = 6;
 pub const DEFAULT_DEVNET_SEQUENCER_BIN: &str = "target/debug/wallet-sequencer-devnet";
 pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 
@@ -53,7 +74,8 @@ pub const DEFAULT_TEST_LOGS_DIR: &str = "tests/e2e/results";
 pub struct ManagedSequencerConfig {
     pub sequencer_bin: PathBuf,
     /// Optional genesis tool invoked as `<binary> <absent-prefix> devnet` for
-    /// initial setup. Its output is deleted before `run` and never regenerated.
+    /// each setup without a base, whose `--state-file` it supplies. Its output
+    /// is deleted once setup ends, so `run` never depends on it.
     pub genesis_bin: Option<PathBuf>,
     pub log_prefix: String,
     pub logs_dir: PathBuf,
@@ -70,73 +92,98 @@ pub struct ManagedSequencerConfig {
 pub struct BatchCounts {
     pub total: u64,
     pub sealed: u64,
-    pub invalidated: u64,
 }
 
 /// Highest batch nonce sealed locally and highest accepted on safe L1.
 /// Returned by [`ManagedSequencer::batch_nonce_frontier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchNonceFrontier {
-    /// Highest nonce among valid sealed batches.
+    /// Highest nonce among sealed batches.
     pub sealed: Option<u64>,
-    /// Highest nonce in `safe_accepted_batches`.
+    /// Highest accepted batch nonce (`batches.accepted_input` set).
     pub safe_accepted: Option<u64>,
 }
 
-/// Drive the next respawn's `setup` phase into `--recovery` mode against a
-/// captured checkpoint. Set via [`ManagedSequencer::set_recovery_setup`] before
-/// wiping the DB and respawning.
-#[derive(Debug, Clone)]
-pub struct RecoverySetupParams {
-    /// `B` — the checkpoint's L1 inclusion block (`--checkpoint-block`).
-    pub checkpoint_block: u64,
-    /// The captured checkpoint dump dir (`--checkpoint-dump-dir`).
-    pub checkpoint_dump_dir: PathBuf,
+/// The era a setup published, read from the `era` row. Returned by
+/// [`ManagedSequencer::published_era`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedEra {
+    /// The base's L2 tx count, where the era's history starts.
+    pub base_count: u64,
+    /// The stop block: where the rebuilt history ends.
+    pub stop_block: u64,
+    /// The L2 tx count at the end of the stop block.
+    pub rebuilt_history_end: u64,
+    /// InputBox index of the oldest direct still queued at the stop block,
+    /// or the input count there when none is queued.
+    pub first_queued_input: u64,
+    /// The scheduler's next batch nonce at the stop block (the anchor).
+    pub next_batch_nonce: u64,
 }
 
-/// A checkpoint captured from a running sequencer's finalized snapshot, ready to
-/// drive `setup --recovery`. Returned by
-/// [`ManagedSequencer::capture_finalized_checkpoint`].
-#[derive(Debug, Clone)]
-pub struct RecoveryCheckpoint {
-    /// The copied dump dir (lives outside the DB/`dumps` reset scope, so it
-    /// survives [`ManagedSequencer::reset_database`]).
-    pub dir: PathBuf,
-    /// `B` — the finalized snapshot's L1 inclusion block.
-    pub checkpoint_block: u64,
-    /// `N` — the snapshot's recorded resume nonce (`info.toml next_batch_nonce`).
-    pub resume_nonce: u64,
+/// The rows setup's rebuild stored, and how many carry a count. Only an
+/// executed transaction is stored, with its count, so the two agree.
+/// Returned by [`ManagedSequencer::rebuilt_history_rows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuiltHistoryRows {
+    pub total: u64,
+    pub executed: u64,
 }
 
-/// Outcome of a single [`ManagedSequencer::respawn_and_watch`] attempt.
+/// How a `setup` child ended. Setup prints its summary on stdout; the log
+/// file gets stdout and stderr both.
 #[derive(Debug)]
-pub enum RespawnAttemptOutcome {
-    /// The child came up and stayed alive for the requested stabilization
-    /// window.
-    Stable,
-    /// `respawn()` itself returned `Err` — the child exited during bootstrap
-    /// before HTTP became ready. Typically surfaces
-    /// `RecoveryError::Refuse(...)` from the startup decision table.
-    RespawnFailed(String),
-    /// `respawn()` returned `Ok` but the child exited within the
-    /// stabilization window. Typically surfaces a danger-detector worker
-    /// exit from the first post-boot poll.
-    ExitedPostRespawn(std::process::ExitStatus),
+pub struct SetupOutcome {
+    pub status: ExitStatus,
+    pub stdout: String,
 }
 
-impl RespawnAttemptOutcome {
-    pub fn is_stable(&self) -> bool {
-        matches!(self, Self::Stable)
+impl SetupOutcome {
+    pub fn code(&self) -> Option<i32> {
+        self.status.code()
+    }
+
+    pub fn success(&self) -> bool {
+        self.status.success()
     }
 }
 
-/// Parameters for [`ManagedSequencer::respawn_until_stable`]. See that
-/// method's doc for how `advance_per_retry` interacts with the restart cycle.
-#[derive(Debug, Clone)]
-pub struct RespawnPolicy {
-    pub max_attempts: u32,
-    pub stabilization: Duration,
-    pub advance_per_retry: Option<Duration>,
+/// How a start of `run` ended: it reached readiness, or the process exited
+/// first. Returned by [`ManagedSequencer::try_respawn`].
+#[derive(Debug)]
+pub enum RunStart {
+    Ready,
+    Exited(ExitStatus),
+}
+
+/// Whether a running sequencer stopped on a terminal runtime fault: it
+/// aborts (SIGABRT) instead of draining.
+pub fn is_terminal_abort(status: &ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(SIGABRT)
+}
+
+/// The landing reading `GET /healthz` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub struct LandingHealth {
+    /// `H + 1 - s` for the oldest unaccepted batch: its age at the earliest
+    /// block it can still land in, void at `max_wait_blocks`. `None` when
+    /// every batch is accepted or before the first reading.
+    pub landing_lag_blocks: Option<u64>,
+    pub max_wait_blocks: u64,
+    /// Wall clock minus the safe block's L1 timestamp; `None` before the
+    /// first reading.
+    pub safe_head_age_seconds: Option<u64>,
+}
+
+/// The oldest batch L1 has not accepted, closed or open. Returned by
+/// [`ManagedSequencer::oldest_unaccepted_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnacceptedBatch {
+    pub nonce: u64,
+    /// Its first frame's safe block: the batch is stale on chain once it
+    /// lands this many blocks plus the window later.
+    pub first_frame_safe_block: u64,
 }
 
 /// Which child in the devnet stack exited during [`ManagedSequencer::observe_stack_for`].
@@ -151,10 +198,22 @@ pub struct ManagedSequencer {
     child: Child,
     shutdown_timeout: Duration,
     sequencer_bin: PathBuf,
+    genesis_bin: Option<PathBuf>,
     log_prefix: String,
     logs_dir: PathBuf,
-    _data_dir: TempDir,
+    /// Holds the data directories and the faketime rc file. The data
+    /// directory is a child of it, never the root itself, because setup
+    /// refuses a directory that holds anything.
+    _root_dir: TempDir,
     data_dir_path: PathBuf,
+    /// Data directories discarded so far; names the next one.
+    discarded_data_dirs: u32,
+    /// When `true`, the next [`Self::respawn`] runs `setup` before `run`: the
+    /// data directory is new. Cleared once a setup succeeds there.
+    setup_pending: bool,
+    /// The `--base` machine directory setup starts from; `None` is genesis.
+    /// See [`Self::set_setup_base`].
+    setup_base: Option<PathBuf>,
     endpoint: String,
     internal_endpoint: String,
     log_path: PathBuf,
@@ -173,19 +232,14 @@ pub struct ManagedSequencer {
     /// Path to the file libfaketime re-reads for its offset. `None` when
     /// faketime is disabled.
     faketime_rc_path: Option<PathBuf>,
-    /// Internal cumulative forward-offset tracker for
-    /// [`Self::advance_wall_and_mine`]. Not touched by
-    /// [`Self::set_faketime_offset`].
+    /// The cumulative forward offset [`Self::advance_wall_and_mine`] wrote.
     cumulative_offset_secs: u64,
-    /// When `true`, [`Self::respawn`] mines L1 blocks concurrently with the
-    /// post-boot readiness wait so a recovery boot's mempool flush can make
-    /// progress. See [`Self::set_mine_l1_during_boot`]. Persists across
-    /// respawns like the other overrides.
-    mine_l1_during_boot: bool,
-    /// When `Some`, [`Self::respawn`] runs the `setup` phase in `--recovery`
-    /// mode against this checkpoint (and mines L1 concurrently with setup so
-    /// its flush can settle). See [`Self::set_recovery_setup`].
-    recovery_setup: Option<RecoverySetupParams>,
+    /// When `true`, every setup mines L1 blocks while it runs so its flush
+    /// can make progress. See [`Self::set_mine_l1_during_setup`].
+    mine_l1_during_setup: bool,
+    /// The submitter's balance while [`Self::hold_batch_submissions`] holds
+    /// it at zero; restored by [`Self::release_batch_submissions`].
+    held_submitter_balance: Option<U256>,
     /// When `Some(secs)`, passes `--max-batch-open-seconds` to the `run` phase
     /// so the inclusion lane seals the open batch promptly (the default is 2h).
     /// Used by tests that need a batch to close + be promoted. Persists across
@@ -241,13 +295,14 @@ impl ManagedSequencer {
         let rollups = DevnetRollupsStack::spawn(log_prefix.as_str(), logs_dir.as_path()).await?;
 
         fs::create_dir_all(logs_dir.as_path())?;
-        let data_dir = TempDir::new()
+        let root_dir = TempDir::new()
             .map_err(|err| io_other(format!("failed to create temp data dir: {err}")))?;
-        let data_dir_path = data_dir.path().to_path_buf();
+        // Setup creates the data directory itself.
+        let data_dir_path = root_dir.path().join(DATA_DIR_NAME);
 
         let (libfaketime_path, faketime_rc_path) = if config.faketime {
             let libfaketime_path = find_libfaketime()?;
-            let faketime_rc_path = data_dir_path.join("faketime.rc");
+            let faketime_rc_path = root_dir.path().join("faketime.rc");
             fs::write(faketime_rc_path.as_path(), "+0\n")
                 .map_err(|err| io_other(format!("create faketime rc file: {err}")))?;
             (Some(libfaketime_path), Some(faketime_rc_path))
@@ -255,42 +310,50 @@ impl ManagedSequencer {
             (None, None)
         };
 
+        let child_env = ChildEnv {
+            bin: sequencer_bin.as_path(),
+            data_dir: data_dir_path.as_path(),
+            rollups: &rollups,
+            eth_rpc_url: rollups.l1_endpoint(),
+            faketime: libfaketime_path.as_deref().zip(faketime_rc_path.as_deref()),
+        };
+        let log_path = timestamped_log_path(logs_dir.as_path(), log_prefix.as_str());
+        let setup = SetupRequest {
+            chain_id: DEVNET_CHAIN_ID,
+            base: None,
+            dry_run: false,
+            genesis_bin: genesis_bin.as_deref(),
+            fee_oracle_fixed_log_gas_price: config.fee_oracle_fixed_log_gas_price,
+        };
+        // A first setup from genesis finds a settled wallet, so its flush
+        // never waits on L1.
+        require_setup_success(
+            run_setup_process(&child_env, &setup, &log_path, false).await?,
+            &log_path,
+        )?;
         let SpawnedSequencerProcess {
             child,
             endpoint,
             internal_endpoint,
-            log_path,
-        } = spawn_sequencer_process(
-            sequencer_bin.as_path(),
-            log_prefix.as_str(),
-            logs_dir.as_path(),
-            data_dir_path.as_path(),
-            &rollups,
-            None,
-            None,
-            libfaketime_path.as_deref(),
-            faketime_rc_path.as_deref(),
-            // First boot has no stranded nonce to flush, so it never needs L1
-            // to advance during readiness.
-            false,
-            // First boot is always genesis setup, never recovery.
-            None,
-            // Default batch-open deadline on first boot.
-            None,
-            config.fee_oracle_fixed_log_gas_price,
-            genesis_bin.as_deref(),
-        )
-        .await?;
+        } = require_ready(
+            // The default batch-open deadline on first boot.
+            spawn_run_process(&child_env, &log_path, None).await?,
+            &log_path,
+        )?;
 
         Ok(Self {
             rollups,
             child,
             shutdown_timeout: DEFAULT_SEQUENCER_SHUTDOWN_TIMEOUT,
             sequencer_bin,
+            genesis_bin,
             log_prefix,
             logs_dir,
-            _data_dir: data_dir,
+            _root_dir: root_dir,
             data_dir_path,
+            discarded_data_dirs: 0,
+            setup_pending: false,
+            setup_base: None,
             endpoint,
             internal_endpoint,
             log_path,
@@ -299,8 +362,8 @@ impl ManagedSequencer {
             faketime_rc_path,
             libfaketime_path,
             cumulative_offset_secs: 0,
-            mine_l1_during_boot: false,
-            recovery_setup: None,
+            mine_l1_during_setup: false,
+            held_submitter_balance: None,
             max_batch_open_seconds: None,
             fee_oracle_fixed_log_gas_price: config.fee_oracle_fixed_log_gas_price,
         })
@@ -321,109 +384,108 @@ impl ManagedSequencer {
     ///
     /// Used by chain-id mismatch tests to inject a mismatched chain id and
     /// assert that bootstrap refuses before silently pinning a wrong identity.
-    /// NOTE (post setup/run split): `--chain-id` now flows only to `setup`,
-    /// which is idempotent and early-returns once the `setup_complete` marker
-    /// exists — so the override only takes effect on a fresh or
-    /// [`Self::reset_database`]-d data dir. On an already-set-up DB, `setup`
-    /// is a no-op and `run` validates against the *pinned* chain id, so the
-    /// override is silently inert. Does not affect a running process.
+    /// `--chain-id` flows only to `setup`, which runs only in a new data
+    /// directory ([`Self::discard_data_dir`]); `run` validates against the
+    /// pinned chain id, so on a set-up directory the override is inert. Does
+    /// not affect a running process.
     pub fn set_chain_id_override(&mut self, chain_id: Option<u64>) {
         self.chain_id_override = chain_id;
     }
 
-    /// Make [`Self::respawn`] (this one and subsequent ones, until cleared)
-    /// mine L1 blocks concurrently with the post-boot readiness wait.
-    ///
-    /// Why this exists: a *recovery* boot whose persisted state names a wallet
-    /// nonce that L1 never accepted — e.g. a batch-submission tx was dropped
-    /// from the mempool ([`Self::drop_all_pending_txs`]) — runs the mempool
-    /// flush during startup. The flush submits a no-op at the stranded
-    /// wallet-nonce slot and blocks until that slot becomes *safe*
-    /// (`safe_wallet_nonce >= watermark + 1`, I14). Re-enabling auto-mining is not enough:
-    /// auto-mining lands the no-op tx but mints no *further* blocks, so Anvil's
-    /// `safe` tag never advances past it and the flush waits until the boot
-    /// hits the readiness timeout. In production the chain keeps producing
-    /// blocks throughout a slow recovery boot; an on-demand-mining devnet
-    /// produces none. This makes the harness mine a steady trickle for the
-    /// boot window (dropped the instant readiness is reached), reproducing that
-    /// drift so the flush — and the cascade behind it — can complete on the
-    /// first respawn.
-    ///
-    /// Only the tests that deliberately strand a submitted nonce before a
-    /// recovery respawn need this. Leave it off otherwise: every other boot
-    /// reaches readiness without new blocks, and mining empty blocks during an
-    /// unrelated boot would perturb L1-block-sensitive assertions.
-    pub fn set_mine_l1_during_boot(&mut self, enabled: bool) {
-        self.mine_l1_during_boot = enabled;
+    /// The machine directory the next setup starts from (`setup --base`);
+    /// `None` is genesis. Takes effect on the next setup only, which runs in a
+    /// new data directory ([`Self::discard_data_dir`]). Persists until changed.
+    pub fn set_setup_base(&mut self, base: Option<PathBuf>) {
+        self.setup_base = base;
     }
 
-    /// Write a faketime offset to the rc file. Effective **immediately** for
-    /// the running sequencer (if any) and persists across respawns. The
-    /// libfaketime library re-reads the file on every time call (we pass
-    /// `FAKETIME_NO_CACHE=1`), so the next `SystemTime::now()` inside the
-    /// child sees the new offset.
+    /// Make every setup (until cleared) mine L1 blocks while it runs.
     ///
-    /// Format follows faketime's `-f` flag: `"+5h"`, `"-1h"`, `"+1d"`, or
-    /// `"+NNNs"` for absolute seconds. Passing `None` resets to `+0`.
-    /// See `man faketime` for advanced options (speed-up, interval mode).
-    ///
-    /// Does not mine L1 blocks — use [`Self::advance_wall_and_mine`] when you
-    /// want wall-clock and L1 to move together.
-    ///
-    /// Replaces any cumulative advance tracked by
-    /// [`Self::advance_wall_and_mine`], and resets its counter.
-    pub fn set_faketime_offset(&mut self, offset: Option<String>) -> HarnessResult<()> {
-        let rc = self
-            .faketime_rc_path
-            .as_ref()
-            .ok_or_else(|| io_other("faketime is disabled for this ManagedSequencer"))?;
-        let s = offset.as_deref().unwrap_or("+0");
-        fs::write(rc.as_path(), format!("{s}\n"))
-            .map_err(|err| io_other(format!("write faketime rc file: {err}")))?;
-        self.cumulative_offset_secs = 0;
-        Ok(())
+    /// Setup flushes the submitter's wallet and waits until the flushed
+    /// slots are *safe*. Auto-mining lands a flush transaction but mints no
+    /// further blocks, so on an on-demand-mining devnet Anvil's `safe` tag
+    /// never passes it; a live chain keeps producing blocks. Only a setup
+    /// that follows an instance with stranded submissions needs this: mining
+    /// during an unrelated setup would perturb block-sensitive assertions.
+    pub fn set_mine_l1_during_setup(&mut self, enabled: bool) {
+        self.mine_l1_during_setup = enabled;
     }
 
-    /// Delete the sequencer DB file (and its `-wal` / `-shm` siblings) AND the
-    /// `dumps/` subtree, simulating a brand-new install — no pinned identity,
-    /// no batches, no safe-input rows, no genesis snapshot. Call while the
-    /// sequencer is stopped. (Clearing the DB but not `dumps/` would leave a
-    /// stale `genesis-*` dir; the next `setup` mints a fresh one and the old
-    /// one lingers until run's orphan sweep — harmless, but not "brand-new".)
+    /// Move to a new, empty data directory, as an operator does for a new
+    /// deployment, after a failed setup, or for a recovery: the next
+    /// [`Self::respawn`] runs `setup` there before `run`. Call while the
+    /// sequencer is stopped. The old directory is left as it was, and nothing
+    /// runs against it again; it is removed when the harness drops.
     ///
-    /// Distinct from "clear only the identity row": that would leave the DB
-    /// holding `batches` / `safe_inputs` / `l1_safe_head` rows from prior
-    /// boots, which `IdentityError::OrphanedState` then refuses on the next
-    /// `setup`. The right "first boot" simulation is to start from an empty DB.
-    ///
-    /// Used by the no-cache-bootstrap and live-RPC chain-id-mismatch tests:
-    /// both want to exercise the no-cached-identity bootstrap path (next boot
-    /// re-runs `setup`).
-    pub fn reset_database(&self) -> HarnessResult<()> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        for suffix in ["", "-wal", "-shm"] {
-            let path = db_path.with_extension(format!("db{suffix}"));
-            match fs::remove_file(path.as_path()) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(io_other(format!("reset DB ({path:?}): {err}")).into()),
-            }
+    /// Setup refuses a directory that holds anything, so this is the only way
+    /// to set up again: clearing files inside a used directory would leave
+    /// whatever the clearing missed for setup to refuse.
+    pub fn discard_data_dir(&mut self) {
+        self.discarded_data_dirs += 1;
+        self.data_dir_path = self
+            ._root_dir
+            .path()
+            .join(format!("{DATA_DIR_NAME}-{}", self.discarded_data_dirs));
+        self.setup_pending = true;
+    }
+
+    /// Run `setup` in the current data directory without starting `run`, and
+    /// report how it ended instead of failing on a non-zero exit. A success
+    /// clears the pending setup, so the next [`Self::respawn`] only runs. Used
+    /// to assert setup's exit codes, such as its refusal of a set-up directory.
+    pub async fn run_setup(&mut self) -> HarnessResult<SetupOutcome> {
+        let log_path = timestamped_log_path(self.logs_dir.as_path(), self.log_prefix.as_str());
+        let outcome = run_setup_process(
+            &self.child_env(),
+            &self.setup_request(false),
+            &log_path,
+            self.mine_l1_during_setup,
+        )
+        .await?;
+        if outcome.success() {
+            self.setup_pending = false;
         }
-        let dumps_dir = self.data_dir_path.join("dumps");
-        match fs::remove_dir_all(dumps_dir.as_path()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(io_other(format!("reset dumps ({dumps_dir:?}): {err}")).into()),
-        }
-        Ok(())
+        Ok(outcome)
     }
 
-    /// Drive the next [`Self::respawn`]'s `setup` phase into `--recovery` against
-    /// `params` (and mine L1 concurrently with setup so its flush can settle).
-    /// Set this after capturing a checkpoint and wiping the DB. `None` restores
-    /// the normal (genesis) setup. Persists across respawns until cleared.
-    pub fn set_recovery_setup(&mut self, params: Option<RecoverySetupParams>) {
-        self.recovery_setup = params;
+    /// `setup --dry-run` against the configured base: it needs no key and
+    /// never touches the data directory, so it may run at any time, with the
+    /// sequencer up or down.
+    pub async fn setup_dry_run(&self) -> HarnessResult<SetupOutcome> {
+        let log_path = timestamped_log_path(self.logs_dir.as_path(), self.log_prefix.as_str());
+        run_setup_process(
+            &self.child_env(),
+            &self.setup_request(true),
+            &log_path,
+            false,
+        )
+        .await
+    }
+
+    fn child_env(&self) -> ChildEnv<'_> {
+        ChildEnv {
+            bin: self.sequencer_bin.as_path(),
+            data_dir: self.data_dir_path.as_path(),
+            rollups: &self.rollups,
+            eth_rpc_url: self
+                .l1_endpoint_override
+                .as_deref()
+                .unwrap_or_else(|| self.rollups.l1_endpoint()),
+            faketime: self
+                .libfaketime_path
+                .as_deref()
+                .zip(self.faketime_rc_path.as_deref()),
+        }
+    }
+
+    fn setup_request(&self, dry_run: bool) -> SetupRequest<'_> {
+        SetupRequest {
+            chain_id: self.chain_id_override.unwrap_or(DEVNET_CHAIN_ID),
+            base: self.setup_base.as_deref(),
+            dry_run,
+            genesis_bin: self.genesis_bin.as_deref(),
+            fee_oracle_fixed_log_gas_price: self.fee_oracle_fixed_log_gas_price,
+        }
     }
 
     /// Pass `--max-batch-open-seconds` to the `run` phase on the next (and
@@ -434,8 +496,9 @@ impl ManagedSequencer {
         self.max_batch_open_seconds = secs;
     }
 
-    /// The currently exportable canonical checkpoint's L1 block. A rebuilt
-    /// optimistic baseline returns `None` until a matching batch is accepted.
+    /// The currently exportable canonical checkpoint's L1 block. In a new era
+    /// it is the baseline's stop block until the era's first batch is
+    /// accepted.
     pub async fn finalized_inclusion_block(&self) -> HarnessResult<Option<u64>> {
         let response = reqwest::Client::new()
             .get(format!(
@@ -467,7 +530,7 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
         let fee: i64 = conn
             .query_row(
-                "SELECT fee FROM frames ORDER BY batch_index, frame_in_batch LIMIT 1",
+                "SELECT fee FROM frames ORDER BY batch_nonce, frame_in_batch LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -490,8 +553,8 @@ impl ManagedSequencer {
         let (frame_safe_block, persisted_safe_head): (i64, i64) = conn
             .query_row(
                 "SELECT f.safe_block, h.block_number \
-                 FROM valid_open_batch b \
-                 JOIN frames f ON f.batch_index = b.batch_index \
+                 FROM open_batch b \
+                 JOIN frames f ON f.batch_nonce = b.nonce \
                  JOIN l1_safe_head h ON h.singleton_id = 0 \
                  ORDER BY f.frame_in_batch DESC LIMIT 1",
                 [],
@@ -511,98 +574,84 @@ impl ManagedSequencer {
         Ok((frame_safe_block, persisted_safe_head))
     }
 
-    /// Download the leased accepted-checkpoint export, including its coherent
-    /// `checkpoint.toml` receipt, outside the paths cleared by reset_database.
-    pub async fn capture_finalized_checkpoint(&self) -> HarnessResult<RecoveryCheckpoint> {
-        let response = reqwest::Client::new()
-            .get(format!("{}/finalized_snapshot", self.internal_endpoint()))
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await?
-            .error_for_status()?;
-        let inclusion_block: u64 = response
-            .headers()
-            .get("X-Inclusion-Block")
-            .ok_or_else(|| io_other("checkpoint export missing X-Inclusion-Block"))?
-            .to_str()?
-            .parse()?;
-        let bytes = response.bytes().await?;
-        let dst = self.data_dir_path.join("checkpoint");
-        if dst.exists() {
-            fs::remove_dir_all(&dst)?;
-        }
-        fs::create_dir_all(&dst)?;
-        tar::Archive::new(bytes.as_ref()).unpack(&dst)?;
-        #[derive(serde::Deserialize)]
-        struct Receipt {
-            inclusion_block: u64,
-            next_batch_nonce: u64,
-        }
-        let receipt: Receipt = toml::from_str(&fs::read_to_string(dst.join("checkpoint.toml"))?)?;
-        let resume_nonce = read_info_next_batch_nonce(&dst)?;
-        assert_eq!(
-            receipt.inclusion_block, inclusion_block,
-            "checkpoint receipt/header boundary mismatch"
-        );
-        assert_eq!(
-            receipt.next_batch_nonce, resume_nonce,
-            "checkpoint receipt/artifact nonce mismatch"
-        );
-        Ok(RecoveryCheckpoint {
-            dir: dst,
-            checkpoint_block: inclusion_block,
-            resume_nonce,
+    /// The oldest batch L1 has not accepted, closed or open, and its first
+    /// frame's safe block, from one read-only snapshot; `None` when every
+    /// batch is accepted.
+    pub fn oldest_unaccepted_batch(&self) -> HarnessResult<Option<UnacceptedBatch>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.read_only_connection()?;
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT b.nonce, \
+                        (SELECT f.safe_block FROM frames f \
+                          WHERE f.batch_nonce = b.nonce \
+                          ORDER BY f.frame_in_batch LIMIT 1) \
+                 FROM batches b \
+                 WHERE b.accepted_input IS NULL \
+                 ORDER BY b.nonce LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|err| io_other(format!("read the oldest unaccepted batch: {err}")))?;
+        row.map(|(nonce, first_frame_safe_block)| {
+            Ok(UnacceptedBatch {
+                nonce: u64::try_from(nonce)
+                    .map_err(|_| io_other(format!("negative batch nonce {nonce}")))?,
+                first_frame_safe_block: u64::try_from(first_frame_safe_block).map_err(|_| {
+                    io_other(format!(
+                        "negative first-frame safe block {first_frame_safe_block}"
+                    ))
+                })?,
+            })
         })
+        .transpose()
     }
 
-    /// Rewrite the L1 safe-head observation to "unknown", simulating a DB
-    /// that has never successfully synced from L1. Call while the sequencer
-    /// is stopped.
-    ///
-    /// Used by the wall-clock-never-synced test: the danger check treats a
-    /// missing safe-head row as an unusable L1 view and refuses to
-    /// proceed. Deleting this row while the deployment identity is
-    /// populated lets us hit that branch without losing the pinned chain
-    /// ID / InputBox address (which would fail earlier in bootstrap, not
-    /// in the wall-clock fallback).
-    pub fn clear_l1_safe_head_observation(&self) -> HarnessResult<()> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open(db_path.as_path())
-            .map_err(|err| io_other(format!("open DB: {err}")))?;
-        conn.execute("DELETE FROM l1_safe_head WHERE singleton_id = 0", [])
-            .map_err(|err| io_other(format!("reset L1 safe-head observation: {err}")))?;
-        Ok(())
+    /// The accepted batches as `(nonce, accepted safe input)`, by nonce.
+    pub fn accepted_batches(&self) -> HarnessResult<Vec<(u64, u64)>> {
+        let conn = self.read_only_connection()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT nonce, accepted_input FROM batches \
+                 WHERE accepted_input IS NOT NULL ORDER BY nonce",
+            )
+            .map_err(|err| io_other(format!("prepare accepted batches: {err}")))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|err| io_other(format!("read accepted batches: {err}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| io_other(format!("read accepted batches: {err}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(nonce, input)| (nonce as u64, input as u64))
+            .collect())
     }
 
-    /// Read-only snapshot of the `safe_accepted_batches` view: rows
-    /// recovered from the L1-side scheduler frontier (i.e., batches the
-    /// sequencer has *observed accepted on chain*). Returns `(count,
-    /// min_nonce)` — count is the row count, min_nonce is `MIN(nonce)` or
-    /// `None` if empty.
-    ///
-    /// Used by the nonce-0 recovery test to confirm a recovery batch (which reuses nonce 0)
-    /// actually lands and gets accepted on L1 — proving the
-    /// `populate_safe_accepted_batches` cursor handles
-    /// reused-nonce-after-cascade correctly.
-    pub fn count_safe_accepted_batches(&self) -> HarnessResult<(u64, Option<u64>)> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path.as_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
+    /// The causes the terminal-fault black box recorded, oldest first. A
+    /// terminal fact records none, at a refused start or at a runtime abort.
+    pub fn terminal_fault_causes(&self) -> HarnessResult<Vec<String>> {
+        let conn = self.read_only_connection()?;
+        let mut statement = conn
+            .prepare("SELECT cause FROM terminal_faults ORDER BY fault_id")
+            .map_err(|err| io_other(format!("prepare terminal faults: {err}")))?;
+        let causes = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| io_other(format!("read terminal faults: {err}")))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|err| io_other(format!("read terminal faults: {err}")))?;
+        Ok(causes)
+    }
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
-            .map_err(|err| io_other(format!("count safe_accepted_batches: {err}")))?;
-        let min_nonce: Option<i64> = conn
-            .query_row("SELECT MIN(nonce) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
-            .map_err(|err| io_other(format!("min nonce: {err}")))?;
-        Ok((count as u64, min_nonce.map(|n| n as u64)))
+    /// The landing reading `GET /healthz` serves on the internal listener,
+    /// whatever its status code.
+    pub async fn landing_health(&self) -> HarnessResult<LandingHealth> {
+        let response = reqwest::Client::new()
+            .get(format!("{}/healthz", self.internal_endpoint()))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        Ok(response.json().await?)
     }
 
     /// Read-only; safe to call while the sequencer is running.
@@ -614,17 +663,16 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
         let sealed: Option<i64> = conn
+            .query_row("SELECT MAX(nonce) FROM closed_batches", [], |row| {
+                row.get(0)
+            })
+            .map_err(|err| io_other(format!("max sealed batch nonce: {err}")))?;
+        let safe_accepted: Option<i64> = conn
             .query_row(
-                "SELECT MAX(nonce) FROM batches \
-                 WHERE sealed_at_ms IS NOT NULL AND invalidated_at_ms IS NULL",
+                "SELECT MAX(nonce) FROM batches WHERE accepted_input IS NOT NULL",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|err| io_other(format!("max sealed batch nonce: {err}")))?;
-        let safe_accepted: Option<i64> = conn
-            .query_row("SELECT MAX(nonce) FROM safe_accepted_batches", [], |row| {
-                row.get(0)
-            })
             .map_err(|err| io_other(format!("max safe-accepted batch nonce: {err}")))?;
         Ok(BatchNonceFrontier {
             sealed: sealed.map(|n| n as u64),
@@ -632,10 +680,11 @@ impl ManagedSequencer {
         })
     }
 
-    /// The batch-tree anchor nonce, read from the run DB read-only: `N'` after
-    /// cockroach recovery, `0` for a genesis deployment. Lets a recovery e2e
-    /// assert the rebuilt tree is rooted at the checkpoint's resume nonce (I16).
-    pub fn batch_tree_anchor(&self) -> HarnessResult<u64> {
+    /// The era's anchor nonce (`anchor_batch_nonce`), read from the run DB
+    /// read-only: the resume nonce of a rebuilt deployment, `0` for a genesis
+    /// one. The batch nonces are contiguous from it (I16). Fails when the era
+    /// is absent.
+    pub fn anchor_batch_nonce(&self) -> HarnessResult<u64> {
         let db_path = self.data_dir_path.join("sequencer.db");
         let conn = rusqlite::Connection::open_with_flags(
             db_path.as_path(),
@@ -644,81 +693,80 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
         let anchor: i64 = conn
             .query_row(
-                "SELECT nonce FROM batch_tree_anchor WHERE singleton_id = 0",
+                "SELECT anchor_batch_nonce FROM era WHERE singleton_id = 0",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|err| io_other(format!("read batch_tree_anchor: {err}")))?;
+            .map_err(|err| io_other(format!("read the era's anchor nonce: {err}")))?;
         Ok(anchor as u64)
     }
 
-    /// The rebuilt baseline's L1 stop block `C` (`history_state.base_safe_block`),
-    /// read from the run DB read-only.
-    pub fn baseline_safe_block(&self) -> HarnessResult<u64> {
-        let db_path = self.data_dir_path.join("sequencer.db");
-        let conn = rusqlite::Connection::open_with_flags(
-            db_path.as_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
-        let block: i64 = conn
+    /// The era setup published, from one read-only snapshot.
+    pub fn published_era(&self) -> HarnessResult<PublishedEra> {
+        let conn = self.read_only_connection()?;
+        let (base_count, stop_block, rebuilt_history_end, first_queued_input, next_batch_nonce): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT base_safe_block FROM history_state WHERE singleton_id = 0",
+                "SELECT base_l2_tx_count, stop_block, rebuilt_history_end, \
+                        first_queued_input, anchor_batch_nonce \
+                 FROM era WHERE singleton_id = 0",
                 [],
-                |row| row.get(0),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
-            .map_err(|err| io_other(format!("read history_state: {err}")))?;
-        Ok(block as u64)
+            .map_err(|err| io_other(format!("read the published era: {err}")))?;
+        let unsigned = |name: &str, value: i64| {
+            u64::try_from(value).map_err(|_| io_other(format!("{name} is negative: {value}")))
+        };
+        Ok(PublishedEra {
+            base_count: unsigned("base count", base_count)?,
+            stop_block: unsigned("stop block", stop_block)?,
+            rebuilt_history_end: unsigned("rebuilt history end", rebuilt_history_end)?,
+            first_queued_input: unsigned("first queued input", first_queued_input)?,
+            next_batch_nonce: unsigned("next batch nonce", next_batch_nonce)?,
+        })
     }
 
-    /// Nonces of this app's batch submissions from the devnet submitter included
-    /// in L1 blocks `(after_block, through_block]`, in L1 order. Read from the
-    /// InputBox logs, independent of any sequencer database.
-    pub async fn l1_batch_nonces(
-        &self,
-        after_block: u64,
-        through_block: u64,
-    ) -> HarnessResult<Vec<u64>> {
-        use alloy::contract::Event;
-        use alloy::sol_types::{SolCall, SolEvent};
-        use cartesi_rollups_contracts::input_box::InputBox::InputAdded;
-        use cartesi_rollups_contracts::inputs::Inputs::EvmAdvanceCall;
+    /// How many rows setup's rebuild stored, and how many carry a count.
+    pub fn rebuilt_history_rows(&self) -> HarnessResult<RebuiltHistoryRows> {
+        let conn = self.read_only_connection()?;
+        let (total, executed): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(l2_tx_count) FROM rebuilt_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|err| io_other(format!("count rebuilt history rows: {err}")))?;
+        Ok(RebuiltHistoryRows {
+            total: total as u64,
+            executed: executed as u64,
+        })
+    }
 
-        let provider = alloy::providers::ProviderBuilder::new()
-            .connect(self.l1_endpoint())
-            .await
-            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
-        let mut logs: Vec<(InputAdded, alloy::rpc::types::Log)> =
-            Event::new_sol(&provider, &self.input_box_address())
-                .from_block(after_block + 1)
-                .to_block(through_block)
-                .event(InputAdded::SIGNATURE)
-                .topic1(self.app_address().into_word())
-                .query()
-                .await
-                .map_err(|err| io_other(format!("query InputAdded logs: {err}")))?;
-        logs.sort_by_key(|(_, log)| (log.block_number, log.log_index));
-
-        let mut nonces = Vec::new();
-        for (event, _) in logs {
-            let advance = EvmAdvanceCall::abi_decode(&event.input)
-                .map_err(|err| io_other(format!("decode EvmAdvance: {err}")))?;
-            if advance.msgSender != app_core::application::DEVNET_SEQUENCER_ADDRESS {
-                continue;
-            }
-            let batch =
-                <sequencer_core::batch::Batch as ssz::Decode>::from_ssz_bytes(&advance.payload)
-                    .map_err(|err| io_other(format!("decode batch: {err:?}")))?;
-            nonces.push(batch.nonce);
-        }
-        Ok(nonces)
+    fn read_only_connection(&self) -> HarnessResult<rusqlite::Connection> {
+        rusqlite::Connection::open_with_flags(
+            self.db_path().as_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| io_other(format!("open DB read-only: {err}")).into())
     }
 
     /// The canonical-divergence marker (I9/I15) from the run DB, or `None`
-    /// when the frontier is healthy. A recovery/resync e2e asserts this is `None`
-    /// to prove the content-identity check did NOT spuriously freeze the frontier
-    /// (e.g. a false-positive against below-anchor collapsed history) — otherwise
-    /// that silent-failure class is invisible at e2e level.
+    /// when the frontier is healthy: its `kind`, `foreign` or `mismatch`. A
+    /// rebuilt era asserts `None` to prove the content-identity check did not
+    /// spuriously freeze the frontier against its rebuilt history.
     pub fn canonical_divergence(&self) -> HarnessResult<Option<String>> {
         use rusqlite::OptionalExtension;
         let db_path = self.data_dir_path.join("sequencer.db");
@@ -736,7 +784,7 @@ impl ManagedSequencer {
         .map_err(|err| io_other(format!("read canonical_divergence: {err}")).into())
     }
 
-    /// Snapshot of the `batches` table: `(total, sealed, invalidated)`.
+    /// Snapshot of the `batches` table: `(total, sealed)`.
     /// Reads the DB file read-only; safe to call while the sequencer is
     /// running. Useful for asserting that batch closure happened during a
     /// test segment (e.g., the sequencer kept processing through an outage).
@@ -758,36 +806,22 @@ impl ManagedSequencer {
                 |row| row.get(0),
             )
             .map_err(|err| io_other(format!("count sealed batches: {err}")))?;
-        let invalidated: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM batches WHERE invalidated_at_ms IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("count invalidated batches: {err}")))?;
-
         Ok(BatchCounts {
             total: total as u64,
             sealed: sealed as u64,
-            invalidated: invalidated as u64,
         })
     }
 
-    /// Assert the schema-level tree invariants on the sequencer's DB. Runs
+    /// Assert the schema-level batch invariants on the sequencer's DB. Runs
     /// against the DB file read-only; safe to call whether the sequencer is
     /// running or stopped (SQLite WAL + read-only flag handles concurrent
     /// writers).
     ///
     /// Invariants checked:
-    ///   1. At most one `valid_open_batch` row (partial unique index
-    ///      `ux_single_valid_tip` should guarantee this structurally —
+    ///   1. At most one `open_batch` row (partial unique index
+    ///      `ux_single_open_batch` should guarantee this structurally —
     ///      we verify it in case the index ever regressed).
-    ///   2. Every valid batch's `nonce` equals `parent.nonce + 1`, or 0 if
-    ///      `parent_batch_index IS NULL`.
-    ///   3. Every `parent_batch_index` is NULL or references an existing
-    ///      batch (FK-backed, verified explicitly for cross-DB-tool
-    ///      portability).
-    ///   4. The nonces on the valid path form a contiguous `0..N` sequence.
+    ///   2. The batch nonces are contiguous from the era's anchor (I16).
     ///
     /// Panics with a specific violation message if any invariant fails.
     /// Harness-only check (no sequencer changes) that catches regressions
@@ -800,99 +834,35 @@ impl ManagedSequencer {
         )
         .map_err(|err| io_other(format!("open DB read-only: {err}")))?;
 
-        // The batch-tree anchor: the nonce the single parentless root carries
-        // (0 for a genesis deployment, N' for a cockroach-recovered one). The
-        // root/contiguity invariants below are stated relative to it, so a
-        // recovered tree (rooted at N') passes the same checks a genesis tree
-        // (rooted at 0) does. Mirrors `trg_enforce_nonce_contiguity`. Reuses the
-        // `batch_tree_anchor()` accessor (its own short-lived read-only handle)
-        // rather than re-issuing the query against `conn`.
-        let anchor = self.batch_tree_anchor()? as i64;
+        // The era's anchor: the first batch's nonce (0 for a genesis
+        // deployment, N' for a cockroach-recovered one). Mirrors
+        // `trg_batch_insert`. Reuses the `anchor_batch_nonce()`
+        // accessor (its own short-lived read-only handle) rather than
+        // re-issuing the query against `conn`.
+        let anchor = self.anchor_batch_nonce()? as i64;
 
-        // 1. At most one valid open batch.
+        // 1. At most one open batch.
         let open_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM valid_open_batch", [], |row| {
-                row.get(0)
-            })
-            .map_err(|err| io_other(format!("count valid_open_batch: {err}")))?;
+            .query_row("SELECT COUNT(*) FROM open_batch", [], |row| row.get(0))
+            .map_err(|err| io_other(format!("count open_batch: {err}")))?;
         if open_count > 1 {
-            panic!("schema invariant: more than one valid Tip ({open_count} rows)");
+            panic!("schema invariant: more than one open batch ({open_count} rows)");
         }
 
-        // 1b. At most one *valid* parentless root (the anchored root).
-        let valid_root_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM valid_batches WHERE parent_batch_index IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| io_other(format!("count valid roots: {err}")))?;
-        if valid_root_count > 1 {
-            panic!(
-                "schema invariant: more than one valid parentless root ({valid_root_count} rows)"
-            );
-        }
-
-        // 2. Nonce contiguity via parent.
+        // 2. The nonces are contiguous from the anchor.
         let mut stmt = conn
-            .prepare(
-                "SELECT b.batch_index, b.parent_batch_index, b.nonce, p.nonce \
-                 FROM batches b LEFT JOIN batches p ON p.batch_index = b.parent_batch_index",
-            )
-            .map_err(|err| io_other(format!("prepare nonce-check: {err}")))?;
-        let rows: Vec<(i64, Option<i64>, i64, Option<i64>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
-            .map_err(|err| io_other(format!("query nonce-check: {err}")))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|err| io_other(format!("collect nonce-check: {err}")))?;
-        for (bi, parent, nonce, parent_nonce) in &rows {
-            match (parent, parent_nonce) {
-                (None, _) => {
-                    if *nonce != anchor {
-                        panic!(
-                            "schema invariant: batch {bi} has NULL parent but nonce {nonce} (expected anchor {anchor})"
-                        );
-                    }
-                }
-                (Some(p), None) => {
-                    panic!(
-                        "schema invariant: batch {bi}'s parent {p} doesn't exist (FK violation)"
-                    );
-                }
-                (Some(_), Some(pn)) => {
-                    if *nonce != pn + 1 {
-                        panic!(
-                            "schema invariant: batch {bi} nonce={nonce}, expected parent.nonce+1 = {}",
-                            pn + 1
-                        );
-                    }
-                }
-            }
-        }
-
-        // 3. Valid-path nonce uniqueness and contiguity.
-        let mut stmt = conn
-            .prepare("SELECT nonce FROM valid_batches ORDER BY nonce ASC")
-            .map_err(|err| io_other(format!("prepare valid-nonces: {err}")))?;
-        let valid_nonces: Vec<i64> = stmt
+            .prepare("SELECT nonce FROM batches ORDER BY nonce ASC")
+            .map_err(|err| io_other(format!("prepare batch nonces: {err}")))?;
+        let nonces: Vec<i64> = stmt
             .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|err| io_other(format!("query valid-nonces: {err}")))?
+            .map_err(|err| io_other(format!("query batch nonces: {err}")))?
             .collect::<rusqlite::Result<_>>()
-            .map_err(|err| io_other(format!("collect valid-nonces: {err}")))?;
-        for pair in valid_nonces.windows(2) {
-            if pair[0] == pair[1] {
-                panic!(
-                    "schema invariant: duplicate valid nonce {} in {valid_nonces:?}",
-                    pair[0]
-                );
-            }
-        }
-        for (i, &n) in valid_nonces.iter().enumerate() {
+            .map_err(|err| io_other(format!("collect batch nonces: {err}")))?;
+        for (i, &n) in nonces.iter().enumerate() {
             if n != anchor + i as i64 {
                 panic!(
-                    "schema invariant: valid nonces not contiguous from anchor {anchor}: {valid_nonces:?}"
+                    "schema invariant: batch nonces are not contiguous from the anchor \
+                     {anchor}: {nonces:?}"
                 );
             }
         }
@@ -930,6 +900,63 @@ impl ManagedSequencer {
         self.data_dir_path.join("sequencer.db")
     }
 
+    /// The names in the data directory, sorted; empty while it does not
+    /// exist. Setup's refusals before its first write leave at most the lock
+    /// file here.
+    pub fn data_dir_entries(&self) -> HarnessResult<Vec<String>> {
+        let entries = match fs::read_dir(self.data_dir_path.as_path()) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(io_other(format!("read data dir: {err}")).into()),
+        };
+        let mut names = entries
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// Every file and directory under the data directory by relative path,
+    /// sorted, a file with its length and the keccak256 of its bytes; empty
+    /// while the directory does not exist. Two equal readings mean nothing was
+    /// added, removed or rewritten.
+    pub fn data_dir_contents(&self) -> HarnessResult<Vec<DataDirEntry>> {
+        let root = self.data_dir_path.as_path();
+        let mut contents = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = match fs::read_dir(dir.as_path()) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && dir == root => {
+                    return Ok(Vec::new());
+                }
+                Err(err) => {
+                    return Err(io_other(format!("read {}: {err}", dir.display())).into());
+                }
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let name = path
+                    .strip_prefix(root)
+                    .map_err(|err| io_other(format!("{}: {err}", path.display())))?
+                    .to_string_lossy()
+                    .into_owned();
+                if path.is_dir() {
+                    contents.push((name, None));
+                    pending.push(path);
+                    continue;
+                }
+                let bytes = fs::read(path.as_path())
+                    .map_err(|err| io_other(format!("read {}: {err}", path.display())))?;
+                let len =
+                    u64::try_from(bytes.len()).map_err(|_| io_other("file length overflows"))?;
+                contents.push((name, Some((len, alloy_primitives::keccak256(&bytes)))));
+            }
+        }
+        contents.sort();
+        Ok(contents)
+    }
+
     /// Live bytes in the database: pages in use, including pages still in the
     /// WAL and excluding free pages. File sizes show neither. Read while the
     /// sequencer runs, so the WAL index is there for the read-only connection.
@@ -959,6 +986,17 @@ impl ManagedSequencer {
 
     /// L1 blocks of the application's InputBox inputs, in input order.
     pub async fn input_blocks(&self) -> HarnessResult<Vec<u64>> {
+        Ok(self
+            .raw_inputs()
+            .await?
+            .into_iter()
+            .map(|(block, _)| block)
+            .collect())
+    }
+
+    /// The application's InputBox inputs, in input order: each one's L1 block
+    /// and its `EvmAdvance` encoding, the bytes a machine receives.
+    pub async fn raw_inputs(&self) -> HarnessResult<Vec<(u64, Vec<u8>)>> {
         let provider = ProviderBuilder::new()
             .connect(self.l1_endpoint())
             .await
@@ -972,7 +1010,26 @@ impl ManagedSequencer {
             .get_logs(&filter)
             .await
             .map_err(|err| io_other(format!("failed to read InputAdded logs: {err}")))?;
-        Ok(logs.iter().filter_map(|log| log.block_number).collect())
+        // Callers index inputs by position, so the log order must be the
+        // InputBox order.
+        (0_u64..)
+            .zip(&logs)
+            .map(|(position, log)| {
+                let block = log
+                    .block_number
+                    .ok_or_else(|| io_other("InputAdded log without a block number"))?;
+                let event = InputAdded::decode_log_data(&log.inner.data)
+                    .map_err(|err| io_other(format!("failed to decode InputAdded: {err}")))?;
+                if event.index != U256::from(position) {
+                    return Err(io_other(format!(
+                        "InputAdded log {position} carries index {}",
+                        event.index
+                    ))
+                    .into());
+                }
+                Ok((block, event.input.to_vec()))
+            })
+            .collect()
     }
 
     pub fn erc20_portal_address(&self) -> Address {
@@ -1010,10 +1067,10 @@ impl ManagedSequencer {
     }
 
     /// Toggle Anvil's auto-mining mode. When disabled, txs accumulate in
-    /// the mempool until an explicit mine or re-enable. Used to hold a
-    /// sequencer's batch-submission tx out of a block while the chain
-    /// advances, reproducing the "delayed inclusion" fault that the
-    /// scheduler handles by skipping past-stale batches.
+    /// the mempool until an explicit mine or re-enable: a sequencer's
+    /// batch-submission tx waits there, where [`Self::drop_all_pending_txs`]
+    /// can lose it. `anvil_mine` includes pending txs, so hold submissions
+    /// across mining with [`Self::hold_batch_submissions`] instead.
     pub async fn set_automine(&self, enabled: bool) -> HarnessResult<()> {
         self.rollups.set_automine(enabled).await
     }
@@ -1048,12 +1105,7 @@ impl ManagedSequencer {
     ///     call (or a post-respawn first call) sees the shifted clock.
     ///   - Anvil mines `duration.as_secs() / DEVNET_SECONDS_PER_BLOCK` blocks.
     ///
-    /// **Cumulative**: calling with `1h` twice totals `+2h`, not `+1h`. Use
-    /// [`Self::set_faketime_offset`] to jump to a specific offset or reset.
-    ///
-    /// Tests that need decoupled wall-clock vs L1 (e.g., the `saturating_sub`
-    /// backward-jump test) should use [`Self::set_faketime_offset`] and
-    /// [`Self::mine_l1_blocks`] directly.
+    /// **Cumulative**: calling with `1h` twice totals `+2h`, not `+1h`.
     pub async fn advance_wall_and_mine(&mut self, duration: Duration) -> HarnessResult<()> {
         let secs = duration.as_secs();
         let blocks = secs / DEVNET_SECONDS_PER_BLOCK;
@@ -1072,9 +1124,8 @@ impl ManagedSequencer {
     /// exit handle.
     ///
     /// - Returns `Ok(None)` if the child is still alive when `grace`
-    ///   elapses. The internal `wait()` future is dropped, so subsequent
-    ///   calls to [`Self::wait_for_exit`] / [`Self::respawn_and_watch`]
-    ///   still work.
+    ///   elapses. The internal `wait()` future is dropped, so a later
+    ///   [`Self::wait_for_exit`] still works.
     /// - Returns `Ok(Some(status))` if the child exited inside the
     ///   window. The exit status is captured and the child is reaped;
     ///   the caller shouldn't call `wait_for_exit` afterwards (it would
@@ -1133,9 +1184,9 @@ impl ManagedSequencer {
     /// process's exit status. Times out after `timeout` to avoid hanging
     /// tests when the process refuses to exit.
     ///
-    /// Used by tests that expect the sequencer to detect a condition
-    /// (e.g., wall-clock danger) and self-exit with a non-zero status.
-    /// After this returns, call [`Self::respawn`] to start a fresh process.
+    /// Used by tests that expect the sequencer to stop on its own, such as
+    /// on a terminal fact. After this returns, call [`Self::respawn`] or
+    /// [`Self::try_respawn`] to start a fresh process.
     pub async fn wait_for_exit(
         &mut self,
         timeout: Duration,
@@ -1149,84 +1200,6 @@ impl ManagedSequencer {
             })?
             .map_err(|err| io_other(format!("wait_for_exit: {err}")))?;
         Ok(status)
-    }
-
-    /// Respawn the sequencer and watch the child for `stabilization` to
-    /// confirm it stays alive. Classifies the outcome so tests can model an
-    /// orchestrator restart cycle without re-deriving the failure modes.
-    ///
-    /// There are two distinct "unstable" shapes the sequencer can take:
-    ///   - The child dies during bootstrap (before HTTP readiness), which
-    ///     makes `respawn()` itself return `Err`. Canonical cause:
-    ///     `RecoveryError::Refuse(...)` from the startup decision table
-    ///     when L1 is unreachable and the persisted state looks stalled.
-    ///   - The child comes up (HTTP ready, bootstrap passed), then one of
-    ///     the internal tasks returns a fatal error and the process exits.
-    ///     Canonical cause: danger-detector worker exit when the first
-    ///     post-boot poll sees a batch past `danger_threshold`.
-    ///
-    /// The race between bootstrap-finishes and submitter-first-tick is
-    /// short (the poll interval is 5s by default, but the first tick runs
-    /// immediately), so both cases can surface for a single logical event —
-    /// tests should generally treat either as "not stable" and retry.
-    ///
-    /// Callers must ensure the previous child is already reaped (via
-    /// [`Self::stop`] or [`Self::wait_for_exit`]) — same rule as
-    /// [`Self::respawn`].
-    pub async fn respawn_and_watch(
-        &mut self,
-        stabilization: Duration,
-    ) -> HarnessResult<RespawnAttemptOutcome> {
-        if let Err(err) = self.respawn().await {
-            return Ok(RespawnAttemptOutcome::RespawnFailed(err.to_string()));
-        }
-        tokio::select! {
-            wait_result = self.child.wait() => {
-                let status = wait_result
-                    .map_err(|err| io_other(format!("child.wait(): {err}")))?;
-                Ok(RespawnAttemptOutcome::ExitedPostRespawn(status))
-            }
-            _ = tokio::time::sleep(stabilization) => {
-                Ok(RespawnAttemptOutcome::Stable)
-            }
-        }
-    }
-
-    /// Loop [`Self::respawn_and_watch`] until the sequencer stays up for
-    /// `policy.stabilization`, or `policy.max_attempts` is reached. Returns
-    /// the full sequence of attempts.
-    ///
-    /// The restart-loop convergence story: an aged Tip in the danger zone
-    /// (not yet past-stale) auto-closes on respawn, and the resulting closed
-    /// batch is in the danger zone, so the detector exits with `DangerDetected`.
-    /// Startup recovery's cascade fires at `MAX_WAIT_BLOCKS`, not at the
-    /// danger threshold — so the loop only converges once enough *additional*
-    /// L1 blocks have aged the batch past `MAX_WAIT_BLOCKS`. In production
-    /// the orchestrator restart itself takes seconds, during which real L1
-    /// blocks are produced; `advance_per_retry` simulates that drift. Tests
-    /// that expect a short hiccup to self-heal (no danger involved) should
-    /// leave `advance_per_retry` unset.
-    ///
-    /// The loop always returns Ok — assert on the final attempt's outcome
-    /// to decide pass/fail in the test body.
-    pub async fn respawn_until_stable(
-        &mut self,
-        policy: RespawnPolicy,
-    ) -> HarnessResult<Vec<RespawnAttemptOutcome>> {
-        let mut outcomes = Vec::with_capacity(policy.max_attempts as usize);
-        for attempt in 0..policy.max_attempts {
-            let outcome = self.respawn_and_watch(policy.stabilization).await?;
-            let stable = outcome.is_stable();
-            outcomes.push(outcome);
-            if stable {
-                break;
-            }
-            let is_last = attempt + 1 == policy.max_attempts;
-            if let Some(advance) = policy.advance_per_retry.filter(|_| !is_last) {
-                self.advance_wall_and_mine(advance).await?;
-            }
-        }
-        Ok(outcomes)
     }
 
     /// Kill the sequencer process. Anvil stays running, so `mine_l1_blocks()` still works.
@@ -1254,36 +1227,141 @@ impl ManagedSequencer {
     /// Respawn the sequencer process using the same data directory and Anvil instance.
     ///
     /// Honors any `l1_endpoint_override` set via [`Self::set_l1_endpoint_override`]
-    /// and the faketime offset in the rc file (see [`Self::set_faketime_offset`] /
-    /// [`Self::advance_wall_and_mine`]).
+    /// and the faketime offset [`Self::advance_wall_and_mine`] wrote.
+    ///
+    /// Runs `setup` first only when the data directory is new
+    /// ([`Self::discard_data_dir`]): setup refuses a directory that holds
+    /// anything, so a set-up directory goes straight to `run`. A failed setup
+    /// stays pending, and its retry meets whatever the failure left behind,
+    /// as an operator's would. A `run` that exits before readiness is an
+    /// error; [`Self::try_respawn`] reports its status instead.
     pub async fn respawn(&mut self) -> HarnessResult<()> {
-        let SpawnedSequencerProcess {
-            child,
-            endpoint,
-            internal_endpoint,
-            log_path,
-        } = spawn_sequencer_process(
-            self.sequencer_bin.as_path(),
-            self.log_prefix.as_str(),
-            self.logs_dir.as_path(),
-            self.data_dir_path.as_path(),
-            &self.rollups,
-            self.l1_endpoint_override.as_deref(),
-            self.chain_id_override,
-            self.libfaketime_path.as_deref(),
-            self.faketime_rc_path.as_deref(),
-            self.mine_l1_during_boot,
-            self.recovery_setup.as_ref(),
-            self.max_batch_open_seconds,
-            self.fee_oracle_fixed_log_gas_price,
-            None,
-        )
-        .await?;
-        self.child = child;
-        self.endpoint = endpoint;
-        self.internal_endpoint = internal_endpoint;
+        match self.try_respawn().await? {
+            RunStart::Ready => Ok(()),
+            RunStart::Exited(status) => Err(io_other(format!(
+                "sequencer exited before readiness: status={status} (see {})",
+                self.log_path.display()
+            ))
+            .into()),
+        }
+    }
+
+    /// [`Self::respawn`], reporting a `run` that exits before readiness by
+    /// its exit status, so a refused start is asserted by its code. The
+    /// exited process becomes the managed child.
+    pub async fn try_respawn(&mut self) -> HarnessResult<RunStart> {
+        let log_path = timestamped_log_path(self.logs_dir.as_path(), self.log_prefix.as_str());
+        if self.setup_pending {
+            require_setup_success(
+                run_setup_process(
+                    &self.child_env(),
+                    &self.setup_request(false),
+                    &log_path,
+                    self.mine_l1_during_setup,
+                )
+                .await?,
+                &log_path,
+            )?;
+            self.setup_pending = false;
+        }
+        let started =
+            spawn_run_process(&self.child_env(), &log_path, self.max_batch_open_seconds).await?;
         self.log_path = log_path;
+        match started {
+            RunProcess::Ready(SpawnedSequencerProcess {
+                child,
+                endpoint,
+                internal_endpoint,
+            }) => {
+                self.child = child;
+                self.endpoint = endpoint;
+                self.internal_endpoint = internal_endpoint;
+                Ok(RunStart::Ready)
+            }
+            RunProcess::Exited(child, status) => {
+                self.child = child;
+                Ok(RunStart::Exited(status))
+            }
+        }
+    }
+
+    /// Hold the batch submitter's transactions back while the sequencer
+    /// runs: its balance goes to zero, so every send is refused for
+    /// insufficient funds and the poster retries on its next tick. Nothing
+    /// reaches the mempool, so mining does not land it either.
+    pub async fn hold_batch_submissions(&mut self) -> HarnessResult<()> {
+        if self.held_submitter_balance.is_some() {
+            return Err(io_other("batch submissions are already held").into());
+        }
+        let submitter = app_core::application::DEVNET_SEQUENCER_ADDRESS;
+        let balance = self.rollups.balance_of(submitter).await?;
+        self.rollups.set_balance(submitter, U256::ZERO).await?;
+        self.held_submitter_balance = Some(balance);
         Ok(())
+    }
+
+    /// Restore the balance [`Self::hold_batch_submissions`] took away.
+    pub async fn release_batch_submissions(&mut self) -> HarnessResult<()> {
+        let balance = self
+            .held_submitter_balance
+            .take()
+            .ok_or_else(|| io_other("batch submissions are not held"))?;
+        self.rollups
+            .set_balance(app_core::application::DEVNET_SEQUENCER_ADDRESS, balance)
+            .await
+    }
+
+    /// Broadcast `payload` to the application's InputBox from `signer` without
+    /// waiting for it to be mined; returns its hash. With auto-mining off it
+    /// stays in the mempool, as a zombie of an old instance would.
+    pub async fn broadcast_input_as(
+        &self,
+        signer: &TestSigner,
+        payload: Vec<u8>,
+    ) -> HarnessResult<B256> {
+        use cartesi_rollups_contracts::input_box::InputBox;
+        let provider = signer.connect_l1_provider(self.l1_endpoint()).await?;
+        let pending = InputBox::new(self.input_box_address(), &provider)
+            .addInput(self.app_address(), payload.into())
+            .send()
+            .await
+            .map_err(|err| io_other(format!("failed to send InputBox input: {err}")))?;
+        Ok(*pending.tx_hash())
+    }
+
+    /// Whether the transaction `hash` is in a block.
+    pub async fn transaction_mined(&self, hash: B256) -> HarnessResult<bool> {
+        let provider = ProviderBuilder::new()
+            .connect(self.l1_endpoint())
+            .await
+            .map_err(|err| io_other(format!("failed to connect L1 provider: {err}")))?;
+        let receipt = provider
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|err| io_other(format!("failed to read receipt {hash}: {err}")))?;
+        Ok(receipt.is_some())
+    }
+
+    /// Send `payload` to the application's InputBox from `signer`, as any
+    /// account can; returns the block that holds it. Inputs from the batch
+    /// submitter's key are batches, whatever process signs them.
+    pub async fn add_input_as(&self, signer: &TestSigner, payload: Vec<u8>) -> HarnessResult<u64> {
+        use cartesi_rollups_contracts::input_box::InputBox;
+        let provider = signer.connect_l1_provider(self.l1_endpoint()).await?;
+        let receipt = InputBox::new(self.input_box_address(), &provider)
+            .addInput(self.app_address(), payload.into())
+            .send()
+            .await
+            .map_err(|err| io_other(format!("failed to send InputBox input: {err}")))?
+            .get_receipt()
+            .await
+            .map_err(|err| io_other(format!("failed to confirm InputBox input: {err}")))?;
+        if !receipt.status() {
+            return Err(io_other("InputBox input reverted").into());
+        }
+        receipt
+            .block_number
+            .ok_or_else(|| io_other("InputBox receipt has no block number").into())
     }
 
     pub async fn restart(&mut self) -> HarnessResult<()> {
@@ -1305,25 +1383,30 @@ impl ManagedSequencer {
             self.data_dir_path.join("sequencer.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        let (era, generation): (Vec<u8>, i64) = conn.query_row(
-            "SELECT era_id, recovery_generation FROM history_state",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let era: Vec<u8> =
+            conn.query_row("SELECT era_id FROM era WHERE singleton_id = 0", [], |r| {
+                r.get(0)
+            })?;
         Ok(sequencer_rust_client::HistoryClaim {
-            version: sequencer_rust_client::HistoryVersion {
-                era_id: sequencer_core::history::EraId::try_from(era.as_slice())?,
-                recovery_generation: sequencer_core::history::RecoveryGeneration::new(
-                    u64::try_from(generation)?,
-                ),
-            },
-            next_input: sequencer_rust_client::ExecutedInputCount::new(next_input),
+            era_id: sequencer_core::history::EraId::try_from(era.as_slice())?,
+            next_input: sequencer_rust_client::L2TxCount::new(next_input),
         })
     }
 
     pub async fn ws(&self, next_input: u64) -> HarnessResult<WsClient> {
         let client = self.sequencer_client()?;
         WsClient::connect(&client, self.history_claim(next_input)?).await
+    }
+
+    /// Subscribe as a client of an older era holding state at `count` does
+    /// after a recovery: adopt the current era at its own count through the
+    /// SDK, then follow the feed from there.
+    pub async fn ws_adopting(&self, count: u64) -> HarnessResult<WsClient> {
+        let client = self.sequencer_client()?;
+        let claim = client
+            .adopt_current_era(sequencer_rust_client::L2TxCount::new(count))
+            .await?;
+        WsClient::connect(&client, claim).await
     }
 
     pub async fn wallet_l1(&self, signer: TestSigner) -> HarnessResult<WalletL1Client> {
@@ -1353,8 +1436,8 @@ impl ManagedSequencer {
         rollups_result
     }
 
-    /// A client for the internal listener, where the feed lives.
-    fn sequencer_client(&self) -> HarnessResult<SequencerClient> {
+    /// A client for the internal listener, where the feed and `/history` live.
+    pub fn sequencer_client(&self) -> HarnessResult<SequencerClient> {
         SequencerClient::new_with_timeout(self.internal_endpoint.clone(), Duration::from_secs(5))
             .map_err(|err| io_other(format!("failed to create sequencer client: {err}")).into())
     }
@@ -1386,41 +1469,49 @@ impl ManagedSequencer {
 
 use alloy_primitives::Address;
 
-/// The timing flags the e2e zone math depends on, passed explicitly so an
-/// exported `CARTESI_SEQUENCER_*` variable cannot shift them.
-fn timing_args() -> [String; 4] {
+/// The block time the harness mines outages at, passed explicitly so an
+/// exported `CARTESI_SEQUENCER_*` variable cannot shift it.
+fn timing_args() -> [String; 2] {
     [
-        "--preemptive-margin-blocks".into(),
-        DEVNET_PREEMPTIVE_MARGIN_BLOCKS.to_string(),
         "--seconds-per-block".into(),
         DEVNET_SECONDS_PER_BLOCK.to_string(),
     ]
+}
+
+/// The batch submitter's signer (Anvil account 9). A transaction it signs to
+/// the InputBox is a batch, whichever process sends it.
+pub fn batch_submitter_signer() -> HarnessResult<TestSigner> {
+    TestSigner::from_private_key_hex(&devnet_submitter()?.0)
+}
+
+/// A batch's InputBox payload: its SSZ encoding, with no envelope or tag.
+pub fn encode_batch(batch: &sequencer_core::batch::Batch) -> Vec<u8> {
+    ssz::Encode::as_ssz_bytes(batch)
 }
 
 struct SpawnedSequencerProcess {
     child: Child,
     endpoint: String,
     internal_endpoint: String,
-    log_path: PathBuf,
 }
 
-/// Read `next_batch_nonce` out of a dump dir's `info.toml` (the resume nonce
-/// `N`). The file is the simple `key = value` form the sequencer writes.
-fn read_info_next_batch_nonce(dump_dir: &Path) -> HarnessResult<u64> {
-    let info_path = dump_dir.join("info.toml");
-    let content = fs::read_to_string(info_path.as_path())
-        .map_err(|err| io_other(format!("read {info_path:?}: {err}")))?;
-    for line in content.lines() {
-        if let Some((key, value)) = line.split_once(" = ")
-            && key.trim() == "next_batch_nonce"
-        {
-            return value
-                .trim()
-                .parse::<u64>()
-                .map_err(|err| io_other(format!("parse next_batch_nonce: {err}")).into());
-        }
+/// How a `run` child's start ended.
+enum RunProcess {
+    Ready(SpawnedSequencerProcess),
+    /// The child exited before readiness, with this status.
+    Exited(Child, ExitStatus),
+}
+
+/// A start a spawn depends on must reach readiness.
+fn require_ready(started: RunProcess, log_path: &Path) -> HarnessResult<SpawnedSequencerProcess> {
+    match started {
+        RunProcess::Ready(process) => Ok(process),
+        RunProcess::Exited(_, status) => Err(io_other(format!(
+            "sequencer exited before readiness: status={status} (see {})",
+            log_path.display()
+        ))
+        .into()),
     }
-    Err(io_other(format!("info.toml missing next_batch_nonce: {info_path:?}")).into())
 }
 
 /// `(page_count - freelist_count) * page_size`, read in one statement so all
@@ -1440,297 +1531,326 @@ fn logical_db_bytes_at(db_path: &Path) -> HarnessResult<u64> {
     u64::try_from(bytes).map_err(|_| io_other(format!("negative logical DB size: {bytes}")).into())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn spawn_sequencer_process(
-    sequencer_bin: &Path,
-    log_prefix: &str,
-    logs_dir: &Path,
-    data_dir: &Path,
-    rollups: &DevnetRollupsStack,
-    l1_endpoint_override: Option<&str>,
-    chain_id_override: Option<u64>,
-    libfaketime_path: Option<&Path>,
-    faketime_rc_path: Option<&Path>,
-    mine_l1_during_boot: bool,
-    recovery: Option<&RecoverySetupParams>,
-    max_batch_open_seconds: Option<u64>,
-    fee_oracle_fixed_log_gas_price: Option<i16>,
-    genesis_bin: Option<&Path>,
-) -> HarnessResult<SpawnedSequencerProcess> {
-    let (endpoint, http_addr) = build_local_endpoint()?;
-    let (internal_endpoint, internal_http_addr) = build_local_endpoint()?;
-    let log_path = timestamped_log_path(logs_dir, log_prefix);
+/// What every child the harness starts shares: the binary, the stack it
+/// talks to, its data directory and its clock.
+struct ChildEnv<'a> {
+    bin: &'a Path,
+    data_dir: &'a Path,
+    rollups: &'a DevnetRollupsStack,
+    eth_rpc_url: &'a str,
+    /// The libfaketime library and the rc file it re-reads; `None` runs on
+    /// the real clock.
+    faketime: Option<(&'a Path, &'a Path)>,
+}
 
-    // Dedicated batch submitter = anvil account 9 (NOT the deployer/funder,
-    // account 0). `setup`'s detection gate refuses when the submitter's wallet
-    // nonce is unsettled, so the submitter must not share a key with the
-    // deployer or with an e2e wallet whose transactions are in flight. Account
-    // 9 starts at nonce 0. Must match `DEVNET_SEQUENCER_ADDRESS` (app-core); an
-    // assert below pins that. Account 9 is the highest standard funded anvil
-    // account, so it stays clear of the e2e wallets (0–3) and the bench
-    // workload (indices 0..concurrency).
-    const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
-    let batch_submitter_key = default_private_keys()[DEVNET_SUBMITTER_ACCOUNT_INDEX].clone();
-    // `setup` takes the submitter *address* (it never signs); `run` takes the
-    // key. Derive the address from the key so the harness configures both
-    // consistently.
-    let submitter_address = TestSigner::from_private_key_hex(&batch_submitter_key)?.address();
-    // `assert_eq!`, not `debug_assert_eq!`: benches build the harness `--release`,
-    // where a debug-assert is a no-op — drift between app-core and the harness
-    // submitter must fail fast in every build. Cost is one comparison per spawn.
+impl ChildEnv<'_> {
+    fn command(&self) -> HarnessResult<Command> {
+        let mut command = Command::new(self.bin);
+        // `kill_on_drop`: a `ManagedSequencer` normally reaps its child via
+        // `shutdown()` / `stop()`, but an error path that drops the struct
+        // without either (e.g. a benchmark returning early on a misconfigured
+        // run) would otherwise leave the child running while the owning
+        // `TempDir` deletes the data dir — the child's next DB open then
+        // fails `ENOENT` and it exits with a confusing `unable to open
+        // database file` that masks the real failure. `child` is declared
+        // before `_root_dir`, so on drop the SIGKILL lands before the dir is
+        // removed.
+        command
+            .kill_on_drop(true)
+            .env_remove("CARTESI_SEQUENCER_STATE_FILE")
+            .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG);
+        // libfaketime is applied via env vars (not the `faketime` wrapper
+        // binary), which the file-based FAKETIME_TIMESTAMP_FILE mechanism
+        // reads on every time call (FAKETIME_NO_CACHE=1) so tests can shift
+        // the clock at runtime.
+        if let Some((lib, rc)) = self.faketime {
+            apply_faketime_env(&mut command, lib, rc)?;
+        }
+        Ok(command)
+    }
+}
+
+/// One `setup` invocation: the base it starts from and whether it only
+/// reports.
+struct SetupRequest<'a> {
+    chain_id: u64,
+    /// The stored machine to rebuild from; `None` is genesis.
+    base: Option<&'a Path>,
+    dry_run: bool,
+    /// The C host's genesis tool, run for a setup from genesis.
+    genesis_bin: Option<&'a Path>,
+    fee_oracle_fixed_log_gas_price: Option<i16>,
+}
+
+/// The harness's batch submitter: its private key (hex) and address.
+fn devnet_submitter() -> HarnessResult<(String, Address)> {
+    let key = default_private_keys()[DEVNET_SUBMITTER_ACCOUNT_INDEX].clone();
+    let address = TestSigner::from_private_key_hex(&key)?.address();
+    // `assert_eq!`, not `debug_assert_eq!`: benches build the harness
+    // `--release`, where a debug-assert is a no-op — drift between app-core
+    // and the harness submitter must fail fast in every build.
     assert_eq!(
-        submitter_address,
+        address,
         app_core::application::DEVNET_SEQUENCER_ADDRESS,
         "harness submitter (anvil account {DEVNET_SUBMITTER_ACCOUNT_INDEX}) must equal \
          DEVNET_SEQUENCER_ADDRESS — keep app-core and the harness in sync"
     );
-    let batch_submitter_address = submitter_address.to_string();
-    let eth_rpc_url = l1_endpoint_override.unwrap_or_else(|| rollups.l1_endpoint());
+    Ok((key, address))
+}
 
-    let chain_id = chain_id_override.unwrap_or(DEVNET_CHAIN_ID);
-    let bin = path_as_str(sequencer_bin)?.to_owned();
-
-    let genesis_dir = if let Some(genesis_bin) = genesis_bin {
-        let dir = TempDir::new()?;
-        let mut command = Command::new(genesis_bin);
-        command
-            .kill_on_drop(true)
-            .arg(dir.path().join("state"))
-            .arg("devnet");
-        let output = tokio::time::timeout(DEFAULT_SEQUENCER_START_TIMEOUT, command.output())
-            .await
-            .map_err(|_| {
-                io_other(format!(
-                    "genesis tool '{}' timed out",
-                    genesis_bin.display()
-                ))
-            })?
-            .map_err(|err| {
-                io_other(format!(
-                    "failed to run genesis tool '{}': {err}",
-                    genesis_bin.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(io_other(format!(
-                "genesis tool '{}' failed: status={}: {}",
-                genesis_bin.display(),
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-            .into());
-        }
-        Some(dir)
+/// The arguments of one `setup` run. Setup takes the submitter key, the same
+/// way `run` does, because it flushes the submitter's wallet; the dry run
+/// flushes nothing and gets no key. The genesis state goes only to a setup
+/// without a base.
+fn setup_args(
+    request: &SetupRequest<'_>,
+    data_dir: &Path,
+    eth_rpc_url: &str,
+    app_address: Address,
+    submitter: (&str, Address),
+    genesis_state: Option<&Path>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+    if request.base.is_none()
+        && let Some(state) = genesis_state
+    {
+        args.extend(["--state-file".into(), state.into()]);
+    }
+    args.extend([
+        "setup".into(),
+        "--data-dir".into(),
+        data_dir.into(),
+        "--eth-rpc-url".into(),
+        eth_rpc_url.into(),
+        "--chain-id".into(),
+        request.chain_id.to_string().into(),
+        "--app-address".into(),
+        app_address.to_string().into(),
+        "--batch-submitter-address".into(),
+        submitter.1.to_string().into(),
+    ]);
+    args.extend(timing_args().map(OsString::from));
+    if let Some(base) = request.base {
+        args.extend(["--base".into(), base.into()]);
+    }
+    if request.dry_run {
+        args.push("--dry-run".into());
     } else {
-        None
-    };
+        args.extend(["--batch-submitter-private-key".into(), submitter.0.into()]);
+    }
+    args
+}
 
-    // libfaketime is applied via env vars (not the `faketime` wrapper binary),
-    // which the file-based FAKETIME_TIMESTAMP_FILE mechanism reads on every
-    // time call (FAKETIME_NO_CACHE=1) so tests can shift the clock at runtime.
-    let open_log = |append: bool| -> HarnessResult<std::fs::File> {
-        Ok(OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(!append)
-            .append(append)
-            .open(log_path.as_path())?)
+/// Run `setup` to completion and report how it ended. Its summary (stdout)
+/// is returned and, with stderr, appended to `log_path`. With
+/// `mine_l1_during_setup`, L1 advances while setup runs, so a flush of an
+/// old instance's stranded transactions can reach safe depth on an
+/// on-demand-mining devnet.
+async fn run_setup_process(
+    env: &ChildEnv<'_>,
+    request: &SetupRequest<'_>,
+    log_path: &Path,
+    mine_l1_during_setup: bool,
+) -> HarnessResult<SetupOutcome> {
+    let (submitter_key, submitter_address) = devnet_submitter()?;
+    // The genesis tool runs only for a setup from genesis; its output is
+    // removed when setup ends, so neither `run` nor a later recovery may
+    // depend on it.
+    let genesis_dir = match (request.base, request.genesis_bin) {
+        (None, Some(genesis_bin)) => Some(run_genesis_tool(genesis_bin).await?),
+        _ => None,
     };
+    let genesis_state = genesis_dir.as_ref().map(|dir| dir.path().join("state"));
 
-    // Phase A — `setup` (run once; idempotent on re-spawns, so it is a cheap
-    // no-op once the DB is set up, and needs L1 only on the first run / after
-    // a DB reset). Run to completion as a blocking step; a bootstrap refusal
-    // (e.g. a chain-id mismatch) surfaces here as a non-zero exit, just as it
-    // surfaced from the monolithic boot before the split.
-    let mut setup_cmd = Command::new(&bin);
-    setup_cmd.env_remove("CARTESI_SEQUENCER_STATE_FILE");
-    if let Some(dir) = &genesis_dir {
-        setup_cmd.arg("--state-file").arg(dir.path().join("state"));
-    }
-    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
-        apply_faketime_env(&mut setup_cmd, lib, rc)?;
-    }
-    let setup_log = open_log(false)?;
-    let setup_log_err = setup_log.try_clone()?;
-    setup_cmd
-        .arg("setup")
-        .arg("--data-dir")
-        .arg(path_as_str(data_dir)?)
-        .arg("--eth-rpc-url")
-        .arg(eth_rpc_url)
-        .arg("--chain-id")
-        .arg(chain_id.to_string())
-        .arg("--app-address")
-        .arg(rollups.app_address().to_string())
-        .arg("--batch-submitter-address")
-        .arg(&batch_submitter_address)
-        .args(timing_args());
-    if let Some(recovery) = recovery {
-        // Recovery setup rebuilds the wiped DB from a checkpoint: it signs (the
-        // flush), so it takes the key, plus the checkpoint block + dump dir.
-        setup_cmd
-            .arg("--recovery")
-            .arg("--checkpoint-block")
-            .arg(recovery.checkpoint_block.to_string())
-            .arg("--checkpoint-dump-dir")
-            .arg(path_as_str(&recovery.checkpoint_dump_dir)?)
-            .arg("--batch-submitter-private-key")
-            .arg(&batch_submitter_key);
-    }
-    setup_cmd
-        .env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG)
-        .stdout(Stdio::from(setup_log))
-        .stderr(Stdio::from(setup_log_err));
-    // Unknown chains require an explicit setup-time source. Normal Anvil e2e
-    // pins zero; the dedicated fee test overrides it before identity exists.
-    setup_cmd.env(
-        "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
-        fee_oracle_fixed_log_gas_price.unwrap_or(0).to_string(),
-    );
-    let mut setup_child = setup_cmd
-        .spawn()
-        .map_err(|err| io_other(format!("failed to spawn `setup` for '{bin}': {err}")))?;
-    // Bound the setup phase so a stalled/lagging RPC during the initial sync
-    // can't hang the harness indefinitely. Recovery setup additionally flushes
-    // the wallet nonce, which can block until a stranded slot becomes safe — so
-    // mine L1 concurrently (nothing else does on an on-demand devnet) and give
-    // it the generous recovery-boot budget. Genesis setup never flushes.
-    let setup_status = if recovery.is_some() {
-        let deadline = std::time::Instant::now() + RECOVERY_BOOT_START_TIMEOUT;
-        loop {
-            if let Some(status) = setup_child
-                .try_wait()
-                .map_err(|err| io_other(format!("poll recovery `setup`: {err}")))?
-            {
-                break status;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = setup_child.start_kill();
-                let _ = setup_child.wait().await;
-                return Err(io_other(format!(
-                    "recovery `setup` timed out after {:?} (see {})",
-                    RECOVERY_BOOT_START_TIMEOUT,
-                    log_path.display()
-                ))
-                .into());
-            }
-            let _ = rollups.mine_l1_block_at_wall_clock().await;
-            tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
-        }
-    } else {
-        match tokio::time::timeout(DEFAULT_SEQUENCER_START_TIMEOUT, setup_child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let _ = setup_child.start_kill();
-                let _ = setup_child.wait().await;
-                return Err(io_other(format!(
-                    "sequencer `setup` timed out after {:?} (see {})",
-                    DEFAULT_SEQUENCER_START_TIMEOUT,
-                    log_path.display()
-                ))
-                .into());
-            }
-        }
-    };
-    if !setup_status.success() {
-        return Err(io_other(format!(
-            "sequencer `setup` failed: status={setup_status} (see {})",
-            log_path.display()
+    let mut command = env.command()?;
+    command
+        .args(setup_args(
+            request,
+            env.data_dir,
+            env.eth_rpc_url,
+            env.rollups.app_address(),
+            (submitter_key.as_str(), submitter_address),
+            genesis_state.as_deref(),
         ))
-        .into());
-    }
+        // Unknown chains require an explicit setup-time source. Normal Anvil
+        // e2e pins zero; the dedicated fee test overrides it.
+        .env(
+            "CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE",
+            request
+                .fee_oracle_fixed_log_gas_price
+                .unwrap_or(0)
+                .to_string(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let timeout = if request.base.is_some() {
+        BASE_SETUP_TIMEOUT
+    } else if mine_l1_during_setup {
+        FLUSHING_SETUP_TIMEOUT
+    } else {
+        GENESIS_SETUP_TIMEOUT
+    };
+
+    // Dropping the output future on timeout kills the child (`kill_on_drop`).
+    let output = command.output();
+    let output = if mine_l1_during_setup {
+        let miner = mine_forever(env.rollups);
+        tokio::select! {
+            output = tokio::time::timeout(timeout, output) => output,
+            _ = miner => unreachable!("the setup miner loops forever; only setup resolves"),
+        }
+    } else {
+        tokio::time::timeout(timeout, output).await
+    };
+    let output = output
+        .map_err(|_| {
+            io_other(format!(
+                "sequencer `setup` timed out after {timeout:?} (see {})",
+                log_path.display()
+            ))
+        })?
+        .map_err(|err| {
+            io_other(format!(
+                "failed to run `setup` for '{}': {err}",
+                env.bin.display()
+            ))
+        })?;
+
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    // Tracing writes to stdout; stderr holds what escaped it, such as clap's
+    // usage errors.
+    log.write_all(&output.stdout)?;
+    log.write_all(&output.stderr)?;
     if let Some(dir) = genesis_dir {
-        // Neither startup nor later recovery may depend on the original source.
         dir.close()
             .map_err(|err| io_other(format!("remove initial genesis after setup: {err}")))?;
     }
+    Ok(SetupOutcome {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    })
+}
 
-    // Phase B — `run` (re-spawned on every restart; reads identity from the
-    // setup DB).
-    let mut run_cmd = Command::new(&bin);
-    run_cmd.env_remove("CARTESI_SEQUENCER_STATE_FILE");
-    if let (Some(lib), Some(rc)) = (libfaketime_path, faketime_rc_path) {
-        apply_faketime_env(&mut run_cmd, lib, rc)?;
+/// A setup that a spawn depends on must succeed.
+fn require_setup_success(outcome: SetupOutcome, log_path: &Path) -> HarnessResult<()> {
+    if outcome.success() {
+        return Ok(());
     }
-    let run_log = open_log(true)?;
-    let run_log_err = run_log.try_clone()?;
-    // `kill_on_drop`: a `ManagedSequencer` normally reaps its child via
-    // `shutdown()` / `stop()`, but an error path that drops the struct without
-    // either (e.g. a benchmark returning early on a misconfigured run) would
-    // otherwise leave the child running while the owning `TempDir` deletes the
-    // data dir — the child's next DB open then fails `ENOENT` and it exits with
-    // a confusing `unable to open database file` that masks the real failure.
-    // `child` is declared before `_data_dir`, so on drop the SIGKILL lands
-    // before the dir is removed.
-    run_cmd
+    Err(io_other(format!(
+        "sequencer `setup` failed: status={} (see {})",
+        outcome.status,
+        log_path.display()
+    ))
+    .into())
+}
+
+/// Write the C host's genesis state into a new temporary directory.
+async fn run_genesis_tool(genesis_bin: &Path) -> HarnessResult<TempDir> {
+    let dir = TempDir::new()?;
+    let mut command = Command::new(genesis_bin);
+    command
         .kill_on_drop(true)
+        .arg(dir.path().join("state"))
+        .arg("devnet");
+    let output = tokio::time::timeout(DEFAULT_SEQUENCER_START_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            io_other(format!(
+                "genesis tool '{}' timed out",
+                genesis_bin.display()
+            ))
+        })?
+        .map_err(|err| {
+            io_other(format!(
+                "failed to run genesis tool '{}': {err}",
+                genesis_bin.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(io_other(format!(
+            "genesis tool '{}' failed: status={}: {}",
+            genesis_bin.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(dir)
+}
+
+/// Mine one block per [`SETUP_L1_MINE_INTERVAL`] until dropped, as a live
+/// chain advances while setup flushes. Transient RPC hiccups are non-fatal —
+/// the next tick retries; a genuine mining failure shows as the caller's
+/// timeout.
+async fn mine_forever(rollups: &DevnetRollupsStack) {
+    loop {
+        tokio::time::sleep(SETUP_L1_MINE_INTERVAL).await;
+        let _ = rollups.mine_l1_block_at_wall_clock().await;
+    }
+}
+
+/// Start `run` on a set-up data directory and wait for its public listener,
+/// or for the process to exit first. Its output is appended to `log_path`.
+async fn spawn_run_process(
+    env: &ChildEnv<'_>,
+    log_path: &Path,
+    max_batch_open_seconds: Option<u64>,
+) -> HarnessResult<RunProcess> {
+    let (endpoint, http_addr) = build_local_endpoint()?;
+    let (internal_endpoint, internal_http_addr) = build_local_endpoint()?;
+    let (submitter_key, _) = devnet_submitter()?;
+
+    let run_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let run_log_err = run_log.try_clone()?;
+    let mut run_cmd = env.command()?;
+    run_cmd
         .arg("run")
         .arg("--http-addr")
         .arg(http_addr)
         .arg("--internal-http-addr")
         .arg(internal_http_addr)
         .arg("--data-dir")
-        .arg(path_as_str(data_dir)?)
+        .arg(env.data_dir)
         .arg("--eth-rpc-url")
-        .arg(eth_rpc_url)
+        .arg(env.eth_rpc_url)
         .arg("--batch-submitter-private-key")
-        .arg(&batch_submitter_key)
+        .arg(&submitter_key)
         .args(timing_args());
     if let Some(secs) = max_batch_open_seconds {
         run_cmd
             .arg("--max-batch-open-seconds")
             .arg(secs.to_string());
     }
-    run_cmd.env("RUST_LOG", DEFAULT_SEQUENCER_RUST_LOG);
     run_cmd
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_err));
     let mut child = run_cmd.spawn().map_err(|err| {
         io_other(format!(
             "failed to spawn sequencer binary '{}': {err}",
-            sequencer_bin.display()
+            env.bin.display()
         ))
     })?;
 
-    if mine_l1_during_boot {
-        // A recovery boot blocks in the mempool flush until the stranded
-        // wallet-nonce slot becomes safe, which needs L1 to keep producing
-        // blocks. On an on-demand-mining devnet nothing produces them, so mine
-        // a trickle concurrently with the readiness wait — mirroring a live
-        // chain that advances during a slow boot. The miner is dropped the
-        // instant readiness resolves, so L1 only advances for the boot window.
-        let miner = async {
-            loop {
-                tokio::time::sleep(BOOT_L1_MINE_INTERVAL).await;
-                // Transient RPC hiccups mid-boot are non-fatal — the next tick
-                // retries. A genuine mining failure manifests as the boot
-                // timing out, reported by the readiness arm.
-                let _ = rollups.mine_l1_block_at_wall_clock().await;
-            }
-        };
-        tokio::select! {
-            res = wait_for_http_readiness(
-                endpoint.as_str(),
-                &mut child,
-                RECOVERY_BOOT_START_TIMEOUT,
-            ) => res?,
-            _ = miner => unreachable!("boot miner loops forever; only readiness resolves"),
-        }
-    } else {
-        wait_for_http_readiness(
-            endpoint.as_str(),
-            &mut child,
-            DEFAULT_SEQUENCER_START_TIMEOUT,
-        )
-        .await?;
+    match wait_for_http_readiness(
+        endpoint.as_str(),
+        &mut child,
+        DEFAULT_SEQUENCER_START_TIMEOUT,
+    )
+    .await?
+    {
+        Readiness::Ready => Ok(RunProcess::Ready(SpawnedSequencerProcess {
+            child,
+            endpoint,
+            internal_endpoint,
+        })),
+        Readiness::Exited(status) => Ok(RunProcess::Exited(child, status)),
     }
-
-    Ok(SpawnedSequencerProcess {
-        child,
-        endpoint,
-        internal_endpoint,
-        log_path,
-    })
 }
 
 /// Configure the child process env to preload libfaketime and point it at
@@ -1851,7 +1971,85 @@ fn find_libfaketime_in_dirs(lib_dirs: &[PathBuf], candidates: &[&str]) -> Option
 mod tests {
     use std::fs;
 
-    use super::{candidate_libfaketime_dirs, find_libfaketime_in_dirs, logical_db_bytes_at};
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use alloy_primitives::Address;
+
+    use super::{
+        SetupRequest, candidate_libfaketime_dirs, find_libfaketime_in_dirs, logical_db_bytes_at,
+        setup_args,
+    };
+
+    fn args_of(base: Option<&Path>, dry_run: bool, genesis_state: Option<&Path>) -> Vec<String> {
+        let request = SetupRequest {
+            chain_id: 31337,
+            base,
+            dry_run,
+            genesis_bin: None,
+            fee_oracle_fixed_log_gas_price: None,
+        };
+        setup_args(
+            &request,
+            Path::new("/data"),
+            "http://127.0.0.1:8545",
+            Address::repeat_byte(0xaa),
+            ("0xkey", Address::repeat_byte(0x99)),
+            genesis_state,
+        )
+        .into_iter()
+        .map(|arg: OsString| arg.into_string().expect("utf-8 arg"))
+        .collect()
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|arg| arg == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    /// Setup flushes the submitter's wallet, so it gets the key `run` gets;
+    /// the genesis state is the host's option, before the subcommand.
+    #[test]
+    fn a_genesis_setup_takes_the_key_and_the_genesis_state() {
+        let args = args_of(None, false, Some(Path::new("/genesis/state")));
+        assert_eq!(&args[..3], ["--state-file", "/genesis/state", "setup"]);
+        assert_eq!(
+            value_after(&args, "--batch-submitter-private-key"),
+            Some("0xkey")
+        );
+        assert_eq!(value_after(&args, "--data-dir"), Some("/data"));
+        assert!(!args.iter().any(|arg| arg == "--base" || arg == "--dry-run"));
+    }
+
+    /// A setup from a stored machine builds its application from the
+    /// machine's state, so the genesis state is not passed.
+    #[test]
+    fn a_base_setup_names_the_machine_and_no_genesis_state() {
+        let args = args_of(
+            Some(Path::new("/machines/base")),
+            false,
+            Some(Path::new("/genesis/state")),
+        );
+        assert_eq!(args[0], "setup");
+        assert_eq!(value_after(&args, "--base"), Some("/machines/base"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--batch-submitter-private-key")
+        );
+        assert!(!args.iter().any(|arg| arg == "--state-file"));
+    }
+
+    /// The dry run flushes nothing, so it never sees the key.
+    #[test]
+    fn a_dry_run_gets_no_key() {
+        let args = args_of(Some(Path::new("/machines/base")), true, None);
+        assert!(args.iter().any(|arg| arg == "--dry-run"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("private-key") || arg == "0xkey")
+        );
+    }
 
     /// The logical size counts pages still in the WAL and drops freed pages,
     /// so it falls after a DELETE while the file, never vacuumed, does not.

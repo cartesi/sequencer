@@ -21,8 +21,8 @@ and its canonical state coincide; one write per `create_dump`.
 Here `prefix` is the app-owned `state` directory inside the sequencer's dump
 directory. Thus the wallet file is `dumps/<id>/state/state`. The surrounding
 `info.toml` and exported `checkpoint.toml` use the sequencer's metadata format
-version; that version does not identify the wallet's SSZ schema. Application
-progress is embedded in the wallet bytes. History identity and acceptance
+version; that version does not identify the wallet's SSZ schema. The L2 tx
+count is embedded in the wallet bytes. History identity and acceptance
 metadata come from the sequencer; see [application history](../protocol/application-history.md).
 
 ## Toy Wallet Wire Format
@@ -44,12 +44,13 @@ metadata come from the sequencer; see [application history](../protocol/applicat
 - `nonces` (`Vec<SnapshotNonce>`)
   - `address` (`[u8; 20]`)
   - `nonce` (`u32`)
-- `executed_input_count` (`u64`)
-- `last_executed_safe_block` (`u64`) — the app's safe-block clock
-  (reported by `Application::progress`): max block carried by any
-  executed input. Recovery reads it as `A`, the safe block this state
-  reflects, so it must live in the canonical state bytes (both the
-  bare-metal and canonical-machine sides advance it identically).
+- `l2_tx_count` (`u64`) — the L2 tx count, reported by
+  `Application::l2_tx_count`. `WalletApp::from_canonical_state`
+  refuses bytes whose count differs from the machine's.
+
+The wallet holds no clock. The safe-block clock belongs to the scheduler and
+travels in its export, not in the application's bytes
+([the scheduler clock](../protocol/scheduler-semantics.md#the-scheduler-clock)).
 
 ### Determinism
 
@@ -70,7 +71,6 @@ The decoder rejects:
 - Malformed SSZ bytes (any decode error from the SSZ library).
 - A snapshot containing two entries in `balances` with the same address.
 - A snapshot containing two entries in `nonces` with the same address.
-- Zero `executed_input_count` with a nonzero `last_executed_safe_block`.
 
 Duplicate checks prevent an entry from silently overwriting another during
 restore. The decoder accepts unique entries in any order; re-encoding the
@@ -90,6 +90,12 @@ If a future change ever needs to break the wire format against live dumps:
    themselves stay tag-less.
 
 Until then, do not reorder, repurpose, or reinterpret existing fields in place.
+
+The one in-place break so far removed the trailing `last_executed_safe_block`
+field (the fixed part went from 84 to 76 bytes). It was deliberate and
+pre-launch: it ships with a new template hash, and no live dump had to
+survive it. A dump in the old layout fails to decode (`snapshot decode
+failed`) rather than being misread.
 
 ## Trust Model
 

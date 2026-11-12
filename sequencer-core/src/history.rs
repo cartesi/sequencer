@@ -1,25 +1,25 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! External history identity and version coordinates.
+//! External history identity and coordinates: the era and the L2 tx count.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
 
-/// Boundary before the next canonical application input executes.
+/// The L2 tx count: how many L2 transactions have executed.
 ///
-/// If the application is at `X`, history entry `X` is the next input and a
-/// successful execution moves the boundary to `X + 1`. Arithmetic is kept
+/// If the application is at `X`, history entry `X` executes next and a
+/// successful execution moves the count to `X + 1`. Arithmetic is kept
 /// behind checked methods so this coordinate cannot be confused with a
 /// physical SQLite cursor or advanced with wrapping/saturating math.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
 #[serde(transparent)]
-pub struct ExecutedInputCount(u64);
+pub struct L2TxCount(u64);
 
-impl ExecutedInputCount {
+impl L2TxCount {
     pub const ZERO: Self = Self(0);
 
     pub const fn new(value: u64) -> Self {
@@ -40,9 +40,18 @@ impl ExecutedInputCount {
             None => None,
         }
     }
+
+    /// Advance by one executed transaction, as an application does on every
+    /// success. A count with no successor has no canonical next state, so
+    /// this panics rather than wrap.
+    pub fn advance(&mut self) {
+        *self = self
+            .checked_next()
+            .expect("L2 tx count overflow: no canonical successor");
+    }
 }
 
-/// One durable setup/rebuild era.
+/// One durable era, published by setup.
 ///
 /// The bytes must carry the RFC 4122 UUIDv4 version and variant bits. Text and
 /// JSON use the canonical lowercase hyphenated representation.
@@ -138,63 +147,40 @@ pub enum EraIdParseError {
     InvalidVariant,
 }
 
-/// Monotonic soft-history revision within one [`EraId`].
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct RecoveryGeneration(u64);
-
-impl RecoveryGeneration {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Equality/discontinuity token for locally available application history.
-/// Consumers must claim both fields when resuming application history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HistoryVersion {
-    pub era_id: EraId,
-    pub recovery_generation: RecoveryGeneration,
-}
-
 /// The history a consumer holds and the next application input it can execute.
+///
+/// An era is the history's whole identity: inside one era the history only
+/// appends, so a claim needs no revision besides its era. A client of an older
+/// era adopts a new one only through
+/// [`crate::history_api::HistoryInfo::adopt_claim`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryClaim {
-    pub version: HistoryVersion,
-    pub next_input: ExecutedInputCount,
+    pub era_id: EraId,
+    pub next_input: L2TxCount,
 }
 
 /// One coherent view of the locally available canonical history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryBounds {
-    pub version: HistoryVersion,
-    pub available_from: ExecutedInputCount,
-    pub head: ExecutedInputCount,
+    pub era_id: EraId,
+    pub available_from: L2TxCount,
+    pub head: L2TxCount,
 }
 
 impl HistoryBounds {
     /// Validate identity before position: equal counts cannot resume a different
-    /// history. Every count in the inclusive range is admissible; `head` waits
-    /// for the next input.
+    /// history by themselves. A client of another era first checks its count
+    /// against the new era's rebuilt range and claims the current era
+    /// ([`crate::history_api::HistoryInfo::adopt_claim`]). Every count in the
+    /// inclusive range is admissible; `head` waits for the next input.
     pub fn validate(&self, claim: HistoryClaim) -> Result<(), HistoryPolicyError> {
         assert!(
             self.available_from <= self.head,
             "available history base exceeds its head"
         );
-        if claim.version.era_id != self.version.era_id {
+        if claim.era_id != self.era_id {
             return Err(HistoryPolicyError::EraChanged {
-                current: self.version,
-            });
-        }
-        if claim.version.recovery_generation != self.version.recovery_generation {
-            return Err(HistoryPolicyError::StaleGeneration {
-                current: self.version,
+                era_id: self.era_id,
             });
         }
         if claim.next_input < self.available_from {
@@ -212,14 +198,13 @@ impl HistoryBounds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryPolicyError {
+    /// The claim names another era; `era_id` is the server's current one.
     #[error("history era changed")]
-    EraChanged { current: HistoryVersion },
-    #[error("history generation changed")]
-    StaleGeneration { current: HistoryVersion },
+    EraChanged { era_id: EraId },
     #[error("requested input precedes locally available history")]
-    HistoryUnavailable { available_from: ExecutedInputCount },
+    HistoryUnavailable { available_from: L2TxCount },
     #[error("requested input is ahead of the history head")]
-    AheadOfHead { head: ExecutedInputCount },
+    AheadOfHead { head: L2TxCount },
 }
 
 #[cfg(test)]
@@ -240,12 +225,16 @@ mod tests {
             "\"00112233-4455-4677-8899-aabbccddeeff\""
         );
         let claim = HistoryClaim {
-            version: HistoryVersion {
-                era_id: era,
-                recovery_generation: RecoveryGeneration::new(7),
-            },
-            next_input: ExecutedInputCount::new(u64::MAX),
+            era_id: era,
+            next_input: L2TxCount::new(u64::MAX),
         };
+        assert_eq!(
+            serde_json::to_value(claim).unwrap(),
+            serde_json::json!({
+                "era_id": "00112233-4455-4677-8899-aabbccddeeff",
+                "next_input": u64::MAX
+            })
+        );
         assert_eq!(
             serde_json::from_str::<HistoryClaim>(&serde_json::to_string(&claim).unwrap()).unwrap(),
             claim
@@ -260,34 +249,21 @@ mod tests {
 
     #[test]
     fn history_policy_errors_preserve_literal_wire_codes_and_fields() {
-        let current = HistoryVersion {
-            era_id: CANONICAL.parse().unwrap(),
-            recovery_generation: RecoveryGeneration::new(7),
-        };
+        let era_id: EraId = CANONICAL.parse().unwrap();
         for (error, json) in [
             (
-                HistoryPolicyError::EraChanged { current },
-                serde_json::json!({
-                    "code": "ERA_CHANGED",
-                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
-                }),
-            ),
-            (
-                HistoryPolicyError::StaleGeneration { current },
-                serde_json::json!({
-                    "code": "STALE_GENERATION",
-                    "current": { "era_id": CANONICAL, "recovery_generation": 7 }
-                }),
+                HistoryPolicyError::EraChanged { era_id },
+                serde_json::json!({ "code": "ERA_CHANGED", "era_id": CANONICAL }),
             ),
             (
                 HistoryPolicyError::HistoryUnavailable {
-                    available_from: ExecutedInputCount::new(41),
+                    available_from: L2TxCount::new(41),
                 },
                 serde_json::json!({ "code": "HISTORY_UNAVAILABLE", "available_from": 41 }),
             ),
             (
                 HistoryPolicyError::AheadOfHead {
-                    head: ExecutedInputCount::new(50),
+                    head: L2TxCount::new(50),
                 },
                 serde_json::json!({ "code": "AHEAD_OF_HEAD", "head": 50 }),
             ),
@@ -324,69 +300,54 @@ mod tests {
     }
 
     #[test]
-    fn executed_input_count_advances_checked() {
-        assert_eq!(
-            ExecutedInputCount::ZERO.checked_next(),
-            Some(ExecutedInputCount::new(1))
-        );
-        assert_eq!(ExecutedInputCount::new(u64::MAX).checked_next(), None);
-        assert_eq!(
-            ExecutedInputCount::new(7).checked_add(5),
-            Some(ExecutedInputCount::new(12))
-        );
+    fn l2_tx_count_advances_checked() {
+        assert_eq!(L2TxCount::ZERO.checked_next(), Some(L2TxCount::new(1)));
+        assert_eq!(L2TxCount::new(u64::MAX).checked_next(), None);
+        assert_eq!(L2TxCount::new(7).checked_add(5), Some(L2TxCount::new(12)));
+
+        let mut count = L2TxCount::new(u64::MAX - 1);
+        count.advance();
+        assert_eq!(count, L2TxCount::new(u64::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "L2 tx count overflow: no canonical successor")]
+    fn l2_tx_count_advance_fails_loud_without_a_successor() {
+        L2TxCount::new(u64::MAX).advance();
     }
 
     fn history_bounds(base: u64, head: u64) -> HistoryBounds {
         HistoryBounds {
-            version: HistoryVersion {
-                era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
-                recovery_generation: RecoveryGeneration::new(4),
-            },
-            available_from: ExecutedInputCount::new(base),
-            head: ExecutedInputCount::new(head),
+            era_id: EraId::from_bytes(CANONICAL_BYTES).unwrap(),
+            available_from: L2TxCount::new(base),
+            head: L2TxCount::new(head),
         }
     }
 
     #[test]
-    fn history_claim_checks_era_before_generation_and_position() {
+    fn history_bounds_json_pins_the_era_and_both_counts() {
+        assert_eq!(
+            serde_json::to_value(history_bounds(7, 12)).unwrap(),
+            serde_json::json!({ "era_id": CANONICAL, "available_from": 7, "head": 12 })
+        );
+    }
+
+    #[test]
+    fn history_claim_checks_era_before_position() {
         let bounds = history_bounds(41, 45);
         let mut other_era = CANONICAL_BYTES;
         other_era[0] ^= 1;
         let other_era = EraId::from_bytes(other_era).unwrap();
-        for (generation, next_input) in [(4, 43), (3, 0), (u64::MAX, u64::MAX)] {
+        for next_input in [43, 0, u64::MAX] {
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: HistoryVersion {
-                        era_id: other_era,
-                        recovery_generation: RecoveryGeneration::new(generation),
-                    },
-                    next_input: ExecutedInputCount::new(next_input),
+                    era_id: other_era,
+                    next_input: L2TxCount::new(next_input),
                 }),
                 Err(HistoryPolicyError::EraChanged {
-                    current: bounds.version,
+                    era_id: bounds.era_id,
                 })
             );
-        }
-    }
-
-    #[test]
-    fn history_claim_requires_equal_generation_before_checking_position() {
-        let bounds = history_bounds(41, 45);
-        for generation in [0, 3, 5, u64::MAX] {
-            for next_input in [0, 43, u64::MAX] {
-                assert_eq!(
-                    bounds.validate(HistoryClaim {
-                        version: HistoryVersion {
-                            recovery_generation: RecoveryGeneration::new(generation),
-                            ..bounds.version
-                        },
-                        next_input: ExecutedInputCount::new(next_input),
-                    }),
-                    Err(HistoryPolicyError::StaleGeneration {
-                        current: bounds.version,
-                    })
-                );
-            }
         }
     }
 
@@ -403,8 +364,8 @@ mod tests {
             };
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: bounds.version,
-                    next_input: ExecutedInputCount::new(next_input),
+                    era_id: bounds.era_id,
+                    next_input: L2TxCount::new(next_input),
                 }),
                 Err(expected)
             );
@@ -425,8 +386,8 @@ mod tests {
             let bounds = history_bounds(base, head);
             assert_eq!(
                 bounds.validate(HistoryClaim {
-                    version: bounds.version,
-                    next_input: ExecutedInputCount::new(next_input),
+                    era_id: bounds.era_id,
+                    next_input: L2TxCount::new(next_input),
                 }),
                 Ok(())
             );
@@ -438,8 +399,8 @@ mod tests {
     fn incoherent_history_bounds_fail_loud() {
         let bounds = history_bounds(42, 41);
         let _ = bounds.validate(HistoryClaim {
-            version: bounds.version,
-            next_input: ExecutedInputCount::new(41),
+            era_id: bounds.era_id,
+            next_input: L2TxCount::new(41),
         });
     }
 }

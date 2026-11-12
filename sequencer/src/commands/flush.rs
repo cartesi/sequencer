@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! The `flush-mempool` command: settle the batch-submitter wallet nonce on demand
-//! with the same flush startup recovery and `setup --recovery` run. It needs the
-//! signing key and a completed setup, and never syncs, cascades or launches
-//! workers (README "Running").
+//! with the same flush that setup runs. It needs the signing key and a
+//! completed setup, and never syncs or launches workers (README "Running").
 
 use super::load_setup_identity;
 use crate::commands::config::FlushConfig;
 use crate::commands::error::CommandError;
-use crate::recovery::MempoolFlusher;
+use crate::l1::flusher::MempoolFlusher;
 use crate::storage::{self, LifecycleCommand};
 
 pub async fn flush_mempool(config: FlushConfig) -> Result<(), CommandError> {
@@ -42,7 +41,7 @@ async fn flush_mempool_admitted(
     // The durable flush anchor: every slot we ever broadcast
     // must resolve at safe depth, regardless of the local pool's memory.
     let watermark = {
-        let mut storage = storage::Storage::open_writer(&db_path)?;
+        let mut storage = storage::Storage::open_read_only(&db_path)?;
         storage.wallet_nonce_watermark()?
     };
 

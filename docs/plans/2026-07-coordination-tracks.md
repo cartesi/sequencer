@@ -12,40 +12,36 @@ freely at this stage — no backward-compatibility constraints.
 
 | # | Track | Owner | Status |
 |---|-------|-------|--------|
-| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented; client adoption and deployment work remain; frozen until the shared recovery tool and a new client sync** — [scope](#track-3--feed--replay-protocol-redesign) |
+| 3 | Feed & replay protocol redesign | us (design) → us/Stephen (impl) | **implemented; client adoption and deployment work remain; frozen until a new client sync** — [scope](#track-3--feed--replay-protocol-redesign) |
 | 5 | Fee exponentiation LUT | us | **unblocked, needs Bart** — fees stay in log space; the batch-level alternative is deferred with [batch-scoped replay protection](2026-10-batch-scoped-replay-protection.md). Shape decided: exact-floor table, algorithm-free; a consensus change agreed with Bart before implementation; the log-additive `batch_policy` design is frozen until then |
 | 6 | Dump / `Application` API redesign | us + Bart | **interface and reference C binding implemented** — [Application contract](../protocol/application-contract.md); native-engine integration gates remain |
 
 **Current campaign order:**
 
-1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. A shared recovery tool, still to be designed, will produce both the sequencer's and the client's startup state from a checkpoint. Until it lands, `setup --recovery`, `fold.rs` and the cockroach reader seams get bug fixes only.
-2. Application integrators/operators validate the private engine, canonical-to-native exporter and recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
+1. Bart's client integrates the feed and treats cockroach recoveries as out of scope; we fix bugs it finds, and other feedback is input to the new sync. [Sequencer recovery](2026-11-sequencer-recovery/README.md) is built: `setup --base <MACHINE_DIR>` rebuilds the sequencer from a canonical machine's exported state through `from_canonical_state` ([cockroach recovery](../recovery/cockroach.md#what-setup-does)), and each client realigns through the feed from its own count. Its devnet round-trip drills run in CI, and the rest is in its [to do](2026-11-sequencer-recovery/todo.md).
+2. Application integrators/operators validate the private engine, its `from_canonical_state` and the recovery drill, and representative capacity before production use. Reference C-host lifecycle coverage is part of repository CI.
 3. Track 5 (fee LUT) after a sync with Bart, batched with other guest-image changes.
 
-Full restore archives now support file and directory application prefixes.
+Full restore archives support file and directory application prefixes.
 Additional snapshot retention or transport mechanisms require a measured consumer need.
 
 ## Track 3 — Feed & replay protocol redesign
 
-The egress API is implemented. The [history contract](../protocol/application-history.md),
-the [projection contract](../protocol/projection-replay.md) and the
-[API contract](../../README.md#api) own its behavior; the
-[integration plan](2026-07-track3-feed-replay-design.md) owns deployment follow-ups.
+The egress API is implemented. The [history contract](../protocol/application-history.md)
+and the [API contract](../../README.md#api) own its behavior; the
+[register](../review/register.md#integration-work-owned-elsewhere) owns deployment follow-ups.
 
-A shared recovery tool will produce the sequencer's and a client's startup
-state from one checkpoint, and a new client sync follows its design. Until
-then, what they replace gets bug fixes only, and its docs are not polished:
+[Cockroach recovery](../recovery/cockroach.md) rebuilds the sequencer from a
+canonical machine's exported state, and each client realigns through the feed
+from its own count, so the sequencer serves no raw L1 inputs for a client to
+replay. A new client sync follows that design. Until then, what it
+replaces gets bug fixes only, and its docs are not polished:
 
-- Deleted when the tool lands: projection replay across a rebuild
-  (`/historical-l1-inputs`, the SDK's `historical_l1_inputs`, the main
-  `historical_bootstrap` test, the projection contract, and the integration
-  plan). First move the projection contract's seed/replay rules and worked
-  boundary into the tool's design and tests, move the integration plan's
-  deployment follow-ups to the register, and repoint the links to both files.
 - Reshaped or retired with the new sync: the WS wire format, the SDK
   snapshot-then-subscribe bootstrap, `/latest_snapshot` and its history headers,
-  `/history`'s baseline, accepted checkpoint and compatibility query, and the
-  era/generation identity types. In-era generation signalling survives in some form.
+  and `/history`'s baseline and accepted checkpoint. Within an era the
+  history only appends
+  ([history identity](../protocol/application-history.md#identity-and-available-history)).
 
 Not frozen: the ingress routes, `/finalized_state` and its probes,
 `/finalized_snapshot`, download leases, and the canonical page reader with `HistoryClaim`.
@@ -73,24 +69,21 @@ table with Bart and ship it with the other guest-image changes.
 The [Application contract](../protocol/application-contract.md) owns execution,
 engine progress, and checkpoint semantics. The [C binding guide](../protocol/c-application-binding.md)
 maps that contract to native engines. Its reference conformance suite and C-host
-process scenarios cover snapshot-to-live bootstrap, restart, standard recovery,
-and fresh-era rebuild with canonical comparison. Reference bridge conformance
-cannot establish private-engine correctness.
+process scenarios cover snapshot-to-live bootstrap, restart, and the rebuild
+from genesis and from a stored machine.
+Reference bridge conformance cannot establish private-engine correctness.
 
 Remaining checks need the actual consumer:
 
-- Supply the application's versioned canonical-machine-to-native recovery
-  exporter and completed operator runbook. Require the
-  [non-genesis recovery drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
-  for production readiness: the old native state is unavailable, the exported
-  bundle restores correctly, and execution after rebuild matches the canonical
-  machine. For the DEX, pin the designated state drive/memory region and derive
-  resume metadata from canonical execution. The exporter must check
-  [pending-direct eligibility](../recovery/cockroach.md#checkpoint-eligibility)
-  and the drill must exercise refusal and earlier-checkpoint fallback, alongside
-  eligible pending-queue recovery. Add the integration check to the
-  release validation once the actual artifacts are available; no generic trait
-  or deployment gate currently enforces this requirement.
+- Supply the application's `from_canonical_state` and its `state` inspect
+  answer, and the completed operator runbook. Require a recovery drill from a
+  stored machine for production readiness: the old native state is
+  unavailable, `setup --base` builds the engine from the machine's state, and
+  execution after the rebuild matches the canonical machine, with directs
+  queued at the stop block. For the DEX, pin the designated state drive/memory
+  region. Add the integration check to the release validation once the actual
+  artifacts are available; no generic trait or deployment gate currently
+  enforces this requirement.
 - Repeat snapshot-to-live bootstrap and canonical comparison with the private
   engine's genesis and meaningful accepted/rejected inputs. The reference
   `c_host_` scenarios supply the lifecycle pattern; compare canonical state
@@ -108,7 +101,7 @@ Remaining checks need the actual consumer:
   Proposed: an `Application` nonce query plus an enumeration method. Setup
   already holds the baseline engine when it publishes the baseline, so it can
   enumerate it into a write-once `baseline_nonces` table in the same
-  transaction, the user-nonce counterpart of `batch_tree_anchor`. The point
+  transaction, the user-nonce counterpart of the era's `anchor_batch_nonce`. The point
   query also lets the shared execution boundary check the one-step nonce
   advance per op, as it checks progress. Both need C ABI exports and the
   engine owner's agreement.

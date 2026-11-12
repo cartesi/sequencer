@@ -17,8 +17,9 @@ use crate::commands::config::{FlushConfig, RunConfig, SetupConfig};
     name = "sequencer",
     version,
     about = "App-specific rollup sequencer.\n\n\
-             Subcommands: `setup` (pin identity + initial sync, run once), \
-             `run` (boot the sequencer from a set-up DB), and `flush-mempool` \
+             Subcommands: `setup` (start an era in an empty data directory, from \
+             genesis or a canonical machine), `run` (boot the sequencer from a \
+             set-up DB), and `flush-mempool` \
              (settle the batch-submitter wallet nonce on demand).\n\n\
              All options can also be set via environment variables (shown in brackets)."
 )]
@@ -31,10 +32,10 @@ pub struct Cli {
 /// `large_enum_variant`); `RunConfig` is the largest.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Establish the deployment's timeless state: pin identity, do the initial
-    /// L1 sync, register the genesis snapshot, and mark setup complete. Run
-    /// once before `run`. L1-read-only (takes the submitter address, not the
-    /// key).
+    /// Start a new era in an empty data directory: pin identity, flush the
+    /// submitter's wallet with its key, sync L1, rebuild the history from the
+    /// base (genesis, or `--base <MACHINE_DIR>`) and publish the era. Refuses a
+    /// directory that holds anything. `--dry-run` only reports.
     Setup(Box<SetupConfig>),
     /// Boot the sequencer from an already-set-up DB. Refuses unless `setup`
     /// completed. Reads identity from the DB; keeps the signing key.
@@ -54,7 +55,7 @@ where
 }
 
 /// Run a parsed command with the same panic and exit-code handling as [`run_main`].
-/// The fallible genesis factory runs only when plain setup needs its initial snapshot.
+/// The fallible genesis factory runs only when setup starts from genesis.
 pub async fn run_command<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
 where
     A: Application + 'static,
@@ -94,8 +95,8 @@ fn project_dispatch_join(
 /// `CommandError` maps through `CommandError::exit_code`.
 /// Terminal runtime faults abort the process directly; see [`crate::run`].
 ///
-/// `genesis_app` is called at most once — only when plain `setup` needs to
-/// register the genesis snapshot. File-backed applications return load errors through
+/// `genesis_app` is called at most once — only when `setup` starts from
+/// genesis. File-backed applications return load errors through
 /// `AppError`; ordinary I/O failures are not invariant panics.
 pub async fn dispatch<A, F>(command: Command, genesis_app: F) -> std::process::ExitCode
 where
@@ -129,8 +130,10 @@ where
 mod tests {
     use super::*;
 
+    /// A completed setup's directory is refused with exit 30 before the
+    /// genesis factory runs; setup runs once per directory.
     #[tokio::test]
-    async fn completed_setup_does_not_construct_genesis_app() {
+    async fn setup_on_a_completed_data_dir_exits_30_without_genesis() {
         use crate::storage::{LifecycleCommand, Storage};
         use crate::test_support::StubApp;
         use std::sync::Arc;
@@ -151,6 +154,8 @@ mod tests {
             "0x1111111111111111111111111111111111111111",
             "--batch-submitter-address",
             "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            "--batch-submitter-private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
         ])
         .expect("parse setup");
         let db_path = match &cli.command {
@@ -161,12 +166,9 @@ mod tests {
         let mut storage = Storage::initialize_for_command(&db_path, LifecycleCommand::Setup)
             .expect("initialize setup");
         storage
-            .complete_baseline_setup(
+            .publish_era(
                 &std::path::Path::new(&data_dir).join("baseline"),
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-                0,
-                false,
+                &crate::storage::NewEra::EMPTY_GENESIS,
             )
             .expect("complete setup");
         drop(storage);
@@ -175,14 +177,11 @@ mod tests {
         let observed = Arc::clone(&constructions);
         let exit = run_command::<StubApp, _>(cli.command, move || {
             observed.fetch_add(1, Ordering::SeqCst);
-            Err(AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "genesis file no longer exists",
-            )))
+            Ok(StubApp::default())
         })
         .await;
 
-        assert_eq!(exit, std::process::ExitCode::SUCCESS);
+        assert_eq!(exit, std::process::ExitCode::from(30));
         assert_eq!(constructions.load(Ordering::SeqCst), 0);
     }
 
@@ -191,9 +190,8 @@ mod tests {
     /// `setup` never completed is deterministic operator error, class 30.
     /// The per-variant table in `commands::error` pins every shape against
     /// the constants; this is the in-process assertion of a wire value
-    /// through the real command bracket, beside the e2e suite's 10 (the
-    /// aging-tip scenario) and 0 (`ManagedSequencer::stop_expecting_clean_exit`)
-    /// from a real process. Offline by construction: the admission preflight
+    /// through the real command bracket, beside the e2e suite's 0
+    /// (`ManagedSequencer::stop_expecting_clean_exit`) from a real process. Offline by construction: the admission preflight
     /// refuses before the key is read or any provider is built.
     #[tokio::test]
     async fn run_on_a_never_set_up_data_dir_exits_30() {

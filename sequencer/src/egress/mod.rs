@@ -7,3 +7,5 @@
 
 pub mod api;
 pub mod l2_tx_feed;
+#[cfg(test)]
+pub(crate) mod test_era;

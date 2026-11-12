@@ -247,9 +247,9 @@ impl WalletL2Client {
     }
 
     /// Override the next user-op nonce this client will sign. A fresh client
-    /// starts at 0; after a state-preserving recovery (where the sender's nonce
-    /// carries over) a test sets this to the sender's continuing nonce so its
-    /// post-recovery ops are accepted.
+    /// starts at 0; after a restart or a new era, where the sender's nonce
+    /// carries over, a test sets this to the sender's continuing nonce so its
+    /// later ops are accepted.
     pub fn set_next_nonce(&mut self, nonce: u32) {
         self.next_nonce = nonce;
     }

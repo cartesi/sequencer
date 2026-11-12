@@ -437,7 +437,7 @@ mod tests {
 
     const CONSENSUS_VECTORS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/consensus_vectors_v1.json"
+        "/../tests/fixtures/consensus_vectors_v2.json"
     ));
 
     #[derive(Debug, Deserialize)]
@@ -482,14 +482,14 @@ mod tests {
         assert_eq!(decoded.payload, fields.payload, "{case}");
     }
 
-    /// Pinned in `consensus_vectors_v1.json`, never regenerated. The variants
+    /// Pinned in `consensus_vectors_v2.json`, never regenerated. The variants
     /// pin today's lenient decode: trailing bytes and dirty padding decode to
     /// the canonical fields. A flip to strict decoding changes `accepted`,
     /// which is a finding, not a fixture update.
     #[test]
     fn evm_advance_decode_matches_the_pinned_vector() {
         let vector = serde_json::from_str::<ConsensusVectors>(CONSENSUS_VECTORS)
-            .expect("parse consensus_vectors_v1.json")
+            .expect("parse consensus_vectors_v2.json")
             .evm_advance;
         let decoded = decode_evm_advance_input(&vector.calldata).expect("decode pinned calldata");
         assert_fields(&decoded, &vector.fields, "canonical");

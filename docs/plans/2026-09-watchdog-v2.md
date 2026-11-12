@@ -31,6 +31,19 @@ file keeps the remaining work.
   exit code 0. The test guest's `xhalt` can be shared.
 - **trolley exceptions.** Add an exception call to `sdk/guest/trolley`; the
   test guest raises its exception through `libcmt-sys` meanwhile.
+- **Stop calling `verify_hash_tree`.** PR #56 runs it on the starting machine
+  of `init` and `replay`, but the emulator team asked that nothing call it on
+  v0.22.0 (Dave's `docs/todo.md`), and it catches corruption only, not hash
+  files rewritten to match ([hashing](../cartesi-machine.md#hashing)). Replace
+  it with the untrusted-load verification an upcoming emulator release brings.
+- **A tie to the validators**, outside the current scope. The watchdog checks
+  the sequencer against its own replay from the operator's bootstrap, not
+  against what Dave's validators settled. At each settled epoch boundary it
+  could compare its own machine's root with `getLastFinalizedMachineMerkleRoot`.
+  The root is its own, so no untrusted load is involved, but the watchdog
+  would have to read the consensus contract and take a root at an input index,
+  often inside a block
+  ([Dave epochs](../cartesi-machine.md#rollup-host-semantics)).
 
 ## Open questions for the DEX integration
 

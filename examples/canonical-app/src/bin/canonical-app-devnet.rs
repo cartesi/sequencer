@@ -1,12 +1,14 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use app_core::application::{DEVNET_SEQUENCER_ADDRESS, WalletApp, WalletConfig};
+use app_core::application::{WalletApp, WalletConfig};
 use canonical_app::{SchedulerConfig, run_scheduler_forever};
 use trolley::cmt::RollupCmt;
 
 fn main() {
     let rollup = RollupCmt::try_new().expect("failed to initialize rollup");
-    let app = WalletApp::new(WalletConfig::devnet());
-    run_scheduler_forever(rollup, app, SchedulerConfig::new(DEVNET_SEQUENCER_ADDRESS));
+    // One address both submits the batches and collects the fees.
+    let wallet = WalletConfig::devnet();
+    let config = SchedulerConfig::for_application::<WalletApp>(wallet.sequencer_address);
+    run_scheduler_forever(rollup, WalletApp::new(wallet), config);
 }

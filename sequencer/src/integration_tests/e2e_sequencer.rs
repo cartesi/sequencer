@@ -6,12 +6,15 @@ use std::time::Duration;
 use crate::storage::{ApplicationInputRow, L2TxContext};
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::Eip712Domain;
-use app_core::application::{MAX_METHOD_PAYLOAD_BYTES, Method, WalletConfig, Withdrawal};
+use app_core::application::{
+    MAX_METHOD_PAYLOAD_BYTES, Method, WalletApp, WalletConfig, Withdrawal,
+};
 use futures_util::StreamExt;
 use k256::ecdsa::SigningKey;
 use sequencer::storage::{Storage, StoredSafeInput};
 use sequencer_core::api::{TxRequest, TxResponse, WsTxMessage};
-use sequencer_core::history::{ExecutedInputCount, HistoryClaim};
+use sequencer_core::application::Application;
+use sequencer_core::history::{HistoryClaim, L2TxCount};
 use sequencer_core::test_support::sign_user_op;
 use sequencer_core::user_op::UserOp;
 use sequencer_rust_client::SequencerClient;
@@ -884,11 +887,10 @@ async fn api_serves_the_next_nonce_after_each_ack_and_the_signing_domain() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_rejects_user_op_when_balance_below_fee_cost() {
     // if sender's balance < `fee_to_linear(current_frame_fee)` the
-    // user op must be rejected with 422 `InsufficientFeeBalance` and leave
-    // state unchanged. Exercises the balance check in
-    // `WalletApp::validate_user_op` (app-core). A fresh sender with no
-    // deposits has balance 0, well below `fee_to_linear(1356)` (the
-    // bootstrapped frame fee).
+    // user op must be refused with 422 and leave state unchanged. The
+    // refusal is `WalletApp::admit_user_op`'s `Underfunded` policy, whose
+    // text clients parse. A fresh sender with no deposits has balance 0,
+    // well below `fee_to_linear(1356)` (the bootstrapped frame fee).
     let db = temp_db("insufficient-fee-balance");
     let domain = test_domain();
     let signing_key = SigningKey::from_bytes((&[11_u8; 32]).into()).expect("create signing key");
@@ -924,12 +926,118 @@ async fn api_rejects_user_op_when_balance_below_fee_cost() {
         status, 422,
         "insufficient-balance must produce 422, got {status}: {body}",
     );
-    assert!(
-        body.contains("insufficient balance for fee"),
-        "expected InsufficientFeeBalance message, got: {body}",
+    let envelope: serde_json::Value = serde_json::from_str(&body).expect("response is JSON");
+    assert_eq!(envelope["code"], "EXECUTION_REJECTED", "{body}");
+    assert_eq!(
+        envelope["message"],
+        format!(
+            "insufficient balance for fee: required {}, available 0",
+            sequencer_core::fee::fee_to_linear(1356)
+        ),
+        "the refusal's text reaches the client verbatim: {body}",
+    );
+    assert_eq!(
+        client
+            .get_nonce(sender)
+            .await
+            .expect("GET /nonce")
+            .next_nonce,
+        0,
+        "a refused op leaves the sender's nonce unchanged"
     );
 
     runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_cap_direct_never_executes_and_survives_restart() {
+    // A direct longer than the template's cap never joins the fridge: it gets
+    // no execution row, the next direct takes the next offset with its own
+    // InputBox index, and a restarted lane replays the same history.
+    let db = temp_db("over-cap-direct");
+    let domain = test_domain();
+    let signing_key = SigningKey::from_bytes((&[7_u8; 32]).into()).expect("create signing key");
+    let sender = address_from_signing_key(&signing_key);
+    bootstrap_open_frame_with_deposits(db.path.as_str(), &[(sender, U256::from(1_000_000_u64))]);
+    let cap = usize::try_from(WalletApp::scheduler_limits().max_direct_payload_bytes)
+        .expect("cap fits usize");
+    seed_safe_direct_input(db.path.as_str(), 10, vec![0xbb; cap + 1]);
+    seed_safe_direct_input(db.path.as_str(), 11, vec![0xcc; cap]);
+
+    let runtime = start_full_server(db.path.as_str(), domain.clone()).await;
+    let client = SequencerClient::new_with_timeout(
+        format!("http://{}", runtime.public_addr),
+        Duration::from_secs(2),
+    )
+    .expect("build sequencer client");
+    let ws_url = SequencerClient::new(format!("http://{}", runtime.internal_addr))
+        .expect("build feed client")
+        .ws_subscribe_url(history_claim(&db.path, 0));
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url))
+        .await
+        .expect("timeout connecting websocket")
+        .expect("connect websocket");
+    let mut live = vec![
+        recv_ws_message(&mut ws).await,
+        recv_ws_message(&mut ws).await,
+    ];
+    let (status, body) = client
+        .submit_tx_with_status(&make_valid_request(&domain))
+        .await
+        .expect("submit tx");
+    assert_eq!(status, 200, "a later op still executes: {body}");
+    live.push(recv_ws_message(&mut ws).await);
+    drop(ws);
+
+    let expected = all_ordered_l2_txs(db.path.as_str());
+    let direct_indexes: Vec<u64> = expected
+        .iter()
+        .filter_map(|row| match &row.context {
+            L2TxContext::Direct { tx, .. } => Some(tx.input_index),
+            L2TxContext::UserOp { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        direct_indexes,
+        vec![0, 2],
+        "the over-cap direct (index 1) has no execution row"
+    );
+    assert_eq!(expected.len(), 3, "deposit, at-cap direct, user op");
+    for (offset, (message, row)) in live.into_iter().zip(&expected).enumerate() {
+        assert_ws_message_matches_tx(message, row, offset as u64);
+    }
+    runtime.shutdown().await;
+
+    let restarted = start_full_server(db.path.as_str(), domain.clone()).await;
+    let user_op = UserOp {
+        nonce: 1,
+        max_fee: TEST_MAX_FEE,
+        data: ssz::Encode::as_ssz_bytes(&Method::Withdrawal(Withdrawal {
+            amount: U256::from(0_u64),
+        }))
+        .into(),
+    };
+    let request = TxRequest {
+        signature: sign_user_op_hex(&domain, &user_op, &signing_key),
+        sender: sender.to_string(),
+        message: user_op,
+    };
+    let (status, body) = SequencerClient::new_with_timeout(
+        format!("http://{}", restarted.public_addr),
+        Duration::from_secs(2),
+    )
+    .expect("build sequencer client after restart")
+    .submit_tx_with_status(&request)
+    .await
+    .expect("submit tx after restart");
+    assert_eq!(
+        status, 200,
+        "the restarted lane replays without the over-cap direct: {body}"
+    );
+    let after = all_ordered_l2_txs(db.path.as_str());
+    assert_eq!(after.len(), 4);
+    assert_eq!(after[3].offset, L2TxCount::new(3));
+    restarted.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1091,8 +1199,8 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
     let config = WalletConfig::default();
     pin_test_deployment_identity(&mut storage, TEST_BATCH_SUBMITTER);
 
-    // Always record a safe-head observation: production callers are gated by
-    // the startup recovery procedure, so storage paths like `safe_input_frontier`
+    // Always record a safe-head observation: in production setup's sync
+    // leaves one before `run` starts, so storage paths like `safe_input_frontier`
     // assume a row exists. With no deposits we still write an empty advance
     // so the lane can start without `current_safe_block_required` failing.
     let safe_inputs: Vec<StoredSafeInput> = deposits
@@ -1110,12 +1218,7 @@ fn bootstrap_open_frame_with_deposits(db_path: &str, deposits: &[(Address, U256)
         })
         .collect();
     storage
-        .append_safe_inputs(
-            1,
-            &safe_inputs,
-            TEST_BATCH_SUBMITTER,
-            &crate::storage::test_helpers::default_protocol_timing(),
-        )
+        .append_safe_inputs(1, &safe_inputs, TEST_BATCH_SUBMITTER)
         .expect("seed safe head (and any deposits)");
 }
 
@@ -1152,7 +1255,6 @@ fn seed_safe_direct_input(db_path: &str, safe_block: u64, payload: Vec<u8>) {
                 block_number: safe_block,
             }],
             TEST_BATCH_SUBMITTER,
-            &crate::storage::test_helpers::default_protocol_timing(),
         )
         .expect("append safe direct input");
 }
@@ -1195,16 +1297,20 @@ fn assert_ws_message_matches_tx(
                 sender,
                 block_number,
                 payload,
+                input_index,
+                block_timestamp,
                 ..
             },
-            L2TxContext::DirectInput { tx: expected, .. },
+            L2TxContext::Direct { tx: expected, .. },
         ) => {
             assert_eq!(offset, expected_offset);
             assert_eq!(
                 decode_hex_prefixed(sender.as_str()),
                 expected.sender.as_slice()
             );
-            assert_eq!(block_number, expected.block_number);
+            assert_eq!(block_number, expected.block);
+            assert_eq!(input_index, expected.input_index);
+            assert_eq!(block_timestamp, expected.timestamp);
             assert_eq!(
                 decode_hex_prefixed(payload.as_str()),
                 expected.payload.as_slice()
@@ -1320,11 +1426,7 @@ fn test_domain() -> Eip712Domain {
 
 fn history_claim(db_path: &str, next: u64) -> HistoryClaim {
     HistoryClaim {
-        version: Storage::open_read_only(db_path)
-            .unwrap()
-            .history_state()
-            .unwrap()
-            .version,
-        next_input: ExecutedInputCount::new(next),
+        era_id: Storage::open_read_only(db_path).unwrap().era().unwrap().id,
+        next_input: L2TxCount::new(next),
     }
 }

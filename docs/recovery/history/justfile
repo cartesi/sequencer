@@ -1,0 +1,19 @@
+tlc := env("TLC", "tlc")
+
+# Archived models of recovery designs the sequencer does not implement. They
+# are dev analysis tools for revisiting those designs, not checks of the code.
+
+# Check the startup repair and runtime admission model
+check-admission:
+    {{tlc}} -workers auto -deadlock admission.tla
+
+# Check the preemptive recovery model (~90s)
+check-preemptive:
+    {{tlc}} -workers auto -deadlock preemptive.tla
+
+# Check the optimistic recovery model (~3min)
+check-optimistic:
+    {{tlc}} -workers auto -deadlock optimistic.tla
+
+# Check every archived model
+check-all: check-admission check-preemptive check-optimistic

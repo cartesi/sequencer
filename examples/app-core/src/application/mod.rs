@@ -7,4 +7,7 @@ mod wallet;
 
 pub use method::{MAX_METHOD_PAYLOAD_BYTES, Method, Transfer, Withdrawal};
 pub use notice::{DepositNotice, TransferNotice};
-pub use wallet::{DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, WalletApp, WalletConfig};
+pub use wallet::{
+    DEVNET_SEQUENCER_ADDRESS, SEPOLIA_SEQUENCER_ADDRESS, WALLET_SCHEDULER_LIMITS, WalletApp,
+    WalletConfig,
+};

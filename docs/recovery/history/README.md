@@ -1,9 +1,22 @@
 # Recovery Design History
 
-This directory preserves the **historical optimistic recovery design** and its
-counterexample. It is not the production recovery procedure. The
-[current recovery guide](../README.md) owns automatic recovery; the
-[cockroach guide](../cockroach.md) owns manual rebuilding.
+This directory preserves recovery designs the sequencer does not implement:
+the **optimistic recovery design** and its counterexample, the **preemptive
+recovery** with its two models, and two superseded cockroach-recovery plans.
+The sequencer's one recovery is [cockroach recovery](../cockroach.md);
+[batch landing and outages](../README.md) owns what happens when batches stop
+landing and [why there is no automatic repair](../README.md#why-there-is-no-automatic-repair).
+
+## Superseded cockroach-recovery plans
+
+Archived on 2026-11-05. Each opens with the commit it was checked against,
+and its links point at the code and docs of that commit: some name headings
+and files that later changes removed, so read them at that commit.
+
+| Plan | What it proposed | Why it was superseded |
+|---|---|---|
+| [Shared recovery tool](2026-10-shared-recovery-tool.md) | A tool that rebuilds the scheduler's history from L1, starting from three values a machine reports, shared by the sequencer and its clients | Reading the whole scheduler state from the machine needs no replay from L1 and no shared tool |
+| [Recovery from a canonical machine](2026-11-recovery-from-a-machine.md) | The rebuild folded into setup, from four values a machine reports | The owner's review led to exporting the whole scheduler state, fridge included |
 
 ## The optimistic alternative
 
@@ -16,7 +29,7 @@ from the invalidated suffix may remain in the network as zombies competing with
 new recovery batches.
 
 The recorded bounded check reported 194M states with no invariant violations
-after the Silver-only fix. This is model evidence, not a proof of production
+after the Silver-only fix. This is model evidence, not a proof of that
 recovery or its completion time. Bounds are in [`optimistic.cfg`](optimistic.cfg).
 
 ## The counterexample: invalidating before slot resolution
@@ -52,26 +65,40 @@ argument depended on. The retained optimistic model's `Resolve` therefore
 requires a Silver frontier that is stale by inclusion: that original batch is
 already on safe L1 and cannot be displaced by a replacement.
 
-## Why production uses preemptive recovery
+## The preemptive recovery and its models
 
-Production closes intake and performs recovery offline. For closed-batch
-recovery, the flush consumes every covered wallet-nonce slot at safe depth,
-**whether the original transaction or a no-op wins**, then re-syncs the accepted
-prefix before cascading. It does not require the original frontier batch to
-become Silver. An unsubmitted open Tip has no wallet slot to settle.
+The preemptive design repaired the history in place. A detector stopped the
+process at a threshold before staleness; the next start flushed every wallet
+slot the closed unaccepted batches had used, so that the original or a no-op
+landed at safe depth in each, then re-synced the accepted prefix, invalidated
+the suffix after it, and opened a fresh batch at the first unaccepted nonce.
+It did not require the original frontier batch to be on safe L1, and it closed
+intake while it ran. The sequencer does not implement it.
 
-This gives recovery a sequential procedure and stops new soft confirmations
-while submission uncertainty is being resolved. The optimistic alternative
-keeps serving through that interval and may add confirmations that a later
-cascade revokes.
+Two bounded TLA+ models checked it. They were not a refinement proof of the
+Rust code, a proof of their composition, or a liveness guarantee.
 
-The tradeoff is downtime. Flush completion requires L1 progress; fee headroom
-does not guarantee replacement or establish a deadline. The
-[current recovery guide](../README.md) owns the safety conditions, and the
-[L1 fee policy](../../l1-fee-policy.md) owns the accepted liveness limits.
+- [`preemptive.tla`](preemptive.tla) ([bounds](preemptive.cfg)) models
+  safe-block advancement, wallet-slot competition between batches and no-ops,
+  scheduler acceptance and branch invalidation. Its `Inv` checks
+  `ZombieSafety` (`schedulerExpected = CountGold(spine)`) with batch-nonce
+  contiguity, invalid-branch ancestry, wallet-slot uniqueness and cursor
+  bounds.
+- [`admission.tla`](admission.tla) ([bounds](admission.cfg)) models the
+  startup controller: the local terminal gate, the initial-sync fallback, at
+  most one repair, the flush observation and mandatory sync, the guarded
+  cascade, and admission before any worker exists. Its invariants cover
+  terminal dominance, repair preconditions, a caught-up post-flush view, and
+  admission soundness.
 
-## Running the historical model
+Both models exist because replacing a batch reuses its batch nonce, so a late
+transaction of the replaced batch can race the replacement. Inside an era no
+batch nonce is reused: a late transaction of the sequencer's carries the bytes
+of a batch it still holds, and it is accepted as that batch or skipped. The
+race these models guard against cannot occur there.
+
+## Running the models
 
 ```bash
-tlc -workers auto -deadlock docs/recovery/history/optimistic.tla
+just -f docs/recovery/history/justfile check-all
 ```

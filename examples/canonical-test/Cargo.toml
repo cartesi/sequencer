@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 app-core = { path = "../app-core" }
 canonical-app = { path = "../canonical-app" }
+# Setup's base loader, run against real machines.
+sequencer = { path = "../../sequencer" }
 sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
 ssz = { workspace = true }
 testsi = { workspace = true }
@@ -23,3 +25,4 @@ rollups-types = { workspace = true, features = ["test-support"] }
 k256 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -3,8 +3,11 @@
 What to do when the watchdog latches a divergence: `tick` exits 2 and
 `cartesi_watchdog_status{state="failed"}` is 1. Every step names the command
 that performs it, and each scenario has a drill that practices it before an
-incident does. The [watchdog README](README.md) owns how the latch and its
-evidence are produced.
+incident does. Resolving **Sequencer wrong** is drilled on the devnet for the
+rebuild and a toy-wallet client's realignment; clearing the latch around a
+rebuild and realigning an application's own readers have no drill yet
+([Drills](#drills)). The
+[watchdog README](README.md) owns how the latch and its evidence are produced.
 
 ## What you have
 
@@ -82,7 +85,8 @@ finish, so the stop can take as long as the download; a supervisor that kills
 the sequencer first leaves `sequencer_bytes_missing: transient: …`. Do not
 wait for the file: step 2's verdict comes from `replay`. To end the download
 now, kill the collecting watchdog tick. Preserve the sequencer's data
-directory before any restart (cockroach recovery, step 1).
+directory before anything is rebuilt
+([before anything](../recovery/cockroach.md#before-anything)).
 
 ## 2. Find the faulty side
 
@@ -92,17 +96,19 @@ Re-derive the canonical state at B from a trusted machine that predates the
 incident, independently of the watchdog's checkpoint chain:
 
 ```bash
-sequencer-watchdog replay --from <trusted machine> --from-block <A> \
+sequencer-watchdog replay --from <trusted machine> --from-block <trusted-block> \
     --to-block <B> --out /tmp/replay-<B>
 ```
 
 Use the application's template machine with `--from-block 0` (`replay` checks
 it against the on-chain template hash), or an archived checkpoint whose block
-you trust. `replay` needs an RPC with state at `A` (an archive node for old
-blocks), absolute paths, and an `--out` that does not exist; it never writes
-the state directory. Run it with a watchdog release on the deployment's
-Cartesi Machine version: templates, checkpoints and `incident/canonical` load
-only in the version that stored them
+you trust. `<trusted-block>` is the block its name states; `replay` checks it
+against the machine only for the template
+([commands](README.md#commands)). `replay` needs an RPC with state at
+`<trusted-block>` (an archive node for old blocks), absolute paths, and an
+`--out` that does not exist; it never writes the state directory. Run it with a
+watchdog release on the deployment's Cartesi Machine version: templates,
+checkpoints and `incident/canonical` load only in the version that stored them
 ([upgrades](operator-deployment.md#upgrades)).
 
 | `replay`'s `sha256` equals | Conclusion |
@@ -135,19 +141,29 @@ regression; the watchdog idles.
 
 ## 3. Resolve
 
-**Sequencer wrong.** Fix the bug, then rebuild the sequencer with
-[cockroach recovery](../recovery/cockroach.md) from a trusted canonical
-checkpoint: `incident/canonical` at B (or step 2's `replay --out` directory
-when `incident/canonical` is absent), or the head at P. Resume the sequencer,
-then clear the latch:
+**Sequencer wrong.** Make sure the old instance never runs again with the
+submitter key ([restart policy](operator-deployment.md#sequencer-restart-policy)),
+and fix the bug. Then rebuild the sequencer in a new data directory with
+`setup --base`, following
+[the operator's playbook](../recovery/cockroach.md#the-operators-playbook).
+Its base is a trusted canonical machine at or below every client's trusted
+count: `incident/canonical` at B (or step 2's `replay --out` directory when
+`incident/canonical` is absent), the head at P, or an older checkpoint. Setup
+loads only a machine that waits for an input, and not every stored machine
+does ([which ones](README.md#machines-a-recovery-can-start-from)). Start
+`run` on the new directory, then clear the latch:
 
 ```bash
-sequencer-watchdog clear --block <B> --reason "sequencer fixed: <ticket>"
+sequencer-watchdog clear --block <B> --reason "sequencer rebuilt: <ticket>"
 ```
 
 The watchdog keeps its head at P: recovering the sequencer does not change
-canonical history, so the next tick replays to the new accepted block and
-compares.
+canonical history. Until a batch of the new era is accepted, the sequencer
+serves the era's baseline as its comparison checkpoint at the stop block, so
+the next tick replays from P to the stop block and compares the baseline. A
+mismatch there means the base machine was not canonical: rebuild again from a
+trusted one. Realign affected clients at their own counts
+([the client's playbook](../recovery/cockroach.md#the-clients-playbook)).
 
 **Watchdog wrong.** Copy `incident/` somewhere for the record, fix the cause
 (configuration, bootstrap machine, image), wipe the state directory, run
@@ -170,19 +186,35 @@ it confirms that has not landed when `foreclose()` executes never will. On
 Kubernetes, scale the Deployment to zero, because Deployments restart regardless
 of exit code ([restart policy](operator-deployment.md#sequencer-restart-policy)).
 Never restart the sequencer for a foreclosed application: batch posts fail at
-gas estimation, and every recovery cycle sends a few no-op flush transactions.
+gas estimation on every attempt, and the open batch ages until the history is
+void.
 
 ## Drills
 
+Every drill with a test runs in CI: the watchdog's Lua unit tests
+(`just test-watchdog` locally) in the Rust job, and
+`just test-rollups-e2e` and `just test-watchdog-e2e` in the `rollups-e2e` job
+([`ci.yml`](../../.github/workflows/ci.yml)). The devnet scenarios are in
+[`test_cases.rs`](../../tests/e2e/src/test_cases.rs), the recovery ones in
+[`recovery_round_trip.rs`](../../tests/e2e/src/recovery_round_trip.rs).
+
 | Scenario | Drill | Practices |
 |---|---|---|
-| Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong non-genesis bootstrap latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
+| Watchdog wrong (`state_mismatch`) | `watchdog_divergence_drill_test` in `just test-rollups-e2e` | init refusing a non-template image at genesis; a wrong image, advanced through every input up to the first input's block, bootstrapped there and latching; `status`; `clear` refusing another block; `replay` from the trusted image matching the sequencer; re-latching after a premature `clear`; re-`init` agreeing |
 | Canonical machine dead | `tick latches a dead canonical machine and replay reproduces the stop` in `just test-watchdog-e2e` | the latch at the stopping input, and `replay` reproducing the stop |
 | Sequencer wrong (`state_mismatch`) | `tick latches a mismatch with the canonical machine and a byte diff` in `just test-watchdog-e2e` | the evidence: canonical machine, both byte strings, and the first difference |
+| Sequencer wrong: the rebuild from genesis | `recovery_from_genesis_round_trip_test` and `c_host_recovery_from_genesis_round_trip_test` in `just test-rollups-e2e` | the dry run; `setup` in a new directory with two directs queued at the stop block; `run`'s root frame draining them first, then a live op; a toy-wallet client refused with `ERA_CHANGED`, refused at a count past the rebuilt history end, adopting the new era at its count and checking its rows; a fresh watchdog agreeing with the era's baseline at the stop block, and another with the new era's first accepted batch |
+| Sequencer wrong: the rebuild from a machine | `recovery_from_stored_machine_round_trip_test` and `c_host_recovery_from_stored_machine_round_trip_test` in `just test-rollups-e2e` | the same from a machine that `init` and `replay --out` stored at a block where an old-era direct is still queued, its `scheduler` report checked, and a client below that base refused with `BelowBase` |
+| Sequencer wrong: setup refusing a set-up directory | `setup_refuses_a_set_up_data_directory_test` and `c_host_setup_refuses_a_set_up_data_directory_test` in `just test-rollups-e2e` | the dry run leaving the directory untouched, a second setup refused with exit 30, and `run` starting on the directory as it was |
+| Sequencer wrong: the latch and an application's readers | none yet | clearing a latch around a rebuild, and realigning a reader other than the toy wallet |
 | Evidence lost to a full disk | `main tick keeps a divergence latched when its evidence cannot be kept` in `just test-watchdog` | the latch and exit 2 surviving a failed evidence item, which `evidence` names |
 | `inclusion_block_regressed` | `tick latches a regression below an agreed block` and `tick idles while the sequencer has not reached the bootstrap block` in `just test-watchdog` | the latch, and idling instead behind a never-agreed bootstrap |
 
 Before production, run the first drill once against the staging deployment
-with the operators who will be paged: bootstrap a scratch watchdog state
-directory from a wrong image at a block after the first input, and walk this
-runbook to the re-`init`.
+with the operators who will be paged: advance a wrong image through every
+input up to a block past genesis (the drill uses the first input's block) with
+`cartesi-machine --cmio-advance-state`, bootstrap a scratch watchdog state
+directory from it at that block, and walk this runbook to the re-`init`. A
+wrong image that skips those inputs latches `canonical_machine_dead`, not
+`state_mismatch`: the guest halts on the first input it receives out of
+InputBox order.

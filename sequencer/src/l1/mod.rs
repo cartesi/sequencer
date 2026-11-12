@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! L1 client surface: reads InputBox events into storage (`reader`), submits
-//! batches back out (`submitter`), and shares L1 utilities (`provider`,
-//! `partition`).
+//! batches back out (`submitter`), settles the submitter's wallet slots
+//! (`flusher`), and shares L1 utilities (`provider`, `partition`).
 
 pub mod eip1559;
 pub mod fee_oracle;
+pub mod flusher;
 pub mod partition;
 pub mod provider;
 pub mod reader;

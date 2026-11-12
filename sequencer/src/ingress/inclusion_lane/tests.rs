@@ -10,18 +10,24 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::test_helpers::{
-    SENDER_A, default_protocol_timing, record_canonical_divergence, set_one_op_batch_target,
+    SENDER_A, WriteHeadParts, record_canonical_divergence, set_one_op_batch_target,
 };
-use crate::storage::{DirectInputExecution, SafeInputRange, Storage, StoredSafeInput, WriteHead};
+use crate::storage::{
+    DirectInputExecution, IngestedSafeInput, L2TxContext, SafeInputRange, Storage, StoredSafeInput,
+    WriteHead,
+};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
-use sequencer_core::application::{AppError, Application};
-use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::{DirectInput, SequencedL2Tx};
+use alloy_primitives::B256;
+use sequencer_core::application::{
+    Admission, AppError, AppOutputs, Application, SchedulerLimits, SkipReason,
+};
+use sequencer_core::history::L2TxCount;
+use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
 use sequencer_core::user_op::{SignedUserOp, UserOp};
 
 use crate::test_support::{ReplayEvent, StubApp, shutdown_lane, wait_until};
 
-use super::catch_up::{catch_up_application_paged, catch_up_snapshot};
+use super::catch_up::catch_up_application_paged;
 use super::dequeue_and_execute_user_op_chunk;
 use super::error::CatchUpError;
 use super::{
@@ -37,6 +43,7 @@ fn default_test_config() -> InclusionLaneConfig {
         dumps_dir: tempfile::tempdir()
             .expect("create dumps_dir tempdir")
             .keep(),
+        snapshot_leases: crate::storage::SnapshotLeases::default(),
         max_user_ops_per_chunk: 16,
         safe_input_buffer_capacity: 16,
         max_batch_open: Duration::MAX,
@@ -68,7 +75,7 @@ fn register_genesis_snapshot<A: Application>(app: &mut A, storage: &mut Storage,
     )
     .expect("create genesis dump");
     storage
-        .insert_baseline_snapshot(&dump_dir, ExecutedInputCount::ZERO)
+        .insert_baseline_snapshot(&dump_dir, L2TxCount::ZERO)
         .expect("insert finalized snapshot");
 }
 
@@ -83,7 +90,7 @@ async fn start_lane(
     let mut storage = Storage::open(db_path).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
@@ -109,7 +116,7 @@ fn make_pending_user_op(
     let user_op = UserOp {
         nonce: 0,
         // Must be >= the DB default recommended_fee (1356) to pass the
-        // protocol-level max_fee >= fee_price check in the trait default.
+        // lane's max_fee >= frame fee check.
         max_fee: u16::MAX,
         data: vec![seed; 4].into(),
     };
@@ -131,7 +138,7 @@ fn make_included_user_op(seed: u8, offset: u64) -> IncludedUserOp {
     let (pending, _response) = make_pending_user_op(seed);
     IncludedUserOp {
         pending,
-        executed_input_offset: ExecutedInputCount::new(offset),
+        l2_tx_index: L2TxCount::new(offset),
     }
 }
 
@@ -140,7 +147,7 @@ fn fast_turn_processes_at_most_one_rejected_chunk() {
     let db = temp_db("one-rejected-chunk-per-fast-turn");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -186,7 +193,7 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
     let db = temp_db("reject-flood-does-not-starve-frontier");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     storage.ensure_open_tip().expect("establish open tip");
 
@@ -211,8 +218,7 @@ async fn sustained_rejected_queue_cannot_starve_poisoned_frontier() {
         storage,
         config,
     };
-    let mut lane_handle =
-        tokio::task::spawn_blocking(move || lane.run_forever(ExecutedInputCount::ZERO));
+    let mut lane_handle = tokio::task::spawn_blocking(move || lane.run_forever(L2TxCount::ZERO));
 
     let producer_tx = tx.clone();
     let producer = tokio::spawn(async move {
@@ -275,7 +281,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
     let config = default_test_config();
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -292,8 +298,7 @@ fn reconciliation_digests_an_epoch_sized_outage_backlog_in_one_turn() {
         .append_safe_inputs(
             JUMP_TARGET_BLOCK,
             backlog.as_slice(),
-            SENDER_A,
-            &default_protocol_timing(),
+            Address::repeat_byte(0xff),
         )
         .expect("seed the outage backlog at the jump target");
 
@@ -336,7 +341,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     let config = default_test_config();
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -360,8 +365,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
                 payload: vec![0xaa],
                 block_number: 4,
             }],
-            SENDER_A,
-            &default_protocol_timing(),
+            Address::repeat_byte(0xff),
         )
         .expect("append below-threshold direct");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
@@ -370,7 +374,7 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     assert_eq!(lane.storage.next_undrained_safe_input_index().unwrap(), 0);
 
     lane.storage
-        .append_safe_inputs(5, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(5, &[], Address::repeat_byte(0xff))
         .expect("advance to first clock tick");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("rotate at block 5");
@@ -390,35 +394,35 @@ fn frame_clock_waits_five_blocks_and_collapses_observation_jumps() {
     assert_eq!(sequenced.len(), 2);
     assert!(matches!(
         &sequenced[0].context,
-        crate::storage::L2TxContext::DirectInput {
-            tx: DirectInput {
-                block_number: 4,
-                ..
-            },
+        L2TxContext::Direct {
+            tx: Direct { block: 4, .. },
             ..
         }
     ));
     assert!(matches!(
         &sequenced[1].context,
-        crate::storage::L2TxContext::UserOp { safe_block: 5, .. }
+        L2TxContext::UserOp {
+            tx: UserOpTx { block: 5, .. },
+            ..
+        }
     ));
 
     lane.storage
-        .append_safe_inputs(32, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(32, &[], Address::repeat_byte(0xff))
         .expect("jump safe head");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("collapse jump to one frame");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 32]);
 
     lane.storage
-        .append_safe_inputs(36, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(36, &[], Address::repeat_byte(0xff))
         .expect("advance below reset threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("observe block 36");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 32]);
 
     lane.storage
-        .append_safe_inputs(37, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(37, &[], Address::repeat_byte(0xff))
         .expect("advance to reset threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("rotate at block 37");
@@ -431,7 +435,7 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     let db = temp_db("batch-frame-does-not-reset-clock");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -448,18 +452,17 @@ fn structural_batch_frame_does_not_reset_frame_clock_anchor() {
     let mut safe_inputs = Vec::new();
 
     lane.storage
-        .append_safe_inputs(4, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(4, &[], SENDER_A)
         .expect("advance below threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("observe block 4");
-    let unchanged_clock = state.head.safe_block;
     lane.storage
-        .close_frame_and_batch(&mut state.head, unchanged_clock)
+        .close_frame_and_batch(&mut state.head)
         .expect("create successor batch frame");
     assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 0]);
 
     lane.storage
-        .append_safe_inputs(5, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(5, &[], SENDER_A)
         .expect("reach original five-block threshold");
     lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
         .expect("clock tick after structural frame");
@@ -471,7 +474,7 @@ fn poisoned_frontier_outranks_frame_clock_and_closes_intake() {
     let db = temp_db("poisoned-frontier-outranks-clock");
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], SENDER_A)
         .expect("seed observed safe head");
     let head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -527,7 +530,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
     let user_op_a = make_included_user_op(0x51, 0);
     let user_op_b = make_included_user_op(0x52, 1);
     storage
-        .append_executed_user_ops_chunk(&mut head, &[user_op_a, user_op_b])
+        .append_included_user_ops(&mut head, &[user_op_a, user_op_b])
         .expect("append attributed first-frame user ops");
     storage
         .append_safe_inputs(
@@ -538,7 +541,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 10,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append first direct input");
     storage
@@ -548,14 +550,14 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             SafeInputRange::new(0, 1),
             &[DirectInputExecution {
                 safe_input_index: 0,
-                executed_input_offset: ExecutedInputCount::new(2),
+                l2_tx_index: L2TxCount::new(2),
             }],
         )
         .expect("close first frame with direct attribution");
 
     let user_op_c = make_included_user_op(0x53, 3);
     storage
-        .append_executed_user_ops_chunk(&mut head, &[user_op_c])
+        .append_included_user_ops(&mut head, &[user_op_c])
         .expect("append attributed second-frame user op");
     storage
         .append_safe_inputs(
@@ -566,7 +568,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 20,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append second direct input");
     storage
@@ -576,7 +577,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             SafeInputRange::new(1, 2),
             &[DirectInputExecution {
                 safe_input_index: 1,
-                executed_input_offset: ExecutedInputCount::new(4),
+                l2_tx_index: L2TxCount::new(4),
             }],
         )
         .expect("close second frame with direct attribution");
@@ -590,7 +591,6 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
                 block_number: 30,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append third direct input");
     storage
@@ -600,7 +600,7 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             SafeInputRange::new(2, 3),
             &[DirectInputExecution {
                 safe_input_index: 2,
-                executed_input_offset: ExecutedInputCount::new(5),
+                l2_tx_index: L2TxCount::new(5),
             }],
         )
         .expect("close third frame with direct attribution");
@@ -615,8 +615,10 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             data: vec![0x52; 4],
         },
         ReplayEvent::DirectInput {
+            input_index: 0,
             sender: Address::ZERO,
             block_number: 10,
+            timestamp: 0,
             payload: vec![0xaa],
         },
         ReplayEvent::UserOp {
@@ -624,13 +626,17 @@ fn seed_replay_fixture(db_path: &str) -> Vec<ReplayEvent> {
             data: vec![0x53; 4],
         },
         ReplayEvent::DirectInput {
+            input_index: 1,
             sender: Address::ZERO,
             block_number: 20,
+            timestamp: 0,
             payload: vec![0xbb],
         },
         ReplayEvent::DirectInput {
+            input_index: 2,
             sender: Address::ZERO,
             block_number: 30,
+            timestamp: 0,
             payload: vec![0xcc],
         },
     ]
@@ -643,14 +649,14 @@ fn read_count(db_path: &str, table: &str) -> i64 {
         .expect("count rows")
 }
 
-fn read_frame_direct_count(db_path: &str, batch_index: i64, frame_in_batch: i64) -> i64 {
+fn read_frame_direct_count(db_path: &str, batch_nonce: i64, frame_in_batch: i64) -> i64 {
     let conn = Storage::open_connection(db_path).expect("open sqlite reader");
     conn.query_row(
         "SELECT COUNT(*) FROM application_inputs
-         WHERE batch_index = ?1
+         WHERE batch_nonce = ?1
            AND frame_in_batch = ?2
            AND safe_input_index IS NOT NULL",
-        params![batch_index, frame_in_batch],
+        params![batch_nonce, frame_in_batch],
         |row| row.get(0),
     )
     .expect("query frame direct count")
@@ -661,7 +667,7 @@ fn read_frame_safe_blocks(db_path: &str) -> Vec<u64> {
     let mut statement = conn
         .prepare(
             "SELECT safe_block FROM frames \
-             ORDER BY batch_index ASC, frame_in_batch ASC",
+             ORDER BY batch_nonce ASC, frame_in_batch ASC",
         )
         .expect("prepare frame-clock query");
     statement
@@ -708,8 +714,7 @@ async fn direct_inputs_close_frame_and_persist_drain() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            SENDER_A,
-            &default_protocol_timing(),
+            Address::repeat_byte(0xff),
         )
         .expect("append safe direct input");
 
@@ -729,11 +734,11 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     let db = temp_db("sequenced-safe-inputs-skip");
     let batch_submitter_address = Address::from([0xfe; 20]);
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, batch_submitter_address);
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], batch_submitter_address)
         .expect("seed observed safe head");
     let config = default_test_config();
-    pin_test_deployment_identity(&mut storage, batch_submitter_address);
     {
         let mut app = StubApp::default();
         register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
@@ -766,7 +771,6 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
                 block_number: 10,
             }],
             batch_submitter_address,
-            &default_protocol_timing(),
         )
         .expect("append safe batch-submitter input");
 
@@ -783,10 +787,10 @@ async fn sequenced_safe_inputs_are_drained_but_not_executed() {
     assert!(history_rows(&mut storage, 16).is_empty());
     assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 0);
     let mut fresh_app = StubApp::default();
-    catch_up_application_paged(&mut fresh_app, &mut storage, ExecutedInputCount::ZERO, 16)
+    catch_up_application_paged(&mut fresh_app, &mut storage, L2TxCount::ZERO, 16)
         .expect("catch up");
     assert_eq!(
-        fresh_app.executed_input_count().get(),
+        fresh_app.l2_tx_count().get(),
         0,
         "batch-submitter safe input should be skipped by the local app"
     );
@@ -809,7 +813,7 @@ async fn direct_inputs_are_paginated_by_buffer_capacity() {
         });
     }
     feeder_storage
-        .append_safe_inputs(10, directs.as_slice(), SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(10, directs.as_slice(), Address::repeat_byte(0xff))
         .expect("append safe direct inputs");
 
     let drained = wait_until(Duration::from_secs(2), || {
@@ -837,8 +841,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
                 payload: vec![0xaa],
                 block_number: 10,
             }],
-            SENDER_A,
-            &default_protocol_timing(),
+            Address::repeat_byte(0xff),
         )
         .expect("append safe direct input");
 
@@ -858,7 +861,7 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
         .expect("wait for ack")
         .expect("ack channel open");
 
-    let replay: Vec<SequencedL2Tx> = {
+    let replay: Vec<L2Tx> = {
         let mut storage = Storage::open(db.path.as_str()).expect("open storage");
         history_rows(&mut storage, 1_000_000)
             .into_iter()
@@ -871,11 +874,11 @@ async fn safe_inputs_already_available_are_sequenced_before_later_user_ops() {
     assert_eq!(replay.len(), 2);
     assert!(matches!(
         replay.first(),
-        Some(SequencedL2Tx::Direct(direct)) if direct.payload.as_slice() == [0xaa]
+        Some(L2Tx::Direct(direct)) if direct.payload.as_slice() == [0xaa]
     ));
     assert!(matches!(
         replay.get(1),
-        Some(SequencedL2Tx::UserOp(user_op)) if user_op.data.as_slice() == [0x31, 0x31, 0x31, 0x31]
+        Some(L2Tx::UserOp(user_op)) if user_op.data.as_slice() == [0x31, 0x31, 0x31, 0x31]
     ));
 }
 
@@ -959,16 +962,12 @@ async fn batch_closes_when_max_user_op_bytes_is_reached() {
 /// in `dequeue_and_execute_user_op_chunk` never triggers from the size check
 /// alone. Tests that want to exercise the size check construct their own.
 fn unbounded_head() -> WriteHead {
-    WriteHead {
-        batch_index: 0,
+    WriteHeadParts {
         batch_created_at: SystemTime::now(),
-        frame_fee: 0,
-        safe_block: 0,
-        batch_user_op_count: 0,
-        open_frame_user_op_count: 0,
-        frame_in_batch: 0,
         max_batch_user_op_bytes: u64::MAX,
+        ..WriteHeadParts::ZERO
     }
+    .build()
 }
 
 #[test]
@@ -1050,16 +1049,13 @@ fn catch_up_replays_multiple_pages() {
     assert_eq!(mappings, vec![0, 1, 2, 3, 4, 5]);
     let mut app = StubApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect("catch up in pages");
 
+    // The expected events carry each direct's index, block and timestamp, so
+    // they also pin what replay hands the application.
     assert_eq!(app.replayed, expected);
-    assert_eq!(app.executed_input_count().get(), expected.len() as u64);
-    assert_eq!(
-        app.last_executed_safe_block(),
-        30,
-        "catch-up must advance application-owned progress through execution"
-    );
+    assert_eq!(app.l2_tx_count().get(), expected.len() as u64);
 }
 
 #[test]
@@ -1068,10 +1064,10 @@ fn catch_up_rejects_history_gap_before_execution() {
     seed_replay_fixture(&db.path);
     let mut storage = Storage::open(&db.path).unwrap();
     let conn = Storage::open_connection(&db.path).unwrap();
-    conn.execute_batch("DROP TRIGGER trg_protect_valid_application_input_delete; DELETE FROM application_inputs WHERE offset=1;").unwrap();
+    conn.execute_batch("DROP TRIGGER trg_application_inputs_not_deletable; DELETE FROM application_inputs WHERE l2_tx_count=1;").unwrap();
     let mut app = StubApp::default();
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2);
+        let _ = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2);
     }));
     assert!(failure.is_err());
     assert!(app.replayed.is_empty());
@@ -1082,9 +1078,9 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
     let db = temp_db("catch-up-wrong-mapping");
     seed_replay_fixture(db.path.as_str());
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    let mut app = StubApp::with_progress(3, 0);
+    let mut app = StubApp::with_progress(3);
 
-    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect_err("mapping from a different application boundary must stop catch-up");
 
     assert!(matches!(
@@ -1098,7 +1094,7 @@ fn catch_up_rejects_wrong_snapshot_count_before_execution() {
         app.replayed.is_empty(),
         "mapping is checked before execution"
     );
-    assert_eq!(app.executed_input_count(), ExecutedInputCount::new(3));
+    assert_eq!(app.l2_tx_count(), L2TxCount::new(3));
     assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
 }
 
@@ -1109,243 +1105,10 @@ fn catch_up_handles_mixed_user_ops_and_direct_inputs_across_page_boundary() {
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     let mut app = StubApp::default();
 
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 4)
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 4)
         .expect("catch up across page boundary");
 
     assert_eq!(app.replayed, expected);
-}
-
-#[test]
-fn standard_recovery_rebases_history_and_restart_on_surviving_checkpoint() {
-    let db = temp_db("standard-recovery-history-boundary");
-    let dumps_dir = tempfile::tempdir().expect("create dump directory");
-    let batch_submitter = Address::from([0xff; 20]);
-    let direct_sender = Address::repeat_byte(0x44);
-    let protocol = default_protocol_timing();
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-    pin_test_deployment_identity(&mut storage, batch_submitter);
-    storage
-        .append_safe_inputs(0, &[], batch_submitter, &protocol)
-        .expect("seed genesis safe head");
-    storage.ensure_open_tip().expect("open genesis Tip");
-    let mut head = storage.open_state().unwrap().unwrap();
-    let initial_history = storage.history_state().expect("initial history");
-    let mut live_app = StubApp::default();
-
-    // Batch 0 is the surviving prefix. Its pending snapshot reflects exactly
-    // input 0 and becomes the recovery checkpoint once the batch lands.
-    let (prefix_op, _response) = make_pending_user_op(0x51);
-    let mut included = Vec::new();
-    super::execute_user_op(
-        &mut live_app,
-        prefix_op,
-        head.frame_fee,
-        head.safe_block,
-        &mut included,
-    )
-    .expect("execute prefix user op");
-    assert_eq!(included[0].executed_input_offset, ExecutedInputCount::ZERO);
-    storage
-        .append_executed_user_ops_chunk(&mut head, &included)
-        .expect("persist prefix user op");
-    super::snapshot::close_batch_with_snapshot(
-        &mut live_app,
-        &mut storage,
-        &mut head,
-        0,
-        dumps_dir.path(),
-    )
-    .expect("close prefix batch with snapshot");
-
-    let prefix_landing = crate::storage::test_helpers::local_batch_payload(&mut storage, 0);
-    let direct = DirectInput {
-        sender: direct_sender,
-        block_number: 10,
-        payload: vec![0xd1],
-    };
-    storage
-        .append_safe_inputs(
-            10,
-            &[
-                StoredSafeInput {
-                    sender: batch_submitter,
-                    payload: prefix_landing,
-                    block_number: 10,
-                },
-                StoredSafeInput {
-                    sender: direct.sender,
-                    payload: direct.payload.clone(),
-                    block_number: direct.block_number,
-                },
-            ],
-            batch_submitter,
-            &protocol,
-        )
-        .expect("observe prefix landing and direct input");
-    let direct_receipt = sequencer_core::application::execute_direct_input(&mut live_app, &direct)
-        .expect("execute direct input in doomed suffix");
-    assert_eq!(direct_receipt.offset, ExecutedInputCount::new(1));
-    storage
-        .close_frame_only_with_executions(
-            &mut head,
-            10,
-            SafeInputRange::new(0, 2),
-            &[DirectInputExecution {
-                safe_input_index: 1,
-                executed_input_offset: direct_receipt.offset,
-            }],
-        )
-        .expect("drain direct and promote prefix snapshot");
-    let finalized_before = storage
-        .finalized_dump()
-        .expect("read finalized prefix")
-        .expect("prefix snapshot promoted");
-    assert_eq!(
-        finalized_before.executed_input_count,
-        ExecutedInputCount::new(1)
-    );
-
-    // The direct and this user op are both beyond the finalized checkpoint.
-    // Closing batch 1 makes it the first non-gold recovery pivot.
-    let (doomed_op, _response) = make_pending_user_op(0x52);
-    included.clear();
-    super::execute_user_op(
-        &mut live_app,
-        doomed_op,
-        head.frame_fee,
-        head.safe_block,
-        &mut included,
-    )
-    .expect("execute doomed user op");
-    assert_eq!(
-        included[0].executed_input_offset,
-        ExecutedInputCount::new(2)
-    );
-    storage
-        .append_executed_user_ops_chunk(&mut head, &included)
-        .expect("persist doomed user op");
-    super::snapshot::close_batch_with_snapshot(
-        &mut live_app,
-        &mut storage,
-        &mut head,
-        10,
-        dumps_dir.path(),
-    )
-    .expect("close doomed batch with snapshot");
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(3)
-    );
-
-    let before_recovery = history_rows(&mut storage, 32);
-    assert_eq!(
-        before_recovery
-            .iter()
-            .map(|row| row.offset.get())
-            .collect::<Vec<_>>(),
-        vec![0, 1, 2]
-    );
-    let invalidated = storage
-        .recover_post_flush_for_recovery(10, &protocol, crate::clock::unix_now_ms())
-        .expect("standard recovery cascade");
-    assert_eq!(invalidated, vec![1, 2]);
-    let recovered_history = storage.history_state().expect("recovered history");
-    assert_eq!(
-        recovered_history.version.era_id, initial_history.version.era_id,
-        "standard recovery must stay in the same era"
-    );
-    assert_eq!(recovered_history.version.recovery_generation.get(), 1);
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(2),
-        "H rolls back the doomed user op while the direct is re-drained"
-    );
-    assert_eq!(
-        storage.finalized_dump().unwrap().unwrap(),
-        finalized_before,
-        "the accepted prefix checkpoint must survive the cascade"
-    );
-    assert_eq!(
-        storage.latest_snapshot().unwrap().unwrap().dump,
-        finalized_before.dump
-    );
-    let after_recovery = history_rows(&mut storage, 32);
-    assert_eq!(after_recovery.len(), 2);
-    assert!(matches!(
-        &after_recovery[1].context,
-        crate::storage::L2TxContext::DirectInput { input_index: 1, .. }
-    ));
-    assert_eq!(after_recovery[1].offset, ExecutedInputCount::new(1));
-
-    let checkpoint = catch_up_snapshot(&mut storage).expect("select surviving checkpoint");
-    assert_eq!(
-        checkpoint.executed_input_count,
-        finalized_before.executed_input_count
-    );
-    let mut restarted = StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
-        .expect("load surviving application checkpoint");
-    assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(1));
-    catch_up_application_paged(
-        &mut restarted,
-        &mut storage,
-        checkpoint.executed_input_count,
-        2,
-    )
-    .expect("catch up through recovery re-drain");
-    assert_eq!(restarted.executed_input_count(), ExecutedInputCount::new(2));
-
-    // The replacement suffix reuses offset 2, rolling H forward without
-    // retaining the invalidated op that previously occupied that coordinate.
-    let mut recovery_head = storage.open_state().unwrap().unwrap();
-    let (replacement_op, _response) = make_pending_user_op(0x53);
-    included.clear();
-    super::execute_user_op(
-        &mut restarted,
-        replacement_op,
-        recovery_head.frame_fee,
-        recovery_head.safe_block,
-        &mut included,
-    )
-    .expect("execute replacement user op");
-    assert_eq!(
-        included[0].executed_input_offset,
-        ExecutedInputCount::new(2)
-    );
-    storage
-        .append_executed_user_ops_chunk(&mut recovery_head, &included)
-        .expect("persist replacement suffix");
-    assert_eq!(
-        storage.next_executed_input_count().unwrap(),
-        ExecutedInputCount::new(3)
-    );
-
-    let valid = history_rows(&mut storage, 32);
-    let mappings: Vec<_> = valid.iter().map(|row| row.offset.get()).collect();
-    assert_eq!(mappings, vec![0, 1, 2]);
-    let user_seeds: Vec<_> = valid
-        .iter()
-        .filter_map(|row| match &row.context {
-            crate::storage::L2TxContext::UserOp { tx, .. } => Some(tx.data[0]),
-            crate::storage::L2TxContext::DirectInput { .. } => None,
-        })
-        .collect();
-    assert_eq!(user_seeds, vec![0x51, 0x53]);
-
-    let mut restarted_again =
-        StubApp::from_dump(&super::dump_info::app_prefix(&checkpoint.dump.prefix))
-            .expect("reload surviving checkpoint");
-    catch_up_application_paged(
-        &mut restarted_again,
-        &mut storage,
-        checkpoint.executed_input_count,
-        2,
-    )
-    .expect("catch up through replacement suffix");
-    assert_eq!(
-        restarted_again.executed_input_count(),
-        ExecutedInputCount::new(3)
-    );
-    assert_eq!(restarted_again.last_executed_safe_block(), 10);
 }
 
 #[test]
@@ -1354,7 +1117,7 @@ fn catch_up_load_error_reports_offset() {
     let mut storage = Storage::open_writer(db.path.as_str()).expect("open raw storage");
     let mut app = StubApp::default();
 
-    let err = catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2)
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
         .expect_err("catch up should fail without schema");
 
     assert!(matches!(err, CatchUpError::LoadReplay { offset: 0, .. }));
@@ -1367,15 +1130,10 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(
-            0,
-            &[],
-            Address::repeat_byte(0xff),
-            &default_protocol_timing(),
-        )
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
 
-    let mut app = StubApp::with_progress(1, 0);
+    let mut app = StubApp::with_progress(1);
     register_genesis_snapshot(&mut app, &mut storage, &config.dumps_dir);
     storage.ensure_open_tip().expect("establish genesis tip");
 
@@ -1401,7 +1159,7 @@ async fn lane_refuses_snapshot_whose_application_count_disagrees_with_storage() 
 fn read_dump_counter(dump_dir: &Path) -> u64 {
     StubApp::from_dump(&super::dump_info::app_prefix(dump_dir))
         .expect("decode dump progress")
-        .executed_input_count()
+        .l2_tx_count()
         .get()
 }
 
@@ -1424,7 +1182,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         // Batch size target < one user op, so every op closes its batch.
         set_one_op_batch_target(&mut storage);
         storage
-            .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+            .append_safe_inputs(0, &[], SENDER_A)
             .expect("seed observed safe head");
     }
 
@@ -1468,7 +1226,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix) == 3)
+            .map(|p| read_dump_counter(&p.prefix) == 3)
             .unwrap_or(false)
     })
     .await;
@@ -1482,7 +1240,8 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
             s.finalized_dump()
                 .expect("finalized")
                 .expect("genesis finalized exists")
-                .executed_input_count
+                .snapshot
+                .l2_tx_count
                 .get(),
             0,
             "finalized must still be genesis (nothing was promoted)"
@@ -1514,7 +1273,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix) == 4)
+            .map(|p| read_dump_counter(&p.prefix) == 4)
             .unwrap_or(false)
     })
     .await;
@@ -1522,7 +1281,7 @@ async fn restart_resumes_from_pending_checkpoint_without_skipping_txs() {
         let mut s = Storage::open(db.path.as_str()).expect("open");
         s.latest_snapshot()
             .expect("read pending")
-            .map(|p| read_dump_counter(&p.dump.prefix))
+            .map(|p| read_dump_counter(&p.prefix))
     };
     shutdown_lane(&shutdown2, handle2).await;
 
@@ -1543,32 +1302,27 @@ fn application_dump_failure_leaves_tip_and_latest_snapshot_unchanged() {
     let dumps = tempfile::tempdir().unwrap();
     let mut app = StubApp::default();
     register_genesis_snapshot(&mut app, &mut storage, dumps.path());
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 0, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
-    let tip = head.batch_index;
-    let dump_count = storage.list_dump_rows().unwrap().len();
+    let tip = head.batch_nonce();
+    let dump_count = storage.list_snapshots().unwrap().len();
 
     app.fail_dump = true;
-    let error = super::snapshot::close_batch_with_snapshot(
-        &mut app,
-        &mut storage,
-        &mut head,
-        0,
-        dumps.path(),
-    )
-    .expect_err("an application dump failure must precede the batch seal");
+    let error =
+        super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
+            .expect_err("an application dump failure must precede the batch seal");
     assert!(matches!(
         error,
         super::snapshot::TakeDumpError::CreateDump(super::dump_info::CreateDumpDirError::App(
             AppError::Io(ref source)
         )) if source.to_string() == "injected application dump failure"
     ));
-    assert_eq!(head.batch_index, tip);
-    assert_eq!(storage.open_state().unwrap().unwrap().batch_index, tip);
-    assert_eq!(storage.latest_batch_index().unwrap(), Some(tip));
+    assert_eq!(head.batch_nonce(), tip);
+    assert_eq!(storage.open_state().unwrap().unwrap().batch_nonce(), tip);
+    assert_eq!(storage.latest_batch_nonce().unwrap(), Some(tip));
     assert_eq!(storage.latest_snapshot().unwrap().unwrap(), snapshot);
-    assert_eq!(storage.list_dump_rows().unwrap().len(), dump_count);
+    assert_eq!(storage.list_snapshots().unwrap().len(), dump_count);
 }
 
 #[test]
@@ -1577,19 +1331,18 @@ fn empty_batch_snapshot_preserves_application_count() {
     let expected = seed_replay_fixture(&db.path);
     let mut storage = Storage::open(&db.path).unwrap();
     let mut app = StubApp::default();
-    catch_up_application_paged(&mut app, &mut storage, ExecutedInputCount::ZERO, 2).unwrap();
+    catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2).unwrap();
     assert_eq!(app.replayed, expected);
     let mut head = storage.open_state().unwrap().unwrap();
     let dumps = tempfile::tempdir().unwrap();
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
-    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, 30, dumps.path())
+    super::snapshot::close_batch_with_snapshot(&mut app, &mut storage, &mut head, dumps.path())
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
-    assert_eq!(snapshot.executed_input_count.get(), 6);
-    let restored =
-        StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.dump.prefix)).unwrap();
-    assert_eq!(restored.executed_input_count().get(), 6);
+    assert_eq!(snapshot.l2_tx_count.get(), 6);
+    let restored = StubApp::from_dump(&super::dump_info::app_prefix(&snapshot.prefix)).unwrap();
+    assert_eq!(restored.l2_tx_count().get(), 6);
 }
 
 fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::ApplicationInputRow> {
@@ -1597,7 +1350,7 @@ fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::Appl
     storage
         .canonical_history_page(
             sequencer_core::history::HistoryClaim {
-                version: bounds.version,
+                era_id: bounds.era_id,
                 next_input: bounds.available_from,
             },
             limit,
@@ -1606,10 +1359,10 @@ fn history_rows(storage: &mut Storage, limit: usize) -> Vec<crate::storage::Appl
         .rows
 }
 
-fn context_tx(context: crate::storage::L2TxContext) -> SequencedL2Tx {
+fn context_tx(context: L2TxContext) -> L2Tx {
     match context {
-        crate::storage::L2TxContext::UserOp { tx, .. } => SequencedL2Tx::UserOp(tx),
-        crate::storage::L2TxContext::DirectInput { tx, .. } => SequencedL2Tx::Direct(tx),
+        L2TxContext::UserOp { tx, .. } => L2Tx::UserOp(tx),
+        L2TxContext::Direct { tx, .. } => L2Tx::Direct(tx),
     }
 }
 
@@ -1623,7 +1376,7 @@ fn lane_with_closed_queue_and_due_direct(
     let mut storage = Storage::open(db.path.as_str()).expect("open storage");
     pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
     storage
-        .append_safe_inputs(0, &[], SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
         .expect("seed observed safe head");
     storage.ensure_open_tip().expect("establish open tip");
     storage
@@ -1634,8 +1387,7 @@ fn lane_with_closed_queue_and_due_direct(
                 payload: vec![0xaa],
                 block_number: 5,
             }],
-            SENDER_A,
-            &default_protocol_timing(),
+            Address::repeat_byte(0xff),
         )
         .expect("append a direct at the first clock tick");
 
@@ -1660,7 +1412,7 @@ fn lane_stops_cleanly_when_its_queue_closes_during_shutdown() {
     let (_dir, mut lane, shutdown) =
         lane_with_closed_queue_and_due_direct("closed-queue-during-shutdown", true);
 
-    let result = lane.run_forever(ExecutedInputCount::ZERO);
+    let result = lane.run_forever(L2TxCount::ZERO);
 
     assert!(shutdown.is_shutdown_requested());
     assert!(result.is_ok(), "{result:?}");
@@ -1671,7 +1423,393 @@ fn lane_reports_a_closed_queue_without_shutdown() {
     let (_dir, mut lane, _shutdown) =
         lane_with_closed_queue_and_due_direct("closed-queue-without-shutdown", false);
 
-    let result = lane.run_forever(ExecutedInputCount::ZERO);
+    let result = lane.run_forever(L2TxCount::ZERO);
 
     assert!(matches!(result, Err(InclusionLaneError::ChannelClosed)));
+}
+
+/// Run one queued op through a dequeue chunk whose frame price is 10 and
+/// return the 422 text it was refused with. Nothing may execute.
+fn refusal_text(app: &mut StubApp, user_op: UserOp) -> String {
+    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(1);
+    let (mut pending, mut response) = make_pending_user_op(0x61);
+    pending.signed.user_op = user_op;
+    tx.try_send(pending).expect("enqueue refused op");
+    let head = WriteHeadParts {
+        frame_fee: 10,
+        ..WriteHeadParts::of(&unbounded_head())
+    }
+    .build();
+    let count_before = app.l2_tx_count();
+    let mut included = Vec::new();
+
+    dequeue_and_execute_user_op_chunk(&mut rx, app, 1, &head, &mut included)
+        .expect("a refusal never stops the lane");
+
+    assert!(included.is_empty(), "a refused op is never persisted");
+    assert_eq!(app.l2_tx_count(), count_before);
+    assert!(
+        app.replayed.is_empty(),
+        "a refused op never reaches the app"
+    );
+    match response.try_recv() {
+        Ok(Err(SequencerError::Invalid(message))) => message,
+        other => panic!("expected a 422 refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn lane_refuses_with_each_refusal_text_in_check_order() {
+    let sender = Address::from_slice(&[0x61; 20]);
+    let op = |nonce: u32, max_fee: u16| UserOp {
+        nonce,
+        max_fee,
+        data: vec![0x61; 4].into(),
+    };
+    let refusing = || StubApp {
+        refuse_user_ops: Some("sender is frozen by policy".to_owned()),
+        ..StubApp::default()
+    };
+
+    // Fee cap first: it outranks a wrong nonce and a policy refusal.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(3, 9)),
+        "max fee 9 below base fee 10"
+    );
+    // Then the executor's nonce rule, ahead of admission.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(3, 10)),
+        "bad nonce: expected 0, got 3"
+    );
+    let mut exhausted = refusing();
+    exhausted.nonces.insert(sender, u32::MAX);
+    assert_eq!(
+        refusal_text(&mut exhausted, op(u32::MAX, 10)),
+        "nonce 4294967295 has no successor"
+    );
+    // Admission last, its text verbatim.
+    assert_eq!(
+        refusal_text(&mut refusing(), op(0, 10)),
+        "sender is frozen by policy"
+    );
+}
+
+/// Reports every sender one nonce higher after its first read, so the
+/// executor disagrees with the lane's pre-check about an op it admitted.
+#[derive(Default)]
+struct NonceDriftApp {
+    inner: StubApp,
+    reads: std::cell::Cell<u32>,
+}
+
+impl Application for NonceDriftApp {
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError> {
+        let drift = self.reads.get().min(1);
+        self.reads.set(self.reads.get().saturating_add(1));
+        Ok(self.inner.user_nonce(sender)? + drift)
+    }
+
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError> {
+        self.inner.apply_user_op(op)
+    }
+
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError> {
+        self.inner.apply_direct(direct)
+    }
+
+    fn l2_tx_count(&self) -> L2TxCount {
+        self.inner.l2_tx_count()
+    }
+
+    fn max_method_payload_bytes() -> usize {
+        StubApp::max_method_payload_bytes()
+    }
+
+    fn scheduler_limits() -> SchedulerLimits {
+        StubApp::scheduler_limits()
+    }
+
+    fn admit_user_op(&self, sender: Address, op: &UserOp, fee: u16) -> Result<Admission, AppError> {
+        self.inner.admit_user_op(sender, op, fee)
+    }
+
+    fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
+        unreachable!("the drift double is never restored")
+    }
+
+    fn create_dump(&mut self, _prefix: &Path) -> Result<(), AppError> {
+        unreachable!("the drift double is never dumped")
+    }
+
+    fn state_file_in_dump(prefix: &Path) -> std::path::PathBuf {
+        StubApp::state_file_in_dump(prefix)
+    }
+
+    fn from_canonical_state(_state_file: &Path, _l2_tx_count: L2TxCount) -> Result<Self, AppError> {
+        unreachable!("the drift double is never restored")
+    }
+}
+
+#[test]
+fn admitted_op_that_the_executor_skips_is_a_terminal_lane_error() {
+    let (tx, mut rx) = mpsc::channel::<PendingUserOp>(2);
+    let (pending, response) = make_pending_user_op(0x62);
+    tx.blocking_send(pending).expect("enqueue admitted op");
+    let (later, mut later_response) = make_pending_user_op(0x63);
+    tx.blocking_send(later).expect("enqueue later op");
+    let mut app = NonceDriftApp::default();
+    let mut included = Vec::new();
+
+    let err =
+        dequeue_and_execute_user_op_chunk(&mut rx, &mut app, 16, &unbounded_head(), &mut included)
+            .expect_err("a skip after admission must stop the lane");
+
+    assert!(matches!(
+        err,
+        InclusionLaneError::AdmittedOpSkipped {
+            reason: SkipReason::WrongNonce {
+                expected: 1,
+                got: 0
+            }
+        }
+    ));
+    assert!(err.is_terminal_invariant());
+    assert!(included.is_empty());
+    assert_eq!(app.l2_tx_count(), L2TxCount::ZERO);
+    // The client gets the fixed 500 text, never the skip reason.
+    let response = response
+        .blocking_recv()
+        .expect("lane answers the skipped op")
+        .expect_err("skipped op gets an internal error");
+    assert!(matches!(
+        response,
+        SequencerError::Internal(message) if message == "application internal error"
+    ));
+    assert!(
+        matches!(
+            later_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "the chunk stops at the faulting op"
+    );
+}
+
+#[test]
+fn catch_up_stops_on_a_stored_op_the_application_would_skip() {
+    let db = temp_db("catch-up-replay-skipped");
+    seed_replay_fixture(db.path.as_str());
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut app = StubApp::default();
+    // The restored application already moved the first sender past its
+    // stored op, so history and application disagree.
+    app.nonces.insert(Address::from_slice(&[0x51; 20]), 1);
+
+    let err = catch_up_application_paged(&mut app, &mut storage, L2TxCount::ZERO, 2)
+        .expect_err("a replayed skip must stop catch-up");
+
+    assert!(matches!(
+        err,
+        CatchUpError::ReplaySkipped {
+            offset: 0,
+            reason: SkipReason::WrongNonce {
+                expected: 1,
+                got: 0
+            }
+        }
+    ));
+    assert!(app.replayed.is_empty());
+    assert_eq!(app.l2_tx_count(), L2TxCount::ZERO);
+    assert!(InclusionLaneError::CatchUp { source: err }.is_terminal_invariant());
+}
+
+fn ingested_direct(block: u64, timestamp: u64, payload: Vec<u8>) -> IngestedSafeInput {
+    IngestedSafeInput {
+        sender: Address::repeat_byte(0x77),
+        payload,
+        block_number: block,
+        block_timestamp: timestamp,
+        transaction_hash: B256::ZERO,
+    }
+}
+
+#[test]
+fn direct_over_the_payload_cap_never_executes_and_later_directs_do() {
+    let cap = usize::try_from(StubApp::scheduler_limits().max_direct_payload_bytes)
+        .expect("payload cap fits usize");
+    let db = temp_db("direct-payload-cap");
+    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    pin_test_deployment_identity(&mut storage, Address::repeat_byte(0xff));
+    storage
+        .append_safe_inputs(0, &[], Address::repeat_byte(0xff))
+        .expect("seed observed safe head");
+    let head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize open state");
+    let (_tx, rx) = mpsc::channel(1);
+    let mut lane = InclusionLane {
+        rx,
+        shutdown: RuntimeScope::default(),
+        app: StubApp::default(),
+        storage,
+        config: default_test_config(),
+    };
+    let mut state = LaneState::new(0, head);
+    let mut safe_inputs = Vec::new();
+
+    lane.storage
+        .append_ingested_safe_inputs_with_timestamp(
+            5,
+            1_005,
+            &[
+                ingested_direct(3, 1_003, vec![0xa1; cap]),
+                ingested_direct(4, 1_004, vec![0xee; cap + 1]),
+                ingested_direct(5, 1_005, vec![0xa3]),
+            ],
+        )
+        .expect("append directs around the payload cap");
+    lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
+        .expect("drain the range and close the frame");
+
+    let at_cap = ReplayEvent::DirectInput {
+        input_index: 0,
+        sender: Address::repeat_byte(0x77),
+        block_number: 3,
+        timestamp: 1_003,
+        payload: vec![0xa1; cap],
+    };
+    let after_dropped = ReplayEvent::DirectInput {
+        input_index: 2,
+        sender: Address::repeat_byte(0x77),
+        block_number: 5,
+        timestamp: 1_005,
+        payload: vec![0xa3],
+    };
+    // Each direct reaches the application with its own L1 index and block
+    // timestamp; the over-cap one never reaches it at all.
+    assert_eq!(
+        lane.app.replayed,
+        vec![at_cap.clone(), after_dropped.clone()]
+    );
+    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5]);
+    assert_eq!(read_frame_direct_count(db.path.as_str(), 0, 1), 2);
+    assert_eq!(lane.storage.next_undrained_safe_input_index().unwrap(), 3);
+
+    // A later frame keeps executing directs at the next contiguous offset.
+    lane.storage
+        .append_ingested_safe_inputs_with_timestamp(
+            10,
+            1_010,
+            &[ingested_direct(10, 1_010, vec![0xb1])],
+        )
+        .expect("append a later direct");
+    lane.maybe_advance_safe_frontier(&mut state, &mut safe_inputs)
+        .expect("drain the later direct");
+    let later = ReplayEvent::DirectInput {
+        input_index: 3,
+        sender: Address::repeat_byte(0x77),
+        block_number: 10,
+        timestamp: 1_010,
+        payload: vec![0xb1],
+    };
+    assert_eq!(read_frame_safe_blocks(db.path.as_str()), vec![0, 5, 10]);
+    let rows = history_rows(&mut lane.storage, 16);
+    let stored: Vec<_> = rows
+        .iter()
+        .map(|row| match &row.context {
+            L2TxContext::Direct { tx, .. } => (row.offset.get(), tx.input_index),
+            L2TxContext::UserOp { .. } => panic!("no user op was submitted"),
+        })
+        .collect();
+    assert_eq!(stored, vec![(0, 0), (1, 2), (2, 3)]);
+
+    // Replay hands a restarted application the same directs, index and
+    // timestamp included.
+    let mut restarted = StubApp::default();
+    catch_up_application_paged(&mut restarted, &mut lane.storage, L2TxCount::ZERO, 2)
+        .expect("catch up over the dropped direct");
+    assert_eq!(restarted.replayed, vec![at_cap, after_dropped, later]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lane_in_a_rebuilt_era_drains_from_the_eras_first_queued_input() {
+    use crate::egress::test_era;
+
+    let db = temp_db("lane-rebuilt-era");
+    let config = default_test_config();
+    let baseline = config.dumps_dir.join("era-baseline");
+    super::dump_info::create_dump_dir_with_info(
+        &mut StubApp::with_progress(test_era::REBUILT_END),
+        &baseline,
+        &super::dump_info::DumpInfo::at_baseline(test_era::NEXT_BATCH_NONCE),
+    )
+    .expect("create the era's baseline dump");
+    let mut storage = test_era::publish_rebuilt_era(&db.path, &baseline);
+    // Input 3 sits at the stop block but is still queued, so the drain starts
+    // there, not after the stop block's last input.
+    assert_eq!(
+        storage.next_undrained_safe_input_index().unwrap(),
+        test_era::FIRST_QUEUED_INPUT
+    );
+    // `run`'s startup: the root frame drains the queued direct.
+    storage.ensure_open_tip().expect("open the root frame");
+    assert_eq!(
+        storage.next_undrained_safe_input_index().unwrap(),
+        test_era::FIRST_QUEUED_INPUT + 1
+    );
+
+    let shutdown = RuntimeScope::default();
+    let (_tx, handle) = InclusionLane::<StubApp>::start(16, shutdown.clone(), storage, config);
+    let later = IngestedSafeInput {
+        sender: test_era::DIRECT_SENDER,
+        payload: vec![0xb4],
+        block_number: test_era::STOP_BLOCK + 6,
+        block_timestamp: 1_016,
+        transaction_hash: B256::repeat_byte(0xb4),
+    };
+    Storage::open(&db.path)
+        .expect("open feeder storage")
+        .append_ingested_safe_inputs_with_timestamp(test_era::STOP_BLOCK + 6, 1_016, &[later])
+        .expect("land a direct after the root frame");
+    let head = |db_path: &str| {
+        Storage::open_read_only(db_path)
+            .unwrap()
+            .history_bounds()
+            .unwrap()
+            .head
+            .get()
+    };
+    let drained = wait_until(Duration::from_secs(2), || {
+        head(&db.path) == test_era::REBUILT_END + 2
+    })
+    .await;
+    // A clean stop means catch-up replayed the queued direct onto the
+    // baseline, so the lane's own direct executed at the next count.
+    shutdown_lane(&shutdown, handle).await;
+    assert!(drained, "the lane must drain the later direct");
+
+    let mut storage = Storage::open_read_only(&db.path).unwrap();
+    let bounds = storage.history_bounds().unwrap();
+    let live: Vec<_> = storage
+        .canonical_history_page(
+            sequencer_core::history::HistoryClaim {
+                era_id: bounds.era_id,
+                next_input: L2TxCount::new(test_era::REBUILT_END),
+            },
+            16,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| match row.context {
+            L2TxContext::Direct { tx, .. } => (row.offset.get(), tx.input_index),
+            L2TxContext::UserOp { .. } => panic!("no user op was submitted"),
+        })
+        .collect();
+    assert_eq!(
+        live,
+        vec![
+            (test_era::REBUILT_END, test_era::FIRST_QUEUED_INPUT),
+            (test_era::REBUILT_END + 1, test_era::FIRST_QUEUED_INPUT + 1),
+        ]
+    );
 }

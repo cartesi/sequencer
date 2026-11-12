@@ -1,76 +1,38 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Coherent history metadata and bounded pages of the immutable era L1 prefix.
+//! Coherent history metadata.
 
-use std::io::Cursor;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use sequencer_core::history::{EraId, RecoveryGeneration};
-use sequencer_core::history_api::{HISTORICAL_INPUT_MAX_ITEMS, HistoricalL1InputStart};
+use sequencer_core::history::EraId;
 use serde::Deserialize;
-use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio_util::io::ReaderStream;
 
 use crate::http::{ApiError, StorageTaskError, storage_task};
 use crate::runtime::shutdown::RuntimeScope;
 use crate::storage::{HistoricalReadError, Storage};
 
-const MAX_HISTORICAL_RESPONSES: usize = 8;
-
 struct HistoryState {
     db_path: String,
     shutdown: RuntimeScope,
-    responses: Arc<Semaphore>,
 }
 
 pub(super) fn router(db_path: String, shutdown: RuntimeScope) -> Router {
     Router::new()
         .route("/history", get(history))
-        .route("/historical-l1-inputs", get(historical_l1_inputs))
-        .with_state(Arc::new(HistoryState {
-            db_path,
-            shutdown,
-            responses: Arc::new(Semaphore::new(MAX_HISTORICAL_RESPONSES)),
-        }))
+        .with_state(Arc::new(HistoryState { db_path, shutdown }))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryQuery {
     era_id: Option<EraId>,
-    from_generation: Option<RecoveryGeneration>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HistoricalInputsQuery {
-    era_id: EraId,
-    next_input_index: Option<u64>,
-    after_block: Option<u64>,
-    limit: Option<usize>,
-}
-
-impl HistoricalInputsQuery {
-    fn start(&self) -> Result<HistoricalL1InputStart, ApiError> {
-        match (self.next_input_index, self.after_block) {
-            (Some(index), None) => Ok(HistoricalL1InputStart::NextInputIndex(index)),
-            (None, Some(block)) => Ok(HistoricalL1InputStart::AfterBlock(block)),
-            _ => Err(ApiError::bad_request(
-                "provide exactly one of next_input_index or after_block",
-            )),
-        }
-    }
 }
 
 async fn history(
@@ -81,15 +43,12 @@ async fn history(
         Ok(query) => query,
         Err(error) => return ApiError::bad_request(error.body_text()).into_response(),
     };
-    if query.from_generation.is_some() && query.era_id.is_none() {
-        return ApiError::bad_request("from_generation requires era_id").into_response();
-    }
     if let Err(error) = crate::http::reject_if_shutting_down(&state.shutdown) {
         return error.into_response();
     }
     let db_path = state.db_path.clone();
     match storage_task(state.shutdown.clone(), "read history metadata", move |_| {
-        Ok(Storage::open_read_only(&db_path)?.history_info(query.era_id, query.from_generation)?)
+        Ok(Storage::open_read_only(&db_path)?.history_info(query.era_id)?)
     })
     .await
     {
@@ -98,81 +57,12 @@ async fn history(
     }
 }
 
-async fn historical_l1_inputs(
-    State(state): State<Arc<HistoryState>>,
-    query: Result<Query<HistoricalInputsQuery>, QueryRejection>,
-) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => return ApiError::bad_request(error.body_text()).into_response(),
-    };
-    let start = match query.start() {
-        Ok(start) => start,
-        Err(error) => return error.into_response(),
-    };
-    if let Err(error) = crate::http::reject_if_shutting_down(&state.shutdown) {
-        return error.into_response();
-    }
-    let permit = match state.responses.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => return ApiError::overloaded("historical response limit reached").into_response(),
-    };
-    let db_path = state.db_path.clone();
-    let result = storage_task(
-        state.shutdown.clone(),
-        "read historical L1 inputs",
-        move |_| {
-            // The blocking task owns admission even if its HTTP request is cancelled.
-            let page = Storage::open_read_only(&db_path)?.historical_l1_inputs(
-                query.era_id,
-                start,
-                query.limit.unwrap_or(HISTORICAL_INPUT_MAX_ITEMS),
-            )?;
-            let bytes = serde_json::to_vec(&page)?;
-            Ok((bytes, permit))
-        },
-    )
-    .await;
-    match result {
-        Ok((bytes, permit)) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            Body::from_stream(ReaderStream::new(HistoricalResponseBody {
-                bytes: Cursor::new(bytes),
-                _permit: permit,
-            })),
-        )
-            .into_response(),
-        Err(error) => read_error(error),
-    }
-}
-
 fn read_error(error: StorageTaskError) -> Response {
-    match error.downcast_ref::<HistoricalReadError>() {
-        Some(HistoricalReadError::Policy(policy)) => {
-            return (StatusCode::CONFLICT, Json(*policy)).into_response();
-        }
-        Some(HistoricalReadError::BadRequest(message)) => {
-            return ApiError::bad_request(message.clone()).into_response();
-        }
-        _ => {}
+    if let Some(HistoricalReadError::Policy(policy)) = error.downcast_ref::<HistoricalReadError>() {
+        return (StatusCode::CONFLICT, Json(*policy)).into_response();
     }
     tracing::warn!(%error, "history read unavailable");
     ApiError::unavailable("history read unavailable").into_response()
-}
-
-struct HistoricalResponseBody {
-    bytes: Cursor<Vec<u8>>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl AsyncRead for HistoricalResponseBody {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.bytes).poll_read(cx, buf)
-    }
 }
 
 #[cfg(test)]
@@ -185,33 +75,15 @@ mod tests {
         Arc::new(HistoryState {
             db_path: "unused: invalid queries do not access storage".to_owned(),
             shutdown: RuntimeScope::default(),
-            responses: Arc::new(Semaphore::new(1)),
         })
     }
 
     #[tokio::test]
     async fn malformed_queries_return_bad_request_json_before_storage() {
         for query in [
-            "",
-            "?era_id=bad&next_input_index=0",
-            &format!("?era_id={ERA}"),
-            &format!("?era_id={ERA}&next_input_index=0&after_block=0"),
-            &format!("?era_id={ERA}&next_input_index=-1"),
-            &format!("?era_id={ERA}&next_input_index=0&unrecognized=1"),
-        ] {
-            let uri = format!("/historical-l1-inputs{query}").parse().unwrap();
-            let response = historical_l1_inputs(State(state()), Query::try_from_uri(&uri)).await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
-            let bytes = axum::body::to_bytes(response.into_body(), 4096)
-                .await
-                .unwrap();
-            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(error["code"], "BAD_REQUEST");
-        }
-        for query in [
+            "?era_id=invalid",
             "?from_generation=0",
-            &format!("?era_id={ERA}&from_generation=-1"),
-            &format!("?era_id={ERA}&from_generation=invalid"),
+            &format!("?era_id={ERA}&from_generation=0"),
             &format!("?era_id={ERA}&unrecognized=1"),
         ] {
             let uri = format!("/history{query}").parse().unwrap();
@@ -226,23 +98,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_and_overload_refuse_before_opening_storage() {
+    async fn shutdown_refuses_before_opening_storage() {
         let state = state();
-        let uri = format!("/historical-l1-inputs?era_id={ERA}&next_input_index=0")
-            .parse()
-            .unwrap();
-        let permit = state.responses.clone().try_acquire_owned().unwrap();
-        let response = historical_l1_inputs(State(state.clone()), Query::try_from_uri(&uri)).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        drop(permit);
         state.shutdown.request_shutdown();
-        let response = historical_l1_inputs(State(state.clone()), Query::try_from_uri(&uri)).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        for query in [
-            "".to_owned(),
-            format!("?era_id={ERA}"),
-            format!("?era_id={ERA}&from_generation=0"),
-        ] {
+        for query in ["".to_owned(), format!("?era_id={ERA}")] {
             let uri = format!("/history{query}").parse().unwrap();
             let response = history(State(state.clone()), Query::try_from_uri(&uri)).await;
             assert_eq!(
@@ -254,23 +113,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_body_holds_admission_until_consumed_or_dropped() {
-        let permits = Arc::new(Semaphore::new(1));
-        for consume in [false, true] {
-            let body = Body::from_stream(ReaderStream::new(HistoricalResponseBody {
-                bytes: Cursor::new(vec![1; 100_000]),
-                _permit: permits.clone().try_acquire_owned().unwrap(),
-            }));
-            assert!(permits.clone().try_acquire_owned().is_err());
-            if consume {
-                assert_eq!(
-                    axum::body::to_bytes(body, 100_000).await.unwrap().len(),
-                    100_000
-                );
-            } else {
-                drop(body);
-            }
-            assert_eq!(permits.available_permits(), 1);
-        }
+    async fn history_reports_a_rebuilt_eras_base_and_rebuilt_end() {
+        use crate::egress::test_era;
+
+        let db = crate::test_support::temp_db("history-rebuilt-era");
+        let mut storage =
+            test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
+        test_era::append_live_user_op(&mut storage, 2);
+        let era_id = storage.era().unwrap().id;
+        drop(storage);
+        let state = Arc::new(HistoryState {
+            db_path: db.path.clone(),
+            shutdown: RuntimeScope::default(),
+        });
+        let response = history(
+            State(state.clone()),
+            Query::try_from_uri(&format!("/history?era_id={era_id}").parse().unwrap()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let keys: Vec<&str> = info
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["accepted_checkpoint", "baseline", "deployment", "history"]
+        );
+        // The era starts at the base count; the head is past the queued
+        // direct and the live op.
+        assert_eq!(
+            info["history"],
+            serde_json::json!({
+                "era_id": era_id.to_string(),
+                "available_from": test_era::BASE,
+                "head": test_era::REBUILT_END + 2,
+            })
+        );
+        assert_eq!(
+            info["baseline"],
+            serde_json::json!({
+                "l1_stop_block": test_era::STOP_BLOCK,
+                "l1_end_input_index": test_era::FIRST_QUEUED_INPUT + 1,
+                "next_batch_nonce": test_era::NEXT_BATCH_NONCE,
+                "rebuilt_history_end": test_era::REBUILT_END,
+            })
+        );
+        // With no accepted batch yet, the era's baseline is the checkpoint.
+        assert_eq!(
+            info["accepted_checkpoint"],
+            serde_json::json!({
+                "inclusion_block": test_era::STOP_BLOCK,
+                "executed_input_count": test_era::REBUILT_END,
+                "next_batch_nonce": test_era::NEXT_BATCH_NONCE,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn another_era_is_refused_with_the_current_era() {
+        use crate::egress::test_era;
+
+        let db = crate::test_support::temp_db("history-era-changed");
+        let mut storage =
+            test_era::seed_rebuilt_era(&db.path, std::path::Path::new("/unused/baseline"));
+        let era_id = storage.era().unwrap().id;
+        drop(storage);
+        assert_ne!(era_id.to_string(), ERA);
+        let state = Arc::new(HistoryState {
+            db_path: db.path.clone(),
+            shutdown: RuntimeScope::default(),
+        });
+        let uri = format!("/history?era_id={ERA}").parse().unwrap();
+        let response = history(State(state), Query::try_from_uri(&uri)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "code": "ERA_CHANGED", "era_id": era_id.to_string() })
+        );
     }
 }

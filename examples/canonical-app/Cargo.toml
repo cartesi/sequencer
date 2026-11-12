@@ -18,3 +18,7 @@ rollups-types = { workspace = true }
 
 [dev-dependencies]
 k256 = { workspace = true }
+# The native tests sign user ops and build portal deposits and batches.
+sequencer-core = { path = "../../sequencer-core", features = ["test-support"] }
+rollups-types = { workspace = true, features = ["test-support"] }
+ssz = { workspace = true }

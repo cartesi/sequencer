@@ -37,9 +37,9 @@ curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/digest"
 ```
 
-Both answer JSON once the sequencer has a comparable checkpoint and 404 before
-that: genesis is comparable at block zero, while a rebuilt baseline waits for
-its next accepted batch
+Both answer JSON once the sequencer has a comparable checkpoint, which a
+completed setup always provides: the era's baseline at its stop block, until
+an accepted batch replaces it
 ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
 They answer 503 while the sequencer's own divergence marker is set.
 
@@ -196,13 +196,11 @@ but checkpoints.
 A retained checkpoint is a trusted machine at a known block. It can bootstrap
 a new state directory ([initialize](#initialize)), serve as the trusted source
 for `replay` in the [runbook](incident-runbook.md#2-find-the-faulty-side), and
-feed the canonical-to-native export of
-[cockroach recovery](../recovery/cockroach.md#incident-playbook). It is not a
-sequencer restore archive; that is `/finalized_snapshot`
+be the base of `setup --base` in a
+[cockroach recovery](../recovery/cockroach.md). Its name counts InputBox
+inputs, not L2 transactions; `setup --base <dir> --dry-run` prints its L2 tx
+count. It is not a sequencer restore archive; that is `/finalized_snapshot`
 ([recovery exports](../snapshots/lifecycle.md#http-and-recovery-exports)).
-Complete the application's
-[recovery readiness drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
-before production.
 
 ## Deployment facts
 
@@ -373,14 +371,16 @@ checkpoint from a watchdog that already follows the deployment.
 ## Sequencer restart policy
 
 The sequencer's [exit codes](../../README.md#running) are its whole restart
-contract: there is no database gate and no acknowledgement command. Standard
-recovery is automatic on every boot, and a persistent terminal fault
-re-detects fail-loud when the faulty state is next read, so the supervisor's
+contract: there is no database gate and no acknowledgement command. A start
+repairs nothing. A recorded divergence or a void history refuses every boot
+([what the sequencer does](../recovery/README.md#what-the-sequencer-does)),
+and any other persistent terminal fault re-detects fail-loud when the faulty
+state is next read, so the supervisor's
 handling of 30 and SIGABRT (stop and page, do not auto-restart) is what bounds
 a crash loop.
 
 The final `sequencer exiting` line logs at ERROR for exits 30 and 1, and at
-WARN for 10, 20 and 40, with `verdict` and `supervisor_action` fields; the
+WARN for 20 and 40, with `verdict` and `supervisor_action` fields; the
 SIGABRT line says so. Alert on the exit status, not the log level.
 
 - **Supervisor recipes.** systemd can act on the code directly:
@@ -390,28 +390,57 @@ SIGABRT line says so. Alert on the exit status, not the log level.
   re-detection windows, serving traffic in between. There, the crash-loop
   bound is your alerting, not the restart policy: page immediately on
   `lastState.terminated.exitCode == 30` (and on signal exits / 134).
+- **Keeping a sequencer down.** Foreclosure, after which the InputBox refuses
+  the application's inputs, and cockroach recovery need an instance stopped
+  for good: disable its systemd unit, since `RestartPreventExitStatus` covers
+  only exit 30 and SIGABRT, or scale its Kubernetes Deployment to zero. Never
+  again run a command that signs with the submitter key, `run` or
+  `flush-mempool`, against its data directory.
+- **Setup runs once per data directory, never on every boot.** It refuses a
+  directory that holds anything, a completed setup included, with exit 30, so
+  a setup unit or init container that runs before each `run` pages on the
+  second boot. Run it as a one-off Job or unit against a new directory.
+- **Setup takes the submitter key**, from the same variables as `run`, because
+  it flushes the submitter's wallet; mount the key for the setup Job too.
+  `--dry-run` takes none.
 - **A fresh deployment needs a setup retry budget.** `setup` exits 20 until
   the L1 safe head reaches the application's deployment block, about one to
   two epochs on Ethereum (6.4–12.8 min); give a setup Job or unit a longer
   retry budget (a Kubernetes Job's default backoffLimit 6 allows about
-  10.5 min).
+  10.5 min). This and every other exit 20 from setup's checks before it
+  writes leave the directory empty, so a retry in place is safe. A setup that
+  fails after it begins writing leaves a directory to discard, whatever its
+  exit code, and a retry in place exits 30
+  ([what setup does](../recovery/cockroach.md#what-setup-does)).
+- **The sequencer binary links the Cartesi Machine emulator**, statically, to
+  read a base machine. The host needs no emulator install, but it needs the
+  C++ runtime the emulator was built against: Ubuntu 24.04, Debian 13 or newer,
+  with `libgomp1`, `libslirp0`, `libstdc++6` and `ca-certificates`. Each
+  release archive's `RUNNING.md` lists them.
 - **After an unclean death (OOM, node reboot, SIGKILL) no action is
   needed**: the next start re-derives everything from facts. For
   postmortems, the `terminal_faults` table records the cause of every
   command that returned through its bracket with a terminal verdict
   (best-effort, append-only, traveling with the data directory —
-  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; each `run` boot
-  logs the latest row at WARN unless a later completed setup resolved it). Any death that did not return
+  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`, with a `sqlite3`
+  CLI of 3.37 or later, since the tables are STRICT; each `run` boot
+  logs the latest row at WARN, with its age). Any death that did not return
   through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
-  a controller panic — leaves only the process logs.
+  a controller panic — leaves only the process logs. A recorded divergence
+  or a void history leaves no row either: the database holds the fact, and
+  every `run` on the directory refuses with it.
 - **Untrustworthy local state requires manual recovery.** The reader's
   content-identity divergence marker freezes the acceptance frontier and
-  blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
+  refuses every start ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
   A watchdog state mismatch independently signals application-state
   disagreement ([incident runbook](incident-runbook.md)). Diagnose the cause
-  and follow the [incident playbook](../recovery/cockroach.md#incident-playbook)
-  for a fresh-directory rebuild when needed; standard recovery does not repair
-  bugs.
+  and follow the [incident runbook](incident-runbook.md#3-resolve), which
+  rebuilds in a new directory with `setup --base`; the sequencer repairs
+  nothing by itself.
+- **Batches not landing is an outage to fix inside the window.** Keep `run`
+  up and follow [the outage playbook](../recovery/README.md#when-batches-are-not-landing);
+  once the history is void, every start refuses
+  ([when the sequencer has stopped for good](../recovery/README.md#when-the-sequencer-has-stopped-for-good)).
 
 ## Troubleshooting (live deployments)
 
@@ -436,9 +465,9 @@ and failure class, as in
 | `<dir> was initialized for another deployment or state source; wipe it to re-initialize` | The `init` environment names another chain, application, or state source than the directory holds |
 | `no input precedes block <N>, so the machine at <dir> must be the application's template, but its root hash differs from the on-chain template hash` | The image is not this application's template: another chain's image, another build, or another application |
 | `L1 RPC: eth_call: …` during `init` | The RPC has no state at the bootstrap block; use an archive node |
-| `sequencer /finalized_state/inclusion_block: HTTP 404` | No comparable checkpoint yet, or the URL reaches the wrong listener |
+| `sequencer /finalized_state/inclusion_block: HTTP 404` | The URL reaches the wrong listener: a set-up sequencer always has a comparable checkpoint |
 | `sequencer /finalized_state/digest: HTTP 404` while `inclusion_block` answers | A proxy does not forward the digest route, or the sequencer comes from another release |
-| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#incident-playbook) |
+| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#the-operators-playbook) |
 | `L1 RPC safe head <N> is behind target block <B>` | The RPC lags the sequencer's L1 view; the next tick retries |
 | `InputBox counts <N> inputs at block <B> but the scan reached index <M>`, or `InputBox index <N> where <M> was expected: the L1 view is incomplete` | The provider returned incomplete logs, so switch providers; if it persists across them, a safe block below the head may have been replaced ([L1 chain semantics](../threat-model/README.md#l1-chain-semantics)), so confirm with `replay` from a trusted machine at a finalized block, then wipe the state directory and `init` from one |
 | `the L1 RPC does not serve chain <N>` | The RPC endpoint belongs to another chain |
