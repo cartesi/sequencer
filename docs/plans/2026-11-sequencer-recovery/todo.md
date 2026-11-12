@@ -125,6 +125,9 @@ redundant price push; neither is a question.
   earlier ops, which are public on L1, from running again?
 - What does `validate_user_op` check besides the nonce? Each of those checks
   becomes part of execution, which always runs and always counts.
+- When a user op arrives as an L1 input, who is its sender: the L1 address
+  that sent the input, or the signer of a signature inside it? If a
+  signature, what keeps that op from running twice?
 - Does a client ever send several ops from one wallet without waiting for
   each answer? Does anything need a wallet's ops to run with no gap between
   them?
