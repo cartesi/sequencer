@@ -4,7 +4,7 @@
 //! The `flush-mempool` command: settle the batch-submitter wallet nonce on demand
 //! with the same flush startup recovery and `setup --recovery` run. It needs the
 //! signing key and a completed setup, and never syncs, cascades or launches
-//! workers (README "Running").
+//! workers (docs/running.md).
 
 use super::load_setup_identity;
 use crate::commands::config::FlushConfig;

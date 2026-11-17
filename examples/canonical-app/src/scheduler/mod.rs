@@ -96,9 +96,9 @@ fn emit_app_output<R: Rollup>(rollup: &mut R, output: &AppOutput) -> trolley::Ro
 }
 
 /// Coerce a host `U256` block number to the scheduler's `u64` domain. Solidity
-/// exposes block numbers as `uint256`; a value that does not fit `u64` is a
-/// malformed host input for this prototype. Host-side, so it stays in the
-/// harness rather than the pure scheduler library.
+/// exposes block numbers as `uint256`; a value that does not fit `u64` is
+/// malformed host input. Host-side, so it stays in the harness rather than
+/// the pure scheduler library.
 fn block_to_u64(block: U256) -> u64 {
     u64::try_from(block).expect("block number does not fit u64")
 }

@@ -4,7 +4,7 @@ The application-history protocol is implemented. Its current contracts live in:
 
 - [Application history and replay](../protocol/application-history.md): coordinates,
   storage/recovery boundaries, snapshot bootstrap, and consumer resume.
-- [README API](../../README.md#api): routes, wire messages, refusal codes, and limits.
+- [API contract](../api.md): routes, wire messages, refusal codes, and limits.
 - [Snapshot lifecycle](../snapshots/lifecycle.md): durable artifacts, accepted
   comparisons, recovery exports, and leases.
 
@@ -48,7 +48,7 @@ and replay. The sequencer owns optimistic ordering; the scheduler remains the
 canonical authority.
 
 Current contracts live in the [projection replay guide](../protocol/projection-replay.md)
-and [README API](../../README.md#history-metadata-and-historical-l1-inputs-internal-only).
+and [API contract](../api.md#history-metadata-and-historical-l1-inputs-internal-only).
 `/history` supplies deployment/baseline/current-generation metadata and a coherent
 accepted checkpoint receipt. `/historical-l1-inputs` serves the immutable raw
 prefix through the era's stop block, with block seek, bounded pages, and typed

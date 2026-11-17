@@ -29,7 +29,7 @@ Additional snapshot retention or transport mechanisms require a measured consume
 
 The egress API is implemented. The [history contract](../protocol/application-history.md),
 the [projection contract](../protocol/projection-replay.md) and the
-[API contract](../../README.md#api) own its behavior; the
+[API contract](../api.md) own its behavior; the
 [integration plan](2026-07-track3-feed-replay-design.md) owns deployment follow-ups.
 
 A shared recovery tool will produce the sequencer's and a client's startup

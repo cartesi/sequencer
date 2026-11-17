@@ -1,8 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Health probes `/livez`, `/readyz` and `/healthz` (contract: README "Health
-//! probes"). They live on the internal listener because operators and kubelet
+//! Health probes `/livez`, `/readyz` and `/healthz` (contract: docs/api.md,
+//! "Health probes"). They live on the internal listener because operators and kubelet
 //! probe from inside the cluster.
 
 use std::sync::Arc;

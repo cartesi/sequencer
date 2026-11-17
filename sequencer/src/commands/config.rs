@@ -4,7 +4,7 @@
 //! CLI configuration for `setup`, `run` and `flush-mempool`: the owner of
 //! env-var names, defaults and validation. Shared arg groups (`L1RpcArgs`,
 //! `TimingArgs`, `KeyArgs`) are flattened into each command so names and defaults
-//! cannot drift. The setup/run phase split is in README "Running".
+//! cannot drift. The setup/run phase split is in docs/running.md.
 
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};
@@ -390,11 +390,11 @@ pub struct SetupConfig {
     /// signs L1 no-ops). Plain `setup` stays L1-read-only and key-less.
     #[arg(long, env = "CARTESI_SEQUENCER_RECOVERY", default_value_t = false)]
     pub recovery: bool,
-    /// Directory of the trusted checkpoint dump (a finalized `dumps/<id>/` with
-    /// `state/` + `info.toml`) that `setup --recovery` boots the machine `S`
-    /// from. Required with `--recovery`; rejected without it. This is a
-    /// **sequencer** dump from `$CARTESI_SEQUENCER_DATA_DIR/dumps/`, not a
-    /// watchdog CM checkpoint under `.../checkpoints/<block>/`.
+    /// Directory of the trusted checkpoint (an extracted recovery export with
+    /// `info.toml`, `checkpoint.toml` and the application state) that
+    /// `setup --recovery` boots the machine `S` from. Required with
+    /// `--recovery`; rejected without it. A bare `dumps/<id>/` lacks the
+    /// `checkpoint.toml` receipt, and a watchdog CM checkpoint is not a dump.
     #[arg(long, env = "CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR", value_parser = parse_non_empty_string)]
     pub checkpoint_dump_dir: Option<String>,
     /// Batch-submitter signing key, recovery-only (for the wallet-nonce flush).

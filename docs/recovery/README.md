@@ -252,7 +252,7 @@ before any local batch is accepted. A newer surviving optimistic snapshot can
 reduce replay, but cannot replace that rollback guarantee. Snapshot publication,
 artifact validation, leases, and GC are owned by the
 [snapshot lifecycle](../snapshots/lifecycle.md); history coordinates and
-subscription behavior by the [API contract](../../README.md).
+subscription behavior by the [API contract](../api.md).
 
 ## Why the closed-suffix policy is safe
 

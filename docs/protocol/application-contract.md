@@ -160,7 +160,7 @@ execution offsets, checked during catch-up.
 HTTP snapshot metadata and mandatory WS claims carry the history version and
 this count. Both restart and subscriber replay read the same current application
 sequence. The [history guide](application-history.md) owns coordinates and
-replica bootstrap; the [API contract](../../README.md) owns wire shapes.
+replica bootstrap; the [API contract](../api.md) owns wire shapes.
 
 ### 5. Operational capacity for L1 reconciliation
 
