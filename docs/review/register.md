@@ -130,7 +130,7 @@ counts, then correct the estimate and check the separately configured
   attempt's flush witness. Use the [recovery model](../recovery/README.md) to
   bound a scenario and assess whether existing component tests suffice.
 - **OpenAPI drift.** [`openapi.yaml`](../../openapi.yaml) is hand-maintained
-  beside the [API contract](../../README.md#api). CI lints its structure, but
+  beside the [API contract](../api.md). CI lints its structure, but
   nothing checks it against the routes or serde wire types; only the
   change-together rule in [AGENTS.md](../../AGENTS.md#http-endpoints) keeps them
   aligned. Checked 2026-10-04 against the code at `27e55ce`. Next: if a

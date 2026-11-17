@@ -6,7 +6,9 @@
 # what it flags, then run `bash scripts/verify-action-pins.sh --upstream` and
 # bump, or knowingly keep, each pin it flags. An action only this workflow uses gets
 # no CI run, so a bumped one first runs at the tag; if it fails, fix it on main
-# and dispatch this workflow for the same tag.
+# and dispatch this workflow for the same tag. If sequencer/src/storage/migrations/
+# changed since the previous tag, say so in the release notes: operators upgrade
+# across a schema change by rebuilding (docs/running.md#upgrades).
 
 name: Release
 
@@ -91,7 +93,7 @@ jobs:
           tool: cross@${{ env.CROSS_VERSION }}
 
       # `sequencer` is a library crate; the runnable reference binary is the
-      # `wallet-sequencer` example app (sequencer lib + the placeholder wallet).
+      # `wallet-sequencer` example app (sequencer lib + the toy wallet).
       - name: Build (release)
         run: cross build -p wallet-sequencer --release --locked --target ${{ matrix.target }}
 
@@ -111,26 +113,14 @@ jobs:
             --git-sha "$(git rev-parse HEAD)" \
             --output "package/wallet-sequencer-${TAG}-linux-${ARCH}/RELEASE.json"
 
-          cat > "package/wallet-sequencer-${TAG}-linux-${ARCH}/RUNNING.md" <<'EOF'
-          ## Running
-
-          Required environment variables:
-
-          - `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`
-          - `CARTESI_SEQUENCER_BLOCKCHAIN_ID`
-          - `CARTESI_SEQUENCER_APP_ADDRESS`
-          - `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` (or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`)
-
-          Example:
-
-          ```bash
-          CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-          CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
-          CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-          CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-          ./wallet-sequencer
-          ```
-          EOF
+          # Point at the running guide of this tag instead of copying it.
+          {
+            echo "# wallet-sequencer ${TAG}"
+            echo
+            echo "The sequencer library composed with the example toy wallet, configured for Sepolia."
+            echo "Setup, configuration, exit codes, and upgrades:"
+            echo "https://github.com/cartesi/sequencer/blob/${TAG}/docs/running.md"
+          } > "package/wallet-sequencer-${TAG}-linux-${ARCH}/RUNNING.md"
 
           tar -C package -czf "dist/wallet-sequencer-${TAG}-linux-${ARCH}.tar.gz" "wallet-sequencer-${TAG}-linux-${ARCH}"
 

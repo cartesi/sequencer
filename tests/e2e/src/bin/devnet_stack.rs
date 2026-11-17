@@ -1,9 +1,9 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Local Anvil + rollups devnet + `wallet-sequencer-devnet` for manual watchdog runs.
+//! Local Anvil + rollups devnet + `wallet-sequencer-devnet` (`just devnet`).
 //!
-//! Prints `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C or a child exits.
+//! Prints the endpoints and `CARTESI_WATCHDOG_*` exports, then blocks until Ctrl+C or a child exits.
 
 use std::collections::VecDeque;
 use std::fs::File;

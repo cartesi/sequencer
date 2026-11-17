@@ -24,7 +24,7 @@ the sequencer's operator routes.
 
 The sequencer serves these routes on its internal listener
 (`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), without authentication. The
-[API reference](../../README.md#operator-snapshot-endpoints-internal-only)
+[API reference](../api.md#operator-snapshot-endpoints-internal-only)
 owns them and why they must stay private: publish only the public listener,
 and give the watchdog host a path to the internal one. The sequencer hashes the comparison file on each digest request and
 the watchdog waits up to 300 seconds for the answer, so a proxy in between
@@ -372,46 +372,9 @@ checkpoint from a watchdog that already follows the deployment.
 
 ## Sequencer restart policy
 
-The sequencer's [exit codes](../../README.md#running) are its whole restart
-contract: there is no database gate and no acknowledgement command. Standard
-recovery is automatic on every boot, and a persistent terminal fault
-re-detects fail-loud when the faulty state is next read, so the supervisor's
-handling of 30 and SIGABRT (stop and page, do not auto-restart) is what bounds
-a crash loop.
-
-The final `sequencer exiting` line logs at ERROR for exits 30 and 1, and at
-WARN for 10, 20 and 40, with `verdict` and `supervisor_action` fields; the
-SIGABRT line says so. Alert on the exit status, not the log level.
-
-- **Supervisor recipes.** systemd can act on the code directly:
-  `RestartPreventExitStatus=30 ABRT` (SIGABRT/134 is terminal-class too).
-  Kubernetes Deployments restart regardless of exit code, and there is no
-  boot gate — so on k8s a terminal exit will restart-loop through
-  re-detection windows, serving traffic in between. There, the crash-loop
-  bound is your alerting, not the restart policy: page immediately on
-  `lastState.terminated.exitCode == 30` (and on signal exits / 134).
-- **A fresh deployment needs a setup retry budget.** `setup` exits 20 until
-  the L1 safe head reaches the application's deployment block, about one to
-  two epochs on Ethereum (6.4–12.8 min); give a setup Job or unit a longer
-  retry budget (a Kubernetes Job's default backoffLimit 6 allows about
-  10.5 min).
-- **After an unclean death (OOM, node reboot, SIGKILL) no action is
-  needed**: the next start re-derives everything from facts. For
-  postmortems, the `terminal_faults` table records the cause of every
-  command that returned through its bracket with a terminal verdict
-  (best-effort, append-only, traveling with the data directory —
-  `SELECT * FROM terminal_faults ORDER BY fault_id DESC`; each `run` boot
-  logs the latest row at WARN unless a later completed setup resolved it). Any death that did not return
-  through the bracket — SIGKILL, OOM, a node reboot, a terminal runtime abort,
-  a controller panic — leaves only the process logs.
-- **Untrustworthy local state requires manual recovery.** The reader's
-  content-identity divergence marker freezes the acceptance frontier and
-  blocks admission ([I15](../invariants.md#i15-divergence-marker-present--acceptance-frontier-frozen)).
-  A watchdog state mismatch independently signals application-state
-  disagreement ([incident runbook](incident-runbook.md)). Diagnose the cause
-  and follow the [incident playbook](../recovery/cockroach.md#incident-playbook)
-  for a fresh-directory rebuild when needed; standard recovery does not repair
-  bugs.
+The sequencer's exit codes are its whole restart contract;
+[supervision](../running.md#supervision) gives the supervisor recipes, the
+setup retry budget, and what to do after an unclean death.
 
 ## Troubleshooting (live deployments)
 

@@ -8,7 +8,7 @@ its history version; receiving it does not establish L1 acceptance.
 This document owns history coordinates, recovery boundaries, and replica
 bootstrap. The [Application contract](application-contract.md) owns execution
 and progress; the [snapshot lifecycle](../snapshots/lifecycle.md) owns artifact
-publication, selection, and retention; the [README API](../../README.md#api)
+publication, selection, and retention; the [API contract](../api.md)
 owns routes, wire fields, and refusal codes.
 
 ## Progress, ordering, and acceptance
@@ -167,7 +167,7 @@ One durable page reader handles both backlog and live delivery, so there is no
 separate cursor to switch at the live boundary. Each page reads identity,
 bounds, and rows in one SQLite transaction. Interior gaps and invalid source
 context fail loudly. Page size and send queues bound memory; available backlog
-has no total replay cap. The [API contract](../../README.md#api) owns exact
+has no total replay cap. The [API contract](../api.md) owns exact
 resource limits and handshake errors.
 
 History replacement happens across a process boundary, after existing

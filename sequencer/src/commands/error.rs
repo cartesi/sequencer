@@ -53,7 +53,7 @@ pub enum CommandError {
 
 // ── Exit-code projection ────────────────────────────────────────────────
 //
-// README "Running" owns the exit-code contract; `CommandFailureVerdict` is the
+// docs/running.md owns the exit-code contract; `CommandFailureVerdict` is the
 // one classification it projects. Also reserved: 2 (clap usage) and 101 (a
 // panic before the command harness). Diagnosed terminal runtime faults bypass
 // this projection with `abort()` (SIGABRT, 134).

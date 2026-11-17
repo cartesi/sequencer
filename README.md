@@ -10,8 +10,28 @@ Rollup applications need fast transaction confirmations. Waiting for L1 finality
 
 The protocol objective is that, under supported honest operation, **the
 off-chain sequencer predicts the same execution order the rollup's on-chain
-scheduler later produces.** Soft confirmations are optimistic and may be
-invalidated by the recovery cases below; L1 remains canonical truth.
+scheduler later produces.** The scheduler is the program inside the
+application's Cartesi Machine that orders every input from L1. Soft
+confirmations are optimistic and may be invalidated by the recovery cases
+below; L1 remains canonical truth.
+
+## What This Repository Contains
+
+The sequencer is a Rust library. An application crate composes it with its
+`Application` implementation into a binary, as
+[`examples/wallet-sequencer/`](examples/wallet-sequencer/) does with the toy
+wallet in [`examples/app-core/`](examples/app-core/), the example application
+for development, tests, and the Sepolia reference deployment. Native engines
+bind through the [C ABI adapter](bindings/c-app-engine/README.md).
+
+Alongside it are the canonical guest that runs the scheduler on chain
+([`examples/canonical-app/`](examples/canonical-app/)), a Rust client
+([`sdk/rust-client/`](sdk/rust-client/)), and the
+[watchdog](docs/watchdog/README.md), which re-derives canonical state from L1
+and compares it with the sequencer's. Releases ship `wallet-sequencer`
+binaries, canonical machine images, and the
+[watchdog container image](docs/watchdog/operator-deployment.md#release-image). The
+[architecture map](AGENTS.md#architecture-map) covers the whole workspace.
 
 ## Two Chains Synchronizing
 
@@ -24,6 +44,13 @@ Sequencer (off-chain)              Scheduler (on-chain)
   frame: safe_block=105               drain directs up to block 105
          user_ops=[D]                 execute D
 ```
+
+The sequencer opens a frame at a new `safe_block` once five newly-safe L1 blocks
+have accumulated ([frame-clock policy](docs/protocol/scheduler-semantics.md#sequencer-frame-clock-policy)).
+
+A batch is **stale** when it lands on L1 `MAX_WAIT_BLOCKS` (1200 blocks, ~4h)
+or more after its first frame's `safe_block`. The scheduler skips a stale batch
+without consuming its nonce, so every later batch is rejected too.
 
 When things go well, the sequencer's chain and the scheduler's view converge.
 When batches risk becoming stale on L1, the sequencer stops serving and startup
@@ -40,24 +67,13 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 
 **Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
 
-During normal operation the sequencer advances logical frame time after five
-newly-safe blocks have accumulated. That clock tick drains every covered direct
-before later user ops and may also create an empty-direct frame to improve the
-application-visible clock. Safe-head publication is best effort: if the node
-exposes a multi-block jump, the sequencer creates one frame at the observed tip
-and never fabricates intermediate frames.
-
-Soft confirmations are an **optimistic prediction**. A narrow content-identity
-check compares each batch that L1 accepts at the sequencer's nonces with the
-batch it sealed locally. A foreign or byte-different landing freezes the
-accepted frontier and stops the runtime, and every later boot refuses until an
-operator performs cockroach recovery. The check does not replace the watchdog;
-its bounds are recorded in [`docs/invariants.md`](docs/invariants.md) (I9 and I15).
+The [threat model](docs/threat-model/README.md) owns the full set of actors and
+assumptions.
 
 ## Recovery
 
-**[Standard recovery](docs/recovery/README.md)** runs automatically at startup
-using the existing database. It handles liveness failures such as outages and
+**[Automatic recovery](docs/recovery/README.md)** (also called standard
+recovery) runs at startup using the existing database. It handles liveness failures such as outages and
 extended downtime: reconcile L1 outcomes, invalidate the affected optimistic
 suffix, and resume from retained state. Stale batches do not consume the
 scheduler's expected nonce, so their successors cannot be accepted until recovery
@@ -70,6 +86,13 @@ choose a trusted canonical application checkpoint, then rebuild in a fresh data
 directory. The command processes historical L1 inputs through the canonical
 scheduler and prepares a baseline for resuming normal operation.
 
+Soft confirmations are an **optimistic prediction**. A content-identity check
+compares each batch that L1 accepts at the sequencer's nonces with the batch it
+sealed locally; a foreign or byte-different landing stops the sequencer until an
+operator performs cockroach recovery. The check does not replace the
+[watchdog](docs/watchdog/README.md); [I9 and I15](docs/invariants.md) record its
+bounds.
+
 The [threat model](docs/threat-model/README.md#self-trust) explains the boundary
 between normal operation's self-trust and manual repair after a bug.
 
@@ -77,12 +100,17 @@ between normal operation's self-trust and manual repair after a bug.
 
 The sequencer is designed to handle:
 
-- **L1 provider outages** — each worker retries on its next tick; the RPC client resends a rate-limited or temporarily unavailable request at most twice, a second apart or after the server's requested wait when that is 5 s or less. The inclusion lane and API continue operating locally. A wall-clock fallback detects when an outage pushes batches into the danger zone.
-- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean. Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`; terminal runtime aborts leave only process diagnostics.
+- **L1 provider outages** — workers retry on their next tick while the inclusion lane and API keep operating locally ([provider behavior](docs/running.md#the-l1-endpoint)). A wall-clock fallback detects when an outage pushes batches into the danger zone.
+- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean.
 - **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state follows the cockroach recovery procedure above.
 - **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. Recovery waits until every covered wallet-nonce slot is consumed at safe depth, whether the original transaction or a flush no-op wins, so delayed "zombie" submissions cannot land later.
 
 ## Interfaces
+
+The [API contract](docs/api.md) owns routes, listeners, message shapes, and
+status codes. Only the four wallet-facing routes (`POST /tx`, `GET /fee`,
+`GET /nonce`, and `GET /domain`) are public; every other route is internal,
+unauthenticated, and must stay off the public network.
 
 ### User Operations
 
@@ -96,7 +124,7 @@ history; the snapshot's era, generation, and input count bind a resume request
 to the state the consumer actually holds. The endpoint serves a small number of
 infrastructure subscribers, which serve users directly. See the
 [bootstrap workflow](docs/protocol/application-history.md#replica-bootstrap-and-resume)
-and [wire contract](#api).
+and [wire contract](docs/api.md).
 
 ### Batch Submission
 
@@ -104,405 +132,17 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 ## Running
 
-The sequencer runs in two phases. **`setup`** pins the
-deployment identity (including the reviewed fee-oracle source), does the initial L1 sync, and registers the genesis
-snapshot — run it once. Plain `setup` is L1-read-only: it takes the batch-submitter
-*address*, never the signing key. **`run`** boots the sequencer from the
-set-up DB, reading identity from it (so chain id / app address are not `run`
-arguments); it holds the signing key because it submits.
-
-For rebuilding from a trusted checkpoint, follow the
-[cockroach recovery procedure](docs/recovery/cockroach.md#run-a-rebuild).
-`setup --recovery` also needs the submitter key because it flushes transactions.
-
-```bash
-# Phase A — set up the data dir (run once; idempotent).
-CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-CARTESI_SEQUENCER_BLOCKCHAIN_ID=31337 \
-CARTESI_SEQUENCER_APP_ADDRESS=0x1111111111111111111111111111111111111111 \
-CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE=0 \
-CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS=0xa0Ee7A142d267C1f36714E4a8F75612F20a79720 \
-cargo run -p wallet-sequencer -- setup
-
-# Phase B — run the sequencer.
-CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT=http://127.0.0.1:8545 \
-CARTESI_SEQUENCER_AUTH_PRIVATE_KEY=0x2a87...d409c6 \
-cargo run -p wallet-sequencer -- run
-```
-
-`setup` exits 20 (retryable) until the application's deployment block is at or below the L1 safe head, so no reorg can move the block it pins; on Ethereum that is a one-time wait of an epoch or two after deployment, and on Anvil `--slots-in-an-epoch` mined blocks (one in the repo's devnet stack, which sets it to 1; Anvil's default is 32).
-
-A third subcommand, **`flush-mempool`**, settles the batch-submitter wallet
-nonce on demand (keyed operator tool). It is flush-only: it requires a
-completed setup and no canonical divergence, and it never performs
-Sync/Cascade or launches runtime workers.
-
-`setup` requires: `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT`, `CARTESI_SEQUENCER_BLOCKCHAIN_ID`, `CARTESI_SEQUENCER_APP_ADDRESS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_ADDRESS`. On chains other than Ethereum mainnet and Sepolia it also requires a fee-oracle source (listed below).
-The submitter address must equal the `sequencer_address` compiled into the canonical machine; nothing checks this at runtime ([scheduler semantics](docs/protocol/scheduler-semantics.md#the-one-stream-the-one-classification)).
-
-**Use a dedicated submitter address.** Plain `setup` refuses an unsettled wallet
-nonce, so sharing a busy contract-deployer address can trip the detection gate
-while its deployment transactions are not yet safe. The devnet uses Anvil
-account 9 (`DEVNET_SEQUENCER_ADDRESS`), separate from the account-0 deployer.
-The Sepolia reference reserves [`SEPOLIA_SEQUENCER_ADDRESS`](examples/app-core/src/application/wallet.rs)
-for this deployment's batch submissions and application fee revenue; do not share
-its signing key with other app or node instances. Changing that compiled address
-requires a rebuilt canonical image and a matching new application deployment,
-not just a runtime signing-key change.
-
-`run` and `flush-mempool` require `CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT` and the signing key, `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE` (whose first line is the key); both refuse to start until `setup` has completed.
-
-Optional variables, by name; each subcommand's `--help` shows their defaults and validation from [`commands/config.rs`](sequencer/src/commands/config.rs):
-
-- Every subcommand: `CARTESI_SEQUENCER_DATA_DIR` (the SQLite file is `sequencer.db` inside; `setup` creates it, and `run` and `flush-mempool` refuse a missing one), `CARTESI_SEQUENCER_SECONDS_PER_BLOCK`, and `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC` (below).
-- `setup` and `run`: `CARTESI_SEQUENCER_PREEMPTIVE_MARGIN_BLOCKS`, `CARTESI_SEQUENCER_L1_READ_STALE_AFTER_BLOCKS`.
-- `setup`: the fee-oracle source it pins, either `CARTESI_SEQUENCER_FEE_ORACLE_FIXED_LOG_GAS_PRICE` or a Uniswap source (the overrides `CARTESI_SEQUENCER_FEE_TOKEN_ADDRESS`, `CARTESI_SEQUENCER_WETH_ADDRESS` and `CARTESI_SEQUENCER_UNISWAP_V3_POOL`, given together and required on other chains, and `CARTESI_SEQUENCER_FEE_ORACLE_TWAP_WINDOW_SECS`); `CARTESI_SEQUENCER_CHECKPOINT_BLOCK`; and, for a [rebuild](docs/recovery/cockroach.md), `CARTESI_SEQUENCER_RECOVERY`, `CARTESI_SEQUENCER_CHECKPOINT_DUMP_DIR` and the signing key.
-- `run`: `CARTESI_SEQUENCER_HTTP_ADDR` (public listener), `CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR` (internal listener), `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_IDLE_POLL_INTERVAL_MS`, `CARTESI_SEQUENCER_BATCH_SUBMITTER_CONFIRMATION_DEPTH` and `CARTESI_SEQUENCER_FEE_ORACLE_POLL_INTERVAL_MS`.
-
-Logs and errors show only the endpoint's scheme, host and port, since its path, query and userinfo can hold an API key or a password, unless the RPC server echoes them inside a JSON-RPC error message or a malformed result, which alloy builds above the redaction layer, or quotes in an error body only part of them or a different URL that carries them, such as a redirect target on another path. An L1 error's text stays on one line, with each cause cut at 256 bytes. The client follows no redirects: an endpoint that answers 3xx fails with that status, so configure the provider's final URL (setup exits 30 at its chain-id check, since a retry gets the same redirect). Debug-level logging for the `alloy_transport_http` target records the full URL, so keep that target at `info` where logs leave the host.
-
-By default the blockchain endpoint must be `https://` unless its host is loopback (`localhost`, `127.0.0.0/8`, `::1`) — a guard against accidentally sending L1 traffic to a public RPC in the clear. Set `CARTESI_SEQUENCER_ALLOW_INSECURE_RPC=true` (or `--allow-insecure-rpc`) to permit plaintext `http://` to a non-loopback host on a **trusted private network** — e.g. a Docker Compose / Kubernetes service name (`http://anvil:8545`), `host.docker.internal`, or a private-VPC IP.
-
-The flag is **per-invocation, not pinned into the DB**: set it on every subcommand that dials L1 (`setup`, `run`, and `flush-mempool`). Setting it only on `setup` and then omitting it on `run` is refused at boot with `remote RPC must use https` — that is by design (each keyed/read path re-validates the endpoint), not a bug. In a container deployment, put it in the shared environment for all sequencer commands. Example (Docker Compose):
-
-```yaml
-environment:
-  CARTESI_SEQUENCER_BLOCKCHAIN_HTTP_ENDPOINT: "http://anvil:8545"
-  CARTESI_SEQUENCER_ALLOW_INSECURE_RPC: "true"
-```
-
-Process exit codes follow the orchestrator exit-code contract: `0` clean shutdown, `10` restart (expect a recovery boot), `20` transient refusal (retry with backoff), `30` terminal command refusal (operator required — e.g. setup not complete, identity mismatch, canonical divergence, persistent storage/application invariant failure), `40` a previous instance left work past the checkpoint (wipe the data directory and run `setup --recovery`), and `1` for an unclassified operational failure. Diagnosed terminal runtime faults, including worker panics and an undecodable batch landed by the submitter key, immediately call `abort()` (SIGABRT, status 134), without worker drain or database settlement. Supervisors must treat SIGABRT as terminal class. Ordinary shutdown, expected recovery, and transient errors still drain gracefully. Startup panics caught by the command harness are projected to `30`; panics after runtime scope creation abort; `101` remains possible before the command harness starts. The constants live in `sequencer/src/commands/error.rs`; supervisor recipes are in [`docs/watchdog/operator-deployment.md`](docs/watchdog/operator-deployment.md).
-
-The [EIP-712 domain](docs/protocol/scheduler-semantics.md#user-op-signatures) is fixed except `chainId` and `verifyingContract`, which come from `CARTESI_SEQUENCER_BLOCKCHAIN_ID` and `CARTESI_SEQUENCER_APP_ADDRESS`.
-
-## API
-
-This section owns the wire contract. [`openapi.yaml`](openapi.yaml) renders it
-as OpenAPI 3.1 for client generation and documentation tools; change both
-together.
-
-The sequencer serves two listeners. The public one
-(`CARTESI_SEQUENCER_HTTP_ADDR`) serves only `POST /tx`, `GET /fee`,
-`GET /nonce`, and `GET /domain`. Every other route, health probes included, is
-internal and served only on the internal listener
-(`CARTESI_SEQUENCER_INTERNAL_HTTP_ADDR`), without authentication; keep it off
-the public network.
-
-Errors use one JSON shape, `{ "ok": false, "code": "<CODE>", "message": "<text>" }`,
-with these codes: `400` `BAD_REQUEST` or `INVALID_SIGNATURE`, `413`
-`PAYLOAD_TOO_LARGE`, `422` `EXECUTION_REJECTED`, `429` `OVERLOADED`, `500`
-`INTERNAL_ERROR`, and `503` `UNAVAILABLE`. A `500` message is fixed and carries
-no internal detail. Exceptions: history-policy `409` bodies carry the typed
-refusal (`{ "code": "ERA_CHANGED", ... }`), the `/ws/subscribe` pre-upgrade
-`400` is plain text, snapshot-route `404` and `500` responses have empty bodies,
-and the health probes use their own shapes.
-
-JSON `sender` fields in successful `POST /tx` and `GET /nonce` responses and
-WebSocket messages, and `verifyingContract` in `GET /domain`, use EIP-55
-checksum casing. Address fields in `/history` and `sender` fields in
-`/historical-l1-inputs` use lowercase hex. Clients must compare decoded 20-byte
-addresses and use one normalized encoding for account or projection keys across
-these routes.
-
-### `POST /tx`
-
-Request shape:
-
-```json
-{
-  "message": {
-    "nonce": 0,
-    "max_fee": 1,
-    "data": "0x..."
-  },
-  "signature": "0x...",
-  "sender": "0x..."
-}
-```
-
-Notes:
-
-- `signature` must be 65 bytes.
-- `sender` is required and must match the recovered signer.
-- `message.data` is SSZ-encoded method payload bytes.
-- size is bounded at ingress, before the hot path: the raw request body is capped at 4096 bytes (`413 PAYLOAD_TOO_LARGE`), and `message.data` at the application's maximum method payload size (`400 BAD_REQUEST`).
-- the inclusion lane checks nonce, `max_fee`, and fee balance. A rejected op returns `422 EXECUTION_REJECTED` and persists nothing.
-- overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
-- queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
-- Browser wallets can call `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
-
-Success response after inclusion:
-
-```json
-{
-  "ok": true,
-  "sender": "0x...",
-  "nonce": 0
-}
-```
-
-### `GET /fee`
-
-Fee quote for setting signed user-op `max_fee` before `POST /tx`. All three fields are log-space exponents (base 129/128), the same encoding as `max_fee`. Inclusion rejects any op with `max_fee` below the open-frame `fee`.
-
-```json
-{ "fee": 1356, "recommended_fee": 1356, "suggested_max_fee": 1409 }
-```
-
-Notes:
-
-- `fee` is frozen for the lifetime of the open frame (the live inclusion check).
-- `recommended_fee` is what the next frame will sample at rotation (currently after five newly-safe L1 blocks, best-effort).
-- `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space slack. Wallets can copy this into signed `max_fee`; the user pays the frame fee, not this cap. Clients that want their own policy can ignore it and combine the two facts themselves.
-- `200` while an open frame exists (the admitted runtime always has one). Responses carry `Cache-Control: no-store`.
-- `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
-
-### `GET /nonce?sender=<address>`
-
-The nonce to sign into `sender`'s next user op.
-
-```json
-{ "sender": "0xAbC...", "next_nonce": 7 }
-```
-
-Notes:
-
-- `sender` is parsed like the `POST /tx` field: `0x` plus 40 hex digits in any case, echoed in EIP-55 casing. A missing or malformed parameter is `400` with code `BAD_REQUEST`.
-- `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
-- Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
-- `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
-- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
-- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
-- Successful responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
-
-### `GET /domain`
-
-The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTypedData_v4` expects:
-
-```json
-{ "name": "CartesiAppSequencer", "version": "1", "chainId": 31337, "verifyingContract": "0x..." }
-```
-
-Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
-
-### `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
-
-WebSocket stream of the current application history, replaying from the inclusive
-`next_input` offset and then following the optimistic tip. Fetch and restore
-`/latest_snapshot` first; its headers supply the complete subscription claim.
-After each successfully applied input at offset `X`, persist the claim with
-`next_input = X + 1` alongside the replica state.
-
-- All three query fields are required. Missing or malformed fields, or missing
-  or invalid WebSocket upgrade headers, return HTTP `400` with a plain-text body.
-- An era or generation mismatch, an unavailable prefix, or a position ahead of
-  the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
-  header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,
-  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on `ERA_CHANGED` or
-  `HISTORY_UNAVAILABLE`. On `STALE_GENERATION`, a compatible saved checkpoint
-  can first be selected through `/history` (below). `AHEAD_OF_HEAD` is an
-  invalid claim to correct.
-- A claim exactly at the head waits for the next input. Replay uses bounded
-  pages and queues, with no total catch-up limit. The subscriber cap is `64`.
-- Before upgrade, checks run in order: query and upgrade headers (`400`),
-  shutdown (`503 UNAVAILABLE`), the subscriber cap (`429 OVERLOADED`), then the
-  claim (`409`, or `503 UNAVAILABLE` on an operational subscription failure).
-  At capacity, a stale claim sees `429` until a slot frees.
-- Messages are JSON text frames; binary fields are `0x`-prefixed hex.
-  Direct-input `block_timestamp` values are Unix seconds.
-- Batch envelopes are absent. Offsets count executed application inputs,
-  including business failures and malformed-direct no-ops.
-- Recovery stops the process and disconnects subscribers. A reconnect must
-  present its saved claim; offsets alone cannot distinguish a replaced suffix.
-- Shutdown or a feed read/send failure may disconnect without a WebSocket
-  Close frame. Resume from the saved claim after an unexpected disconnect;
-  a clean close is not required for safe replay.
-
-Message shapes:
-
-```json
-{ "kind": "user_op", "offset": 10, "sender": "0x...", "nonce": 7, "fee": 1, "data": "0x...", "safe_block": 123, "batch_nonce": 4 }
-```
-
-```json
-{ "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
-```
-
-### History metadata and historical L1 inputs (internal only)
-
-Readers that maintain additional transfer/order history can reconstruct it from
-L1 and then join the application feed. The
-[projection replay contract](docs/protocol/projection-replay.md) describes
-bootstrap, client checkpoints, pending directs, and terminal drain.
-
-`GET /history` returns one coherent view of the deployment, current application
-history, immutable era baseline, and latest accepted checkpoint. Optional
-`era_id=<uuid>` requires the selected era; a mismatch returns `409 ERA_CHANGED`.
-Example immediately after a rebuild:
-
-```json
-{
-  "deployment": {
-    "chain_id": 31337,
-    "app_address": "0x1111111111111111111111111111111111111111",
-    "input_box_address": "0x2222222222222222222222222222222222222222",
-    "app_deployment_block": 1,
-    "batch_submitter_address": "0x3333333333333333333333333333333333333333"
-  },
-  "history": {
-    "version": {
-      "era_id": "22222222-2222-4222-8222-222222222222",
-      "recovery_generation": 0
-    },
-    "available_from": 7,
-    "head": 7
-  },
-  "baseline": {
-    "l1_stop_block": 1240,
-    "l1_end_input_index": 8,
-    "next_batch_nonce": 2
-  },
-  "accepted_checkpoint": null,
-  "compatibility": null
-}
-```
-
-- `history.available_from` is baseline application count `K`; entries `[K,head)`
-  are available through WS. Counts include all executed application inputs.
-- `baseline` describes the fixed L1 stopping block `C`, exclusive InputBox end
-  `R`, and scheduler nonce after recovery's terminal drain. It survives generation
-  changes and baseline artifact GC. It is distinct from the moving safe head.
-- `accepted_checkpoint`, when available, has `inclusion_block`,
-  `executed_input_count`, and `next_batch_nonce`, under `history.version`.
-  Genesis supplies the zero checkpoint; a rebuilt baseline is not itself an
-  accepted checkpoint. The metadata does not lease or download a native artifact
-  and does not certify a client projection. A known divergence returns `503`.
-- `compatibility` is `null` unless `from_generation=<u64>` is supplied together
-  with `era_id`. It then contains `from_generation` and `preserved_input_count`:
-  the prefix that survived every standard recovery since that generation,
-  bounded by the current head. A future generation or missing era returns
-  `400 BAD_REQUEST`; an era mismatch takes precedence over the generation bound.
-
-For example, `GET /history?era_id=<uuid>&from_generation=0` can return
-`"compatibility": {"from_generation": 0, "preserved_input_count": 3}`.
-A saved checkpoint from that era/generation is reusable when its count `X`
-satisfies `K <= X <= 3`. The boundary is inclusive: the checkpoint has executed
-entries before `X`, and resumes at entry `X`. Each checkpoint must be checked
-using its own saved generation. With no intervening recovery, the bound is the
-current head. The [history contract](docs/protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)
-defines the calculation and trust boundary.
-
-Restore an eligible checkpoint, persist the response's current history version
-with it, and subscribe using that version and its actual count. A recovery
-between lookup and subscription still returns `STALE_GENERATION`; repeat the
-lookup using the version associated with the restored state. Compatibility does
-not certify the client's application or projection implementation, and cannot
-cross a cockroach recovery's new era.
-
-`GET /historical-l1-inputs` requires `era_id` and exactly one starting selector:
-
-- `next_input_index=<u64>`: inclusive per-application InputBox index, starting at 0.
-- `after_block=<u64>`: initially seek to the first input strictly after that block;
-  continue using the returned `next_input_index`.
-
-The endpoint serves only `[0,R)` through the selected era's `C`. A response to
-`next_input_index=5&limit=1` can be:
-
-```json
-{
-  "era_id": "22222222-2222-4222-8222-222222222222",
-  "l1_stop_block": 1240,
-  "end_input_index": 8,
-  "next_input_index": 6,
-  "items": [{
-    "input_index": 5,
-    "sender": "0x3333333333333333333333333333333333333333",
-    "payload": "0x00",
-    "block_number": 1230,
-    "block_timestamp": 1700014760,
-    "transaction_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
-  }]
-}
-```
-
-Records preserve original inner payloads and authenticated senders, including
-malformed/rejected batches; they are not complete `EvmAdvance` envelopes. Indices
-are contiguous and ordered. Binary values are hex; timestamps are Unix seconds.
-Clients must preserve integer precision. A page may split a block.
-
-Optional `limit` defaults to 256 and accepts 1–256. Pages target 1 MiB of raw
-payloads; a larger first input is returned alone, intact. Hex encoding increases
-wire size, so this is not a hard response-size limit. Eight historical responses
-can be in flight; a permit remains held through body delivery or cancellation.
-SQLite read transactions end before network delivery. These limits bound memory
-by the page target or largest single input, not total history length.
-
-Only `next_input_index == end_input_index` means EOF; a short page does not.
-Requesting `next_input_index=R` or `after_block=C` returns an empty completed page.
-Generation changes do not invalidate historical pages; an era change does.
-
-Malformed/unknown query fields, invalid selectors/limits, or positions above
-`R`/`C` return the existing `400 BAD_REQUEST` JSON shape. An era mismatch returns
-the existing `409 ERA_CHANGED` history-policy body before semantic position
-checks. Capacity exhaustion returns `429 OVERLOADED`; shutdown or an operational
-read failure returns `503 UNAVAILABLE`. Interrupted bodies are failed pages.
-Missing durable rows or other storage invariant failures follow the process's
-terminal fault policy, never a successful partial page.
-
-The Rust SDK exposes `history(expected_era, from_generation)` and
-`historical_l1_inputs(era, start, limit)` with typed metadata and era refusals.
-Both use the configured request deadline, including body transfer; callers may
-increase it for large historical inputs. The client owns replay, persistence,
-checkpoint selection, and subscription.
-
-### Operator snapshot endpoints (internal only)
-
-These serve application state to the operator's watchdog and indexers.
-**They are operator-internal — no auth — and must not be exposed publicly**:
-they are served only on the internal listener, behind network controls.
-
-- `GET /finalized_state/inclusion_block` — cheap JSON the watchdog polls:
-  `{ "inclusion_block": <u64>, "executed_input_count": <u64> }`.
-- `GET /finalized_state/digest` — the SHA-256 of the accepted checkpoint's
-  comparison file, as lowercase hex, hashed under the same lease:
-  `{ "inclusion_block": <u64>, "executed_input_count": <u64>, "sha256": "<hex>" }`.
-  The watchdog replays to that block and compares digests.
-- `GET /finalized_state` — streams the accepted checkpoint's comparison file
-  (`application/octet-stream`), with `X-Inclusion-Block`,
-  `X-Executed-Input-Count`, and `ETag: "block-<n>"` (`If-None-Match` supports `304`).
-  The watchdog downloads it only as divergence evidence.
-- `GET /latest_snapshot` — streams a restorable tar archive of the newest valid
-  batch-close snapshot, or the era baseline. Includes immutable `info.toml`
-  and the application's opaque `state` file or directory.
-- `GET /finalized_snapshot` — streams the accepted snapshot as a tar archive,
-  adding a coherent `checkpoint.toml` receipt with its L1 inclusion block and
-  next batch nonce for trusted recovery.
-
-Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
-and `X-Executed-Input-Count`, selected atomically with the artifact lease.
-Streaming holds the lease until the response ends or the client disconnects.
-Bodies stream without `Content-Length`; a failure after the headers aborts the
-transfer, so treat an incomplete body as a failed download.
-The accepted endpoints return `404` until a comparable checkpoint exists:
-genesis is comparable at block zero; a rebuilt baseline is restorable but only
-a later accepted batch establishes a comparison point. Known divergence makes
-all four finalized endpoints return `503 UNAVAILABLE`, including conditional
-state requests. The check shares the checkpoint-selection transaction, before
-any lease or archive is created. See [snapshot lifecycle](docs/snapshots/lifecycle.md).
-
-### Health probes (internal only)
-
-- `GET /livez` returns `200` whenever the handler responds, with an empty body.
-- `GET /readyz` returns `200` while the inclusion-lane receiver is open and
-  shutdown has not been requested; otherwise `503`. Its body is empty.
-- `GET /healthz` uses the same status as `/readyz` and returns JSON:
-  `{ "status": "ok", "inclusion_lane": "ok" }`. `status` becomes `"degraded"`
-  for either failure condition; `inclusion_lane` becomes `"stopped"` once its
-  receiver is closed. The lane closes it soon after shutdown is requested, so it
-  can still read `"ok"` early in a shutdown.
-
-These probes cover process reachability, the lane channel, and shutdown state.
-They do not certify L1 freshness, submitter balance, or canonical agreement.
+`setup` pins the deployment identity and initial L1 state, and runs once; `run`
+boots the sequencer from that database and holds the batch-submitter key.
+[Running the sequencer](docs/running.md) covers invocation, configuration, the
+L1 endpoint, exit codes, and upgrades.
+
+To try it locally, run `just devnet`. It starts Anvil with the rollups
+contracts and a set-up `wallet-sequencer-devnet`, prints their endpoints, and
+runs until Ctrl+C. The first run downloads dependencies and builds the devnet
+machine image, which needs the tools in the
+[devnet prerequisites](docs/watchdog/getting-started.md#prerequisites); the Nix
+development shell provides them.
 
 ## Storage Model
 
@@ -513,27 +153,11 @@ They do not certify L1 freshness, submitter balance, or canonical agreement.
 - `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
 - `safe_inputs`: every raw InputBox observation, including batch envelopes
 - `history_state`: immutable era baseline (application count and accounted L1 block) plus recovery generation
-- `snapshots` and `dumps`: immutable batch-close/baseline artifacts and streaming leases; accepted status is derived from `safe_accepted_batches`
+- `snapshots` and `dumps`: immutable application-state artifacts, one registered atomically with each batch seal plus the era baseline, and their streaming leases. Restart restores the latest valid snapshot and replays application inputs from its count; acceptance, derived from `safe_accepted_batches`, selects the recovery checkpoint and the garbage-collection frontier ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.
 
-## Project Layout
-
-The sequencer is a library: an application crate composes it with its
-`Application` implementation into a binary, as
-[`examples/wallet-sequencer/`](examples/wallet-sequencer/) does with the
-placeholder wallet in [`examples/app-core/`](examples/app-core/). Native engines
-bind through the [C ABI adapter](bindings/c-app-engine/README.md). The
-[architecture map](AGENTS.md#architecture-map) covers the workspace and the
-sequencer's modules.
-
-The watchdog ships as a multi-arch container image per release tag; the
-[operator deployment guide](docs/watchdog/operator-deployment.md) gives the
-image names and how to run it.
-
-## Prototype Limits
-
-- The `Application` trait defines dump/load behavior ([format](docs/snapshots/format.md)). Every batch close registers a durable snapshot atomically with the seal. Restart restores the latest valid snapshot and replays application inputs from its count. Acceptance determines the recovery checkpoint and garbage-collection frontier without mutating artifact metadata. [Snapshot lifecycle](docs/snapshots/lifecycle.md) documents leases and crash ordering.
-- Schema and migrations are still in prototype mode and may change.
+The schema is one baseline migration; a release that changes it is
+[upgraded by rebuilding](docs/running.md#upgrades).
 
 ## Development
 
@@ -542,11 +166,21 @@ toolchain selection, Nix/direnv tooling, compilation, tests, formatting, and
 linting. Read the [testing guidance](AGENTS.md#testing-guidance) before choosing
 validation for a change; some tests require Anvil or libslirp.
 
-## Further Reading
+## Documentation
 
 [`AGENTS.md`](AGENTS.md) is the developer guide: architecture, conventions, and
 rules. Its [Reading Routes](AGENTS.md#reading-routes) name the document that
-owns each contract.
+owns each contract. The main entry points:
+
+| Topic | Document |
+|---|---|
+| Invocation, configuration, exit codes, and upgrades | [Running the sequencer](docs/running.md) |
+| Routes, messages, and status codes | [API contract](docs/api.md), rendered as [`openapi.yaml`](openapi.yaml) |
+| How the scheduler orders inputs | [Scheduler semantics](docs/protocol/scheduler-semantics.md) |
+| What an application must implement | [Application contract](docs/protocol/application-contract.md) |
+| Repair after outages or lost state | [Automatic recovery](docs/recovery/README.md) and [cockroach recovery](docs/recovery/cockroach.md) |
+| Actors, assumptions, and residual risks | [Threat model](docs/threat-model/README.md) |
+| Independent checking of the sequencer's state | [Watchdog](docs/watchdog/README.md) |
 
 ## License
 

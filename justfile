@@ -46,8 +46,8 @@ test-watchdog-e2e:
 watchdog-lua-deps:
     @just watchdog lua-deps
 
-# Anvil + rollups + wallet-sequencer-devnet; prints CARTESI_WATCHDOG_* exports until Ctrl+C.
-devnet-for-watchdog: setup ensure-machine-image
+# Anvil + rollups + a set-up wallet-sequencer-devnet; prints endpoints and watchdog exports until Ctrl+C.
+devnet: setup ensure-machine-image
     cargo build -p wallet-sequencer --bin wallet-sequencer-devnet
     cargo build -p rollups-e2e --bin devnet-stack
     cargo run -p rollups-e2e --bin devnet-stack
@@ -116,7 +116,3 @@ clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 verify: fmt-check check test clippy
-
-run addr="127.0.0.1:3000" data_dir="sequencer-data":
-    rm -rf {{data_dir}}
-    CARTESI_SEQUENCER_HTTP_ADDR={{addr}} CARTESI_SEQUENCER_DATA_DIR={{data_dir}} cargo run -p wallet-sequencer --release

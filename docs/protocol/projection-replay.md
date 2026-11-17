@@ -4,7 +4,7 @@ A reader may maintain transfers, orders, or other application-specific history
 absent from the latest application state. It owns that projection and its
 checkpoints. The sequencer supplies raw scheduler inputs for the immutable era
 baseline, then application inputs for the optimistic suffix. The canonical
-scheduler remains the ordering authority. The [README API](../../README.md#history-metadata-and-historical-l1-inputs-internal-only)
+scheduler remains the ordering authority. The [API contract](../api.md#history-metadata-and-historical-l1-inputs-internal-only)
 owns routes, fields, limits, and refusals; the
 [history contract](application-history.md) owns application coordinates.
 

@@ -74,7 +74,7 @@ sequencer accepts batches, through both the Rust and the C-engine host, and
 In one terminal:
 
 ```bash
-just devnet-for-watchdog
+just devnet
 ```
 
 It starts Anvil and `wallet-sequencer-devnet` on ephemeral ports and prints
@@ -105,7 +105,7 @@ past genesis; the next tick then replays the new inputs and logs
 [`tests/e2e/src/test_cases.rs`](../../tests/e2e/src/test_cases.rs) drives the
 deposits and transfers that get there.
 
-Restarting `just devnet-for-watchdog` starts a new chain on new ports. Paste
+Restarting `just devnet` starts a new chain on new ports. Paste
 the new exports: `tick` reads both endpoints from the environment. The printed
 state directory is the same path every time, and a head from the old chain
 does not describe the new one: remove `$CARTESI_WATCHDOG_STATE_DIR` and run

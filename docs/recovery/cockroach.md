@@ -4,7 +4,9 @@ Cockroach recovery (`setup --recovery`) creates a fresh sequencer starting state
 from a trusted application checkpoint and historical L1 inputs. Use it when the
 local database is lost or cannot be trusted, including after a sequencer bug has
 corrupted its state or produced malformed batches. **Find and fix the bug before
-rebuilding.** The operator initiates recovery; the command automates the rebuild.
+rebuilding.** It is also how a deployment upgrades across a
+[schema change](../running.md#upgrades). The operator initiates recovery; the
+command automates the rebuild.
 
 The procedure is **flush → fold → fill**:
 
@@ -169,7 +171,7 @@ describes this bundle. An export receipt checks metadata agreement; it does not
 prove the checkpoint correct. An ordinary optimistic snapshot, a subscriber's
 dump, or a bare local `dumps/<id>/` directory is insufficient.
 
-With the deployment's [setup configuration](../../README.md#running) and
+With the deployment's [setup configuration](../running.md#configuration) and
 batch-submitter signing key configured, use a fresh data directory:
 
 ```sh
