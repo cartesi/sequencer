@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 --- Client for the sequencer's operator routes for its accepted checkpoint
---- (README.md#operator-snapshot-endpoints-internal-only). Every failure is
+--- (docs/api.md#operator-snapshot-endpoints-internal-only). Every failure is
 --- transient: a missing checkpoint (404) or the sequencer's own divergence
 --- refusal (503) clears on the sequencer's side, not the watchdog's.
 

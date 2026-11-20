@@ -184,7 +184,7 @@ The guardian multisig, run by the sequencer's operators, decides foreclosure.
 Stop and disable the sequencer as soon as foreclosure is decided: an operation
 it confirms that has not landed when `foreclose()` executes never will. On
 Kubernetes, scale the Deployment to zero, because Deployments restart regardless
-of exit code ([restart policy](operator-deployment.md#sequencer-restart-policy)).
+of exit code ([restart policy](../running.md#supervision)).
 Never restart the sequencer for a foreclosed application: batch posts fail at
 gas estimation on every attempt, and the open batch ages until the history is
 void.

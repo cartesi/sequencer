@@ -28,7 +28,7 @@ Additional snapshot retention or transport mechanisms require a measured consume
 ## Track 3 — Feed & replay protocol redesign
 
 The egress API is implemented. The [history contract](../protocol/application-history.md)
-and the [API contract](../../README.md#api) own its behavior; the
+and the [API contract](../api.md) own its behavior; the
 [register](../review/register.md#integration-work-owned-elsewhere) owns deployment follow-ups.
 
 [Cockroach recovery](../recovery/cockroach.md) rebuilds the sequencer from a

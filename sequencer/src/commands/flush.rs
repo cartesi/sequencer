@@ -3,7 +3,7 @@
 
 //! The `flush-mempool` command: settle the batch-submitter wallet nonce on demand
 //! with the same flush that setup runs. It needs the signing key and a
-//! completed setup, and never syncs or launches workers (README "Running").
+//! completed setup, and never syncs or launches workers (docs/running.md).
 
 use super::load_setup_identity;
 use crate::commands::config::FlushConfig;

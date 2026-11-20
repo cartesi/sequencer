@@ -8,7 +8,7 @@ its era; receiving it does not establish L1 acceptance.
 This document owns history coordinates, recovery boundaries, and replica
 bootstrap. The [Application contract](application-contract.md) owns execution
 and the count; the [snapshot lifecycle](../snapshots/lifecycle.md) owns artifact
-publication, selection, and retention; the [README API](../../README.md#api)
+publication, selection, and retention; the [API contract](../api.md)
 owns routes, wire fields, and refusal codes.
 
 ## Progress, ordering, and acceptance
@@ -209,7 +209,7 @@ count order up to `E`, then the live rows, and a page may span that
 seam. Each page reads identity, bounds, and rows in one SQLite transaction.
 Interior gaps, a missing rebuilt row below `E`, and invalid source context
 fail loudly. Page size and send queues bound memory; available backlog
-has no total replay cap. The [API contract](../../README.md#api) owns exact
+has no total replay cap. The [API contract](../api.md) owns exact
 resource limits and handshake errors.
 
 The history never changes inside an era, and a new era lives in a new data

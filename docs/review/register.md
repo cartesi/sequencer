@@ -121,7 +121,7 @@ counts, then correct the estimate and check the separately configured
   so a stale stamp means failing polls. That is one FULL-sync commit per
   successful poll, an estimated (unmeasured) cost under 0.1% of writer time.
 - **OpenAPI drift.** [`openapi.yaml`](../../openapi.yaml) is hand-maintained
-  beside the [API contract](../../README.md#api). CI lints its structure, but
+  beside the [API contract](../api.md). CI lints its structure, but
   nothing checks it against the routes or serde wire types; only the
   change-together rule in [AGENTS.md](../../AGENTS.md#http-endpoints) keeps them
   aligned. Checked 2026-10-04 against the code at `27e55ce`. Next: if a
@@ -264,7 +264,7 @@ unverified paths.
   corrects the client in one round trip, and an exact answer would need the
   lane to ask the application per request or a sender table seeded from the
   baseline (the [sender index](#known-optimizations) entry). The
-  [README](../../README.md#get-noncesenderaddress) documents it. Revisit if a
+  [README](../api.md#get-noncesenderaddress) documents it. Revisit if a
   wallet cannot recover from the `422` without user action. Evidence:
   [`storage/ingress.rs`](../../sequencer/src/storage/ingress.rs).
 - **A base machine's state through the range source.** Setup reads the

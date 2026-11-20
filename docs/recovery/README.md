@@ -139,7 +139,7 @@ diagnosed terminal fault; a clean shutdown that finds one exits 30 instead of
 | `landing_lag_blocks` | `H + 1 - s` for the oldest unaccepted batch: its age at the next block. The history is void when it reaches `max_wait_blocks` |
 | `safe_head_age_seconds` | The wall clock less the safe block's L1 timestamp. The lag freezes while the provider is down; this number does not |
 
-Both are in [`GET /healthz`](../../README.md#health-probes-internal-only),
+Both are in [`GET /healthz`](../api.md#health-probes-internal-only),
 which answers `null` for them until the worker's first reading, and in a
 `landing lag` log line, written at start and every five minutes.
 

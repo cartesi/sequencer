@@ -535,7 +535,7 @@ CREATE TABLE IF NOT EXISTS deployment_identity (
 --
 -- Fee unit:
 --   `gas_price` is denominated in "fee-token smallest units per L1 gas unit"
---   (application-defined ERC-20 X; the wallet prototype starts with USDC).
+--   (application-defined ERC-20 X; the toy wallet uses USDC).
 --   The L1 fee oracle converts base+priority gas (wei) via a pinned Uniswap V3
 --   WETH/X TWAP and encodes the approximate quote to log space. The tenfold safety
 --   margin lives in `log_slack` (not in the oracle). Local Anvil uses an

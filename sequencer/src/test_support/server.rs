@@ -46,7 +46,7 @@ pub(crate) async fn bind_api_listeners() -> (
     )
 }
 
-/// The public routes, per README#api; every other route is internal.
+/// The public routes, per docs/api.md; every other route is internal.
 pub(crate) const PUBLIC_ROUTES: [&str; 4] = ["/tx", "/fee", "/nonce", "/domain"];
 
 enum QueueMode {

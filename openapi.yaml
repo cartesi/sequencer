@@ -26,15 +26,15 @@ info:
 
     Errors use `ErrorResponse` unless a response says otherwise.
 
-    The README's API section owns the wire contract and its client guidance;
-    this document renders it for tooling, and the two change together.
+    `docs/api.md` owns the wire contract and its client guidance; this
+    document renders it for tooling, and the two change together.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
 security: []
 externalDocs:
-  description: README API contract
-  url: https://github.com/cartesi/sequencer/blob/main/README.md#api
+  description: Sequencer API contract
+  url: https://github.com/cartesi/sequencer/blob/main/docs/api.md
 servers:
   - url: http://127.0.0.1:3000
     description: Default public listener (`CARTESI_SEQUENCER_HTTP_ADDR`).

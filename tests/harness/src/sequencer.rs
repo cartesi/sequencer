@@ -61,7 +61,7 @@ const DATA_DIR_NAME: &str = "data";
 /// is the highest standard funded account, clear of the e2e wallets (0-3) and
 /// the bench workload (indices 0..concurrency).
 const DEVNET_SUBMITTER_ACCOUNT_INDEX: usize = 9;
-/// The exit code of a command that must not be restarted (README "Running"):
+/// The exit code of a command that must not be restarted (docs/running.md, "Exit codes"):
 /// among others, every start of `run` while a terminal fact holds.
 pub const EXIT_TERMINAL: i32 = 30;
 /// The signal a running sequencer raises on a terminal runtime fault, a

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Public ingress routes (`POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`);
-//! README "API" owns their contract. `/fee` and `/nonce` read SQLite, never the lane.
+//! docs/api.md owns their contract. `/fee` and `/nonce` read SQLite, never the lane.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

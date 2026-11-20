@@ -9,7 +9,7 @@ file keeps the remaining work.
 | Divergence playbook and drills | [Incident runbook](../watchdog/incident-runbook.md) |
 | Emulator behavior and measurements | [Cartesi Machine facts](../cartesi-machine.md) |
 | Comparison bytes an application must produce | [Application contract §6](../protocol/application-contract.md#6-checkpoint-lifecycle) |
-| `GET /finalized_state/digest` | [README API](../../README.md#operator-snapshot-endpoints-internal-only) |
+| `GET /finalized_state/digest` | [API contract](../api.md#operator-snapshot-endpoints-internal-only) |
 
 ## Remaining work
 

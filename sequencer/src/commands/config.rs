@@ -4,7 +4,7 @@
 //! CLI configuration for `setup`, `run` and `flush-mempool`: the owner of
 //! env-var names, defaults and validation. Shared arg groups (`L1RpcArgs`,
 //! `TimingArgs`, `KeyArgs`) are flattened into each command so names and defaults
-//! cannot drift. The setup/run phase split is in README "Running".
+//! cannot drift. The setup/run phase split is in docs/running.md.
 
 use alloy_primitives::Address;
 use clap::{ArgGroup, Args};

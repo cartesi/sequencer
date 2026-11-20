@@ -6,7 +6,8 @@ corrupt, or its disk failed. The watchdog reports most of these as a divergence
 ([incident runbook](../watchdog/incident-runbook.md)). It is the sequencer's
 only recovery: a void history and a recorded divergence both stop the
 sequencer for good and send the operator here
-([batch landing and outages](README.md)).
+([batch landing and outages](README.md)). It is also how a deployment upgrades
+across a [schema change](../running.md#upgrades).
 
 The operator starts a recovery and one command does the work: `setup`, the
 same command that starts a new deployment. Every setup starts from a **base**
@@ -52,7 +53,7 @@ one can resubmit it while its sender's nonce is unused.
 | A base machine | `--base <MACHINE_DIR>`, optional; setup trusts it, and the operator checks it ([before anything](#before-anything)). |
 | The submitter key | `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY` or `CARTESI_SEQUENCER_AUTH_PRIVATE_KEY_FILE`, as for `run`; it must sign for the submitter address, and `--dry-run` takes none. |
 | An empty data directory | Absent, empty, or holding only `sequencer.lock`; setup refuses anything else. |
-| The setup configuration | The RPC endpoint, chain id, application address, submitter address and fee source ([Running](../../README.md#running)). |
+| The setup configuration | The RPC endpoint, chain id, application address, submitter address and fee source ([configuration](../running.md#configuration)). |
 
 Setup takes no client count; each client checks its own
 ([the client's playbook](#the-clients-playbook)).
@@ -92,7 +93,7 @@ setup's own sync.
 
 `/history` reports the base count as `history.available_from`, and the stop
 block, its input count, the anchor and the rebuilt history end under
-`baseline` ([history metadata](../../README.md#history-metadata-internal-only)).
+`baseline` ([history metadata](../api.md#history-metadata-internal-only)).
 The first queued input stays off the wire.
 
 ### What setup does

@@ -12,7 +12,7 @@ Build and evolve a **DeFi sequencer** — the off-chain component that gives use
 
 This is **security-critical infrastructure**. Treat every change with the care that financial systems demand. Correctness, determinism, and safety come before features.
 
-The current application (`examples/app-core/`) is a **hardcoded placeholder** (deposit, transfer, withdrawal). It will be replaced by a production DeFi application. The sequencer itself is the product; the app is a stand-in for development.
+The application in this repository (`examples/app-core/`) is a **toy wallet** (deposit, transfer, withdrawal), kept as the example application for development, tests, and the Sepolia reference deployment. Production applications compose the sequencer library from their own crates. The sequencer itself is the product.
 
 ## Requirements
 
@@ -120,7 +120,7 @@ signing, and SSZ batch encoding.
 
 - `sequencer/` — sequencer **library** (no binary). App crates compose it into a binary.
 - `sequencer-core/` — the canonical scheduler, the executor and shared domain types (`Application`, `SignedUserOp`, `L2Tx`, `Batch`, `Frame`).
-- `examples/app-core/` — placeholder wallet app implementing the `Application` trait.
+- `examples/app-core/` — toy wallet app implementing the `Application` trait.
 - `examples/wallet-sequencer/` — binary crate: wallet app + sequencer library. The model for what an app author builds (their `Application` impl ≙ `app-core`; their binary crate ≙ this).
 - `bindings/c-app-engine/` — reusable C ABI adapter implementing `Application` for a native engine.
 - `bindings/c-app-sequencer/` — optional C-engine CLI host and external-archive binary.
@@ -188,7 +188,7 @@ The [application contract](docs/protocol/application-contract.md) owns the `Appl
 
 Only the ingress routes (`POST /tx`, `GET /fee`, `GET /nonce`, `GET /domain`) are
 public; every other route, snapshot and state downloads included, is internal,
-unauthenticated, and **must not be exposed publicly**. The [README API contract](README.md#api)
+unauthenticated, and **must not be exposed publicly**. The [API contract](docs/api.md)
 owns routes, listeners, shapes, caps, and codes; [`openapi.yaml`](openapi.yaml)
 renders it for client generation and documentation tools, so change both in the
 same patch. CI lints it; run `direnv exec . redocly lint openapi.yaml` locally.
@@ -200,7 +200,7 @@ Every command takes the signing key: `setup` flushes the submitter's wallet
 runs once, in an empty data directory, from genesis or a stored machine
 (`--base`); it is not idempotent and refuses a directory that holds anything.
 `run` and `flush-mempool` read the pinned identity from the database.
-[Running](README.md#running) owns invocation and why the submitter address must
+[Running the sequencer](docs/running.md) owns invocation and why the submitter address must
 be dedicated (the devnet uses Anvil account 9). [`commands/config.rs`](sequencer/src/commands/config.rs) owns
 every variable name, default, and validation; check it before documenting or
 changing configuration.
@@ -291,7 +291,7 @@ direnv exec . cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 The shared command harness is in [`sequencer/src/harness.rs`](sequencer/src/harness.rs).
-See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
+See [Running the sequencer](docs/running.md) for the two-phase `setup` / `run` workflow.
 
 ## Always / Ask First / Never
 
@@ -322,9 +322,16 @@ See [Running](README.md#running) for the two-phase `setup` / `run` workflow.
 
 ## Migration Policy
 
-At this stage it is acceptable to rewrite baseline migrations for clarity. There are no deployed environments requiring forward-only migrations. Keep schema bootstrap (initial open rows and invariants) explicit and deterministic.
+The schema is one baseline migration, `0001_schema.sql`, edited in place
+whenever the schema changes. There are no forward migrations: a deployment
+upgrades across a schema change by rebuilding its data directory with cockroach
+recovery ([upgrades](docs/running.md#upgrades)). One rehearsed procedure then
+covers lost state, sequencer bugs, and upgrades, with no migration code to
+maintain and test; a canonical machine, or genesis, becomes what carries state
+between releases. Say in the release notes when a release changes the schema. Revisit if
+upgrade rebuilds, or the new era they give subscribers, become a burden.
 
-Once environments are shared or deployed, switch to append-only forward migrations.
+Keep schema bootstrap (initial open rows and invariants) explicit and deterministic.
 
 ## Definition of Done
 
@@ -348,11 +355,11 @@ work reaches another boundary.
 | Application implementation, execution, or native integration | [Application contract](docs/protocol/application-contract.md) — determinism, progress, failure, capacity, and checkpoints; [C binding](docs/protocol/c-application-binding.md) for native engines. |
 | Batch landing, the void history, or outages | [Batch landing and outages](docs/recovery/README.md) — the rule that ends an era, what `run` does at start and while running, and the operator's playbook. |
 | Setup, or a manual rebuild after lost state or a sequencer bug | [Cockroach recovery](docs/recovery/cockroach.md) — one setup from any base, the rebuild, the era it publishes, the playbooks, and a code map; [sequencer recovery plan](docs/plans/2026-11-sequencer-recovery/README.md) for what remains. |
-| API, subscriber replay, or application-history coordinates | [README API contract](README.md#api) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, offsets, and recovery boundaries. |
+| API, subscriber replay, or application-history coordinates | [API contract](docs/api.md) — wire behavior, with [`openapi.yaml`](openapi.yaml) changed alongside it; [application history](docs/protocol/application-history.md) — era, offsets, and recovery boundaries. |
 | Snapshots, restart, export, retention, or watchdog checkpoints | [Snapshot lifecycle](docs/snapshots/lifecycle.md) — durable publication, accepted comparison points, leases, and GC; [wallet format](docs/snapshots/format.md) when changing wallet bytes. |
 | Trust boundaries, provider behavior, or hostile L1 input | [Threat model](docs/threat-model/README.md) — actor assumptions, supported failures, and residual risks. |
 | Submission fees or oracle pricing | [L1 fee policy](docs/l1-fee-policy.md) — estimation and replacement limits; [threat model's fee oracle section](docs/threat-model/README.md#fee-oracle) — oracle source and outage assumptions. |
-| Command setup or deployment configuration | [Running](README.md#running) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
+| Command setup or deployment configuration | [Running the sequencer](docs/running.md) and [config.rs](sequencer/src/commands/config.rs) — invocation, identity pinning, defaults, and validation. |
 | Watchdog development or operation | [Watchdog README](docs/watchdog/README.md) — contract, state sources, commands, and state; [incident runbook](docs/watchdog/incident-runbook.md) — what a latched divergence requires; [local dev](docs/watchdog/getting-started.md) for Anvil; [operator deployment](docs/watchdog/operator-deployment.md) for Sepolia/mainnet. |
 | Canonical guest, machine images, or a Cartesi Machine bump | [Cartesi Machine facts](docs/cartesi-machine.md) — version pinning, host semantics, storage, memory ranges, and the guest side. |
 | A release, or adding or bumping a GitHub Action | [`release.yml`](.github/workflows/release.yml) header — what to run before tagging; [`verify-action-pins.sh`](scripts/verify-action-pins.sh) — pin form, upstream audit, and why bumps are manual. |

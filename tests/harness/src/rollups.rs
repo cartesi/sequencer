@@ -601,7 +601,7 @@ async fn deploy_devnet_application(
     let template_hash = load_template_hash(paths::devnet_machine_image_path().as_path())?;
     // Withdrawals disabled: a zero guardian can never `foreclose()`, so the
     // InputBox's v3 `notForeclosed` gate on `addInput` stays permanently open,
-    // and no withdrawal output builder is needed for the placeholder wallet.
+    // and no withdrawal output builder is needed for the toy wallet.
     let withdrawal_config = WithdrawalConfig {
         guardian: Address::ZERO,
         log2LeavesPerAccount: 0,
