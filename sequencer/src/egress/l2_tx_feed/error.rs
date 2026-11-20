@@ -74,7 +74,11 @@ pub enum SubscriptionError {
 impl SubscriptionError {
     pub(super) fn is_persistent_storage_invariant(&self) -> bool {
         match self {
-            Self::History(_) => false,
+            // The claim was admitted when the subscription was prepared, and
+            // inside one database the era is immutable and the history only
+            // appends. A page that refuses the claim it continues from means
+            // the history changed under the reader.
+            Self::History(_) => true,
             Self::OpenStorage { source } => open_error_is_persistent(source),
             Self::LoadReplay { source, .. } => is_persistent_storage_error(source),
             Self::Join { source } => source.is_panic(),

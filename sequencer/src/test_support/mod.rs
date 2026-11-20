@@ -41,13 +41,29 @@ pub(crate) fn pin_test_deployment_identity(
     storage: &mut Storage,
     batch_submitter_address: Address,
 ) {
+    pin_test_deployment_identity_with_window(
+        storage,
+        batch_submitter_address,
+        app_core::application::WALLET_SCHEDULER_LIMITS.max_wait_blocks,
+    );
+}
+
+/// [`pin_test_deployment_identity`] with another staleness window, for tests
+/// that pin where storage reads the window from.
+pub(crate) fn pin_test_deployment_identity_with_window(
+    storage: &mut Storage,
+    batch_submitter_address: Address,
+    max_wait_blocks: u64,
+) {
     storage
-        .load_or_insert_deployment_identity(DeploymentIdentity {
+        .pin_deployment_identity(DeploymentIdentity {
             chain_id: 1,
             app_address: Address::repeat_byte(0x11),
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 0,
             batch_submitter_address,
+            max_direct_payload_bytes: crate::storage::test_helpers::TEST_MAX_DIRECT_PAYLOAD_BYTES,
+            max_wait_blocks,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         })
         .expect("pin test deployment identity");

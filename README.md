@@ -12,7 +12,7 @@ The protocol objective is that, under supported honest operation, **the
 off-chain sequencer predicts the same execution order the rollup's on-chain
 scheduler later produces.** The scheduler is the program inside the
 application's Cartesi Machine that orders every input from L1. Soft
-confirmations are optimistic and may be invalidated by the recovery cases
+confirmations are optimistic and may be revoked by the recovery described
 below; L1 remains canonical truth.
 
 ## What This Repository Contains
@@ -22,7 +22,10 @@ The sequencer is a Rust library. An application crate composes it with its
 [`examples/wallet-sequencer/`](examples/wallet-sequencer/) does with the toy
 wallet in [`examples/app-core/`](examples/app-core/), the example application
 for development, tests, and the Sepolia reference deployment. Native engines
-bind through the [C ABI adapter](bindings/c-app-engine/README.md).
+bind through the [C ABI adapter](bindings/c-app-engine/README.md). A C or C++
+guest reaches the canonical scheduler through the proposed
+[`scheduler.h`](bindings/c-scheduler/README.md), and a port of it is held to the
+[conformance vectors](docs/protocol/scheduler-semantics.md#conformance).
 
 Alongside it are the canonical guest that runs the scheduler on chain
 ([`examples/canonical-app/`](examples/canonical-app/)), a Rust client
@@ -35,7 +38,7 @@ binaries, canonical machine images, and the
 
 ## Two Chains Synchronizing
 
-The sequencer maintains an optimistic chain of batches — a tree that normally degenerates into a list. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
+The sequencer maintains an optimistic list of batches, which L1 accepts in order. Each batch contains frames, and each frame contains user operations plus a `safe_block` reference. The `safe_block` is the synchronization primitive: it tells the on-chain scheduler "drain all direct inputs (deposits) up to this L1 block, then execute these user ops." Both sides follow the rule, producing identical state.
 
 ```
 Sequencer (off-chain)              Scheduler (on-chain)
@@ -48,14 +51,14 @@ Sequencer (off-chain)              Scheduler (on-chain)
 The sequencer opens a frame at a new `safe_block` once five newly-safe L1 blocks
 have accumulated ([frame-clock policy](docs/protocol/scheduler-semantics.md#sequencer-frame-clock-policy)).
 
-A batch is **stale** when it lands on L1 `MAX_WAIT_BLOCKS` (1200 blocks, ~4h)
-or more after its first frame's `safe_block`. The scheduler skips a stale batch
+A batch is **stale** when it lands on L1 the application's `max_wait_blocks`
+(7200 blocks, ~24h, for the wallet) or more after its first frame's
+`safe_block`. The scheduler skips a stale batch
 without consuming its nonce, so every later batch is rejected too.
 
 When things go well, the sequencer's chain and the scheduler's view converge.
-When batches risk becoming stale on L1, the sequencer stops serving and startup
-determines the required repair. A lost or untrustworthy local state instead
-requires an operator rebuild. Both recovery modes are described below.
+When a batch can no longer land before it goes stale, or local state is lost or
+untrustworthy, an operator rebuilds the sequencer, as described below.
 
 ## Trust Model
 
@@ -65,26 +68,25 @@ The sequencer is a **centralized, single-writer** system. It cannot steal funds 
 - **Go offline** — stop providing soft confirmations.
 - **Diverge** — if batches fail to land on L1 in time, soft confirmations that were issued become invalid.
 
-**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to `MAX_WAIT_BLOCKS`, ~4h), but cannot prevent it.
+**Direct inputs** (L1 → L2 messages, used for deposits) bypass the sequencer entirely. They are posted directly to L1 and are **uncensorable** by the sequencer — the scheduler drains them at every `safe_block` boundary. A censoring sequencer can delay when a direct input is executed (up to the application's `max_wait_blocks`, ~24h for the wallet), but cannot prevent it. A direct whose payload is over the application's cap never executes, on L1 or in the sequencer.
 
 The [threat model](docs/threat-model/README.md) owns the full set of actors and
 assumptions.
 
 ## Recovery
 
-**[Automatic recovery](docs/recovery/README.md)** (also called standard
-recovery) runs at startup using the existing database. It handles liveness failures such as outages and
-extended downtime: reconcile L1 outcomes, invalidate the affected optimistic
-suffix, and resume from retained state. Stale batches do not consume the
-scheduler's expected nonce, so their successors cannot be accepted until recovery
-supplies a replacement at that nonce.
+The sequencer has one recovery, **[cockroach recovery](docs/recovery/cockroach.md)**:
+an operator-triggered rebuild when the era has ended or the local database is
+lost or cannot be trusted, including after a sequencer bug that corrupted state
+or emitted malformed batches. The operator
+runs `setup --base <machine>` in a new data directory: setup rebuilds the
+history from a trusted canonical machine and L1 through a stop block and
+publishes a new era, and each client realigns at its own count.
 
-**[Cockroach recovery](docs/recovery/cockroach.md)** is an operator-triggered
-rebuild when the local database is lost or cannot be trusted. This includes a
-sequencer bug that corrupted state or emitted malformed batches: fix the bug,
-choose a trusted canonical application checkpoint, then rebuild in a fresh data
-directory. The command processes historical L1 inputs through the canonical
-scheduler and prepares a baseline for resuming normal operation.
+An era ends when its oldest unaccepted batch can no longer land before it goes
+stale, the **void history**: no later batch can then be accepted, so the
+sequencer stops and refuses every start
+([batch landing and outages](docs/recovery/README.md)).
 
 Soft confirmations are an **optimistic prediction**. A content-identity check
 compares each batch that L1 accepts at the sequencer's nonces with the batch it
@@ -100,10 +102,10 @@ between normal operation's self-trust and manual repair after a bug.
 
 The sequencer is designed to handle:
 
-- **L1 provider outages** — workers retry on their next tick while the inclusion lane and API keep operating locally ([provider behavior](docs/running.md#the-l1-endpoint)). A wall-clock fallback detects when an outage pushes batches into the danger zone.
-- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart can recover automatically: every boot derives any required recovery from SQLite and L1 safe state through startup recovery, never assuming the previous exit was clean.
-- **Extended downtime** — startup syncs to the current L1 safe head, flushes if needed, and recovers before admission. A terminal exit requires operator investigation; rebuilding untrustworthy state follows the cockroach recovery procedure above.
-- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. Recovery waits until every covered wallet-nonce slot is consumed at safe depth, whether the original transaction or a flush no-op wins, so delayed "zombie" submissions cannot land later.
+- **L1 provider outages** — workers retry on their next tick while the inclusion lane and API keep operating locally ([provider behavior](docs/running.md#the-l1-endpoint)). The sequencer acts only on what L1 shows: it reports the safe head's age for monitoring and makes no wall-clock estimate ([outages](docs/recovery/README.md#when-batches-are-not-landing)).
+- **Undiagnosed interruptions (OOM, SIGKILL, reboot)** — restart resumes: every boot syncs L1 and checks the terminal facts from SQLite and L1 safe state, never assuming the previous exit was clean ([what the sequencer does](docs/recovery/README.md#what-the-sequencer-does)). Terminal errors returned through a command bracket best-effort record their cause in `terminal_faults`, except a terminal fact, which the database already holds and every `run` states; terminal runtime aborts leave only process diagnostics.
+- **Extended downtime** — startup syncs to the current L1 safe head and resumes. A stop longer than the window ends the era, and every start refuses until cockroach recovery, above.
+- **Adversarial L1 mempool** — block builders and private mempools are treated as adversarial. No batch nonce is reused inside an era, so a delayed "zombie" submission carries a batch the sequencer still holds. Before a rebuild, setup's flush replaces what the provider's pool holds for the submitter; a submission of the old era that escapes it is refused by setup's escape check or, if it lands later, read as a foreign batch that ends the new era ([the flush and the stop block](docs/recovery/cockroach.md#the-flush-and-the-stop-block)).
 
 ## Interfaces
 
@@ -119,8 +121,8 @@ Users submit signed operations via `POST /tx` (JSON). Operations are signed with
 ### Sequenced Transaction Feed
 
 Subscribers restore an HTTP snapshot, then use one WebSocket stream to replay
-application inputs and follow the optimistic tip. Recovery can replace that
-history; the snapshot's era, generation, and input count bind a resume request
+application inputs and follow the optimistic tip. A cockroach rebuild starts
+a new era; the snapshot's era and input count bind a resume request
 to the state the consumer actually holds. The endpoint serves a small number of
 infrastructure subscribers, which serve users directly. See the
 [bootstrap workflow](docs/protocol/application-history.md#replica-bootstrap-and-resume)
@@ -132,10 +134,12 @@ The batch submitter posts closed batches to L1's InputBox contract. Each batch c
 
 ## Running
 
-`setup` pins the deployment identity and initial L1 state, and runs once; `run`
-boots the sequencer from that database and holds the batch-submitter key.
-[Running the sequencer](docs/running.md) covers invocation, configuration, the
-L1 endpoint, exit codes, and upgrades.
+`setup` creates a data directory, once: it pins the deployment identity,
+flushes the submitter's wallet, and rebuilds the history from a base through a
+stop block. `run` boots the sequencer from that directory. Both take the
+batch-submitter key. [Running the sequencer](docs/running.md) covers
+invocation, configuration, the L1 endpoint, exit codes, supervision, and
+upgrades.
 
 To try it locally, run `just devnet`. It starts Anvil with the rollups
 contracts and a set-up `wallet-sequencer-devnet`, prints their endpoints, and
@@ -146,14 +150,15 @@ development shell provides them.
 
 ## Storage Model
 
-- `batches`: batch metadata
+- `batches`: one row per batch, keyed by its nonce, with the safe input that carried its accepted landing (`accepted_input`)
 - `frames`: frame boundaries within each batch
 - `frames.fee`: committed fee for each frame
 - `user_ops`: included user operations
 - `application_inputs`: current application sequence keyed by mandatory pre-execution offset; each row references a user op or an external direct input and its owning batch/frame
 - `safe_inputs`: every raw InputBox observation, including batch envelopes
-- `history_state`: immutable era baseline (application count and accounted L1 block) plus recovery generation
-- `snapshots` and `dumps`: immutable application-state artifacts, one registered atomically with each batch seal plus the era baseline, and their streaming leases. Restart restores the latest valid snapshot and replays application inputs from its count; acceptance, derived from `safe_accepted_batches`, selects the recovery checkpoint and the garbage-collection frontier ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
+- `era`: one immutable row (base count, stop block, rebuilt history end, first queued input, anchor batch nonce); it exists exactly when setup has completed
+- `rebuilt_history`: the transactions setup executed from the base through the stop block, each with its count; the feed serves them before the live rows
+- `snapshots`: one immutable row per batch-close or baseline artifact (its directory and count), registered atomically with each batch seal; download leases live in the serving process. Restart restores the latest valid snapshot and replays application inputs from its count; acceptance, read from `batches.accepted_input`, selects the comparison checkpoint and the garbage-collection frontier ([snapshot lifecycle](docs/snapshots/lifecycle.md)).
 - `batch_policy`: singleton fee and batch-sizing knobs; `batch_policy_derived` exposes `recommended_fee` and `batch_size_target` ([formula](sequencer/src/storage/migrations/0001_schema.sql)). A batch closes when its `batch_size_target` byte budget fills or `CARTESI_SEQUENCER_MAX_BATCH_OPEN_SECONDS` elapses, whichever comes first. The [threat model](docs/threat-model/README.md#fee-oracle) owns how the oracle prices and refreshes.
 
 The schema is one baseline migration; a release that changes it is
@@ -174,11 +179,11 @@ owns each contract. The main entry points:
 
 | Topic | Document |
 |---|---|
-| Invocation, configuration, exit codes, and upgrades | [Running the sequencer](docs/running.md) |
+| Invocation, configuration, exit codes, supervision, and upgrades | [Running the sequencer](docs/running.md) |
 | Routes, messages, and status codes | [API contract](docs/api.md), rendered as [`openapi.yaml`](openapi.yaml) |
 | How the scheduler orders inputs | [Scheduler semantics](docs/protocol/scheduler-semantics.md) |
 | What an application must implement | [Application contract](docs/protocol/application-contract.md) |
-| Repair after outages or lost state | [Automatic recovery](docs/recovery/README.md) and [cockroach recovery](docs/recovery/cockroach.md) |
+| Outages, and the rebuild after lost state | [Batch landing and outages](docs/recovery/README.md) and [cockroach recovery](docs/recovery/cockroach.md) |
 | Actors, assumptions, and residual risks | [Threat model](docs/threat-model/README.md) |
 | Independent checking of the sequencer's state | [Watchdog](docs/watchdog/README.md) |
 

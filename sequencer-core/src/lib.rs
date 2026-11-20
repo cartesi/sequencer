@@ -20,10 +20,6 @@ pub mod scheduler;
 pub mod test_support;
 pub mod user_op;
 
-/// Maximum number of L1 blocks a batch can wait before the scheduler considers it stale.
-/// Shared between the scheduler (canonical-app) and the sequencer (batch submitter, startup detection).
-pub const MAX_WAIT_BLOCKS: u64 = 1200;
-
 /// EIP-712 domain name shared between sequencer and scheduler.
 pub const DOMAIN_NAME: &str = "CartesiAppSequencer";
 

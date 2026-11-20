@@ -19,10 +19,15 @@ use tokio::process::Command;
 
 use crate::ScenarioResult;
 
-const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
+pub(crate) const DEVNET_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image";
 const SEPOLIA_MACHINE_IMAGE: &str = "examples/canonical-app/out/canonical-machine-image-sepolia";
 
-fn require_cartesi_machine() {
+/// Bound on one watchdog command. On the devnet a tick or replay from genesis
+/// covers a few dozen inputs and ends in seconds; a hung L1 or sequencer call
+/// must fail the scenario instead of stalling the suite.
+const WATCHDOG_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(crate) fn require_cartesi_machine() {
     assert!(
         std::process::Command::new("cartesi-machine")
             .arg("--version")
@@ -34,7 +39,7 @@ fn require_cartesi_machine() {
     );
 }
 
-fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
+pub(crate) fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
     let image = paths::workspace_root().join(relative);
     if !image.is_dir() {
         return Err(format!(
@@ -47,19 +52,22 @@ fn machine_image(relative: &str) -> ScenarioResult<PathBuf> {
 }
 
 /// One watchdog state directory, bootstrapped from `image` at `block`, driven
-/// through the production `sequencer-watchdog` wrapper.
-struct Watchdog {
+/// through the production `sequencer-watchdog` wrapper. Its checkpoints are
+/// whole machines, so the directory goes when the watchdog is dropped.
+pub(crate) struct Watchdog {
+    _dir: tempfile::TempDir,
     state_dir: PathBuf,
     image: PathBuf,
     block: u64,
 }
 
 impl Watchdog {
-    fn new(image: PathBuf, block: u64) -> ScenarioResult<Self> {
-        let state_dir = tempfile::tempdir()
-            .map_err(|err| format!("temp watchdog state dir: {err}"))?
-            .keep();
+    pub(crate) fn new(image: PathBuf, block: u64) -> ScenarioResult<Self> {
+        let dir = tempfile::tempdir().map_err(|err| format!("temp watchdog state dir: {err}"))?;
+        // `init` creates the state directory, as it does after a wipe.
+        let state_dir = dir.path().join("state");
         Ok(Self {
+            _dir: dir,
             state_dir,
             image,
             block,
@@ -113,16 +121,23 @@ impl Watchdog {
                 "CARTESI_WATCHDOG_CM_SNAPSHOT_SAFE_BLOCK",
                 self.block.to_string(),
             );
-        let output = command
-            .output()
+        // Dropping the timed-out future kills the child.
+        command.kill_on_drop(true);
+        let output = tokio::time::timeout(WATCHDOG_COMMAND_TIMEOUT, command.output())
             .await
+            .map_err(|_| {
+                format!(
+                    "sequencer-watchdog {} ran past {WATCHDOG_COMMAND_TIMEOUT:?}",
+                    args.join(" ")
+                )
+            })?
             .map_err(|err| format!("failed to run sequencer-watchdog: {err}"))?;
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         Ok(output)
     }
 
     /// Run a command that must exit with `code`; returns its stdout.
-    async fn expect(
+    pub(crate) async fn expect(
         &self,
         runtime: &ManagedSequencer,
         args: &[&str],
@@ -140,14 +155,38 @@ impl Watchdog {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    async fn status(&self, runtime: &ManagedSequencer) -> ScenarioResult<serde_json::Value> {
+    pub(crate) async fn status(
+        &self,
+        runtime: &ManagedSequencer,
+    ) -> ScenarioResult<serde_json::Value> {
         let stdout = self.expect(runtime, &["status"], 0).await?;
         serde_json::from_str(&stdout).map_err(|err| format!("status JSON: {err}: {stdout}").into())
     }
 
-    fn wipe(&self) -> ScenarioResult<()> {
+    /// The runbook's re-`init`: the state directory wiped, then bootstrapped
+    /// from `image` at `block`.
+    fn wiped_for(self, image: PathBuf, block: u64) -> ScenarioResult<Self> {
         std::fs::remove_dir_all(&self.state_dir)
-            .map_err(|err| format!("wipe watchdog state: {err}").into())
+            .map_err(|err| format!("wipe watchdog state: {err}"))?;
+        Ok(Self {
+            image,
+            block,
+            ..self
+        })
+    }
+}
+
+/// A machine stored in a temporary directory, removed when this is dropped.
+pub(crate) struct StoredMachine {
+    _dir: tempfile::TempDir,
+    pub(crate) path: PathBuf,
+}
+
+impl StoredMachine {
+    pub(crate) fn new(name: &str) -> ScenarioResult<Self> {
+        let dir = tempfile::tempdir().map_err(|err| format!("stored machine dir: {err}"))?;
+        let path = dir.path().join(name);
+        Ok(Self { _dir: dir, path })
     }
 }
 
@@ -176,7 +215,7 @@ async fn sequencer_digest(runtime: &ManagedSequencer) -> ScenarioResult<(u64, St
     Ok((block, sha256))
 }
 
-fn head_block(status: &serde_json::Value) -> Option<u64> {
+pub(crate) fn head_block(status: &serde_json::Value) -> Option<u64> {
     status["head"]["block"].as_u64()
 }
 
@@ -276,12 +315,14 @@ pub async fn run_watchdog_divergence_drill_test(
     wait_for_non_genesis_finalized_state(finalized_url.as_str(), runtime, Duration::from_secs(60))
         .await?;
     let (block, _) = sequencer_digest(runtime).await?;
-    let first_input_block = *runtime
-        .input_blocks()
+    let inputs = runtime
+        .raw_inputs()
         .await
-        .map_err(|err| format!("read InputBox inputs: {err}"))?
+        .map_err(|err| format!("read InputBox inputs: {err}"))?;
+    let first_input_block = inputs
         .first()
-        .ok_or("no InputBox inputs before the accepted checkpoint")?;
+        .ok_or("no InputBox inputs before the accepted checkpoint")?
+        .0;
     eprintln!(
         "[watchdog-harness] drill target block={block} first input block={first_input_block}"
     );
@@ -301,7 +342,8 @@ pub async fn run_watchdog_divergence_drill_test(
     eprintln!(
         "[watchdog-harness] drill 2/7: a wrong non-genesis bootstrap latches a state mismatch"
     );
-    let watchdog = Watchdog::new(wrong, first_input_block)?;
+    let wrong_machine = wrong_machine_through(&wrong, &inputs, first_input_block).await?;
+    let watchdog = Watchdog::new(wrong_machine.path.clone(), first_input_block)?;
     watchdog.expect(runtime, &["init"], 0).await?;
     watchdog.expect(runtime, &["tick"], 2).await?;
     watchdog.expect(runtime, &["tick"], 2).await?;
@@ -383,12 +425,7 @@ pub async fn run_watchdog_divergence_drill_test(
     watchdog.expect(runtime, &["tick"], 2).await?;
 
     eprintln!("[watchdog-harness] drill 7/7: re-initializing from the trusted image agrees");
-    watchdog.wipe()?;
-    let fixed = Watchdog {
-        state_dir: watchdog.state_dir.clone(),
-        image: trusted,
-        block: 0,
-    };
+    let fixed = watchdog.wiped_for(trusted, 0)?;
     fixed.expect(runtime, &["init"], 0).await?;
     fixed.expect(runtime, &["tick"], 0).await?;
     if fixed.status(runtime).await?["latched"] != false {
@@ -397,14 +434,65 @@ pub async fn run_watchdog_divergence_drill_test(
     Ok(())
 }
 
+/// A stored machine of another application at the right input count: the
+/// `wrong` template advanced by the Cartesi Machine CLI through every input up
+/// to `block`. The guest takes inputs only in InputBox order, so a bootstrap
+/// that skips inputs dies at the next one; this one agrees on the count and
+/// differs in state, the runbook's bad-bootstrap case.
+async fn wrong_machine_through(
+    wrong: &Path,
+    inputs: &[(u64, Vec<u8>)],
+    block: u64,
+) -> ScenarioResult<StoredMachine> {
+    let stored = StoredMachine::new("machine")?;
+    let work_dir = stored
+        .path
+        .parent()
+        .ok_or("a stored machine lies in its directory")?;
+    let mut count = 0_usize;
+    for (index, (_, input)) in inputs.iter().take_while(|(b, _)| *b <= block).enumerate() {
+        std::fs::write(work_dir.join(format!("input-{index}.bin")), input)
+            .map_err(|err| format!("write input {index}: {err}"))?;
+        count = index + 1;
+    }
+    // No revert snapshots: the inputs are known to be accepted, and a
+    // rejection aborts the run, which fails the drill loud. Every output file
+    // is disabled, and the CLI runs in the work directory in case it writes
+    // another.
+    let status = Command::new("cartesi-machine")
+        .current_dir(work_dir)
+        .arg("--no-revert")
+        .arg(format!("--load={},sharing:none", wrong.display()))
+        .arg(format!(
+            "--cmio-advance-state=input:{},input_file_index_begin:0,input_file_index_end:{count},\
+             output:,report:,outputs_merkle_root:,outputs_merkle_root_proof:",
+            work_dir.join("input-%i.bin").display()
+        ))
+        .arg(format!("--store={}", stored.path.display()))
+        .arg("--quiet")
+        .status()
+        .await
+        .map_err(|err| format!("cartesi-machine advance failed to start: {err}"))?;
+    if !status.success() {
+        return Err(format!("cartesi-machine advance exited with {status}").into());
+    }
+    Ok(stored)
+}
+
 /// The canonical image's answer to the `state` inspect query, via the CLI.
 async fn cm_inspect_state(machine_image: &Path) -> ScenarioResult<Vec<u8>> {
+    cm_inspect(machine_image, b"state").await
+}
+
+/// A stored machine's answer to an inspect query, via the CLI.
+pub(crate) async fn cm_inspect(machine_image: &Path, query: &[u8]) -> ScenarioResult<Vec<u8>> {
     let work_dir = tempfile::tempdir().map_err(|err| format!("temp cm work dir: {err}"))?;
     let query_path = work_dir.path().join("inspect-query.bin");
     let report_path = work_dir.path().join("inspect-report-0.bin");
-    std::fs::write(query_path.as_path(), b"state")
+    std::fs::write(query_path.as_path(), query)
         .map_err(|err| format!("write inspect query: {err}"))?;
     let status = Command::new("cartesi-machine")
+        .current_dir(work_dir.path())
         .arg("--no-revert")
         .arg(format!("--load={},sharing:none", machine_image.display()))
         .arg(format!(

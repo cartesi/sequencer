@@ -2,59 +2,34 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 use crate::{
-    EraId, HistoricalL1InputStart, HistoricalL1InputsPage, HistoryInfo, HistoryPolicyError,
-    HistoryReadError, RecoveryGeneration, SequencerClient,
+    AdoptEraError, EraId, HistoryClaim, HistoryInfo, HistoryPolicyError, HistoryReadError,
+    L2TxCount, SequencerClient,
 };
 
 impl SequencerClient {
-    /// Discover history, optionally requiring the era selected for bootstrap.
-    /// A compatibility query supplies both the checkpoint's era and its generation.
+    /// The claim that resumes the current era at a client's own count, after
+    /// a cockroach recovery replaced the client's era (its claim was refused
+    /// with `ERA_CHANGED`). Below the era's base count the base is newer than
+    /// the client's state; past its rebuilt history's end the state holds
+    /// rows that never landed. Both refusals need another starting state, and
+    /// neither check sees a state that is wrong below its count.
+    pub async fn adopt_current_era(&self, count: L2TxCount) -> Result<HistoryClaim, AdoptEraError> {
+        Ok(self.history(None).await?.adopt_claim(count)?)
+    }
+
+    /// Discover history, optionally requiring the era selected for bootstrap:
+    /// a different current era is the typed `ERA_CHANGED` refusal.
     pub async fn history(
         &self,
         expected_era: Option<EraId>,
-        from_generation: Option<RecoveryGeneration>,
     ) -> Result<HistoryInfo, HistoryReadError> {
-        let mut query: Vec<_> = expected_era
+        let query: Vec<_> = expected_era
             .map(|era| ("era_id", era.to_string()))
             .into_iter()
             .collect();
-        if let Some(generation) = from_generation {
-            query.push(("from_generation", generation.get().to_string()));
-        }
         let request = self
             .http_client
             .get(format!("{}/history", self.endpoint.trim_end_matches('/')))
-            .query(&query)
-            .timeout(self.request_timeout);
-        let body = read_history_response(request).await?;
-        Ok(serde_json::from_str(&body)?)
-    }
-
-    /// Read one complete raw-input page under the configured request deadline.
-    /// Continue with its `next_input_index`; a short page is not necessarily EOF.
-    /// Use `with_request_timeout` when historical transfers need a longer deadline.
-    pub async fn historical_l1_inputs(
-        &self,
-        era: EraId,
-        start: HistoricalL1InputStart,
-        limit: Option<usize>,
-    ) -> Result<HistoricalL1InputsPage, HistoryReadError> {
-        let mut query = vec![("era_id", era.to_string())];
-        query.push(match start {
-            HistoricalL1InputStart::NextInputIndex(index) => {
-                ("next_input_index", index.to_string())
-            }
-            HistoricalL1InputStart::AfterBlock(block) => ("after_block", block.to_string()),
-        });
-        if let Some(limit) = limit {
-            query.push(("limit", limit.to_string()));
-        }
-        let request = self
-            .http_client
-            .get(format!(
-                "{}/historical-l1-inputs",
-                self.endpoint.trim_end_matches('/')
-            ))
             .query(&query)
             .timeout(self.request_timeout);
         let body = read_history_response(request).await?;
@@ -142,39 +117,21 @@ mod tests {
                 "batch_submitter_address": "0x3333333333333333333333333333333333333333"
             },
             "history": {
-                "version": { "era_id": ERA, "recovery_generation": 2 },
+                "era_id": ERA,
                 "available_from": 7,
                 "head": 12
             },
             "baseline": {
                 "l1_stop_block": 1240,
                 "l1_end_input_index": 8,
-                "next_batch_nonce": 2
+                "next_batch_nonce": 2,
+                "rebuilt_history_end": 9
             },
             "accepted_checkpoint": {
                 "inclusion_block": 1250,
                 "executed_input_count": 10,
                 "next_batch_nonce": 3
-            },
-            "compatibility": null
-        })
-        .to_string()
-    }
-
-    fn page_body() -> String {
-        serde_json::json!({
-            "era_id": ERA,
-            "l1_stop_block": 1240,
-            "end_input_index": 8,
-            "next_input_index": 6,
-            "items": [{
-                "input_index": 5,
-                "sender": "0x3333333333333333333333333333333333333333",
-                "payload": "0x00ff80",
-                "block_number": 1230,
-                "block_timestamp": 1700014760_u64,
-                "transaction_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
-            }]
+            }
         })
         .to_string()
     }
@@ -183,12 +140,12 @@ mod tests {
     async fn discovery_decodes_history_and_encodes_optional_era() {
         for expected_era in [None, Some(ERA.parse().unwrap())] {
             let (client, server) = serve_once(200, history_body()).await;
-            let info = client.history(expected_era, None).await.unwrap();
+            let info = client.history(expected_era).await.unwrap();
             assert_eq!(info.history.available_from.get(), 7);
             assert_eq!(info.history.head.get(), 12);
-            assert_eq!(info.history.version.era_id.to_string(), ERA);
+            assert_eq!(info.history.era_id.to_string(), ERA);
             assert_eq!(info.baseline.l1_stop_block, 1240);
-            assert!(info.compatibility.is_none());
+            assert_eq!(info.baseline.rebuilt_history_end.get(), 9);
             let url = request_url(&server.await.unwrap());
             assert_eq!(url.path(), "/history");
             let query: Vec<_> = url.query_pairs().collect();
@@ -201,98 +158,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatibility_encodes_checkpoint_generation_and_decodes_preserved_boundary() {
-        let mut body: serde_json::Value = serde_json::from_str(&history_body()).unwrap();
-        body["compatibility"] = serde_json::json!({
-            "from_generation": 1,
-            "preserved_input_count": 9
-        });
-        let (client, server) = serve_once(200, body.to_string()).await;
-        let info = client
-            .history(Some(ERA.parse().unwrap()), Some(RecoveryGeneration::new(1)))
-            .await
-            .unwrap();
-        let compatibility = info.compatibility.unwrap();
-        assert_eq!(compatibility.from_generation.get(), 1);
-        assert_eq!(compatibility.preserved_input_count.get(), 9);
-        assert_eq!(info.history.version.recovery_generation.get(), 2);
-        let url = request_url(&server.await.unwrap());
-        assert_eq!(url.path(), "/history");
-        assert_eq!(
-            url.query_pairs().collect::<Vec<_>>(),
-            [
-                ("era_id".into(), ERA.into()),
-                ("from_generation".into(), "1".into())
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn pages_encode_one_selector_and_decode_original_binary_fields() {
-        for (start, limit, selector, value) in [
-            (
-                HistoricalL1InputStart::NextInputIndex(5),
-                Some(1),
-                "next_input_index",
-                "5",
-            ),
-            (
-                HistoricalL1InputStart::AfterBlock(10),
-                None,
-                "after_block",
-                "10",
-            ),
-        ] {
-            let (client, server) = serve_once(200, page_body()).await;
-            let page = client
-                .historical_l1_inputs(ERA.parse().unwrap(), start, limit)
-                .await
-                .unwrap();
-            assert_eq!(page.next_input_index, 6);
-            assert_eq!(page.items[0].input_index, 5);
-            assert_eq!(page.items[0].payload.as_ref(), &[0x00, 0xff, 0x80]);
-            assert_eq!(page.items[0].sender.as_slice(), &[0x33; 20]);
-            assert_eq!(page.items[0].transaction_hash.as_slice(), &[0x44; 32]);
+    async fn adoption_claims_the_current_era_only_from_the_base_through_the_rebuilt_end() {
+        let adopt = |count| async move {
+            let (client, server) = serve_once(200, history_body()).await;
+            let result = client.adopt_current_era(L2TxCount::new(count)).await;
             let url = request_url(&server.await.unwrap());
-            assert_eq!(url.path(), "/historical-l1-inputs");
-            let query: std::collections::BTreeMap<_, _> = url.query_pairs().collect();
-            assert_eq!(query.get("era_id").unwrap(), ERA);
-            assert_eq!(query.get(selector).unwrap(), value);
-            assert_eq!(query.len(), if limit.is_some() { 3 } else { 2 });
-            if let Some(limit) = limit {
-                assert_eq!(query.get("limit").unwrap(), &limit.to_string());
-            }
+            assert_eq!(url.path(), "/history");
+            assert!(url.query().is_none(), "adoption reads the current era");
+            result
+        };
+        for count in [7, 8, 9] {
+            let claim = adopt(count).await.unwrap();
+            assert_eq!(claim.era_id.to_string(), ERA);
+            assert_eq!(claim.next_input.get(), count);
+        }
+        for count in [0, 6] {
+            assert!(matches!(
+                adopt(count).await,
+                Err(AdoptEraError::Adopt(crate::AdoptError::BelowBase { available_from }))
+                    if available_from.get() == 7
+            ));
+        }
+        // Rows the old instance served past the rebuilt end never landed,
+        // even though the new era's head is already past them.
+        for count in [10, 12] {
+            assert!(matches!(
+                adopt(count).await,
+                Err(AdoptEraError::Adopt(crate::AdoptError::PastRebuiltEnd { rebuilt_history_end }))
+                    if rebuilt_history_end.get() == 9
+            ));
         }
     }
 
     #[tokio::test]
-    async fn era_change_is_typed_for_both_reads() {
+    async fn adoption_reports_a_failed_history_read() {
+        let (client, server) = serve_once(503, "unavailable".into()).await;
+        assert!(matches!(
+            client.adopt_current_era(L2TxCount::new(7)).await,
+            Err(AdoptEraError::Read(HistoryReadError::Http {
+                status: 503,
+                ..
+            }))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn era_change_is_a_typed_refusal() {
+        let current = "11111111-1111-4111-8111-111111111111";
         let policy = HistoryPolicyError::EraChanged {
-            current: crate::HistoryVersion {
-                era_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
-                recovery_generation: sequencer_core::history::RecoveryGeneration::new(0),
-            },
+            era_id: current.parse().unwrap(),
         };
-        for page_request in [false, true] {
-            let (client, server) = serve_once(409, serde_json::to_string(&policy).unwrap()).await;
-            let result = if page_request {
-                client
-                    .historical_l1_inputs(
-                        ERA.parse().unwrap(),
-                        HistoricalL1InputStart::NextInputIndex(0),
-                        None,
-                    )
-                    .await
-                    .map(|_| ())
-            } else {
-                client
-                    .history(Some(ERA.parse().unwrap()), None)
-                    .await
-                    .map(|_| ())
-            };
-            assert!(matches!(result, Err(HistoryReadError::History(actual)) if actual == policy));
-            server.await.unwrap();
-        }
+        let body = serde_json::json!({ "code": "ERA_CHANGED", "era_id": current }).to_string();
+        let (client, server) = serve_once(409, body).await;
+        let result = client.history(Some(ERA.parse().unwrap())).await;
+        assert!(matches!(result, Err(HistoryReadError::History(actual)) if actual == policy));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -301,7 +222,7 @@ mod tests {
             let body = format!("refusal {status}");
             let (client, server) = serve_once(status, body.clone()).await;
             assert!(matches!(
-                client.history(None, None).await,
+                client.history(None).await,
                 Err(HistoryReadError::Http { status: actual_status, body: actual_body })
                     if actual_status == status && actual_body == body
             ));
@@ -313,7 +234,7 @@ mod tests {
     async fn malformed_success_is_a_decode_error() {
         let (client, server) = serve_once(200, "{}".into()).await;
         assert!(matches!(
-            client.history(None, None).await,
+            client.history(None).await,
             Err(HistoryReadError::Decode(_))
         ));
         server.await.unwrap();
@@ -321,39 +242,24 @@ mod tests {
 
     #[tokio::test]
     async fn history_deadline_covers_the_response_body() {
-        for page_request in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                request_headers(&mut stream).await;
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
-                    .await
-                    .unwrap();
-                std::future::pending::<()>().await;
-            });
-            let client = SequencerClient::new(endpoint)
-                .unwrap()
-                .with_request_timeout(Duration::from_millis(100));
-            let result = tokio::time::timeout(Duration::from_secs(5), async {
-                if page_request {
-                    client
-                        .historical_l1_inputs(
-                            ERA.parse().unwrap(),
-                            HistoricalL1InputStart::NextInputIndex(0),
-                            None,
-                        )
-                        .await
-                        .map(|_| ())
-                } else {
-                    client.history(None, None).await.map(|_| ())
-                }
-            })
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = SequencerClient::new(endpoint)
+            .unwrap()
+            .with_request_timeout(Duration::from_millis(100));
+        let result = tokio::time::timeout(Duration::from_secs(5), client.history(None))
             .await
             .expect("the configured deadline must include body transfer");
-            server.abort();
-            assert!(matches!(result, Err(HistoryReadError::Request(error)) if error.is_timeout()));
-        }
+        server.abort();
+        assert!(matches!(result, Err(HistoryReadError::Request(error)) if error.is_timeout()));
     }
 }

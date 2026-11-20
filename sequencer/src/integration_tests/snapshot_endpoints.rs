@@ -12,7 +12,7 @@ use app_core::application::WalletApp;
 use futures_util::StreamExt;
 use sequencer::ingress::inclusion_lane::dump_info;
 use sequencer::storage::Storage;
-use sequencer_core::application::Application;
+use sequencer_core::application::{Application, CanonicalState};
 
 use crate::test_support::server::{PUBLIC_ROUTES, TestServer};
 use crate::test_support::temp_db;
@@ -44,22 +44,19 @@ fn register_accepted(
 ) -> i64 {
     let mut storage = Storage::open(db_path).unwrap();
     let sender = alloy_primitives::Address::repeat_byte(0x7f);
-    crate::test_support::pin_test_deployment_identity(&mut storage, sender);
+    // A test registers several accepted batches on one database.
+    if storage.deployment_identity().unwrap().is_none() {
+        crate::test_support::pin_test_deployment_identity(&mut storage, sender);
+    }
     let mut head = storage.open_state().unwrap().unwrap_or_else(|| {
         storage
             .initialize_open_state(inclusion_block, crate::storage::SafeInputRange::empty_at(0))
             .unwrap()
     });
-    let nonce = storage.batch_nonce(head.batch_index).unwrap();
+    let nonce = head.batch_nonce();
     let prefix = write_state(dir, name, bytes, nonce + 1);
-    let safe_block = head.safe_block;
     storage
-        .close_frame_and_batch_with_snapshot(
-            &mut head,
-            safe_block,
-            &prefix,
-            crate::storage::ExecutedInputCount::ZERO,
-        )
+        .close_frame_and_batch_with_snapshot(&mut head, &prefix, crate::storage::L2TxCount::ZERO)
         .unwrap();
     crate::storage::test_helpers::seed_safe_inputs_with_batch_nonces(
         &mut storage,
@@ -67,31 +64,42 @@ fn register_accepted(
         inclusion_block,
         &[nonce],
     );
-    storage.finalized_dump().unwrap().unwrap().dump.id
+    storage.finalized_dump().unwrap().unwrap().snapshot.id
 }
 
 fn register_optimistic(db_path: &str, dir: &Path, name: &str, bytes: &[u8], nonce: u64) -> i64 {
     let mut storage = Storage::open(db_path).unwrap();
     let mut head = storage.open_state().unwrap().unwrap();
-    while storage.batch_nonce(head.batch_index).unwrap() <= nonce {
-        let current = storage.batch_nonce(head.batch_index).unwrap();
+    while head.batch_nonce() <= nonce {
+        let current = head.batch_nonce();
         let dump_name = if current == nonce {
             name.to_owned()
         } else {
             format!("intermediate-{current}")
         };
         let prefix = write_state(dir, &dump_name, bytes, current + 1);
-        let safe_block = head.safe_block;
         storage
             .close_frame_and_batch_with_snapshot(
                 &mut head,
-                safe_block,
                 &prefix,
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .unwrap();
     }
-    storage.latest_snapshot().unwrap().unwrap().dump.id
+    storage.latest_snapshot().unwrap().unwrap().id
+}
+
+/// The response's `X-` headers, sorted: the claim travels in the era and the
+/// count, and nothing else names the history.
+fn history_headers(response: &reqwest::Response) -> Vec<&str> {
+    let mut names: Vec<_> = response
+        .headers()
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with("x-"))
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 fn archive_state(bytes: &[u8]) -> Vec<u8> {
@@ -105,11 +113,11 @@ fn archive_state(bytes: &[u8]) -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_block_divergence_refuses_every_finalized_endpoint() {
-    use crate::storage::test_helpers::{default_protocol_timing, local_batch_payload};
-    use crate::storage::{ExecutedInputCount, SafeInputRange, StoredSafeInput};
+    use crate::storage::test_helpers::local_batch_payload;
+    use crate::storage::{L2TxCount, SafeInputRange, StoredSafeInput};
     use crate::test_support::pin_test_deployment_identity;
     use sequencer_core::batch::{Batch, Frame};
-    use sequencer_core::scheduler::{Scheduler, SchedulerConfig, SchedulerInput};
+    use sequencer_core::scheduler::{CanonicalRunner, L1Input, SchedulerConfig};
     use ssz::Encode;
 
     let db = temp_db("same-block-divergence-http");
@@ -122,7 +130,7 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
         .unwrap();
     let prefix = write_state(root.path(), "local", b"local checkpoint", 1);
     storage
-        .close_frame_and_batch_with_snapshot(&mut head, 5, &prefix, ExecutedInputCount::ZERO)
+        .close_frame_and_batch_with_snapshot(&mut head, &prefix, L2TxCount::ZERO)
         .unwrap();
     let snapshot = storage.latest_snapshot().unwrap().unwrap();
     let inputs = vec![
@@ -150,28 +158,33 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
             block_number: 10,
         },
     ];
-    storage
-        .append_safe_inputs(10, &inputs, submitter, &default_protocol_timing())
-        .unwrap();
+    storage.append_safe_inputs(10, &inputs, submitter).unwrap();
     assert!(storage.canonical_divergence().unwrap().is_some());
 
     // The foreign batch consumes the next nonce and drains a direct that the
     // matching local batch did not: its snapshot is not the end of block 10.
-    let mut canonical = Scheduler::new(WalletApp::default(), SchedulerConfig::new(submitter));
-    for input in inputs {
+    let mut canonical = CanonicalRunner::genesis(
+        WalletApp::default(),
+        SchedulerConfig::for_application::<WalletApp>(submitter),
+    );
+    for (index, input) in (0_u64..).zip(inputs) {
         canonical
-            .process_input(SchedulerInput {
+            .process_input(L1Input {
+                index,
                 sender: input.sender,
+                block: input.block_number,
+                timestamp: 0,
+                chain_id: 1,
+                app_contract: alloy_primitives::Address::ZERO,
                 payload: input.payload,
-                inclusion_block: input.block_number,
-                domain: sequencer_core::build_input_domain(1, alloy_primitives::Address::ZERO),
             })
             .unwrap();
     }
-    let (app, nonce) = canonical.finish();
-    assert_eq!(nonce, 2);
-    assert_eq!(app.executed_input_count().get(), 1);
-    assert_eq!(snapshot.executed_input_count, ExecutedInputCount::ZERO);
+    let export = canonical.export();
+    assert_eq!(export.next_batch_nonce, 2);
+    assert_eq!(export.l2_tx_count, 1);
+    assert_eq!(export.fridge_len, 0);
+    assert_eq!(snapshot.l2_tx_count, L2TxCount::ZERO);
 
     let server = TestServer::start(&db.path).await;
     let client = reqwest::Client::new();
@@ -195,90 +208,25 @@ async fn same_block_divergence_refuses_every_finalized_endpoint() {
             response.json::<serde_json::Value>().await.unwrap()["code"],
             "UNAVAILABLE"
         );
-        assert_eq!(storage.dump_lease_count(snapshot.dump.id).unwrap(), Some(0));
+        assert_eq!(lease_count(&server, snapshot.id), 0);
     }
 }
 
-/// Transient WAL lock contention vs. a real read failure.
-///
-/// SQLite readers can see `SQLITE_BUSY` in WAL mode during last-connection
-/// cleanup / checkpoint (see
-/// <https://sqlite.org/wal.html#sometimes_queries_return_sqlite_busy_in_wal_mode>).
-/// Production RO opens use a 50ms `busy_timeout` by design; tests must retry
-/// that case rather than `.expect` through it. Non-lock failures are preserved
-/// so diagnostics are not swallowed.
-enum LeaseReadError {
-    Busy,
-    Other(String),
+/// The server's lease count on one snapshot; a missing entry counts as zero.
+fn lease_count(server: &TestServer, snapshot_id: i64) -> u32 {
+    server.snapshot_leases.count(snapshot_id).unwrap_or(0)
 }
 
-impl std::fmt::Display for LeaseReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Busy => write!(f, "database busy"),
-            Self::Other(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-fn sqlite_is_lock_contention(err: &rusqlite::Error) -> bool {
-    matches!(
-        err.sqlite_error_code(),
-        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-    )
-}
-
-fn open_is_lock_contention(err: &sequencer::storage::StorageOpenError) -> bool {
-    match err {
-        sequencer::storage::StorageOpenError::Sqlite(e) => sqlite_is_lock_contention(e),
-        _ => false,
-    }
-}
-
-fn try_lease_count(db_path: &str, dump_id: i64) -> Result<i64, LeaseReadError> {
-    let mut storage = match Storage::open_read_only(db_path) {
-        Ok(storage) => storage,
-        Err(err) if open_is_lock_contention(&err) => return Err(LeaseReadError::Busy),
-        Err(err) => return Err(LeaseReadError::Other(err.to_string())),
-    };
-    match storage.dump_lease_count(dump_id) {
-        Ok(n) => Ok(n.unwrap_or(0)),
-        Err(err) if sqlite_is_lock_contention(&err) => Err(LeaseReadError::Busy),
-        Err(err) => Err(LeaseReadError::Other(err.to_string())),
-    }
-}
-
-fn lease_count(db_path: &str, dump_id: i64) -> i64 {
-    for _ in 0..50 {
-        match try_lease_count(db_path, dump_id) {
-            Ok(n) => return n,
-            Err(LeaseReadError::Busy) => std::thread::sleep(Duration::from_millis(10)),
-            Err(err) => panic!("read lease: {err}"),
-        }
-    }
-    match try_lease_count(db_path, dump_id) {
-        Ok(n) => n,
-        Err(err) => panic!("read lease: {err}"),
-    }
-}
-
-async fn wait_for_lease(db_path: &str, dump_id: i64, want: i64) -> bool {
+/// The server drops a body, and its lease, after the client's last read.
+async fn wait_for_lease(server: &TestServer, snapshot_id: i64, want: u32) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
-        match try_lease_count(db_path, dump_id) {
-            Ok(got) if got == want => return true,
-            // Still waiting for the drop-guard release, or transient WAL
-            // cleanup busy — keep polling.
-            Ok(_) | Err(LeaseReadError::Busy) => {}
-            Err(err) => panic!("read lease: {err}"),
+        if lease_count(server, snapshot_id) == want {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    match try_lease_count(db_path, dump_id) {
-        Ok(got) => got == want,
-        Err(LeaseReadError::Busy) => false,
-        Err(err) => panic!("read lease: {err}"),
-    }
+    lease_count(server, snapshot_id) == want
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,7 +234,7 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     let db = temp_db("snap-finalized-roundtrip");
     let dir = tempfile::tempdir().expect("dumps dir");
     let state = b"the-canonical-finalized-state".to_vec();
-    let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", &state, 4242);
+    let snapshot_id = register_accepted(db.path.as_str(), dir.path(), "fin", &state, 4242);
     let server = TestServer::start(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
@@ -299,7 +247,14 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     assert_eq!(resp.headers()["x-inclusion-block"], "4242");
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        [
+            "x-executed-input-count",
+            "x-history-era",
+            "x-inclusion-block"
+        ]
+    );
     assert_eq!(resp.headers()["etag"], "\"block-4242\"");
     let body = resp.bytes().await.expect("body");
     assert_eq!(
@@ -309,7 +264,7 @@ async fn finalized_state_round_trips_bytes_and_headers() {
     );
 
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 0).await,
+        wait_for_lease(&server, snapshot_id, 0).await,
         "lease released after the stream completed"
     );
 }
@@ -359,7 +314,7 @@ async fn endpoints_404_when_no_finalized_snapshot() {
 async fn finalized_state_if_none_match_returns_304() {
     let db = temp_db("snap-etag");
     let dir = tempfile::tempdir().expect("dumps dir");
-    let dump_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"abc", 500);
+    let snapshot_id = register_accepted(db.path.as_str(), dir.path(), "fin", b"abc", 500);
     let server = TestServer::start(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
@@ -373,7 +328,7 @@ async fn finalized_state_if_none_match_returns_304() {
     assert!(body.is_empty(), "304 has no body");
 
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 0).await,
+        wait_for_lease(&server, snapshot_id, 0).await,
         "the briefly-held lease is released even on a 304"
     );
 }
@@ -392,7 +347,10 @@ async fn latest_snapshot_prefers_newest_valid_batch() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        ["x-executed-input-count", "x-history-era"]
+    );
     let body = resp.bytes().await.expect("body");
     assert_eq!(
         archive_state(body.as_ref()).as_slice(),
@@ -400,7 +358,7 @@ async fn latest_snapshot_prefers_newest_valid_batch() {
         "serves the latest pending, not the finalized fallback"
     );
 
-    assert!(wait_for_lease(db.path.as_str(), pending_id, 0).await);
+    assert!(wait_for_lease(&server, pending_id, 0).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -408,7 +366,7 @@ async fn finalized_state_streams_large_file() {
     let db = temp_db("snap-large");
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0x5Au8; 8 * 1024 * 1024];
-    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
+    let snapshot_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
     let server = TestServer::start(db.path.as_str()).await;
 
     let resp = reqwest::get(server.url("/finalized_state"))
@@ -419,7 +377,7 @@ async fn finalized_state_streams_large_file() {
     assert_eq!(body.len(), big.len(), "full large file streamed");
     assert_eq!(body.as_ref(), big.as_slice());
 
-    assert!(wait_for_lease(db.path.as_str(), dump_id, 0).await);
+    assert!(wait_for_lease(&server, snapshot_id, 0).await);
 }
 
 /// The test that justifies the drop-guard: a client that disconnects
@@ -433,7 +391,7 @@ async fn finalized_state_disconnect_mid_stream_releases_lease() {
     // 8 MiB so the body is still streaming (not fully in the socket buffer)
     // when we disconnect.
     let big = vec![0xABu8; 8 * 1024 * 1024];
-    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 7);
+    let snapshot_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 7);
     let server = TestServer::start(db.path.as_str()).await;
 
     let resp = reqwest::Client::new()
@@ -444,7 +402,7 @@ async fn finalized_state_disconnect_mid_stream_releases_lease() {
     assert_eq!(resp.status().as_u16(), 200);
     // Lease is held for the duration of the stream (X semantics).
     assert_eq!(
-        lease_count(db.path.as_str(), dump_id),
+        lease_count(&server, snapshot_id),
         1,
         "lease held while streaming"
     );
@@ -459,9 +417,9 @@ async fn finalized_state_disconnect_mid_stream_releases_lease() {
     drop(stream);
 
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 0).await,
+        wait_for_lease(&server, snapshot_id, 0).await,
         "drop-guard must release the lease on disconnect (still {})",
-        lease_count(db.path.as_str(), dump_id)
+        lease_count(&server, snapshot_id)
     );
 }
 
@@ -470,7 +428,7 @@ async fn finalized_state_concurrent_streams_count_and_release_independently() {
     let db = temp_db("snap-concurrent");
     let dir = tempfile::tempdir().expect("dumps dir");
     let big = vec![0xCDu8; 8 * 1024 * 1024];
-    let dump_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
+    let snapshot_id = register_accepted(db.path.as_str(), dir.path(), "big", &big, 1);
     let server = TestServer::start(db.path.as_str()).await;
 
     // Two concurrent readers of the same finalized dump.
@@ -493,19 +451,19 @@ async fn finalized_state_concurrent_streams_count_and_release_independently() {
     s2.next().await.expect("chunk 2").expect("ok");
 
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 2).await,
-        "two live streams hold lease_count == 2 (got {})",
-        lease_count(db.path.as_str(), dump_id)
+        wait_for_lease(&server, snapshot_id, 2).await,
+        "two live streams hold two leases (got {})",
+        lease_count(&server, snapshot_id)
     );
 
     drop(s1);
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 1).await,
+        wait_for_lease(&server, snapshot_id, 1).await,
         "dropping one stream steps the lease down to 1"
     );
     drop(s2);
     assert!(
-        wait_for_lease(db.path.as_str(), dump_id, 0).await,
+        wait_for_lease(&server, snapshot_id, 0).await,
         "dropping the second steps it to 0"
     );
 }
@@ -527,32 +485,39 @@ async fn live_stream_blocks_gc_until_it_drops() {
     assert_eq!(resp.status().as_u16(), 200);
     let mut stream = resp.bytes_stream();
     stream.next().await.expect("chunk").expect("ok");
-    assert!(wait_for_lease(db.path.as_str(), served_id, 1).await);
+    assert!(wait_for_lease(&server, served_id, 1).await);
 
     // Acceptance advances independently of the lane's L1 reconciliation.
     register_accepted(db.path.as_str(), dir.path(), "new", b"new-finalized", 2);
 
-    // GC must skip the superseded dump while the stream holds its lease.
+    // GC, sharing the server's registry, must skip the superseded snapshot
+    // while the stream holds its lease.
+    let served = dir.path().join("served");
     let removed = {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
-        storage.gc_unreferenced_dumps().expect("gc")
+        storage
+            .collect_snapshots(&server.snapshot_leases)
+            .expect("gc")
     };
     assert!(
-        !removed.iter().any(|row| row.id == served_id),
-        "live stream's lease must block GC of the superseded dump"
+        !removed.contains(&served),
+        "live stream's lease must block GC of the superseded snapshot"
     );
-    assert_eq!(lease_count(db.path.as_str(), served_id), 1, "still leased");
+    assert_eq!(lease_count(&server, served_id), 1, "still leased");
 
     // Drop the stream → lease released → the next GC reaps it.
     drop(stream);
-    assert!(wait_for_lease(db.path.as_str(), served_id, 0).await);
+    assert!(wait_for_lease(&server, served_id, 0).await);
     let removed_after = {
         let mut storage = Storage::open(db.path.as_str()).expect("open");
-        storage.gc_unreferenced_dumps().expect("gc")
+        storage
+            .collect_snapshots(&server.snapshot_leases)
+            .expect("gc")
     };
-    assert!(
-        removed_after.iter().any(|row| row.id == served_id),
-        "GC reaps the dump once the stream releases its lease"
+    assert_eq!(
+        removed_after,
+        vec![served],
+        "GC reaps the snapshot once the stream releases its lease"
     );
 }
 
@@ -593,7 +558,10 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.headers()["x-executed-input-count"], "0");
     assert!(resp.headers().contains_key("x-history-era"));
-    assert_eq!(resp.headers()["x-recovery-generation"], "0");
+    assert_eq!(
+        history_headers(&resp),
+        ["x-executed-input-count", "x-history-era"]
+    );
     let body = resp.bytes().await.expect("body");
     assert_eq!(
         archive_state(body.as_ref()).as_slice(),
@@ -601,7 +569,7 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
         "restores finalized artifact"
     );
 
-    assert!(wait_for_lease(db.path.as_str(), fin_id, 0).await);
+    assert!(wait_for_lease(&server, fin_id, 0).await);
 }
 
 /// Each route answers only on its own listener: a wrong-method probe gets 405
@@ -609,10 +577,9 @@ async fn latest_snapshot_restores_accepted_batch_when_it_is_newest() {
 /// handler's state.
 #[tokio::test]
 async fn every_route_is_served_on_exactly_its_own_listener() {
-    const INTERNAL_ROUTES: [&str; 11] = [
+    const INTERNAL_ROUTES: [&str; 10] = [
         "/ws/subscribe",
         "/history",
-        "/historical-l1-inputs",
         "/finalized_state",
         "/finalized_state/inclusion_block",
         "/finalized_state/digest",
@@ -736,7 +703,7 @@ async fn cors_permits_browser_preflight_on_fee() {
 async fn cors_is_limited_to_ingress_and_covers_rejections() {
     let db = temp_db("cors-route-scope");
     let dumps = tempfile::tempdir().expect("snapshot directory");
-    let dump_id = register_accepted(&db.path, dumps.path(), "finalized", b"canonical", 1);
+    let snapshot_id = register_accepted(&db.path, dumps.path(), "finalized", b"canonical", 1);
     let server = TestServer::start(db.path.as_str()).await;
     let client = reqwest::Client::new();
     let rejected = client
@@ -797,7 +764,7 @@ async fn cors_is_limited_to_ingress_and_covers_rejections() {
         assert!(response.status().is_success());
         let _ = response.bytes().await.expect("response body");
     }
-    assert!(wait_for_lease(&db.path, dump_id, 0).await);
+    assert!(wait_for_lease(&server, snapshot_id, 0).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -823,7 +790,7 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
         .unpack(restored_dir.path())
         .unwrap();
     let restored = WalletApp::from_dump(&dump_info::app_prefix(restored_dir.path())).unwrap();
-    assert_eq!(restored.executed_input_count(), claim.next_input);
+    assert_eq!(restored.l2_tx_count(), claim.next_input);
     assert!(!restored_dir.path().join("checkpoint.toml").exists());
     let mut stream = client.subscribe(claim).await.unwrap();
     stream.close(None).await.unwrap();
@@ -832,6 +799,18 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
         .await
         .unwrap();
     assert_eq!(export.headers()["x-inclusion-block"], "1");
+    assert_eq!(
+        history_headers(&export),
+        [
+            "x-executed-input-count",
+            "x-history-era",
+            "x-inclusion-block"
+        ]
+    );
+    assert_eq!(
+        export.headers()["x-history-era"].to_str().unwrap(),
+        claim.era_id.to_string()
+    );
     let export_dir = tempfile::tempdir().unwrap();
     tar::Archive::new(export.bytes().await.unwrap().as_ref())
         .unpack(export_dir.path())
@@ -845,11 +824,11 @@ async fn sdk_snapshot_restores_application_and_recovery_export_is_self_contained
             .next_batch_nonce,
         receipt.next_batch_nonce
     );
+    let exported = WalletApp::from_dump(&dump_info::app_prefix(export_dir.path())).unwrap();
+    assert_eq!(exported.l2_tx_count(), app.l2_tx_count());
     assert_eq!(
-        WalletApp::from_dump(&dump_info::app_prefix(export_dir.path()))
-            .unwrap()
-            .progress(),
-        app.progress()
+        exported.canonical_snapshot_bytes().unwrap(),
+        app.canonical_snapshot_bytes().unwrap()
     );
     assert!(
         !dir.path().join("accepted/checkpoint.toml").exists(),
@@ -866,10 +845,10 @@ async fn archive_disconnect_releases_both_stream_and_producer_lease_owners() {
     let response = reqwest::get(server.url("/latest_snapshot")).await.unwrap();
     let mut stream = response.bytes_stream();
     stream.next().await.unwrap().unwrap();
-    assert!(wait_for_lease(&db.path, id, 1).await);
+    assert!(wait_for_lease(&server, id, 1).await);
     drop(stream);
     assert!(
-        wait_for_lease(&db.path, id, 0).await,
+        wait_for_lease(&server, id, 0).await,
         "disconnected archive producer must terminate and release its lease"
     );
 }

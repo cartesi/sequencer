@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::storage::SnapshotLeases;
+
 const DEFAULT_MAX_USER_OPS_PER_CHUNK: usize = 64;
 const DEFAULT_SAFE_INPUT_BUFFER_CAPACITY: usize = 2048;
 const DEFAULT_MAX_BATCH_OPEN: Duration = Duration::from_secs(2 * 60 * 60);
@@ -22,6 +24,9 @@ pub struct InclusionLaneConfig {
     /// lives in its own unique subdirectory of this path. The runtime
     /// sets this to `{data_dir}/dumps/`.
     pub dumps_dir: PathBuf,
+    /// The download leases `run` shares with egress; the lane's GC skips
+    /// leased snapshots.
+    pub snapshot_leases: SnapshotLeases,
     /// Cap on user ops dequeued per chunk. Bounds per-chunk SQL transaction
     /// size and (more importantly) ack latency for the first op in each chunk.
     pub max_user_ops_per_chunk: usize,
@@ -39,9 +44,10 @@ pub struct InclusionLaneConfig {
 }
 
 impl InclusionLaneConfig {
-    pub fn new(dumps_dir: PathBuf) -> Self {
+    pub fn new(dumps_dir: PathBuf, snapshot_leases: SnapshotLeases) -> Self {
         Self {
             dumps_dir,
+            snapshot_leases,
             max_user_ops_per_chunk: DEFAULT_MAX_USER_OPS_PER_CHUNK,
             safe_input_buffer_capacity: DEFAULT_SAFE_INPUT_BUFFER_CAPACITY,
             max_batch_open: DEFAULT_MAX_BATCH_OPEN,

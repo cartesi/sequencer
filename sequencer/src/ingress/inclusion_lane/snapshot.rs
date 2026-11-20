@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::dump_info::{self, DumpInfo};
-use crate::storage::{Storage, WriteHead};
+use crate::storage::{SnapshotLeases, Storage, WriteHead};
 use sequencer_core::application::Application;
 
 #[derive(Debug, thiserror::Error)]
@@ -25,11 +25,11 @@ pub enum GcError {
     Storage(#[from] rusqlite::Error),
 }
 
-pub(super) fn run_gc(storage: &mut Storage) -> Result<usize, GcError> {
-    let removed = storage.gc_unreferenced_dumps()?;
-    for row in &removed {
-        if let Err(err) = dump_info::delete_dump_dir(&row.prefix) {
-            tracing::warn!(error = %err, prefix = ?row.prefix,
+pub(super) fn run_gc(storage: &mut Storage, leases: &SnapshotLeases) -> Result<usize, GcError> {
+    let removed = storage.collect_snapshots(leases)?;
+    for prefix in &removed {
+        if let Err(err) = dump_info::delete_dump_dir(prefix) {
+            tracing::warn!(error = %err, ?prefix,
                 "GC: filesystem delete failed; orphan left for next startup sweep");
         }
     }
@@ -46,33 +46,24 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
     app: &mut A,
     storage: &mut Storage,
     head: &mut WriteHead,
-    next_safe_block: u64,
     dumps_dir: &Path,
 ) -> Result<(), TakeDumpError> {
-    let batch_index = head.batch_index;
-    let nonce = storage.batch_nonce(batch_index)?;
+    let nonce = head.batch_nonce();
     let dump_dir = make_dump_dir(dumps_dir, nonce);
     let started = Instant::now();
     dump_info::create_dump_dir_with_info(app, &dump_dir, &DumpInfo::at_batch_close(nonce))?;
     let snapshot_elapsed = started.elapsed();
-    storage.close_frame_and_batch_with_snapshot(
-        head,
-        next_safe_block,
-        &dump_dir,
-        app.executed_input_count(),
-    )?;
+    storage.close_frame_and_batch_with_snapshot(head, &dump_dir, app.l2_tx_count())?;
     let snapshot_ms = snapshot_elapsed.as_millis();
     if snapshot_elapsed >= SLOW_SNAPSHOT {
         tracing::warn!(
-            batch_index,
-            nonce,
+            batch_nonce = nonce,
             snapshot_ms,
             "slow batch-close snapshot blocked user-op admission"
         );
     } else {
         tracing::debug!(
-            batch_index,
-            nonce,
+            batch_nonce = nonce,
             snapshot_ms,
             "batch closed with snapshot"
         );
@@ -82,7 +73,7 @@ pub(super) fn close_batch_with_snapshot<A: Application>(
 
 fn make_dump_dir(dumps_dir: &Path, nonce: u64) -> PathBuf {
     // Unique per call within a process: nonce + nanos + atomic counter.
-    // Nonces can be reused across recovery cascades, so they alone
+    // Several dumps can carry one nonce, so it alone
     // don't guarantee uniqueness; the nanos+counter pair does. The name
     // is opaque — checkpoint metadata lives in the dir's `info.toml`,
     // never in the path.

@@ -1,8 +1,11 @@
 # Cartesi Machine Facts We Rely On
 
 The canonical application runs inside the Cartesi Machine (CM). The watchdog
-drives it, the canonical guest is built for it, and cockroach recovery exports
-from it. This page records the CM behavior those components depend on,
+drives it, the canonical guest is built for it, and setup reads a base
+machine's `state` and `scheduler` inspect reports when it rebuilds from one
+([cockroach recovery](recovery/cockroach.md);
+[reading a stored machine's export](#reading-a-stored-machines-export)).
+This page records the CM behavior those components depend on,
 especially behavior that is easy to assume wrongly. Everything here holds for
 the pinned version (`CARTESI_MACHINE_VERSION` in
 [`toolchain-pins.env`](../toolchain-pins.env), currently v0.22.0) and was
@@ -70,12 +73,12 @@ not:
 The checkout path does not enter the hash, and `just canonical-print-build-hashes`
 prints all four inputs to compare; compare cold builds, since a warm `target/`
 can hold crates compiled before `rust-src` arrived. A move that is meant to preserve behavior is
-checked against [`tests/fixtures/consensus_vectors_v1.json`](../tests/fixtures/consensus_vectors_v1.json),
+checked against [`tests/fixtures/consensus_vectors_v2.json`](../tests/fixtures/consensus_vectors_v2.json),
 which pins the consensus bytes (EIP-712 hashes, signature recovery, SSZ, fee
-table, output payloads) natively and, through `canonical-test`'s golden cases,
-in the built image, where each signature variant is checked for running as the
-signer or not. The fixture is never regenerated: a mismatch is a behavior
-change to explain. A release that moves the hash says so, and deployed
+table, output payloads) natively, and whose guest scenarios `canonical-test`'s
+golden cases replay in the built image, comparing every output and inspect
+report ([conformance](protocol/scheduler-semantics.md#conformance)). The
+fixture is never regenerated: a mismatch is a behavior change to explain. A release that moves the hash says so, and deployed
 applications keep their old image, which the watchdog checks against the
 on-chain hash.
 
@@ -165,6 +168,21 @@ a cheaper throughput flood breaks Dave settlement first, so the gap is
 accepted on cost; revisit it before deploying on a cheap L2, where such floods
 cost about a thousand times less.
 
+An epoch's inputs are an InputBox index range, not a block range.
+`DaveConsensus` seals each epoch at the input count read in the transaction
+that seals it (its constructor for epoch 0, `acceptStagedTournamentResult` for
+every later one), so an epoch can end inside an L1 block. The last finalized
+machine, whose root `getLastFinalizedMachineMerkleRoot` returns (zero before
+the first acceptance), has consumed exactly the inputs below the current sealed
+epoch's `inputIndexLowerBound`, read when the previous epoch was sealed. Take
+that position from the chain. The machine keeps only the last input it took,
+in the receive buffer ([the guest side](#the-guest-side)), so for a guest that
+never rejects, as ours (a batch the scheduler drops is still accepted), that
+input's `index` plus one cross-checks the position. After an `RX_REJECTED`
+input or at a fixed point the buffer lags, and no root locates a state either,
+since both repeat roots. Sling keeps only the newest finalized machine, ingests
+only L1-finalized blocks, and serves stored machines only as files.
+
 ## Storage, sharing, and snapshots
 
 - **Loading** defaults to `SHARING_NONE`: every backing file is mapped
@@ -204,6 +222,53 @@ Every revert in that run restored exactly the recorded pre-input root hash. On
 a filesystem without reflinks, each clone is a full sparse copy of the
 machine.
 
+## Reading a stored machine's export
+
+Setup reads a base through `sequencer::machine::read_machine_export`
+([`sequencer/src/machine.rs`](../sequencer/src/machine.rs)), which links the
+emulator through the same `cartesi-machine` bindings as `sdk/guest/testsi`.
+`canonical-test`'s `export` cases run it against the built image and against
+a machine advanced and stored by testsi.
+
+- **Load privately, and the directory stays as it was.** `Machine::load` is
+  `SHARING_NONE`: the queries run on a copy-on-write image in memory, which is
+  dropped. A machine that another process runs in place (`SHARING_ALL`, as
+  sling does) holds an exclusive lock and cannot be loaded meanwhile; read a
+  clone.
+- **A stored machine is between inputs only at an `RX_ACCEPTED` manual
+  yield.** The image recipe stores one there, and so does a node; not every
+  machine the watchdog stores does
+  ([which ones](watchdog/README.md#machines-a-recovery-can-start-from)). Check it as
+  the step does (`iflags.H`, `iflags.Y`, then tohost's device, command and
+  reason) before sending anything.
+- **What to send.** An inspect is `send_cmio_response` with the
+  inspect-state reason, the query bytes, and no revert root hash: the
+  emulator refuses one on any response but an advance. An undeliverable
+  response is a silent no-op, so check that `iflags.Y` cleared.
+- **What the machine yields.** Each report is an automatic `TX_REPORT`
+  yield, and `run` returns at each one; the next `run` resumes. The guest
+  then ends at `RX_ACCEPTED` again, so one load answers both queries in turn.
+  The query moves the in-memory root hash (the RX buffer now holds it), which
+  matters only to a host that keeps the machine. Our guest answers each query
+  with exactly one report; it emits no outputs and never rejects.
+- **The bindings panic on some yields.** `receive_cmio_request` panics on an
+  automatic yield with an unknown reason, so classify a yield from the tohost
+  registers first and read its data only for a report or an exception.
+- **The loader bounds each query itself.** It runs to a fixed mcycle target,
+  2^36 cycles past the query, and fails there, so a guest that never answers
+  fails setup instead of hanging it.
+- **A report is at most 2 MiB.** libcmt copies a report's bytes raw into the
+  TX buffer (2^21 bytes) and refuses a longer one with `-ENOBUFS`; the guest
+  halts on that error, so the loader sees a halt, not a state. The wallet's
+  `state` report holds 52 bytes per balance and 24 per nonce, so it fits up
+  to roughly 27,000 accounts that have both. A larger application state
+  needs another state source, such as a labeled memory range read with
+  `read_memory` ([memory ranges](#memory-ranges-for-application-state)), or a
+  guest that splits its answer over several reports.
+- **The `state` report is whatever the guest answered.** A guest whose
+  encode fails answers `inspect failed: …` instead, which the loader writes
+  as the state; the application's `from_canonical_state` refuses those bytes.
+
 ## Memory ranges for application state
 
 An application can keep canonical state in a labeled memory range instead of
@@ -242,6 +307,11 @@ answering an inspect query:
   rootfs. Without `xhalt`, a failing entrypoint halts with payload 0. The
   watchdog test guest ships musl stand-ins for both; the canonical wallet image
   does not, so its panics halt with exit code 0.
+- **The canonical guest answers two inspect queries.** `state` (or an empty
+  query) reports the application's comparison bytes, and `scheduler` reports
+  the scheduler's export: six little-endian `u64` (`SchedulerExport` in
+  [`sequencer-core/src/scheduler/mod.rs`](../sequencer-core/src/scheduler/mod.rs)).
+  Any other query gets the report `unsupported inspect query`, not a halt.
 - **trolley has no exception call.** A guest that must raise a CMIO exception
   does it through `libcmt-sys` directly (see `watchdog/test-guest`).
 - **The last input stays in the machine.** The CMIO receive buffer keeps it,
@@ -261,6 +331,18 @@ answering an inspect query:
   ceil_log2(length))` returns a range's Merkle root at the cost of rehashing
   dirty pages only, and `get_proof` ties it to the machine root hash. Any party
   comparing against that root must reproduce the same tree.
+- Loading a stored machine takes its root hash from the stored hash tree
+  (`hash_tree.sht` and each range's `.dht`), rehashing only pages marked
+  dirty; the load checks only the sparse tree's shape. A root that matches an
+  on-chain hash therefore authenticates a stored machine only from a source we
+  trust.
+- `verify_hash_tree` compares each page not marked dirty with its hash in the
+  range's `.dht` and recomputes nothing above the page: it catches a page
+  changed under a tree that holds it clean, such as in a corrupt copy, but not
+  hash files rewritten to match. In v0.22.0 it serves the emulator's internal
+  tests, is unoptimized, and the emulator team asked that nothing call it, so
+  Dave's node keeps its own check disabled (Dave's `docs/todo.md`). An
+  upcoming release brings a mechanism to verify an untrusted load.
 
 ## The CLI as a test oracle
 

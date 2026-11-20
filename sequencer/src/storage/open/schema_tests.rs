@@ -2,44 +2,58 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 //! Schema-invariant regression tests: the triggers, CHECKs and partial unique
-//! indexes in `migrations/0001_schema.sql` enforce the batch-tree invariants, and
+//! indexes in `migrations/0001_schema.sql` enforce the batch invariants, and
 //! each test pins one tripwire.
 
 use rusqlite::params;
 
 use super::super::test_helpers::{
-    RecoveryFixture, SENDER_A, SENDER_B, default_protocol_timing, local_batch_payload,
-    open_temp_storage, temp_db_with_default_deployment_identity as temp_db,
+    LandingFixture, SENDER_A, SENDER_B, open_temp_storage, set_up_storage,
 };
 use crate::storage::{SafeInputRange, Storage, StoredSafeInput};
 
+const NONCE_RULE: &str = "a batch nonce is the last nonce + 1, or the era anchor";
+const LIFECYCLE_RULE: &str =
+    "a batch changes only by sealing once with its hash, or by being accepted once while sealed";
+const ACCEPTANCE_RULE: &str = "an acceptance extends the accepted prefix of the batches";
+const NOT_DELETABLE_RULE: &str = "batches are retained for the database lifetime";
+const FROZEN_RULE: &str = "batch list frozen: canonical divergence marker present";
+
+fn assert_refused(storage: &Storage, sql: &str, message: &str) {
+    let err = storage.conn.execute(sql, []);
+    assert!(
+        format!("{err:?}").contains(message),
+        "`{sql}` must abort with {message:?}, got: {err:?}"
+    );
+}
+
 #[test]
-fn schema_rejects_second_valid_tip() {
-    // The partial unique index `ux_single_valid_tip` catches a writer that
+fn schema_rejects_a_second_open_batch() {
+    // The partial unique index `ux_single_open_batch` catches a writer that
     // opens a new Tip without sealing the old one first.
     let (_db, mut storage) = open_temp_storage("schema-second-tip");
     storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
 
-    // Try to bypass the lane and insert a second valid Tip directly.
+    // Try to bypass the lane and insert a second open batch directly, at the
+    // right nonce so only the Tip index can refuse it.
     let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-         VALUES (99, 0, 1, 1000)",
+        "INSERT INTO batches (nonce, created_at_ms) VALUES (1, 1000)",
         [],
     );
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("UNIQUE constraint failed") && msg.contains("ux_single_valid_tip"),
-        "expected ux_single_valid_tip violation, got: {msg}"
+        msg.contains("UNIQUE constraint failed") && msg.contains("ux_single_open_batch"),
+        "expected ux_single_open_batch violation, got: {msg}"
     );
 }
 
 #[test]
-fn schema_rejects_bad_nonce_contiguity() {
-    // Nonce must equal parent.nonce + 1 — trigger enforces it.
-    // Insert the bad-nonce batch as already-sealed so it doesn't collide
-    // with the existing Tip on `ux_single_valid_tip`.
+fn schema_rejects_a_wrong_batch_nonce() {
+    // A new batch carries the last nonce + 1. Insert the candidate batches
+    // as already sealed so they don't collide with the Tip on
+    // `ux_single_open_batch`.
     let (_db, mut storage) = open_temp_storage("schema-bad-nonce");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -47,182 +61,457 @@ fn schema_rejects_bad_nonce_contiguity() {
     storage
         .close_batch_at(&mut head, 0)
         .expect("close batch 0; batch 1 is now Tip");
-    // Batch 1 has nonce 1 (0 + 1). Insert child with nonce 99 (should be 2).
-    let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-         VALUES (999, 1, 99, \
-                 (SELECT created_at_ms FROM batches WHERE batch_index = 1), \
-                 (SELECT created_at_ms FROM batches WHERE batch_index = 1))",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("batch nonce must equal parent.nonce + 1"),
-        "expected nonce trigger, got: {err:?}"
-    );
+    // Batch 1 has nonce 1, so the next is 2: a gap, a repeat and an earlier
+    // nonce are refused.
+    for nonce in [99, 3, 1, 0] {
+        assert_refused(
+            &storage,
+            &format!(
+                "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, \
+                 payload_hash) VALUES ({nonce}, 100, 100, zeroblob(32))"
+            ),
+            NONCE_RULE,
+        );
+    }
+    storage
+        .conn
+        .execute(
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (2, 100, 100, zeroblob(32))",
+            [],
+        )
+        .expect("the batch after nonce 1 carries nonce 2");
+}
+
+#[test]
+fn schema_rejects_a_batch_before_the_era_exists() {
+    // With no batch and no era both sides of the COALESCE are NULL,
+    // `IS NOT` holds, and every insert ABORTs, whatever its nonce.
+    let db = crate::test_support::temp_db("schema-batch-without-era");
+    let storage =
+        Storage::initialize_for_command(db.path.as_str(), crate::storage::LifecycleCommand::Setup)
+            .expect("setup schema, no era");
+    for nonce in [0, 7] {
+        assert_refused(
+            &storage,
+            &format!("INSERT INTO batches (nonce, created_at_ms) VALUES ({nonce}, 100)"),
+            NONCE_RULE,
+        );
+    }
 }
 
 #[test]
 fn schema_rejects_genesis_with_nonzero_nonce() {
-    // Default anchor is 0, so a parentless root at a non-zero nonce ABORTs
-    // (genesis must be 0) — the exact-match form of the contiguity rule.
+    // The genesis era's anchor is 0, so a first batch at a non-zero nonce
+    // ABORTs.
     let (_db, storage) = open_temp_storage("schema-genesis-nonzero");
-    let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-         VALUES (0, NULL, 7, 100)",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("parentless root must carry the batch-tree anchor nonce"),
-        "expected anchor-nonce trigger, got: {err:?}"
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms) VALUES (7, 100)",
+        NONCE_RULE,
     );
 }
 
 #[test]
-fn schema_allows_parentless_root_at_anchor_nonce() {
-    // With the anchor set to N' (a recovered deployment), a parentless root
-    // at N' is permitted — the recovery generalization of "genesis at 0".
-    // (Rows are inserted sealed so the single-Tip partial index, which only
-    // covers open rows, doesn't mask the contiguity trigger under test.)
-    let db = temp_db("schema-anchor-root");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    storage
-        .conn
-        .execute(
-            "UPDATE batch_tree_anchor SET nonce = 42 WHERE singleton_id = 0",
-            [],
-        )
-        .expect("set anchor");
-    // A root at the anchor nonce (42) is accepted...
-    storage
-        .conn
-        .execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (0, NULL, 42, 100, 100)",
-            [],
-        )
-        .expect("parentless root at the anchor nonce is allowed");
-    // ...but a root at 0 ABORTs: the rule is an exact match against the anchor.
-    let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-         VALUES (1, NULL, 0, 100, 100)",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("parentless root must carry the batch-tree anchor nonce"),
-        "a root at the wrong nonce must abort, got: {err:?}"
+fn schema_rejects_a_batch_without_its_nonce() {
+    // `nonce` is a rowid alias: SQLite would number a row inserted without
+    // one, and the insert trigger sees that nonce as -1 and refuses it.
+    let (_db, storage) = open_temp_storage("schema-batch-without-nonce");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (created_at_ms) VALUES (100)",
+        NONCE_RULE,
     );
 }
 
 #[test]
-fn schema_rejects_second_valid_parentless_root() {
-    // At most one *valid* parentless root: a second parentless insert (both
-    // valid, both at the anchor nonce 0) ABORTs on the single-root guard.
-    // (Sealed inserts isolate this from the single-Tip index; a fully-torn
-    // cascade re-roots only after invalidating the old root, covered below.)
-    let db = temp_db("schema-two-roots");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    storage
-        .conn
-        .execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (0, NULL, 0, 100, 100)",
-            [],
-        )
-        .expect("first root ok");
-    let err = storage.conn.execute(
-        "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-         VALUES (1, NULL, 0, 100, 100)",
-        [],
+fn schema_first_batch_carries_the_era_anchor() {
+    // With an era anchored at N' (a recovered deployment), the first batch
+    // carries exactly N', and the next N' + 1. (Rows are inserted sealed so
+    // the single-Tip index, which only covers open rows, doesn't mask the
+    // trigger under test.)
+    let db = crate::test_support::temp_db("schema-anchor-first");
+    let storage = Storage::open_with_era(
+        db.path.as_str(),
+        &crate::storage::NewEra {
+            anchor_batch_nonce: 42,
+            ..crate::storage::NewEra::EMPTY_GENESIS
+        },
     );
-    assert!(
-        format!("{err:?}").contains("at most one valid parentless root"),
-        "expected single-root guard, got: {err:?}"
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+         VALUES (0, 100, 100, zeroblob(32))",
+        NONCE_RULE,
     );
-    // Invalidate the first root, then a second parentless root is allowed —
-    // exactly the fully-torn-cascade re-root shape.
     storage
         .conn
         .execute(
-            "UPDATE batches SET invalidated_at_ms = 200 WHERE batch_index = 0",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (42, 100, 100, zeroblob(32))",
             [],
         )
-        .expect("invalidate first root");
+        .expect("the first batch at the anchor nonce is allowed");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+         VALUES (42, 100, 100, zeroblob(32))",
+        NONCE_RULE,
+    );
     storage
         .conn
         .execute(
-            "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms, sealed_at_ms) \
-             VALUES (1, NULL, 0, 100, 100)",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (43, 100, 100, zeroblob(32))",
             [],
         )
-        .expect("re-root parentless after the old root is invalidated");
+        .expect("the next batch carries the anchor + 1");
 }
 
 #[test]
-fn schema_freezes_anchor_after_setup_complete() {
-    // The anchor is write-once: once `setup_complete` exists, UPDATEs abort.
-    let db = temp_db("schema-anchor-frozen");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
-    // Pre-marker: UPDATE is allowed (this is what recovery setup does).
+fn schema_rejects_two_batches_at_one_nonce() {
+    // The nonce trigger refuses a duplicate nonce first (it is never the last
+    // nonce + 1); the primary key on `nonce` refuses it on its own.
+    let (_db, storage) = open_temp_storage("schema-duplicate-nonce");
     storage
         .conn
         .execute(
-            "UPDATE batch_tree_anchor SET nonce = 7 WHERE singleton_id = 0",
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32))",
             [],
         )
-        .expect("anchor settable before setup_complete");
+        .expect("first batch");
+    let duplicate = "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, \
+                     payload_hash) VALUES (0, 100, 100, zeroblob(32))";
+    assert_refused(&storage, duplicate, NONCE_RULE);
     storage
         .conn
-        .execute(
-            "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
-            [],
-        )
-        .expect("mark setup complete");
-    let err = storage.conn.execute(
-        "UPDATE batch_tree_anchor SET nonce = 8 WHERE singleton_id = 0",
-        [],
-    );
+        .execute_batch("DROP TRIGGER trg_batch_insert")
+        .expect("isolate the key");
+    let msg = format!("{:?}", storage.conn.execute(duplicate, []));
     assert!(
-        format!("{err:?}").contains("batch-tree anchor is frozen after setup completes"),
-        "expected anchor-freeze trigger, got: {err:?}"
+        msg.contains("UNIQUE constraint failed") && msg.contains("batches.nonce"),
+        "expected a key violation on batches.nonce, got: {msg}"
     );
 }
 
 #[test]
-fn schema_rejects_re_seal() {
-    let (_db, mut storage) = open_temp_storage("schema-re-seal");
+fn schema_rejects_a_sealed_batch_without_its_hash() {
+    // The CHECK pairs `sealed_at_ms` with `payload_hash` on every row. On an
+    // UPDATE the lifecycle trigger (a BEFORE trigger) answers before it.
+    let (_db, mut storage) = open_temp_storage("schema-seal-without-hash");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
-    storage
-        .close_batch_at(&mut head, 0)
-        .expect("close batch 0 (seals it)");
-    // Batch 0 is sealed. Attempt to re-seal with a different timestamp.
-    let err = storage.conn.execute(
-        "UPDATE batches SET sealed_at_ms = sealed_at_ms + 1 WHERE batch_index = 0",
-        [],
+    storage.close_batch_at(&mut head, 0).expect("close batch 0");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms) \
+         VALUES (2, 100, 100)",
+        "CHECK constraint failed",
     );
-    assert!(
-        format!("{err:?}").contains("sealed_at_ms is write-once"),
-        "expected write-once trigger, got: {err:?}"
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, payload_hash) \
+         VALUES (2, 100, zeroblob(32))",
+        "CHECK constraint failed",
+    );
+    assert_refused(
+        &storage,
+        "UPDATE batches SET sealed_at_ms = 100 WHERE nonce = 1",
+        LIFECYCLE_RULE,
+    );
+}
+
+// ── The batch lifecycle (`trg_batch_lifecycle`) ──────────────────────────
+//
+// The fixture holds batch 0 sealed and batch 1 the open Tip.
+
+fn lifecycle_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
+    let (db, mut storage) = open_temp_storage(name);
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    storage.close_batch_at(&mut head, 0).expect("close batch 0");
+    (db, storage)
+}
+
+#[test]
+fn lifecycle_allows_sealing_the_tip_with_its_hash() {
+    let (_db, storage) = lifecycle_fixture("lifecycle-seal");
+    storage
+        .conn
+        .execute(
+            "UPDATE batches SET sealed_at_ms = 100, payload_hash = zeroblob(32) \
+             WHERE nonce = 1",
+            [],
+        )
+        .expect("the seal arm admits the open Tip's seal");
+}
+
+#[test]
+fn lifecycle_rejects_un_seal() {
+    let (_db, storage) = lifecycle_fixture("lifecycle-un-seal");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET sealed_at_ms = NULL, payload_hash = NULL WHERE nonce = 0",
+        LIFECYCLE_RULE,
     );
 }
 
 #[test]
-fn schema_rejects_re_invalidate() {
-    let (_db, mut storage) = open_temp_storage("schema-re-invalidate");
+fn lifecycle_rejects_re_seal() {
+    let (_db, storage) = lifecycle_fixture("lifecycle-re-seal");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET sealed_at_ms = sealed_at_ms + 1 WHERE nonce = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn lifecycle_rejects_a_payload_hash_rewrite() {
+    // payload_hash is the content-identity anchor for the canonical-
+    // divergence check; a rewrite would let a foreign/zombie L1 landing
+    // false-match a local batch.
+    let (_db, storage) = lifecycle_fixture("lifecycle-hash-rewrite");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET payload_hash = randomblob(32) WHERE nonce = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn lifecycle_rejects_a_nonce_change() {
+    // Nonce immutability underpins the frontier and contiguity invariants.
+    let (_db, storage) = lifecycle_fixture("lifecycle-nonce");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET nonce = nonce + 1 WHERE nonce = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn lifecycle_rejects_a_created_at_change() {
+    let (_db, storage) = lifecycle_fixture("lifecycle-created-at");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET created_at_ms = created_at_ms + 1 WHERE nonce = 0",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn lifecycle_rejects_an_update_that_changes_nothing() {
+    // A no-op update is neither a seal nor an acceptance.
+    let (_db, storage) = lifecycle_fixture("lifecycle-no-op");
+    for nonce in [0, 1] {
+        assert_refused(
+            &storage,
+            &format!("UPDATE batches SET nonce = nonce WHERE nonce = {nonce}"),
+            LIFECYCLE_RULE,
+        );
+    }
+}
+
+// ── Deletion (`trg_batches_not_deletable`) ───────────────────────────────
+
+#[test]
+fn a_batch_is_never_deleted() {
+    // The rows are inserted raw, with no frame, so no foreign key refers to
+    // them and only the trigger can refuse.
+    let db = crate::test_support::temp_db("schema-batch-not-deletable");
+    let storage = Storage::open_with_era(db.path.as_str(), &crate::storage::NewEra::EMPTY_GENESIS);
     storage
+        .conn
+        .execute_batch(
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32));
+             INSERT INTO batches (nonce, created_at_ms) VALUES (1, 100);",
+        )
+        .expect("a sealed batch and an open one");
+    for sql in [
+        "DELETE FROM batches WHERE nonce = 0",
+        "DELETE FROM batches WHERE nonce = 1",
+        "DELETE FROM batches",
+    ] {
+        assert_refused(&storage, sql, NOT_DELETABLE_RULE);
+    }
+    let count: i64 = storage
+        .conn
+        .query_row("SELECT COUNT(*) FROM batches", [], |row| row.get(0))
+        .expect("count batches");
+    assert_eq!(count, 2);
+}
+
+// ── Acceptance (`trg_batch_acceptance_extends_the_prefix`, `trg_batch_lifecycle`) ──
+//
+// The fixture's era is anchored at 7: batches 7, 8, 9 are sealed, batch 10 is
+// the open Tip, and safe inputs 0..=5 exist.
+
+fn acceptance_fixture(name: &str) -> (crate::test_support::TestDb, Storage) {
+    let db = crate::test_support::temp_db(name);
+    let mut storage = Storage::open_with_era(
+        db.path.as_str(),
+        &crate::storage::NewEra {
+            anchor_batch_nonce: 7,
+            ..crate::storage::NewEra::EMPTY_GENESIS
+        },
+    );
+    let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
-    // Seed via test helper (uses now_unix_ms internally).
-    storage.insert_invalid_batch(0).expect("first invalidate");
-    let err = storage.conn.execute(
-        "UPDATE batches SET invalidated_at_ms = invalidated_at_ms + 1 \
-         WHERE batch_index = 0",
-        [],
+    for _ in 0..3 {
+        storage.close_batch_at(&mut head, 0).expect("close a batch");
+    }
+    for index in 0..=5 {
+        storage
+            .conn
+            .execute(
+                "INSERT INTO safe_inputs \
+                 (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+                 VALUES (?1, zeroblob(20), X'', 10, 0, zeroblob(32))",
+                [index],
+            )
+            .expect("insert a safe input");
+    }
+    (db, storage)
+}
+
+fn accept(storage: &Storage, nonce: i64, input: i64) -> rusqlite::Result<usize> {
+    storage.conn.execute(
+        "UPDATE batches SET accepted_input = ?1 WHERE nonce = ?2",
+        [input, nonce],
+    )
+}
+
+#[test]
+fn acceptance_extends_the_prefix_from_the_anchor() {
+    let (_db, storage) = acceptance_fixture("acceptance-prefix");
+    assert_eq!(accept(&storage, 7, 1).expect("the batch at the anchor"), 1);
+    assert_eq!(accept(&storage, 8, 3).expect("the next batch, later"), 1);
+}
+
+#[test]
+fn a_batch_is_never_inserted_accepted() {
+    let (_db, storage) = acceptance_fixture("acceptance-insert");
+    // Nonce 11 follows the Tip's 10, so only the acceptance arm can refuse.
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash, accepted_input) \
+         VALUES (11, 0, 1, zeroblob(32), 1)",
+        "a batch is inserted unaccepted",
     );
-    assert!(
-        format!("{err:?}").contains("invalidated_at_ms is write-once"),
-        "expected write-once trigger, got: {err:?}"
+    // Without the trigger, the table still refuses an acceptance on a batch
+    // that is not sealed.
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER trg_batch_insert")
+        .expect("drop the insert trigger");
+    assert_refused(
+        &storage,
+        "INSERT INTO batches (nonce, created_at_ms, accepted_input) VALUES (11, 0, 1)",
+        "CHECK constraint failed",
+    );
+}
+
+#[test]
+fn acceptance_rejects_skipping_a_nonce() {
+    let (_db, storage) = acceptance_fixture("acceptance-skip");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 8",
+        ACCEPTANCE_RULE,
+    );
+    accept(&storage, 7, 1).expect("the batch at the anchor");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 2 WHERE nonce = 9",
+        ACCEPTANCE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_rejects_an_input_not_after_the_last_acceptance() {
+    let (_db, storage) = acceptance_fixture("acceptance-earlier-input");
+    accept(&storage, 7, 3).expect("the batch at the anchor");
+    for input in [2, 3] {
+        assert_refused(
+            &storage,
+            &format!("UPDATE batches SET accepted_input = {input} WHERE nonce = 8"),
+            ACCEPTANCE_RULE,
+        );
+    }
+}
+
+#[test]
+fn acceptance_rejects_an_unsealed_batch() {
+    let (_db, storage) = acceptance_fixture("acceptance-unsealed");
+    accept(&storage, 7, 1).expect("accept nonce 7");
+    accept(&storage, 8, 2).expect("accept nonce 8");
+    accept(&storage, 9, 3).expect("accept nonce 9");
+    // The Tip carries the frontier nonce 10, so only the lifecycle refuses.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 4 WHERE nonce = 10",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_rejects_sealing_and_accepting_in_one_statement() {
+    let (_db, storage) = acceptance_fixture("acceptance-seal-and-accept");
+    accept(&storage, 7, 1).expect("accept nonce 7");
+    accept(&storage, 8, 2).expect("accept nonce 8");
+    accept(&storage, 9, 3).expect("accept nonce 9");
+    // The Tip carries the frontier nonce 10, so only the lifecycle refuses.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET sealed_at_ms = 100, payload_hash = zeroblob(32), \
+         accepted_input = 4 WHERE nonce = 10",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn acceptance_is_written_once() {
+    let (_db, storage) = acceptance_fixture("acceptance-twice");
+    accept(&storage, 7, 1).expect("the batch at the anchor");
+    for sql in [
+        "UPDATE batches SET accepted_input = 2 WHERE nonce = 7",
+        "UPDATE batches SET accepted_input = NULL WHERE nonce = 7",
+    ] {
+        assert_refused(&storage, sql, LIFECYCLE_RULE);
+    }
+}
+
+#[test]
+fn acceptance_changes_nothing_else() {
+    let (_db, storage) = acceptance_fixture("acceptance-alone");
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1, payload_hash = randomblob(32) \
+         WHERE nonce = 7",
+        LIFECYCLE_RULE,
+    );
+}
+
+#[test]
+fn the_divergence_freeze_answers_an_acceptance_first() {
+    let (_db, mut storage) = acceptance_fixture("acceptance-frozen");
+    crate::storage::test_helpers::record_canonical_divergence(&mut storage, 7, 1);
+    // A well-formed acceptance, then one that breaks both other rules.
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 7",
+        FROZEN_RULE,
+    );
+    assert_refused(
+        &storage,
+        "UPDATE batches SET accepted_input = 1 WHERE nonce = 10",
+        FROZEN_RULE,
     );
 }
 
@@ -239,7 +528,7 @@ fn schema_rejects_frame_insert_into_sealed_batch() {
         .expect("close batch 0; batch 0 is now sealed");
     // Batch 0 is sealed. Any direct insert into its frames must fail.
     let err = storage.conn.execute(
-        "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
+        "INSERT INTO frames (batch_nonce, frame_in_batch, created_at_ms, fee, safe_block) \
          VALUES (0, 1, 100, 1356, 0)",
         [],
     );
@@ -250,48 +539,140 @@ fn schema_rejects_frame_insert_into_sealed_batch() {
 }
 
 #[test]
-fn schema_rejects_frame_insert_into_invalidated_batch() {
-    let (_db, mut storage) = open_temp_storage("schema-frame-into-invalid");
-    storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize");
-    // Invalidate (without sealing) — Tip that never closed, now dead.
-    storage.insert_invalid_batch(0).expect("invalidate tip");
-    let err = storage.conn.execute(
-        "INSERT INTO frames (batch_index, frame_in_batch, created_at_ms, fee, safe_block) \
-         VALUES (0, 1, 100, 1356, 0)",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("frames can only be inserted into the current Tip"),
-        "expected tip-only-frames trigger, got: {err:?}"
-    );
-}
-
-#[test]
-fn schema_rejects_parent_batch_index_mutation() {
-    let (_db, mut storage) = open_temp_storage("schema-parent-immutable");
+fn schema_rejects_user_op_insert_into_sealed_batch() {
+    let (_db, mut storage) = open_temp_storage("schema-user-op-into-sealed");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
-    storage.close_batch_at(&mut head, 0).expect("close batch 0");
-    // Try to change parent of batch 1 — should be rejected.
-    let err = storage.conn.execute(
-        "UPDATE batches SET parent_batch_index = NULL WHERE batch_index = 1",
-        [],
+    storage
+        .close_batch_at(&mut head, 0)
+        .expect("close batch 0; batch 0 is now sealed");
+    // Frame (0, 0) exists, so only the trigger refuses.
+    assert_refused(
+        &storage,
+        &raw_user_op_insert(0, 0, 0),
+        "user_ops can only be inserted into the current Tip",
     );
-    assert!(
-        format!("{err:?}").contains("parent_batch_index is immutable"),
-        "expected parent-immutable trigger, got: {err:?}"
+}
+
+/// A well-formed user-op row at `(batch_nonce, frame_in_batch, pos_in_frame)`.
+fn raw_user_op_insert(batch_nonce: u64, frame_in_batch: u64, pos_in_frame: u64) -> String {
+    format!(
+        "INSERT INTO user_ops \
+         (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, \
+          received_at_ms) \
+         VALUES ({batch_nonce}, {frame_in_batch}, {pos_in_frame}, zeroblob(20), 0, 0, X'', \
+          zeroblob(65), 0)"
+    )
+}
+
+#[test]
+fn frames_and_user_ops_are_written_once() {
+    // Batch 0 is sealed with one frame holding one user op; batch 1's frame
+    // has none, so no foreign key refuses its delete.
+    let (_db, mut storage) = open_temp_storage("schema-frames-user-ops-written-once");
+    storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    storage
+        .conn
+        .execute(&raw_user_op_insert(0, 0, 0), [])
+        .expect("a user op in the open frame");
+    let mut head = storage
+        .open_state()
+        .expect("reload")
+        .expect("the open batch");
+    storage.close_batch_at(&mut head, 0).expect("seal batch 0");
+    for (sql, message) in [
+        (
+            "UPDATE user_ops SET data = X'01' WHERE batch_nonce = 0",
+            "user ops are immutable",
+        ),
+        (
+            "DELETE FROM user_ops WHERE batch_nonce = 0",
+            "user ops are retained for the database lifetime",
+        ),
+        (
+            "UPDATE frames SET fee = fee + 1 WHERE batch_nonce = 0",
+            "frames are immutable",
+        ),
+        (
+            "DELETE FROM frames WHERE batch_nonce = 1",
+            "frames are retained for the database lifetime",
+        ),
+    ] {
+        assert_refused(&storage, sql, message);
+    }
+}
+
+// ── REPLACE (`recursive_triggers`) ───────────────────────────────────────
+//
+// `INSERT OR REPLACE` deletes the row it conflicts with. The connection's
+// `recursive_triggers` makes that delete fire the table's BEFORE DELETE
+// trigger, so a "never deleted" table refuses it.
+
+#[test]
+fn a_replace_never_deletes_a_batch() {
+    let db = crate::test_support::temp_db("schema-replace-batch");
+    let storage = Storage::open_with_era(db.path.as_str(), &crate::storage::NewEra::EMPTY_GENESIS);
+    storage
+        .conn
+        .execute(
+            "INSERT INTO batches (nonce, created_at_ms, sealed_at_ms, payload_hash) \
+             VALUES (0, 100, 100, zeroblob(32))",
+            [],
+        )
+        .expect("a sealed batch");
+    // An insert over an existing nonce is never the last nonce + 1, so the
+    // nonce rule refuses it first; without that rule the REPLACE's delete
+    // still fires `trg_batches_not_deletable`.
+    let replace = "INSERT OR REPLACE INTO batches (nonce, created_at_ms) VALUES (0, 100)";
+    assert_refused(&storage, replace, NONCE_RULE);
+    storage
+        .conn
+        .execute_batch("DROP TRIGGER trg_batch_insert")
+        .expect("isolate the delete trigger");
+    assert_refused(&storage, replace, NOT_DELETABLE_RULE);
+}
+
+#[test]
+fn a_replace_never_deletes_an_application_input() {
+    let (_db, mut storage) = open_temp_storage("schema-replace-application-input");
+    let mut head = storage
+        .initialize_open_state(0, SafeInputRange::empty_at(0))
+        .expect("initialize");
+    storage.land(10, &[(alloy_primitives::Address::ZERO, vec![0xaa])]);
+    storage
+        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
+        .expect("close a frame over one direct");
+    // The next count, into the open frame (0, 1), conflicting on input 0.
+    assert_refused(
+        &storage,
+        "INSERT OR REPLACE INTO application_inputs \
+         (l2_tx_count, batch_nonce, frame_in_batch, safe_input_index) VALUES (1, 0, 1, 0)",
+        "application inputs are retained for the database lifetime",
+    );
+}
+
+#[test]
+fn a_replace_never_deletes_a_safe_input() {
+    // `safe_inputs` has no insert trigger, so only the delete trigger, fired
+    // by the pragma, can refuse.
+    let (_db, mut storage) = open_temp_storage("schema-replace-safe-input");
+    storage.land(10, &[(alloy_primitives::Address::ZERO, vec![0xaa])]);
+    assert_refused(
+        &storage,
+        "INSERT OR REPLACE INTO safe_inputs \
+         (safe_input_index, sender, payload, block_number, block_timestamp, transaction_hash) \
+         VALUES (0, zeroblob(20), X'bb', 10, 0, zeroblob(32))",
+        "safe inputs are retained for the database lifetime",
     );
 }
 
 #[test]
 fn schema_rejects_application_input_into_non_tip() {
-    // The third sibling of the tip-only triggers (frames + user_ops already
-    // have negative tests; application_inputs did not). The global replay order
-    // is the source for recovery re-drain and catch-up; a stale-WriteHead row
-    // into a sealed batch would corrupt it.
+    // The application order is the source for catch-up and the history feed;
+    // a stale-WriteHead row into a sealed batch would corrupt it.
     let (_db, mut storage) = open_temp_storage("schema-sequenced-into-sealed");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
@@ -303,109 +684,42 @@ fn schema_rejects_application_input_into_non_tip() {
     // trigger fires before the safe_input_index FK is evaluated.
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-         (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+         (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
          VALUES (0, 0, 0, NULL, 0)",
         [],
     );
     assert!(
-        format!("{err:?}").contains("application input must target the current valid Tip"),
+        format!("{err:?}").contains("application input must target the open batch"),
         "expected tip-only-sequenced trigger, got: {err:?}"
     );
 }
 
 #[test]
-fn schema_rejects_nonce_mutation() {
-    // Nonce immutability underpins the frontier + contiguity invariants.
-    let (_db, mut storage) = open_temp_storage("schema-nonce-immutable");
+fn an_application_input_is_never_deleted() {
+    // Nothing refers to an application input, so only the trigger refuses.
+    let (_db, mut storage) = open_temp_storage("schema-application-input-not-deletable");
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize");
-    storage.close_batch_at(&mut head, 0).expect("close batch 0");
-    let err = storage.conn.execute(
-        "UPDATE batches SET nonce = nonce + 1 WHERE batch_index = 0",
-        [],
-    );
-    assert!(
-        format!("{err:?}").contains("nonce is immutable"),
-        "expected nonce-immutable trigger, got: {err:?}"
-    );
-}
-
-#[test]
-fn schema_rejects_payload_hash_rewrite() {
-    // payload_hash is the content-identity anchor for the canonical-
-    // divergence check; a rewrite would let a foreign/zombie L1 landing
-    // false-match a local batch. Write-once once stamped at seal.
-    let (_db, mut storage) = open_temp_storage("schema-payload-hash-write-once");
-    let mut head = storage
-        .initialize_open_state(0, SafeInputRange::empty_at(0))
-        .expect("initialize");
+    storage.land(10, &[(alloy_primitives::Address::ZERO, vec![0xaa])]);
     storage
-        .close_batch_at(&mut head, 0)
-        .expect("close batch 0; payload_hash is stamped at seal");
-    let err = storage.conn.execute(
-        "UPDATE batches SET payload_hash = \
-         X'0000000000000000000000000000000000000000000000000000000000000000' \
-         WHERE batch_index = 0",
-        [],
+        .close_frame_only(&mut head, 10, SafeInputRange::new(0, 1))
+        .expect("close a frame over one direct");
+    let rows = || -> i64 {
+        storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM application_inputs", [], |row| {
+                row.get(0)
+            })
+            .expect("count application inputs")
+    };
+    assert_eq!(rows(), 1);
+    assert_refused(
+        &storage,
+        "DELETE FROM application_inputs",
+        "application inputs are retained for the database lifetime",
     );
-    assert!(
-        format!("{err:?}").contains("payload_hash is write-once"),
-        "expected payload-hash-write-once trigger, got: {err:?}"
-    );
-}
-
-#[test]
-fn nonce_reuse_after_cascade_with_valid_ancestor() {
-    // Beautiful part of parent-pointer + structural nonce: after a cascade
-    // that invalidates only the suffix (keeping an ancestor valid), the
-    // new Tip's parent is the last valid ancestor, so its nonce is
-    // `ancestor.nonce + 1` — the same nonce the invalidated suffix's
-    // first batch had. Nonce reuse is automatic.
-    //
-    // Scenario: batch 0 is accepted (safe_accepted_batches advances past
-    // nonce 0). Batch 1 is stale and triggers cascade. Batches 1, 2, 3
-    // invalidated; batch 0 remains valid.
-    let (_db, mut storage) = open_temp_storage("nonce-reuse-with-ancestor");
-
-    let mut head = storage
-        .initialize_open_state(10, SafeInputRange::empty_at(0))
-        .expect("initialize at safe_block=10");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 0 (nonce 0)");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 1 (nonce 1)");
-    storage
-        .close_batch_at(&mut head, 100)
-        .expect("close batch 2 (nonce 2)");
-    // Head is now batch 3 (nonce 3, first_frame_safe_block=100).
-
-    // Batch 0 lands on L1 (accepted): safe_input at block 20 with nonce 0.
-    let landed = local_batch_payload(&mut storage, 0);
-    storage.land(20, &[(SENDER_A, landed)]); // append batch 0 submission
-    // Advance safe head so batches 1, 2, 3 (first_frame=100) are stale.
-    // current_safe=1400 → 1400-100=1300 >= 1200.
-    storage.advance_safe_head(1400); // advance past threshold
-
-    let inv = storage.recover_post_flush(1200).expect("recover");
-    // Batches 1, 2, 3 invalidated; batch 0 (accepted) stays valid.
-    assert_eq!(inv, vec![1, 2, 3], "only the suffix cascades, got {inv:?}");
-
-    // The NEW Tip has parent=0 (the last valid ancestor), nonce=1.
-    // This is what nonce reuse looks like: the invalidated batch 1 had
-    // nonce 1; the recovery batch gets the same nonce via +1-from-parent.
-    let (tip_nonce, tip_parent): (i64, i64) = storage
-        .conn
-        .query_row(
-            "SELECT nonce, parent_batch_index FROM valid_open_batch",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query recovery tip");
-    assert_eq!(tip_nonce, 1, "recovery Tip reuses nonce 1");
-    assert_eq!(tip_parent, 0, "recovery Tip's parent is batch 0");
+    assert_eq!(rows(), 1);
 }
 
 // ── CHECK-constraint regressions ──────────────────────────
@@ -445,7 +759,7 @@ fn schema_rejects_user_op_with_wrong_sender_length() {
         .expect("initialize");
     let err = storage.conn.execute(
             "INSERT INTO user_ops \
-             (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
+             (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
              VALUES (0, 0, 0, X'010203', 0, 0, X'', ?1, 0)",
             params![vec![0u8; 65]],
         );
@@ -468,7 +782,7 @@ fn schema_rejects_user_op_with_wrong_signature_length() {
     let short_sig = vec![0u8; 32]; // Should be 65.
     let err = storage.conn.execute(
             "INSERT INTO user_ops \
-             (batch_index, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
+             (batch_nonce, frame_in_batch, pos_in_frame, sender, nonce, max_fee, data, sig, received_at_ms) \
              VALUES (0, 0, 0, ?1, 0, 0, X'', ?2, 0)",
             params![valid_sender, short_sig],
         );
@@ -492,7 +806,7 @@ fn schema_rejects_application_input_with_neither_xor_branch() {
         .expect("initialize");
     let err = storage.conn.execute(
         "INSERT INTO application_inputs \
-             (offset, batch_index, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
+             (l2_tx_count, batch_nonce, frame_in_batch, user_op_pos_in_frame, safe_input_index) \
              VALUES (0, 0, 0, NULL, NULL)",
         [],
     );
@@ -509,21 +823,68 @@ fn schema_rejects_deployment_identity_with_zero_chain_id() {
     // and break signature recovery; the CHECK refuses to persist it
     // in the first place.
     let db = crate::test_support::temp_db("schema-deployment-chain-id-zero");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    // No identity yet: the test inserts the row itself.
+    let storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
     let address = vec![0u8; 20];
     let err = storage.conn.execute(
         "INSERT INTO deployment_identity \
              (singleton_id, chain_id, app_address, input_box_address, \
-              app_deployment_block, batch_submitter_address, \
-              fee_oracle_mode, fixed_log_gas_price, \
+              app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+              max_wait_blocks, fee_oracle_mode, fixed_log_gas_price, \
               fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
               fee_oracle_twap_window_secs) \
-             VALUES (0, 0, ?1, ?1, 0, ?1, 'fixed', 0, NULL, NULL, NULL, NULL)",
+             VALUES (0, 0, ?1, ?1, 0, ?1, 1024, 1200, 'fixed', 0, NULL, NULL, NULL, NULL)",
         params![address],
     );
     assert!(
-        format!("{err:?}").contains("CHECK constraint failed"),
+        format!("{err:?}").contains("CHECK constraint failed: chain_id > 0"),
         "expected CHECK constraint error on chain_id > 0, got: {err:?}",
+    );
+}
+
+#[test]
+fn schema_rejects_deployment_identity_with_negative_direct_payload_cap() {
+    let db = crate::test_support::temp_db("schema-deployment-negative-cap");
+    // No identity yet: the test inserts the row itself.
+    let storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+    let address = vec![0u8; 20];
+    let err = storage.conn.execute(
+        "INSERT INTO deployment_identity \
+             (singleton_id, chain_id, app_address, input_box_address, \
+              app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+              max_wait_blocks, fee_oracle_mode, fixed_log_gas_price, \
+              fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
+              fee_oracle_twap_window_secs) \
+             VALUES (0, 1, ?1, ?1, 0, ?1, -1, 1200, 'fixed', 0, NULL, NULL, NULL, NULL)",
+        params![address],
+    );
+    assert!(
+        format!("{err:?}").contains("CHECK constraint failed: max_direct_payload_bytes >= 0"),
+        "expected CHECK constraint error on max_direct_payload_bytes >= 0, got: {err:?}",
+    );
+}
+
+#[test]
+fn schema_rejects_deployment_identity_with_a_zero_window() {
+    // A window of zero would make every batch stale on arrival, and the
+    // scheduler refuses to start with one.
+    let db = crate::test_support::temp_db("schema-deployment-zero-window");
+    // No identity yet: the test inserts the row itself.
+    let storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+    let address = vec![0u8; 20];
+    let err = storage.conn.execute(
+        "INSERT INTO deployment_identity \
+             (singleton_id, chain_id, app_address, input_box_address, \
+              app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+              max_wait_blocks, fee_oracle_mode, fixed_log_gas_price, \
+              fee_oracle_weth, fee_oracle_fee_token, fee_oracle_pool, \
+              fee_oracle_twap_window_secs) \
+             VALUES (0, 1, ?1, ?1, 0, ?1, 1024, 0, 'fixed', 0, NULL, NULL, NULL, NULL)",
+        params![address],
+    );
+    assert!(
+        format!("{err:?}").contains("CHECK constraint failed: max_wait_blocks >= 1"),
+        "expected CHECK constraint error on max_wait_blocks >= 1, got: {err:?}",
     );
 }
 
@@ -547,7 +908,7 @@ fn schema_rejects_safe_input_with_negative_block_number() {
 }
 
 #[test]
-fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
+fn divergence_marker_freezes_batch_list_promotions_and_pending_clears() {
     // I15 structural enforcement: with the canonical-divergence marker
     // present, the trg_*_frozen_on_divergence family must RAISE on batch
     // inserts/updates, promotion inserts, and pending-snapshot deletes —
@@ -572,24 +933,23 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
         );
     };
 
+    // Nonce 0 breaks the nonce rule too (the next is 2): the freeze answers
+    // first, as the most recently created BEFORE INSERT trigger.
     frozen(
         storage
             .conn
             .execute(
-                "INSERT INTO batches (batch_index, parent_batch_index, nonce, created_at_ms) \
-                 VALUES (99, NULL, 0, 0)",
+                "INSERT INTO batches (nonce, created_at_ms) VALUES (0, 0)",
                 [],
             )
             .expect_err("batch INSERT must be frozen"),
     );
+    // Likewise before the lifecycle trigger: this nonce change breaks both.
     frozen(
         storage
             .conn
-            .execute(
-                "UPDATE batches SET invalidated_at_ms = 1 WHERE invalidated_at_ms IS NULL",
-                [],
-            )
-            .expect_err("batch UPDATE (cascade shape) must be frozen"),
+            .execute("UPDATE batches SET nonce = 7 WHERE nonce = 0", [])
+            .expect_err("batch UPDATE must be frozen"),
     );
     frozen(
         storage
@@ -598,13 +958,14 @@ fn divergence_marker_freezes_batch_tree_promotions_and_pending_clears() {
             .expect_err("pending-snapshot DELETE must be frozen"),
     );
 
-    // Reads stay usable on a frozen DB: the danger check must still
-    // classify the divergence (the boot-refusal path depends on it).
-    let protocol = default_protocol_timing();
-    let status = storage
-        .check_danger(&protocol, 1_000_000)
-        .expect("check danger on a frozen DB");
-    assert_eq!(status, crate::storage::DangerStatus::CanonicalDivergence(0));
+    // Reads stay usable on a frozen DB: the terminal-fact read must still
+    // report the divergence (the boot refusal depends on it).
+    assert!(matches!(
+        storage
+            .terminal_fact()
+            .expect("terminal fact on a frozen DB"),
+        Some(crate::storage::TerminalFact::Divergence(divergence)) if divergence.nonce == 0
+    ));
 }
 
 #[test]
@@ -644,7 +1005,7 @@ fn schema_rejects_safe_input_with_wrong_transaction_hash_length() {
 #[test]
 fn batch_policy_check_rejects_unsafe_alpha() {
     let db = crate::test_support::temp_db("unsafe-alpha");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let storage = set_up_storage(&db.path, SENDER_A);
     // log_alpha=-350 → log_batch_size_target = 1403-(-350)-419 = 1334 >= log_max_batch_bytes=1333
     let err = storage.conn.execute(
         "UPDATE batch_policy SET log_alpha = ?1, log_one_plus_alpha = ?2 WHERE singleton_id = 0",
@@ -664,7 +1025,7 @@ fn seeded_log_slack_is_the_exponent_nearest_tenfold() {
     use sequencer_core::fee::fee_to_linear;
 
     let db = crate::test_support::temp_db("seeded-log-slack");
-    let storage = Storage::open(db.path.as_str()).expect("open storage");
+    let storage = set_up_storage(&db.path, SENDER_A);
     let slack: u16 = storage
         .conn
         .query_row(
@@ -687,7 +1048,7 @@ fn seeded_log_slack_is_the_exponent_nearest_tenfold() {
 #[test]
 fn schema_rejects_safe_input_update_and_delete() {
     let db = crate::test_support::temp_db("safe-inputs-append-only");
-    let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let inputs = vec![
         StoredSafeInput {
             sender: SENDER_B,
@@ -701,7 +1062,7 @@ fn schema_rejects_safe_input_update_and_delete() {
         },
     ];
     storage
-        .append_safe_inputs(10, inputs.as_slice(), SENDER_A, &default_protocol_timing())
+        .append_safe_inputs(10, inputs.as_slice(), SENDER_A)
         .expect("seed safe inputs");
 
     let update = storage
@@ -724,9 +1085,53 @@ fn schema_rejects_safe_input_update_and_delete() {
 
     assert_eq!(storage.safe_input_end_exclusive().expect("end"), 2);
     assert_eq!(
-        storage
-            .safe_inputs_in_block_range(9, 10)
-            .expect("read back"),
-        inputs
+        storage.safe_input_count_through_block(10).expect("count"),
+        2
     );
+}
+
+#[test]
+fn every_schema_table_is_strict() {
+    // STRICT is what refuses a mis-classed value before any trigger runs, so a
+    // table added without it would reopen that hole.
+    let (_db, storage) = open_temp_storage("schema-every-table-strict");
+    let mut stmt = storage
+        .conn
+        .prepare(
+            "SELECT name FROM pragma_table_list \
+             WHERE type = 'table' AND strict = 0 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .expect("prepare table list");
+    let lax: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .expect("list tables")
+        .collect::<rusqlite::Result<_>>()
+        .expect("read table names");
+    assert!(lax.is_empty(), "tables without STRICT: {lax:?}");
+}
+
+#[test]
+fn strict_type_refusal_is_a_persistent_storage_error() {
+    let (_db, storage) = open_temp_storage("schema-strict-type-refusal");
+    let err = storage
+        .conn
+        .execute(
+            "INSERT INTO wallet_nonce_watermark (singleton_id, watermark) VALUES (0, ?1)",
+            ["not-an-integer"],
+        )
+        .expect_err("STRICT must refuse text in an INTEGER column");
+    let rusqlite::Error::SqliteFailure(source, _) = &err else {
+        panic!("expected a SQLite failure, got {err:?}");
+    };
+    assert_eq!(
+        source.extended_code,
+        rusqlite::ffi::SQLITE_CONSTRAINT_DATATYPE,
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("cannot store TEXT value in INTEGER column"),
+        "{err}"
+    );
+    assert!(crate::storage::convert::is_persistent_storage_error(&err));
 }

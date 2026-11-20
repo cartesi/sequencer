@@ -46,14 +46,20 @@ env:
 jobs:
   build-wallet-sequencer:
     name: Build wallet-sequencer (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
+    # Each arch builds natively on its own runner, the way CI builds: the
+    # sequencer links the pinned emulator's static archive, which the
+    # cartesi-machine .deb ships only for the host's arch and which links only
+    # against GCC 14's libstdc++.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - arch: arm64
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
 
     steps:
@@ -68,17 +74,27 @@ jobs:
       - name: Load toolchain pins
         uses: ./.github/actions/load-toolchain-pins
 
+      # libclang for the emulator bindings' bindgen; cmake for aws-lc-sys; the
+      # .deb's libcartesi.a references libslirp.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             ca-certificates \
-            lua5.4 \
-            liblua5.4-dev \
-            libslirp-dev \
             build-essential \
-            pkg-config \
-            libssl-dev
+            cmake \
+            libclang-dev \
+            libslirp-dev \
+            pkg-config
+
+      # Exports LIBCARTESI_PATH / INCLUDECARTESI_PATH; the binary links the
+      # archive statically, so the release host needs no emulator install.
+      - name: Install cartesi-machine
+        uses: ./.github/actions/install-cartesi-machine
+        with:
+          version: ${{ env.CARTESI_MACHINE_VERSION }}
+          sha256-amd64: ${{ env.CARTESI_MACHINE_SHA256_AMD64 }}
+          sha256-arm64: ${{ env.CARTESI_MACHINE_SHA256_ARM64 }}
 
       # rust-toolchain.toml is the only Rust pin.
       - name: Install Rust toolchain
@@ -87,15 +103,26 @@ jobs:
           rustup toolchain install
           rustup target add ${{ matrix.target }}
 
-      - name: Install cross
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cross@${{ env.CROSS_VERSION }}
-
       # `sequencer` is a library crate; the runnable reference binary is the
       # `wallet-sequencer` example app (sequencer lib + the toy wallet).
       - name: Build (release)
-        run: cross build -p wallet-sequencer --release --locked --target ${{ matrix.target }}
+        run: cargo build -p wallet-sequencer --release --locked --target ${{ matrix.target }}
+
+      # The runner has libcartesi.so installed, so loading proves little on its
+      # own: the binary must not name it, or release hosts would need the .deb.
+      - name: Check the binary's shared libraries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/wallet-sequencer"
+          needed="$(readelf -d "${bin}" | grep NEEDED)"
+          echo "${needed}"
+          if grep -q libcartesi <<< "${needed}"; then
+            echo "::error::wallet-sequencer links libcartesi dynamically"
+            exit 1
+          fi
+          "${bin}" setup --help > /dev/null
 
       - name: Package
         env:
@@ -118,7 +145,7 @@ jobs:
             echo "# wallet-sequencer ${TAG}"
             echo
             echo "The sequencer library composed with the example toy wallet, configured for Sepolia."
-            echo "Setup, configuration, exit codes, and upgrades:"
+            echo "Host libraries, setup, configuration, exit codes, and upgrades:"
             echo "https://github.com/cartesi/sequencer/blob/${TAG}/docs/running.md"
           } > "package/wallet-sequencer-${TAG}-linux-${ARCH}/RUNNING.md"
 

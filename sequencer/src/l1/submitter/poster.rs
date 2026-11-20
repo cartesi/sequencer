@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::l1::eip1559::{Eip1559Fees, estimate_fees, pad_gas_estimate};
 use crate::l1::partition::{decode_evm_advance_input, get_input_added_events_ordered};
 use crate::l1::provider::{KeyedProviders, SendError, error_chain};
-use crate::l1::watermark::{WalletNonceWatermarkError, WalletNonceWatermarkSink};
+use crate::l1::watermark::{Covered, WalletNonceWatermarkError, WalletNonceWatermarkSink, cover};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -257,7 +257,9 @@ impl EthereumBatchPoster {
         payload: Vec<u8>,
         wallet_nonce: u64,
         fees: &Eip1559Fees,
+        covered: &Covered,
     ) -> Result<TxHash, BatchPosterError> {
+        covered.assert_covers(wallet_nonce);
         #[cfg(test)]
         {
             if let Some(message) = self
@@ -444,10 +446,10 @@ impl BatchPoster for EthereumBatchPoster {
 
         // Write-before-broadcast: durably cover every wallet nonce this
         // tick will use before the first send. One raise to the highest
-        // covers the whole consecutive range.
+        // covers the whole consecutive range; each send requires its witness.
         let highest_wallet_nonce =
             checked_highest_wallet_nonce(first_wallet_nonce, payloads.len())?;
-        watermark.raise_to(highest_wallet_nonce)?;
+        let covered = cover(watermark, highest_wallet_nonce)?;
 
         let mut broadcast = Vec::with_capacity(payloads.len());
         let mut any_refused = false;
@@ -464,7 +466,7 @@ impl BatchPoster for EthereumBatchPoster {
                 .expect("validated wallet-nonce range must not overflow");
             self.track_pending(wallet_nonce);
             match self
-                .send_batch_at_wallet_nonce(payload, wallet_nonce, &fees)
+                .send_batch_at_wallet_nonce(payload, wallet_nonce, &fees, &covered)
                 .await
             {
                 Ok(tx_hash) => {
@@ -651,13 +653,13 @@ pub(crate) mod mock {
             let waiting_after = *self.waiting_after.lock().expect("lock");
             let mut tx_hashes = Vec::with_capacity(payloads.len());
             for (index, payload) in payloads.into_iter().enumerate() {
-                let batch_index = ssz::Decode::from_ssz_bytes(payload.as_ref())
+                let batch_nonce = ssz::Decode::from_ssz_bytes(payload.as_ref())
                     .map(|b: Batch| b.nonce)
                     .unwrap_or(0);
                 self.submissions
                     .lock()
                     .expect("lock")
-                    .push((batch_index, payload.len()));
+                    .push((batch_nonce, payload.len()));
                 if waiting_after.is_none_or(|k| index < k) {
                     tx_hashes.push(TxHash::ZERO);
                 }
@@ -932,6 +934,41 @@ mod tests {
             pending, base_wallet_nonce,
             "raise_to must run before any send; a broadcast would have bumped the pending nonce"
         );
+    }
+
+    /// The send wrapper refuses a wallet nonce above its witness before any
+    /// RPC: the endpoint is never dialled, so no node is needed.
+    #[tokio::test]
+    #[should_panic(expected = "above the durably covered watermark")]
+    async fn send_above_the_covered_watermark_panics() {
+        let providers = crate::l1::provider::create_keyed_providers(
+            "http://127.0.0.1:1",
+            SUBMITTER_KEY,
+            31337,
+            false,
+        )
+        .expect("keyed providers");
+        let config = BatchPosterConfig {
+            l1_submit_address: alloy_primitives::Address::repeat_byte(0x11),
+            app_address: alloy_primitives::Address::repeat_byte(0x22),
+            batch_submitter_address: SUBMITTER,
+            start_block: 0,
+            confirmation_depth: 0,
+            seconds_per_block: 1,
+            expected_chain_id: 31337,
+        };
+        let poster = EthereumBatchPoster::new(providers, config);
+        let covered =
+            super::cover(&RecordingWatermarkSink::passing(), 4).expect("passing sink covers");
+        let fees = crate::l1::eip1559::Eip1559Fees {
+            base_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+        };
+
+        let _ = poster
+            .send_batch_at_wallet_nonce(vec![0u8; 4], 5, &fees, &covered)
+            .await;
     }
 
     /// Keyed-write chain-id gate: a long-lived submitter pointed at an RPC that

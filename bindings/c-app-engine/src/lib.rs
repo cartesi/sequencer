@@ -11,13 +11,14 @@ mod tests;
 use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use alloy_primitives::{Address, U256};
 use sequencer_core::application::{
-    AppError, AppOutput, AppOutputs, ApplicationProgress, InvalidReason, ValidationOutcome,
+    Admission, AppError, AppOutput, AppOutputs, PolicyRefusal, SchedulerLimits,
 };
-use sequencer_core::history::ExecutedInputCount;
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::history::L2TxCount;
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
 pub use sequencer_core::application::Application;
@@ -67,14 +68,76 @@ fn internal(reason: impl Into<String>) -> AppError {
     }
 }
 
-/// Validation, execution and draining. NOT_FOUND and INVALID_DUMP describe
-/// lifecycle failures only, so here they break the contract and are fatal.
+/// Refuse an engine built against another header. A changed meaning, such as
+/// an execution that must no longer fail, links without complaint, so only the
+/// reported version tells the two apart.
+fn abi_version_matches(reported: u32) -> Result<(), AppError> {
+    if reported == sys::APPLICATION_ENGINE_ABI_VERSION {
+        return Ok(());
+    }
+    Err(internal(format!(
+        "linked engine reports ABI version {reported}, but this host speaks version {}",
+        sys::APPLICATION_ENGINE_ABI_VERSION
+    )))
+}
+
+/// Asked once per process, before any other engine call: every handle comes
+/// from a constructor that checks it, and the handle-free getters check it too.
+fn check_abi_version() -> Result<(), AppError> {
+    static CHECKED: OnceLock<Result<(), String>> = OnceLock::new();
+    CHECKED
+        .get_or_init(|| {
+            abi_version_matches(unsafe { sys::application_engine_abi_version() })
+                .map_err(|err| err.to_string())
+        })
+        .clone()
+        .map_err(internal)
+}
+
+/// The infallible getters have no error to return, and an engine of another
+/// version must not be asked anything.
+fn assert_abi_version() {
+    if let Err(err) = check_abi_version() {
+        panic!("{err}");
+    }
+}
+
+/// Admission's answer. Only the fee-balance and policy reasons are admission's
+/// to give; the retired ones, or one this host does not know, break the contract.
+fn admission_from(
+    status: i32,
+    invalid: &sys::ApplicationEngineInvalid,
+) -> Result<Admission, AppError> {
+    if status != sys::APPLICATION_ENGINE_STATUS_INVALID {
+        check(status, "admit_user_op")?;
+        return Ok(Admission::Admit);
+    }
+    let refusal = match invalid.reason {
+        sys::APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE => {
+            let balance = unsafe { invalid.values.fee_balance };
+            PolicyRefusal::Underfunded {
+                required: U256::from_be_bytes(balance.required.bytes),
+                available: U256::from_be_bytes(balance.available.bytes),
+            }
+        }
+        sys::APPLICATION_ENGINE_REFUSED_BY_POLICY => PolicyRefusal::Other(last_error_message()),
+        other => {
+            return Err(internal(format!(
+                "engine admission reported unsupported invalid reason {other}"
+            )));
+        }
+    };
+    Ok(Admission::Refuse(refusal))
+}
+
+/// Admission, nonce reads, execution and draining. NOT_FOUND and INVALID_DUMP
+/// describe lifecycle failures only, so here they break the contract and are fatal.
 fn check(status: i32, operation: &str) -> Result<(), AppError> {
     check_status(status, operation, false)
 }
 
-/// `from_dump` and `create_dump`, where a missing or invalid dump is an
-/// operational I/O failure.
+/// `from_dump`, `from_canonical_state` and `create_dump`, where a missing or
+/// invalid dump is an operational I/O failure.
 fn check_lifecycle(status: i32, operation: &str) -> Result<(), AppError> {
     check_status(status, operation, true)
 }
@@ -146,138 +209,127 @@ impl EngineApp {
         }
         Ok(outputs)
     }
+
+    /// Take the handle a successful constructor wrote.
+    fn from_handle(engine: *mut sys::ApplicationEngine) -> Self {
+        assert!(
+            !engine.is_null(),
+            "engine reported successful load without a handle"
+        );
+        Self { engine }
+    }
+
+    /// Run one execution entry point and take the outputs it queued.
+    fn execute_with(
+        &mut self,
+        operation: &str,
+        run: impl FnOnce(*mut sys::ApplicationEngine, &mut u64) -> i32,
+    ) -> Result<AppOutputs, AppError> {
+        let mut count = 0;
+        check(run(self.engine, &mut count), operation)?;
+        self.drain_outputs(count)
+    }
 }
 
 impl Application for EngineApp {
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError> {
+        let mut nonce = 0;
+        check(
+            unsafe {
+                sys::application_engine_user_nonce(self.engine, &abi_address(sender), &mut nonce)
+            },
+            "user_nonce",
+        )?;
+        Ok(nonce)
+    }
+
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError> {
+        let op = sys::ApplicationEngineUserOpTx {
+            sender: abi_address(op.sender),
+            nonce: op.nonce,
+            fee: op.fee,
+            safe_block: op.block,
+            data: abi_span(&op.data),
+        };
+        self.execute_with("execute_user_op", |engine, count| unsafe {
+            sys::application_engine_execute_user_op(engine, &op, count)
+        })
+    }
+
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError> {
+        let direct = sys::ApplicationEngineDirectInput {
+            sender: abi_address(direct.sender),
+            input_index: direct.input_index,
+            block_number: direct.block,
+            timestamp: direct.timestamp,
+            payload: abi_span(&direct.payload),
+        };
+        self.execute_with("execute_direct_input", |engine, count| unsafe {
+            sys::application_engine_execute_direct_input(engine, &direct, count)
+        })
+    }
+
+    fn l2_tx_count(&self) -> L2TxCount {
+        L2TxCount::new(unsafe { sys::application_engine_l2_tx_count(self.engine) })
+    }
+
     fn max_method_payload_bytes() -> usize {
+        assert_abi_version();
         usize::try_from(unsafe { sys::application_engine_max_method_payload_bytes() })
             .expect("engine payload bound exceeds usize")
     }
 
-    fn validate_user_op(
-        &self,
-        sender: Address,
-        user_op: &UserOp,
-        current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError> {
+    fn scheduler_limits() -> SchedulerLimits {
+        assert_abi_version();
+        let mut limits = sys::ApplicationEngineSchedulerLimits {
+            max_wait_blocks: 0,
+            fridge_bound: 0,
+            max_direct_payload_bytes: 0,
+        };
+        unsafe { sys::application_engine_scheduler_limits(&mut limits) };
+        SchedulerLimits {
+            max_wait_blocks: limits.max_wait_blocks,
+            fridge_bound: limits.fridge_bound,
+            max_direct_payload_bytes: limits.max_direct_payload_bytes,
+        }
+    }
+
+    fn admit_user_op(&self, sender: Address, op: &UserOp, fee: u16) -> Result<Admission, AppError> {
         let mut invalid = sys::ApplicationEngineInvalid {
             reason: 0,
             values: sys::ApplicationEngineInvalidValues {
-                nonce: sys::ApplicationEngineInvalidNonce {
-                    expected: 0,
-                    got: 0,
+                fee_balance: sys::ApplicationEngineInsufficientFeeBalance {
+                    required: sys::ApplicationEngineUint256 { bytes: [0; 32] },
+                    available: sys::ApplicationEngineUint256 { bytes: [0; 32] },
                 },
             },
         };
         let op = sys::ApplicationEngineUserOp {
-            nonce: user_op.nonce,
-            max_fee: user_op.max_fee,
-            data: abi_span(user_op.data.as_ref()),
+            nonce: op.nonce,
+            max_fee: op.max_fee,
+            data: abi_span(op.data.as_ref()),
         };
         let status = unsafe {
-            sys::application_engine_validate_user_op(
+            sys::application_engine_admit_user_op(
                 self.engine,
                 &abi_address(sender),
                 &op,
-                current_fee,
+                fee,
                 &mut invalid,
             )
         };
-        if status != sys::APPLICATION_ENGINE_STATUS_INVALID {
-            check(status, "validate_user_op")?;
-            return Ok(ValidationOutcome::Accept);
-        }
-        let reason = match invalid.reason {
-            sys::APPLICATION_ENGINE_INVALID_NONCE => {
-                let nonce = unsafe { invalid.values.nonce };
-                InvalidReason::InvalidNonce {
-                    expected: nonce.expected,
-                    got: nonce.got,
-                }
-            }
-            sys::APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE => {
-                let balance = unsafe { invalid.values.fee_balance };
-                InvalidReason::InsufficientFeeBalance {
-                    required: U256::from_be_bytes(balance.required.bytes),
-                    available: U256::from_be_bytes(balance.available.bytes),
-                }
-            }
-            // Max-fee and exhausted-nonce rejections belong to the shared execution boundary.
-            other => {
-                return Err(internal(format!(
-                    "engine reported unsupported invalid reason {other}"
-                )));
-            }
-        };
-        Ok(ValidationOutcome::Reject(reason))
-    }
-
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError> {
-        let op = sys::ApplicationEngineValidUserOp {
-            sender: abi_address(user_op.sender),
-            fee: user_op.fee,
-            data: abi_span(&user_op.data),
-        };
-        let mut count = 0;
-        check(
-            unsafe {
-                sys::application_engine_execute_valid_user_op(
-                    self.engine,
-                    &op,
-                    safe_block,
-                    &mut count,
-                )
-            },
-            "execute_valid_user_op",
-        )?;
-        self.drain_outputs(count)
-    }
-
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-        let direct = sys::ApplicationEngineDirectInput {
-            sender: abi_address(input.sender),
-            block_number: input.block_number,
-            payload: abi_span(&input.payload),
-        };
-        let mut count = 0;
-        check(
-            unsafe {
-                sys::application_engine_execute_direct_input(self.engine, &direct, &mut count)
-            },
-            "execute_direct_input",
-        )?;
-        self.drain_outputs(count)
-    }
-
-    fn progress(&self) -> ApplicationProgress {
-        let mut progress = sys::ApplicationEngineProgress {
-            executed_input_count: 0,
-            last_executed_safe_block: 0,
-        };
-        unsafe { sys::application_engine_progress(self.engine, &mut progress) };
-        ApplicationProgress::try_new(
-            ExecutedInputCount::new(progress.executed_input_count),
-            progress.last_executed_safe_block,
-        )
-        .expect("engine returned incoherent application progress")
+        admission_from(status, &invalid)
     }
 
     fn from_dump(prefix: &Path) -> Result<Self, AppError> {
+        check_abi_version()?;
         let prefix = path_to_cstring(prefix);
         let mut engine = std::ptr::null_mut();
         check_lifecycle(
             unsafe { sys::application_engine_from_dump(prefix.as_ptr(), &mut engine) },
             "from_dump",
         )?;
-        assert!(
-            !engine.is_null(),
-            "engine reported successful load without a handle"
-        );
-        Ok(Self { engine })
+        Ok(Self::from_handle(engine))
     }
 
     fn create_dump(&mut self, prefix: &Path) -> Result<(), AppError> {
@@ -289,6 +341,7 @@ impl Application for EngineApp {
     }
 
     fn state_file_in_dump(prefix: &Path) -> PathBuf {
+        assert_abi_version();
         let prefix = path_to_cstring(prefix);
         let state_file = unsafe { sys::application_engine_state_file_in_dump(prefix.as_ptr()) };
         assert!(
@@ -299,5 +352,22 @@ impl Application for EngineApp {
         PathBuf::from(OsStr::from_bytes(
             unsafe { CStr::from_ptr(state_file) }.to_bytes(),
         ))
+    }
+
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError> {
+        check_abi_version()?;
+        let state_file = path_to_cstring(state_file);
+        let mut engine = std::ptr::null_mut();
+        check_lifecycle(
+            unsafe {
+                sys::application_engine_from_canonical_state(
+                    state_file.as_ptr(),
+                    l2_tx_count.get(),
+                    &mut engine,
+                )
+            },
+            "from_canonical_state",
+        )?;
+        Ok(Self::from_handle(engine))
     }
 }

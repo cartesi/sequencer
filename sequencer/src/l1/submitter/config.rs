@@ -8,11 +8,10 @@ use std::time::Duration;
 /// [`crate::l1::L1Config`] and its `identity`). These fields are parsed as
 /// part of `RunConfig` and passed through at runtime.
 ///
-/// Danger-zone tuning (`max_wait_blocks`, `preemptive_margin_blocks`) lives
-/// in `ProtocolTiming`, not here — the submitter doesn't read it; the
-/// [`crate::recovery::DangerDetector`] worker owns that. The one timing value
-/// the poster does read is `seconds_per_block`, carried on
-/// `BatchPosterConfig` for its confirmation timeout.
+/// The staleness window is the pinned identity's, not here — the submitter
+/// doesn't read it; the [`crate::landing::LandingWatch`] worker owns the void
+/// history. The one timing value the poster does read is `seconds_per_block`,
+/// carried on `BatchPosterConfig` for its confirmation timeout.
 #[derive(Debug, Clone)]
 pub struct BatchSubmitterConfig {
     /// How often the submitter polls for new work when idle, and how long it

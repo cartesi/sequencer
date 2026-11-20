@@ -363,6 +363,28 @@ mod tests {
         let _ = Storage::open(path).expect("initialize storage schema");
     }
 
+    /// The stored price, or `None` while the database is busy. A running
+    /// worker opens and closes its own writer on every refresh, and a reader
+    /// that meets it gives up after its 50 ms busy timeout, so a poll takes
+    /// busy as "not yet".
+    fn poll_log_gas_price(path: &str) -> Option<i16> {
+        match Storage::open_read_only(path).unwrap().log_gas_price() {
+            Ok(price) => Some(price),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(
+                        rusqlite::ffi::ErrorCode::DatabaseBusy
+                            | rusqlite::ffi::ErrorCode::DatabaseLocked
+                    )
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("reading the gas price: {error}"),
+        }
+    }
+
     fn oracle_with(
         path: &str,
         gas: Box<dyn GasFeeSource>,
@@ -590,21 +612,20 @@ mod tests {
                 result = &mut handle => panic!("fee oracle exited early: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
-            let price = Storage::open_read_only(&db.path)
-                .unwrap()
-                .log_gas_price()
-                .unwrap();
+            let price = poll_log_gas_price(&db.path);
             let calls = gas_calls.load(Ordering::SeqCst);
-            if price == expected_log && calls >= 2 {
+            if price == Some(expected_log) && calls >= 2 {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!(
                     "timed out waiting for retained fee-oracle price \
-                     (expected {expected_log}, last read {price}, gas_calls={calls})"
+                     (expected {expected_log}, last read {price:?}, gas_calls={calls})"
                 );
             }
         }
+        // The worker's only write finished before its second gas call, so
+        // nothing else holds the database now.
         let storage = Storage::open_read_only(&db.path).unwrap();
         assert_eq!(storage.log_gas_price().unwrap(), expected_log);
         drop(storage);
@@ -636,12 +657,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if Storage::open_read_only(&db.path)
-                    .unwrap()
-                    .log_gas_price()
-                    .unwrap()
-                    == expected_log
-                {
+                if poll_log_gas_price(&db.path) == Some(expected_log) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

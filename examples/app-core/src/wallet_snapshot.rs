@@ -34,8 +34,7 @@ struct WalletSnapshot {
     pub sequencer_address: [u8; 20],
     pub balances: Vec<SnapshotBalance>,
     pub nonces: Vec<SnapshotNonce>,
-    pub executed_input_count: u64,
-    pub last_executed_safe_block: u64,
+    pub l2_tx_count: u64,
 }
 
 /// Deterministic SSZ bytes for `app`'s logical state; entries come out in
@@ -63,8 +62,7 @@ pub fn encode(app: &WalletApp) -> Vec<u8> {
         sequencer_address: app.config().sequencer_address.into_array(),
         balances,
         nonces,
-        executed_input_count: app.executed_input_count().get(),
-        last_executed_safe_block: app.last_executed_safe_block(),
+        l2_tx_count: app.l2_tx_count().get(),
     }
     .as_ssz_bytes()
 }
@@ -96,7 +94,7 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         }
     }
 
-    WalletApp::from_snapshot_parts(
+    Ok(WalletApp::from_snapshot_parts(
         WalletConfig {
             erc20_portal_address: Address::from(decoded.erc20_portal_address),
             supported_erc20_token: Address::from(decoded.supported_erc20_token),
@@ -104,9 +102,8 @@ pub fn decode(bytes: &[u8]) -> Result<WalletApp, AppError> {
         },
         balances,
         nonces,
-        decoded.executed_input_count,
-        decoded.last_executed_safe_block,
-    )
+        decoded.l2_tx_count,
+    ))
 }
 
 #[cfg(test)]
@@ -146,11 +143,64 @@ mod tests {
         );
         app.nonces_mut()
             .insert(address!("0x1111111111111111111111111111111111111111"), 1);
-        app.set_executed_input_count(3);
+        app.set_l2_tx_count(3);
 
         let bytes = encode(&app);
         let restored = decode(&bytes).expect("decode snapshot");
         assert_eq!(encode(&restored), bytes);
+    }
+
+    /// A dump from before the clock's removal ends with
+    /// `last_executed_safe_block`. Read as the current layout it would lose
+    /// that field silently, so decoding must refuse it instead.
+    #[test]
+    fn decode_refuses_the_layout_with_the_safe_block_clock() {
+        #[derive(SszEncode)]
+        struct ClockedWalletSnapshot {
+            erc20_portal_address: [u8; 20],
+            supported_erc20_token: [u8; 20],
+            sequencer_address: [u8; 20],
+            balances: Vec<SnapshotBalance>,
+            nonces: Vec<SnapshotNonce>,
+            l2_tx_count: u64,
+            last_executed_safe_block: u64,
+        }
+
+        let refused = |bytes: &[u8]| {
+            matches!(
+                decode(bytes),
+                Err(AppError::Internal { reason }) if reason.starts_with("snapshot decode failed")
+            )
+        };
+        // The empty-wallet golden of that layout, 84 fixed bytes.
+        let old_empty_golden = "3332de61a8bb9ac84893b2f552fe81c9a6dc54191c7d4b196cb0c7b0\
+            1d743fbc6116a902379c723879b88d2f598d8d001832d69f5201332a3f1e14c854000000540000\
+            0000000000000000000000000000000000";
+        let old_empty_golden: Vec<u8> = (0..old_empty_golden.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&old_empty_golden[i..i + 2], 16).expect("hex nibble"))
+            .collect();
+        assert_eq!(old_empty_golden.len(), 84);
+        assert!(refused(&old_empty_golden));
+
+        let account = address!("0x1111111111111111111111111111111111111111");
+        let config = WalletConfig::default();
+        let clocked = ClockedWalletSnapshot {
+            erc20_portal_address: config.erc20_portal_address.into_array(),
+            supported_erc20_token: config.supported_erc20_token.into_array(),
+            sequencer_address: config.sequencer_address.into_array(),
+            balances: vec![SnapshotBalance {
+                address: account.into_array(),
+                balance_be: U256::from(10_u64).to_be_bytes(),
+            }],
+            nonces: vec![SnapshotNonce {
+                address: account.into_array(),
+                nonce: 1,
+            }],
+            l2_tx_count: 3,
+            last_executed_safe_block: 1_000,
+        };
+        assert!(refused(&clocked.as_ssz_bytes()));
     }
 
     #[test]
@@ -193,8 +243,7 @@ mod tests {
                 balance(first_byte, 1),
             ],
             nonces: vec![nonce(last_byte, 8), nonce(first_byte, 7)],
-            executed_input_count: 0,
-            last_executed_safe_block: 0,
+            l2_tx_count: 0,
         };
         assert_eq!(encode(&app), expected.as_ssz_bytes());
     }

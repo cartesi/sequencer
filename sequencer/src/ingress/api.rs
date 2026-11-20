@@ -21,7 +21,7 @@ use tracing::debug;
 use crate::http::{ApiError, reject_if_shutting_down, storage_task};
 use crate::ingress::inclusion_lane::PendingUserOp;
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::Storage;
+use crate::storage::{FeeQuote, Storage};
 use sequencer_core::api::{
     DomainResponse, FeeResponse, NonceResponse, TxRequest, TxResponse, parse_sender_address,
 };
@@ -94,8 +94,9 @@ pub(crate) fn router(submit: Arc<SubmitState>, read: Arc<ReadState>) -> Router {
         )
 }
 
-/// Admission checks only size and signature. Nonce and `max_fee` are left to the
-/// lane, where a stale op costs an in-memory comparison and no transaction; a
+/// Admission checks only size and signature. The fee cap, the nonce and the
+/// application's admission are left to the lane, whose refusal comes back as the
+/// 422; there a stale op costs an in-memory comparison and no transaction; a
 /// pre-check here would add a SQLite read to every honest submit, and a future
 /// nonce or fresh address bypasses it. Revisit if persistent `429`s trace back to
 /// stale-nonce floods.
@@ -135,9 +136,13 @@ async fn get_fee(State(state): State<Arc<ReadState>>) -> Result<Response, ApiErr
     })
     .await;
     match result {
-        Ok(Some((fee, recommended_fee))) => {
-            Ok(no_store(Json(FeeResponse::quote(fee, recommended_fee))))
-        }
+        Ok(Some(FeeQuote {
+            frame_fee,
+            recommended_fee,
+        })) => Ok(no_store(Json(FeeResponse::quote(
+            frame_fee,
+            recommended_fee,
+        )))),
         Ok(None) => Err(ApiError::unavailable("no open frame")),
         Err(err) => {
             tracing::warn!(error = %err, "GET /fee failed");

@@ -15,7 +15,6 @@ use axum::Router;
 use axum::routing::get;
 
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::ReleaseScheduler;
 
 pub(crate) use health::HealthState;
 pub use snapshot::SnapshotState;
@@ -28,7 +27,6 @@ pub(crate) fn router(
     health_state: Arc<HealthState>,
     snapshot_state: SnapshotState,
     shutdown: RuntimeScope,
-    snapshot_release_scheduler: ReleaseScheduler,
 ) -> Router {
     let history_router = history::router(snapshot_state.db_path.clone(), shutdown.clone());
     let subscribe_router = Router::new()
@@ -44,9 +42,5 @@ pub(crate) fn router(
     subscribe_router
         .merge(health_router)
         .merge(history_router)
-        .merge(snapshot::router(
-            snapshot_state,
-            shutdown,
-            snapshot_release_scheduler,
-        ))
+        .merge(snapshot::router(snapshot_state, shutdown))
 }

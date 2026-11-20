@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
 mod cold_replica;
+mod recovery_round_trip;
 pub mod test_cases;
 mod watchdog_compare;
 

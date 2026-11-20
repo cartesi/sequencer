@@ -156,6 +156,31 @@ impl DevnetRollupsStack {
         self.anvil.drop_all_pending_txs().await
     }
 
+    /// The account's ETH balance at the latest block.
+    pub async fn balance_of(&self, account: Address) -> HarnessResult<U256> {
+        let provider = ProviderBuilder::new()
+            .connect(self.anvil.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        provider.get_balance(account).await.map_err(|err| {
+            io_other(format!("failed to read the balance of {account}: {err}")).into()
+        })
+    }
+
+    /// Overwrite the account's ETH balance (`anvil_setBalance`).
+    pub async fn set_balance(&self, account: Address, balance: U256) -> HarnessResult<()> {
+        let provider = ProviderBuilder::new()
+            .connect(self.anvil.endpoint.as_str())
+            .await
+            .map_err(|err| io_other(format!("failed to connect anvil provider: {err}")))?;
+        provider
+            .anvil_set_balance(account, balance)
+            .await
+            .map_err(|err| {
+                io_other(format!("failed to set the balance of {account}: {err}")).into()
+            })
+    }
+
     /// Wait until `sender` has a transaction in Anvil's mempool, i.e. its
     /// pending nonce is ahead of its latest one.
     pub async fn wait_for_pending_tx_from(
@@ -300,12 +325,9 @@ impl ManagedAnvil {
     async fn mine_blocks(&self, block_count: u64) -> HarnessResult<()> {
         // L1 block-time coupling: each mined block advances the L1
         // timestamp by `DEVNET_SECONDS_PER_BLOCK`, which
-        // `ManagedSequencer::advance_wall_and_mine` pairs with faketime.
-        //
-        // Without the explicit `interval`, anvil defaults to 1s/block —
-        // which then desyncs from faketime, making large advances trip
-        // spurious `L1ViewStale` even when wall clock and L1 should move
-        // together. See `ManagedSequencer::advance_wall_and_mine`.
+        // `ManagedSequencer::advance_wall_and_mine` pairs with faketime, so
+        // the safe head's age the sequencer reports follows the outage.
+        // Without the explicit `interval`, Anvil stamps 1 s per block.
         self.mine_blocks_with_interval(block_count, Some(DEVNET_SECONDS_PER_BLOCK))
             .await
     }

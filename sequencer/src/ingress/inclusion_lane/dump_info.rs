@@ -206,14 +206,13 @@ pub fn read_info(dump_dir: &Path) -> io::Result<DumpInfo> {
 
 /// Explain why `dump_dir` is not a usable sequencer checkpoint dump.
 ///
-/// Called when `info.toml` is missing. Distinguishes the common operator
-/// mistake of pointing `--checkpoint-dump-dir` at a **watchdog** CM checkpoint
-/// (`manifest.json` + `snapshot/`) from a merely empty/wrong path.
+/// Called when `info.toml` is missing. Distinguishes a **watchdog** CM
+/// checkpoint (`manifest.json` + `snapshot/`), an easy operator mix-up, from a
+/// merely empty/wrong path.
 pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
     let expected = format!(
         "expected a sequencer dump at {} with `info.toml` and a `state` app artifact. \
-         Recovery additionally requires `checkpoint.toml` from `/finalized_snapshot`. \
-         See docs/snapshots/lifecycle.md and docs/recovery/cockroach.md.",
+         See docs/snapshots/lifecycle.md.",
         dump_dir.display()
     );
 
@@ -235,9 +234,8 @@ pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
         };
         return format!(
             "this looks like a watchdog Cartesi Machine checkpoint (found {found}), \
-             not a sequencer dump. `setup --recovery --checkpoint-dump-dir` cannot \
-             use watchdog state under .../checkpoints/<block>/ — those are CM \
-             snapshots for the watchdog compare loop. {expected}"
+             not a sequencer dump. Watchdog state under .../checkpoints/<block>/ \
+             holds CM snapshots for the watchdog compare loop. {expected}"
         );
     }
 
@@ -255,61 +253,61 @@ pub fn diagnose_missing_dump(dump_dir: &Path) -> String {
 mod tests {
     use super::*;
     use alloy_primitives::Address;
-    use sequencer_core::application::{
-        AppOutputs, ApplicationProgress, ValidationOutcome, execute_direct_input,
-    };
-    use sequencer_core::history::ExecutedInputCount;
-    use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+    use sequencer_core::application::{Admission, AppOutputs, SchedulerLimits, execute};
+    use sequencer_core::history::L2TxCount;
+    use sequencer_core::l2_tx::{Direct, L2Tx, UserOpTx};
     use sequencer_core::user_op::UserOp;
 
+    /// Persists only its count, as a single file or inside a directory.
     #[derive(Default)]
     struct PrefixDumpApp<const DIRECTORY: bool> {
-        progress: ApplicationProgress,
+        count: L2TxCount,
         flushes: usize,
     }
 
     impl<const DIRECTORY: bool> Application for PrefixDumpApp<DIRECTORY> {
+        fn user_nonce(&self, _sender: Address) -> Result<u32, AppError> {
+            unreachable!("dump-prefix tests execute only directs")
+        }
+
+        fn apply_user_op(&mut self, _op: &UserOpTx) -> Result<AppOutputs, AppError> {
+            unreachable!("dump-prefix tests execute only directs")
+        }
+
+        fn apply_direct(&mut self, _direct: &Direct) -> Result<AppOutputs, AppError> {
+            self.count.advance();
+            Ok(Vec::new())
+        }
+
+        fn l2_tx_count(&self) -> L2TxCount {
+            self.count
+        }
+
         fn max_method_payload_bytes() -> usize {
             0
         }
 
-        fn validate_user_op(
+        fn scheduler_limits() -> SchedulerLimits {
+            app_core::application::WALLET_SCHEDULER_LIMITS
+        }
+
+        fn admit_user_op(
             &self,
             _sender: Address,
-            _user_op: &UserOp,
+            _op: &UserOp,
             _fee: u16,
-        ) -> Result<ValidationOutcome, AppError> {
-            Ok(ValidationOutcome::Accept)
-        }
-
-        fn apply_valid_user_op(
-            &mut self,
-            _user_op: &ValidUserOp,
-            safe_block: u64,
-        ) -> Result<AppOutputs, AppError> {
-            self.progress.advance(safe_block);
-            Ok(Vec::new())
-        }
-
-        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-            self.progress.advance(input.block_number);
-            Ok(Vec::new())
-        }
-
-        fn progress(&self) -> ApplicationProgress {
-            self.progress
+        ) -> Result<Admission, AppError> {
+            Ok(Admission::Admit)
         }
 
         fn from_dump(prefix: &Path) -> Result<Self, AppError> {
             let bytes = std::fs::read(Self::state_file_in_dump(prefix))?;
-            let count = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let block = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+            let count = u64::from_le_bytes(bytes.as_slice().try_into().unwrap());
             if DIRECTORY {
                 assert_eq!(std::fs::read(prefix.join("manifest"))?, b"complete");
             }
             Ok(Self {
-                progress: ApplicationProgress::try_new(ExecutedInputCount::new(count), block)
-                    .expect("coherent dumped progress"),
+                count: L2TxCount::new(count),
                 flushes: 0,
             })
         }
@@ -321,13 +319,8 @@ mod tests {
                 std::fs::write(prefix.join("manifest"), b"complete")?;
                 std::fs::File::open(prefix.join("manifest"))?.sync_all()?;
             }
-            let bytes = [
-                self.progress.executed_input_count().get().to_le_bytes(),
-                self.progress.last_executed_safe_block().to_le_bytes(),
-            ]
-            .concat();
             let state = Self::state_file_in_dump(prefix);
-            std::fs::write(&state, bytes)?;
+            std::fs::write(&state, self.count.get().to_le_bytes())?;
             std::fs::File::open(state)?.sync_all()?;
             if DIRECTORY {
                 std::fs::File::open(prefix)?.sync_all()?;
@@ -343,26 +336,35 @@ mod tests {
                 prefix.to_path_buf()
             }
         }
+
+        fn from_canonical_state(
+            _state_file: &Path,
+            _l2_tx_count: L2TxCount,
+        ) -> Result<Self, AppError> {
+            unreachable!("dump-prefix tests never adopt a canonical state")
+        }
     }
 
     fn assert_dump_prefix_round_trip<const DIRECTORY: bool>() {
         let root = tempfile::tempdir().unwrap();
         let dump = root.path().join("original");
-        let input = DirectInput {
+        let input = L2Tx::Direct(Direct {
+            input_index: 0,
             sender: Address::ZERO,
-            block_number: 7,
+            block: 7,
+            timestamp: 0,
             payload: vec![],
-        };
+        });
         let mut app = PrefixDumpApp::<DIRECTORY>::default();
-        execute_direct_input(&mut app, &input).unwrap();
-        let checkpoint = app.progress();
+        execute(&mut app, &input).unwrap();
+        let checkpoint = app.l2_tx_count();
         create_dump_dir_with_info(&mut app, &dump, &sample()).unwrap();
         assert_eq!(
             app.flushes, 1,
             "dump creation can flush mutable runtime state"
         );
         assert_eq!(
-            app.progress(),
+            app.l2_tx_count(),
             checkpoint,
             "dumping preserves logical state"
         );
@@ -378,14 +380,14 @@ mod tests {
         assert_eq!(
             PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&sibling))
                 .unwrap()
-                .progress(),
+                .l2_tx_count(),
             checkpoint,
             "other checkpoints survive deletion"
         );
-        execute_direct_input(&mut first, &input).unwrap();
-        assert_eq!(app.progress(), checkpoint);
+        execute(&mut first, &input).unwrap();
+        assert_eq!(app.l2_tx_count(), checkpoint);
         assert_eq!(
-            second.progress(),
+            second.l2_tx_count(),
             checkpoint,
             "restored instances own independent state"
         );
@@ -393,8 +395,8 @@ mod tests {
         create_dump_dir_with_info(&mut first, &successor, &sample()).unwrap();
         let reloaded = PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&successor)).unwrap();
         assert_eq!(
-            reloaded.progress(),
-            first.progress(),
+            reloaded.l2_tx_count(),
+            first.l2_tx_count(),
             "restored state survives source deletion"
         );
         delete_dump_dir(&successor).unwrap();
@@ -435,7 +437,7 @@ mod tests {
             assert_eq!(read_checkpoint_info(&destination).unwrap(), receipt);
             let restored =
                 PrefixDumpApp::<DIRECTORY>::from_dump(&app_prefix(&destination)).unwrap();
-            assert_eq!(restored.progress(), app.progress());
+            assert_eq!(restored.l2_tx_count(), app.l2_tx_count());
         }
         check::<false>();
         check::<true>();
@@ -526,8 +528,7 @@ mod tests {
             "got: {msg}"
         );
         assert!(msg.contains("manifest.json and snapshot/"), "got: {msg}");
-        assert!(msg.contains("/finalized_snapshot"), "got: {msg}");
-        assert!(msg.contains("checkpoint.toml"), "got: {msg}");
+        assert!(msg.contains("with `info.toml` and a `state`"), "got: {msg}");
 
         let err = read_info(dir.path()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);

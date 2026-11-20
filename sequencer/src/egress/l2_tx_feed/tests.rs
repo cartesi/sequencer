@@ -1,34 +1,35 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use alloy_primitives::{Address, B256, Signature};
 use tokio::sync::oneshot;
 
 use super::{BroadcastTxMessage, L2TxFeed, L2TxFeedConfig, SubscribeError};
+use crate::egress::test_era;
 use crate::ingress::inclusion_lane::{IncludedUserOp, PendingUserOp, SequencerError};
 use crate::runtime::process_lock::{ProcessLock, ProcessLockError};
 use crate::runtime::shutdown::RuntimeScope;
-use crate::storage::{FrontierMode, IngestedSafeInput, SafeInputRange, Storage};
+use crate::storage::test_helpers::{SENDER_A, set_up_storage};
+use crate::storage::{IngestedSafeInput, SafeInputRange, Storage};
 use crate::test_support::{pin_test_deployment_identity, temp_db};
-use sequencer_core::history::{
-    ExecutedInputCount, HistoryClaim, HistoryPolicyError, RecoveryGeneration,
-};
-use sequencer_core::l2_tx::{DirectInput, ValidUserOp};
+use sequencer_core::history::{EraId, HistoryClaim, HistoryPolicyError, L2TxCount};
+use sequencer_core::l2_tx::{Direct, UserOpTx};
 use sequencer_core::user_op::UserOp;
 
 #[test]
 fn broadcast_user_op_serializes_with_hex_data() {
     let msg = BroadcastTxMessage::from_user_op(
         7,
-        ValidUserOp {
+        &UserOpTx {
             sender: Address::from_slice(&[0x11; 20]),
+            nonce: 11,
             fee: 3,
+            block: 1_234,
             data: vec![0xaa, 0xbb],
         },
-        11,
-        1_234,
         5,
     );
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -43,16 +44,16 @@ fn broadcast_user_op_serializes_with_hex_data() {
 
 #[test]
 fn broadcast_direct_input_serializes_with_hex_payload() {
-    let msg = BroadcastTxMessage::from_direct_input(
+    let msg = BroadcastTxMessage::from_direct(
         9,
-        DirectInput {
+        &Direct {
+            input_index: 3,
             sender: Address::ZERO,
-            block_number: 42,
+            block: 42,
+            timestamp: 1_700_000_000,
             payload: vec![0xcc, 0xdd],
         },
-        3,
         5,
-        1_700_000_000,
         B256::repeat_byte(0xab),
     );
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -68,26 +69,26 @@ fn broadcast_direct_input_serializes_with_hex_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscription_refuses_ahead_and_stale_claims() {
+async fn subscription_refuses_ahead_and_other_era_claims() {
     let db = temp_db("subscription-claims");
     seed_ordered_txs(&db.path);
     let feed = test_feed(&db.path, RuntimeScope::default());
     assert!(matches!(feed.subscribe_from(claim(&db.path, 3)).await,
         Err(SubscribeError::History(HistoryPolicyError::AheadOfHead { head })) if head.get() == 2));
-    let mut stale = claim(&db.path, 0);
-    stale.version.recovery_generation = RecoveryGeneration::new(1);
+    let current = claim(&db.path, 0);
+    let other_era: EraId = "00112233-4455-4677-8899-aabbccddeeff".parse().unwrap();
+    assert_ne!(other_era, current.era_id);
     assert!(matches!(
-        feed.subscribe_from(stale).await,
-        Err(SubscribeError::History(
-            HistoryPolicyError::StaleGeneration { .. }
-        ))
+        feed.subscribe_from(HistoryClaim { era_id: other_era, ..current }).await,
+        Err(SubscribeError::History(HistoryPolicyError::EraChanged { era_id }))
+            if era_id == current.era_id
     ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_cap() {
     let db = temp_db("subscription-deep-history");
-    let mut storage = Storage::open(&db.path).unwrap();
+    let mut storage = set_up_storage(&db.path, SENDER_A);
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .unwrap();
@@ -108,12 +109,12 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
                     respond_to,
                     received_at: SystemTime::now(),
                 },
-                executed_input_offset: ExecutedInputCount::new(u64::from(offset)),
+                l2_tx_index: L2TxCount::new(u64::from(offset)),
             }
         })
         .collect();
     storage
-        .append_executed_user_ops_chunk(&mut head, &inputs)
+        .append_included_user_ops(&mut head, &inputs)
         .unwrap();
     drop(storage);
     let feed = L2TxFeed::new(
@@ -133,6 +134,75 @@ async fn subscription_accepts_more_than_fifty_thousand_inputs_without_a_total_ca
         assert_eq!(event.offset(), expected);
     }
     subscription.finish().await.unwrap();
+}
+
+/// Subscribe from `from` and read every row through `end`, one feed per call
+/// so each page size starts a fresh cursor.
+async fn read_feed(db_path: &str, from: u64, end: u64, page_size: usize) -> Vec<serde_json::Value> {
+    let feed = L2TxFeed::new(
+        db_path.to_string(),
+        RuntimeScope::default(),
+        L2TxFeedConfig {
+            idle_poll_interval: Duration::from_millis(2),
+            page_size,
+        },
+    );
+    let mut subscription = feed.subscribe_from(claim(db_path, from)).await.unwrap();
+    let mut messages = Vec::new();
+    for _ in from..end {
+        let message = tokio::time::timeout(Duration::from_secs(2), subscription.recv())
+            .await
+            .expect("wait for a feed row")
+            .expect("the feed is open");
+        messages.push(serde_json::to_value(message).unwrap());
+    }
+    subscription.finish().await.unwrap();
+    messages
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_serves_the_rebuilt_history_then_the_live_rows_across_the_seam() {
+    let db = temp_db("feed-rebuilt-era");
+    let mut storage = test_era::seed_rebuilt_era(&db.path, Path::new("/unused/baseline"));
+    let mut expected: Vec<_> = (test_era::BASE..=test_era::REBUILT_END)
+        .map(test_era::expected_feed_message)
+        .collect();
+    expected.push(test_era::append_live_user_op(&mut storage, 2));
+    expected.push(test_era::append_live_user_op(&mut storage, 3));
+    drop(storage);
+    let head = test_era::BASE + expected.len() as u64;
+    assert_eq!(head, 48);
+
+    // From the base, the middle of the rebuilt range, its last row, its end
+    // (the first live row) and past it, with page sizes that split the seam.
+    for from in [41, 43, 44, 45, 46] {
+        for page_size in [1, 2, 3, 64] {
+            let messages = read_feed(&db.path, from, head, page_size).await;
+            let skip = usize::try_from(from - test_era::BASE).unwrap();
+            assert_eq!(
+                messages,
+                expected[skip..],
+                "from {from}, page size {page_size}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_refuses_a_claim_below_the_rebuilt_eras_base() {
+    let db = temp_db("feed-rebuilt-era-below-base");
+    drop(test_era::seed_rebuilt_era(
+        &db.path,
+        Path::new("/unused/baseline"),
+    ));
+    let feed = test_feed(&db.path, RuntimeScope::default());
+    for next in [0, test_era::BASE - 1] {
+        assert!(matches!(
+            feed.subscribe_from(claim(&db.path, next)).await,
+            Err(SubscribeError::History(HistoryPolicyError::HistoryUnavailable { available_from }))
+                if available_from.get() == test_era::BASE
+        ));
+    }
 }
 
 #[test]
@@ -283,7 +353,15 @@ async fn corrupt_feed_head_trips_terminal_storage_fault() {
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
     let start = claim(&db.path, 0);
-    conn.execute_batch("PRAGMA ignore_check_constraints = ON; DROP TRIGGER trg_history_generation_monotonic; UPDATE history_state SET recovery_generation = 'broken';").expect("corrupt generation");
+    // An era id of the wrong length: the head read decodes it and fails with
+    // a storage error, not a panic. The era is immutable and its CHECK bounds
+    // the length, so both are lifted for the corruption.
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints = ON; \
+         DROP TRIGGER trg_era_immutable; \
+         UPDATE era SET era_id = X'0102';",
+    )
+    .expect("corrupt the era id");
     drop(conn);
 
     let shutdown = RuntimeScope::default();
@@ -304,8 +382,12 @@ async fn corrupt_feed_page_trips_terminal_storage_fault() {
     let db = temp_db("corrupt-feed-page");
     seed_ordered_txs(db.path.as_str());
     let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
-    conn.execute("UPDATE frames SET safe_block = 'not-an-integer'", [])
-        .expect("corrupt safe-block storage type");
+    // A missing frame makes the page's LEFT JOIN read NULL frame columns (fee,
+    // safe block), which the decoder refuses as a wrongly typed stored value.
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF; DROP TRIGGER trg_frames_not_deletable; DELETE FROM frames;",
+    )
+    .expect("drop the frames under stored rows");
     drop(conn);
 
     let shutdown = RuntimeScope::default();
@@ -341,7 +423,7 @@ fn seed_ordered_txs(db_path: &str) {
         .initialize_open_state(123, SafeInputRange::empty_at(0))
         .expect("initialize open state");
     storage
-        .close_frame_and_batch(&mut head, 123)
+        .close_frame_and_batch(&mut head)
         .expect("advance to batch nonce 1");
 
     let (respond_to, _recv) = oneshot::channel::<Result<(), SequencerError>>();
@@ -360,11 +442,11 @@ fn seed_ordered_txs(db_path: &str) {
     };
 
     storage
-        .append_executed_user_ops_chunk(
+        .append_included_user_ops(
             &mut head,
             &[IncludedUserOp {
                 pending,
-                executed_input_offset: ExecutedInputCount::ZERO,
+                l2_tx_index: L2TxCount::ZERO,
             }],
         )
         .expect("append user-op chunk");
@@ -379,9 +461,6 @@ fn seed_ordered_txs(db_path: &str) {
                 block_timestamp: 1_700_000_000,
                 transaction_hash: B256::repeat_byte(0xcd),
             }],
-            NO_OWN_BATCHES,
-            &crate::storage::test_helpers::default_protocol_timing(),
-            FrontierMode::Populate,
         )
         .expect("append direct input");
     storage
@@ -390,9 +469,9 @@ fn seed_ordered_txs(db_path: &str) {
 }
 
 fn claim(db_path: &str, next: u64) -> HistoryClaim {
-    let storage = Storage::open_read_only(db_path).unwrap();
+    let mut storage = Storage::open_read_only(db_path).unwrap();
     HistoryClaim {
-        version: storage.history_state().unwrap().version,
-        next_input: ExecutedInputCount::new(next),
+        era_id: storage.era().unwrap().id,
+        next_input: L2TxCount::new(next),
     }
 }

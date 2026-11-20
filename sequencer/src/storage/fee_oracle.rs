@@ -6,7 +6,7 @@
 use rusqlite::{Result, params};
 
 use super::Storage;
-use super::convert::{i64_to_u64, now_unix_ms};
+use super::convert::now_unix_ms;
 
 impl Storage {
     pub fn log_gas_price(&self) -> Result<i16> {
@@ -29,16 +29,6 @@ impl Storage {
         )
     }
 
-    /// Unix-ms of the last successful `log_gas_price` write. `0` means never
-    /// written (migration default); completed setup guarantees a nonzero value.
-    pub fn log_gas_price_updated_at_ms(&self) -> Result<u64> {
-        self.conn.query_row(
-            "SELECT log_gas_price_updated_at_ms FROM batch_policy WHERE singleton_id = 0",
-            [],
-            |row| Ok(i64_to_u64(row.get::<_, i64>(0)?)),
-        )
-    }
-
     pub fn set_log_gas_price(&mut self, log_gas_price: i16) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE batch_policy \
@@ -55,13 +45,13 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::Storage;
+    use crate::storage::test_helpers::{SENDER_A, set_up_storage};
     use crate::test_support::temp_db;
 
     #[test]
     fn high_gas_price_clamps_recommended_fee_to_max_exponent() {
         let db = temp_db("clamp-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         storage
             .set_log_gas_price(17000)
             .expect("set high gas price");
@@ -74,7 +64,7 @@ mod tests {
     #[test]
     fn negative_log_gas_price_lowers_the_recommended_fee_to_the_floor() {
         let db = temp_db("negative-fee");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         let floor = storage.log_gas_price_floor().expect("floor");
         assert_eq!(floor, -1356);
         storage
@@ -93,7 +83,7 @@ mod tests {
     #[test]
     fn set_log_gas_price_stamps_updated_at() {
         let db = temp_db("fee-price-stamp");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
         assert_eq!(storage.log_gas_price_updated_at_ms().unwrap(), 0);
 
         storage.set_log_gas_price(42).expect("set");

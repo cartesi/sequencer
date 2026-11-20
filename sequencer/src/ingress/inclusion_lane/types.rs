@@ -6,7 +6,8 @@
 
 use std::time::SystemTime;
 
-use sequencer_core::history::ExecutedInputCount;
+use crate::storage::ExecutedUserOp;
+use sequencer_core::history::L2TxCount;
 use sequencer_core::user_op::SignedUserOp;
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -27,12 +28,37 @@ pub struct PendingUserOp {
 #[derive(Debug)]
 pub(crate) struct IncludedUserOp {
     pub pending: PendingUserOp,
-    pub executed_input_offset: ExecutedInputCount,
+    pub l2_tx_index: L2TxCount,
+}
+
+impl IncludedUserOp {
+    /// The borrowed view storage persists.
+    pub(crate) fn executed(&self) -> ExecutedUserOp<'_> {
+        ExecutedUserOp {
+            signed: &self.pending.signed,
+            received_at: self.pending.received_at,
+            l2_tx_index: self.l2_tx_index,
+        }
+    }
+}
+
+#[cfg(test)]
+impl crate::storage::Storage {
+    /// Test shorthand: append a chunk of lane-included ops.
+    pub(crate) fn append_included_user_ops(
+        &mut self,
+        head: &mut crate::storage::WriteHead,
+        user_ops: &[IncludedUserOp],
+    ) -> rusqlite::Result<()> {
+        self.append_executed_user_ops_chunk(head, user_ops.iter().map(IncludedUserOp::executed))
+    }
 }
 
 /// Per-op outcome reported back to the API caller via the response channel.
 ///
-/// - `Invalid` — application rejected the op (nonce mismatch, fee too low, etc.); maps to HTTP 4xx.
+/// - `Invalid` — the lane refused the op: its fee cap is below the frame's price,
+///   the executor would skip it (wrong or exhausted nonce), or the application's
+///   admission refused it; the text is the refusal's own; maps to HTTP 422.
 /// - `Unavailable` — sequencer can't currently accept (shutting down, queue full); maps to HTTP 503/429.
 /// - `Internal` — bug or unrecoverable failure; maps to HTTP 500.
 #[derive(Debug, Error, Clone)]

@@ -1,9 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use crate::history::ExecutedInputCount;
-use crate::l2_tx::DirectInput;
-use crate::l2_tx::ValidUserOp;
+use crate::history::L2TxCount;
+use crate::l2_tx::{Direct, L2Tx, UserOpTx};
 use crate::user_op::UserOp;
 use alloy_primitives::{Address, U256};
 use std::fmt;
@@ -20,21 +19,6 @@ pub enum AppError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionOutcome {
-    /// A canonical application input executed successfully. The receipt owns
-    /// its pre-execution history offset and any application outputs.
-    Included(ExecutedInput),
-
-    Invalid(InvalidReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationOutcome {
-    Accept,
-    Reject(InvalidReason),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppOutput {
     Notice(Vec<u8>),
     Voucher {
@@ -46,171 +30,154 @@ pub enum AppOutput {
 
 pub type AppOutputs = Vec<AppOutput>;
 
-/// Canonical progress owned and persisted by the application alongside its state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ApplicationProgress {
-    executed_input_count: ExecutedInputCount,
-    last_executed_safe_block: u64,
-}
-
-impl ApplicationProgress {
-    /// Construct a coherent application-history boundary: `None` when the
-    /// pair is incoherent (zero executed inputs with a nonzero clock), since
-    /// a nonzero clock proves that at least one input executed. Used when
-    /// restoring a dump or importing progress from a native application;
-    /// a genesis instance starts from `Default`.
-    pub const fn try_new(
-        executed_input_count: ExecutedInputCount,
-        last_executed_safe_block: u64,
-    ) -> Option<Self> {
-        if executed_input_count.get() == 0 && last_executed_safe_block != 0 {
-            return None;
-        }
-        Some(Self {
-            executed_input_count,
-            last_executed_safe_block,
-        })
-    }
-
-    pub const fn executed_input_count(self) -> ExecutedInputCount {
-        self.executed_input_count
-    }
-
-    pub const fn last_executed_safe_block(self) -> u64 {
-        self.last_executed_safe_block
-    }
-
-    /// Advance after one successful input, including an application-level no-op.
-    /// Panics if the history count has no representable successor.
-    pub fn advance(&mut self, safe_block: u64) {
-        *self = self
-            .checked_after_input(safe_block)
-            .expect("executed input count overflow: no canonical successor");
-    }
-
-    fn checked_after_input(self, safe_block: u64) -> Option<Self> {
-        Some(Self {
-            executed_input_count: self.executed_input_count.checked_next()?,
-            last_executed_safe_block: if self.last_executed_safe_block > safe_block {
-                self.last_executed_safe_block
-            } else {
-                safe_block
-            },
-        })
-    }
-}
-
-/// One successfully executed canonical application input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutedInput {
-    /// The boundary before this input executed; this is its history offset.
-    pub offset: ExecutedInputCount,
-    pub outputs: AppOutputs,
-}
-
+/// The scheduler constants a template compiles in for its application. They
+/// belong to the application: the window is how long it lets a sequencer hold
+/// a direct back, and the other two bound what its directs may cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvalidReason {
-    InvalidNonce {
-        expected: u32,
-        got: u32,
-    },
-    /// Both values are log-space exponents (base 129/128).
-    InvalidMaxFee {
-        max_fee: u16,
-        base_fee: u16,
-    },
-    /// The sender's expected nonce is `u32::MAX`, which has no successor.
-    NonceExhausted,
-    /// Sender cannot pay the frame fee. "Fee" (not "gas"): the current fee
+pub struct SchedulerLimits {
+    /// The staleness window, at least 1: a direct queued this many L1 blocks
+    /// is executed, and a batch whose first frame is this old is skipped.
+    pub max_wait_blocks: u64,
+    /// How many admitted directs the fridge may hold.
+    pub fridge_bound: u64,
+    /// A direct with a longer payload never joins the fridge.
+    pub max_direct_payload_bytes: u64,
+}
+
+/// The lane's admission verdict. Policy, never consensus: the canonical
+/// machine never asks, and the answer never changes what an included op does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    Admit,
+    Refuse(PolicyRefusal),
+}
+
+/// Why the operator does not want an op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRefusal {
+    /// The sender cannot pay the frame fee. "Fee" (not "gas"): the fee
     /// tracks DA usage; compute metering, if it ever exists, will be a
     /// separate concept.
-    InsufficientFeeBalance {
-        required: U256,
-        available: U256,
-    },
+    Underfunded { required: U256, available: U256 },
+    /// Any other operator policy; its text reaches the client verbatim.
+    Other(String),
 }
 
-impl fmt::Display for InvalidReason {
+/// Why the executor skipped a user op. A skipped op changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The op's nonce is not its sender's next.
+    WrongNonce { expected: u32, got: u32 },
+    /// The sender's next nonce is `u32::MAX`, which has no successor.
+    NonceExhausted,
+}
+
+/// Why the lane refuses a live user op. Its text is the `POST /tx` 422 body,
+/// which clients parse, so every variant prints exactly today's wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Both values are log-space exponents (base 129/128).
+    FeeCapBelowPrice {
+        max_fee: u16,
+        price: u16,
+    },
+    Skip(SkipReason),
+    Policy(PolicyRefusal),
+}
+
+impl fmt::Display for PolicyRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidNonce { expected, got } => {
-                write!(f, "bad nonce: expected {expected}, got {got}")
-            }
-            Self::InvalidMaxFee { max_fee, base_fee } => {
-                write!(f, "max fee {max_fee} below base fee {base_fee}")
-            }
-            Self::NonceExhausted => write!(f, "nonce {} has no successor", u32::MAX),
-            Self::InsufficientFeeBalance {
+            Self::Underfunded {
                 required,
                 available,
-            } => {
-                write!(
-                    f,
-                    "insufficient balance for fee: required {required}, available {available}"
-                )
-            }
+            } => write!(
+                f,
+                "insufficient balance for fee: required {required}, available {available}"
+            ),
+            Self::Other(reason) => f.write_str(reason),
         }
     }
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongNonce { expected, got } => {
+                write!(f, "bad nonce: expected {expected}, got {got}")
+            }
+            Self::NonceExhausted => write!(f, "nonce {} has no successor", u32::MAX),
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FeeCapBelowPrice { max_fee, price } => {
+                write!(f, "max fee {max_fee} below base fee {price}")
+            }
+            Self::Skip(reason) => reason.fmt(f),
+            Self::Policy(reason) => reason.fmt(f),
+        }
+    }
+}
+
+/// What became of one L2 transaction handed to [`execute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Executed {
+    /// It executed; `index` is the L2 tx count before it, its index in the history.
+    Done {
+        index: L2TxCount,
+        outputs: AppOutputs,
+    },
+    /// A user op whose nonce is not its sender's next. Nothing changed.
+    Skipped(SkipReason),
 }
 
 /// Deterministic application state with exclusive ownership and thread transfer.
+///
+/// The application executes every transaction it is handed and stores each
+/// sender's next nonce; shared code ([`execute`]) decides which user ops run,
+/// so an application bug can change what an op does but not whether it runs.
 pub trait Application: Send + Sized {
-    /// Maximum user-op method payload size, stable for this implementation.
-    /// Zero permits only empty method payloads.
+    // Execution: the canonical machine, the sequencer and every replica.
+
+    /// The sender's next nonce; zero for an address that has sent nothing.
+    /// Must not change state. [`execute`] compares it with the op's nonce.
+    fn user_nonce(&self, sender: Address) -> Result<u32, AppError>;
+
+    /// Execute a user op [`execute`] found at its sender's next nonce. It never
+    /// refuses: whatever the op does or pays, even a fee the sender cannot
+    /// cover (charging what it has, a saturating subtraction, is recommended),
+    /// the sender's nonce and the count each advance by exactly one.
+    /// `AppError` is fatal: callers discard the instance.
+    fn apply_user_op(&mut self, op: &UserOpTx) -> Result<AppOutputs, AppError>;
+
+    /// Execute a direct. Ignored or malformed payloads still count: the count
+    /// advances by exactly one and no nonce moves. `AppError` is fatal.
+    fn apply_direct(&mut self, direct: &Direct) -> Result<AppOutputs, AppError>;
+
+    /// The L2 tx count: starts at zero and advances by exactly one per
+    /// executed transaction, so an application at `X` executes history entry
+    /// `X` next. It must survive dump round-trips.
+    fn l2_tx_count(&self) -> L2TxCount;
+
+    // Admission: the sequencer's lane only. Policy, never consensus.
+
+    /// Maximum user-op method payload size, stable for this implementation,
+    /// which only the lane enforces. Zero permits only empty method payloads.
     fn max_method_payload_bytes() -> usize;
 
-    /// Pure validation predicate over current app state: the op's nonce
-    /// equals the sender's expected nonce (user replay protection), and the
-    /// sender covers the fee. Must not mutate state.
-    /// [`validate_and_execute_user_op`] enforces the protocol
-    /// `max_fee >= current_fee` guard before calling here, and rejects an
-    /// accepted op at nonce `u32::MAX` after. Rejection leaves the app
-    /// unchanged; `AppError` is fatal and defines no successor.
-    fn validate_user_op(
-        &self,
-        sender: Address,
-        user_op: &UserOp,
-        current_fee: u16,
-    ) -> Result<ValidationOutcome, AppError>;
+    /// The template's scheduler constants for this application.
+    fn scheduler_limits() -> SchedulerLimits;
 
-    /// Apply a validated user op and advance progress exactly once on success,
-    /// using `safe_block` for the clock. Also advance the sender's nonce by
-    /// exactly one; the sequencer derives `GET /nonce` from this rule (see the
-    /// application contract). Included business failures and no-ops also
-    /// advance both. `AppError` is fatal: callers discard the instance.
-    /// Execution callers use [`execute_valid_user_op`] to check the transition.
-    fn apply_valid_user_op(
-        &mut self,
-        user_op: &ValidUserOp,
-        safe_block: u64,
-    ) -> Result<AppOutputs, AppError>;
+    /// Does the operator want this op in a frame at this fee? Must not change
+    /// state and must not check the nonce, which [`check_live_user_op`] does
+    /// first. The canonical machine never asks, so a guest need not link it.
+    fn admit_user_op(&self, sender: Address, op: &UserOp, fee: u16) -> Result<Admission, AppError>;
 
-    /// Apply a direct input and advance progress exactly once on success,
-    /// using its L1 block number for the clock. Ignored or malformed inputs
-    /// still count. Never changes a user nonce. Execution callers use
-    /// [`execute_direct_input`] to check the transition; `AppError` requires
-    /// discarding the instance.
-    fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError>;
-
-    /// Return the progress embedded in the application's logical state.
-    fn progress(&self) -> ApplicationProgress;
-
-    /// The app's safe-block clock: the maximum block carried by any input
-    /// this instance has executed (frame safe blocks for user ops, L1
-    /// inclusion blocks for direct inputs), or 0 if nothing executed.
-    /// Recovery reads this as `A`, the safe block a checkpoint state reflects;
-    /// it must survive dump round-trips.
-    fn last_executed_safe_block(&self) -> u64 {
-        self.progress().last_executed_safe_block()
-    }
-
-    /// Canonical application-history boundary. Starts at zero and advances by
-    /// exactly one after each successful user-op or direct-input execution; an
-    /// application at `X` is ready to consume history input `X`. It must
-    /// survive dump round-trips.
-    fn executed_input_count(&self) -> ExecutedInputCount {
-        self.progress().executed_input_count()
-    }
+    // Durable state: the sequencer and replicas.
 
     // Genesis construction stays on the concrete type: its inputs depend on
     // the application. The host manages the resulting instance through dumps.
@@ -224,7 +191,7 @@ pub trait Application: Send + Sized {
 
     /// Write a complete recovery dump at the absent path `prefix`, which may
     /// be a file or directory. A subsequent [`Application::from_dump`] must
-    /// rehydrate equivalent logical state, including progress. Creating the
+    /// rehydrate equivalent logical state, including the count. Creating the
     /// dump must preserve the live instance's logical state; later execution
     /// of that instance must not change the dump. All checkpoint-owned artifacts
     /// must reside at or beneath `prefix`; discarding them uses ordinary
@@ -255,186 +222,212 @@ pub trait Application: Send + Sized {
     /// is a pure function of `prefix`: callers may invoke it without
     /// loading the dump or instantiating the Application.
     fn state_file_in_dump(prefix: &Path) -> PathBuf;
+
+    /// Build an instance from a canonical machine's comparison bytes, held in
+    /// `state_file`, at the machine's count, whether or not those bytes hold
+    /// it. A dump of the result holds the same comparison bytes.
+    fn from_canonical_state(state_file: &Path, l2_tx_count: L2TxCount) -> Result<Self, AppError>;
 }
 
 /// Canonical inspection for applications hosted by the shared Rust scheduler.
 /// Applications using another canonical runtime need not implement this trait.
 pub trait CanonicalState {
-    /// Deterministic bytes matching the state file in a dump of this state.
+    /// Deterministic bytes matching the state file in a dump of this state;
+    /// [`Application::from_canonical_state`] on them yields an equal instance.
     fn canonical_snapshot_bytes(&self) -> Result<Vec<u8>, AppError>;
 }
 
-/// Validate and execute a live user op: protocol guards, app validation, execution.
-///
-/// Live inclusion and the canonical scheduler use this boundary. Trusted
-/// replay uses [`execute_valid_user_op`] with the persisted validation result.
-pub fn validate_and_execute_user_op<A: Application>(
-    app: &mut A,
+/// The nonce rule, shared by [`execute`] and [`check_live_user_op`] so the
+/// lane refuses exactly what the canonical machine would skip. The mismatch
+/// comes first, so a stale op carrying `u32::MAX` reads as a wrong nonce.
+fn nonce_skip(expected: u32, got: u32) -> Option<SkipReason> {
+    if got != expected {
+        Some(SkipReason::WrongNonce { expected, got })
+    } else if expected == u32::MAX {
+        Some(SkipReason::NonceExhausted)
+    } else {
+        None
+    }
+}
+
+/// The one way a transaction reaches the application, in the canonical
+/// machine, a rebuild, the lane and its replay alike. A direct always
+/// executes; a user op executes only at its sender's next nonce. Wrong
+/// application bookkeeping after a successful hook fails loud.
+pub fn execute<A: Application>(app: &mut A, tx: &L2Tx) -> Result<Executed, AppError> {
+    match tx {
+        L2Tx::Direct(direct) => {
+            let index = preflight_count(app);
+            let outputs = app.apply_direct(direct)?;
+            assert_count_advanced(app, index);
+            // A direct's no-nonce rule is not checked: the executor cannot
+            // enumerate the senders whose nonces it might have moved.
+            Ok(Executed::Done { index, outputs })
+        }
+        L2Tx::UserOp(op) => {
+            let expected = app.user_nonce(op.sender)?;
+            if let Some(skip) = nonce_skip(expected, op.nonce) {
+                return Ok(Executed::Skipped(skip));
+            }
+            let nonce_after = expected
+                .checked_add(1)
+                .expect("nonce_skip lets no op through at u32::MAX");
+            let index = preflight_count(app);
+            let outputs = app.apply_user_op(op)?;
+            assert_count_advanced(app, index);
+            assert_eq!(
+                app.user_nonce(op.sender)?,
+                nonce_after,
+                "an executed user op must advance its sender's nonce exactly once"
+            );
+            Ok(Executed::Done { index, outputs })
+        }
+    }
+}
+
+/// The lane's pre-check of a live op, in the order whose texts clients see:
+/// the fee cap, then the executor's own nonce rule, then admission. `None`
+/// means the op is wanted and [`execute`] will run it, not skip it.
+pub fn check_live_user_op<A: Application>(
+    app: &A,
     sender: Address,
-    user_op: &UserOp,
-    current_fee: u16,
-    safe_block: u64,
-) -> Result<ExecutionOutcome, AppError> {
-    // Protocol invariant: max_fee must cover the current frame fee.
-    if user_op.max_fee < current_fee {
-        return Ok(ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
-            max_fee: user_op.max_fee,
-            base_fee: current_fee,
+    op: &UserOp,
+    frame_fee: u16,
+) -> Result<Option<Refusal>, AppError> {
+    if op.max_fee < frame_fee {
+        return Ok(Some(Refusal::FeeCapBelowPrice {
+            max_fee: op.max_fee,
+            price: frame_fee,
         }));
     }
-
-    if let ValidationOutcome::Reject(reason) = app.validate_user_op(sender, user_op, current_fee)? {
-        return Ok(ExecutionOutcome::Invalid(reason));
+    if let Some(skip) = nonce_skip(app.user_nonce(sender)?, op.nonce) {
+        return Ok(Some(Refusal::Skip(skip)));
     }
-    // Protocol invariant: the nonce rule gives `u32::MAX` no successor. Checked
-    // after validation so any other op carrying it gets the app's bad-nonce
-    // diagnostics; only a sender actually at `u32::MAX` is exhausted.
-    if user_op.nonce == u32::MAX {
-        return Ok(ExecutionOutcome::Invalid(InvalidReason::NonceExhausted));
+    match app.admit_user_op(sender, op, frame_fee)? {
+        Admission::Admit => Ok(None),
+        Admission::Refuse(policy) => Ok(Some(Refusal::Policy(policy))),
     }
-
-    let valid = ValidUserOp {
-        sender,
-        fee: current_fee,
-        data: user_op.data.to_vec(),
-    };
-    execute_valid_user_op(app, &valid, safe_block).map(ExecutionOutcome::Included)
 }
 
-/// Execute an already-validated user op and verify the application-owned progress.
-/// The caller is responsible for supplying a valid op, including its fee.
-pub fn execute_valid_user_op<A: Application>(
-    app: &mut A,
-    user_op: &ValidUserOp,
-    safe_block: u64,
-) -> Result<ExecutedInput, AppError> {
-    execute_and_verify_progress(app, safe_block, |app| {
-        app.apply_valid_user_op(user_op, safe_block)
-    })
+/// The count before execution. Panics before the hook runs when the count
+/// has no successor, so an exhausted history never mutates the application.
+fn preflight_count<A: Application>(app: &A) -> L2TxCount {
+    let count = app.l2_tx_count();
+    count
+        .checked_next()
+        .expect("L2 tx count overflow: no canonical successor");
+    count
 }
 
-/// Execute one direct input and verify the application-owned progress.
-pub fn execute_direct_input<A: Application>(
-    app: &mut A,
-    input: &DirectInput,
-) -> Result<ExecutedInput, AppError> {
-    execute_and_verify_progress(app, input.block_number, |app| app.apply_direct_input(input))
-}
-
-fn execute_and_verify_progress<A, F>(
-    app: &mut A,
-    safe_block: u64,
-    apply: F,
-) -> Result<ExecutedInput, AppError>
-where
-    A: Application,
-    F: FnOnce(&mut A) -> Result<AppOutputs, AppError>,
-{
-    let progress_before = app.progress();
-    let progress_after = progress_before
-        .checked_after_input(safe_block)
-        .expect("executed input count overflow: no canonical successor");
-
-    let outputs = apply(app)?;
+fn assert_count_advanced<A: Application>(app: &A, before: L2TxCount) {
     assert_eq!(
-        app.progress(),
-        progress_after,
-        "successful application execution must advance progress exactly once"
+        Some(app.l2_tx_count()),
+        before.checked_next(),
+        "successful application execution must advance the count exactly once"
     );
-
-    Ok(ExecutedInput {
-        offset: progress_before.executed_input_count(),
-        outputs,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
+    /// One sender's worth of state with knobs for every way an application can
+    /// misbehave. The nonce is shared by all senders, which suffices here.
     struct ProgressApp {
-        progress: ApplicationProgress,
+        count: L2TxCount,
+        nonce: u32,
         applied: u64,
-        reject: bool,
-        fail_validation: bool,
+        admit_calls: Cell<u64>,
+        nonce_steps: u32,
+        count_steps: usize,
+        fail_nonce: bool,
         fail_apply: bool,
-        advance_count: usize,
-        clock_override: Option<u64>,
+        admission: Admission,
     }
 
     impl ProgressApp {
         fn new(count: u64) -> Self {
             Self {
-                progress: ApplicationProgress::try_new(ExecutedInputCount::new(count), 0)
-                    .expect("coherent progress"),
+                count: L2TxCount::new(count),
+                nonce: 0,
                 applied: 0,
-                reject: false,
-                fail_validation: false,
+                admit_calls: Cell::new(0),
+                nonce_steps: 1,
+                count_steps: 1,
+                fail_nonce: false,
                 fail_apply: false,
-                advance_count: 1,
-                clock_override: None,
+                admission: Admission::Admit,
             }
         }
 
-        fn apply(&mut self, safe_block: u64) -> Result<AppOutputs, AppError> {
+        fn assert_usable(&self) {
+            assert!(
+                !(self.fail_apply && self.applied > 0),
+                "failed instance is unusable"
+            );
+        }
+
+        fn apply(&mut self) -> Result<AppOutputs, AppError> {
             self.applied += 1;
             if self.fail_apply {
                 return Err(AppError::Internal {
                     reason: "execution failed".into(),
                 });
             }
-            for _ in 0..self.advance_count {
-                self.progress
-                    .advance(self.clock_override.unwrap_or(safe_block));
+            for _ in 0..self.count_steps {
+                self.count.advance();
             }
             Ok(Vec::new())
         }
     }
 
     impl Application for ProgressApp {
+        fn user_nonce(&self, _sender: Address) -> Result<u32, AppError> {
+            self.assert_usable();
+            if self.fail_nonce {
+                return Err(AppError::Internal {
+                    reason: "nonce read failed".into(),
+                });
+            }
+            Ok(self.nonce)
+        }
+
+        fn apply_user_op(&mut self, _op: &UserOpTx) -> Result<AppOutputs, AppError> {
+            let outputs = self.apply()?;
+            self.nonce = self.nonce.wrapping_add(self.nonce_steps);
+            Ok(outputs)
+        }
+
+        fn apply_direct(&mut self, _direct: &Direct) -> Result<AppOutputs, AppError> {
+            self.apply()
+        }
+
+        fn l2_tx_count(&self) -> L2TxCount {
+            self.assert_usable();
+            self.count
+        }
+
         fn max_method_payload_bytes() -> usize {
             0
         }
 
-        fn validate_user_op(
+        fn scheduler_limits() -> SchedulerLimits {
+            SchedulerLimits {
+                max_wait_blocks: 1,
+                fridge_bound: 0,
+                max_direct_payload_bytes: 0,
+            }
+        }
+
+        fn admit_user_op(
             &self,
             _sender: Address,
-            _user_op: &UserOp,
-            _current_fee: u16,
-        ) -> Result<ValidationOutcome, AppError> {
-            if self.fail_validation {
-                return Err(AppError::Internal {
-                    reason: "validation failed".into(),
-                });
-            }
-            if self.reject {
-                Ok(ValidationOutcome::Reject(InvalidReason::InvalidNonce {
-                    expected: 1,
-                    got: 0,
-                }))
-            } else {
-                Ok(ValidationOutcome::Accept)
-            }
-        }
-
-        fn apply_valid_user_op(
-            &mut self,
-            _user_op: &ValidUserOp,
-            safe_block: u64,
-        ) -> Result<AppOutputs, AppError> {
-            self.apply(safe_block)
-        }
-
-        fn apply_direct_input(&mut self, input: &DirectInput) -> Result<AppOutputs, AppError> {
-            self.apply(input.block_number)
-        }
-
-        fn progress(&self) -> ApplicationProgress {
-            assert!(
-                !(self.fail_apply && self.applied > 0),
-                "failed instance is unusable"
-            );
-            self.progress
+            _op: &UserOp,
+            _fee: u16,
+        ) -> Result<Admission, AppError> {
+            self.admit_calls.set(self.admit_calls.get() + 1);
+            Ok(self.admission.clone())
         }
 
         fn from_dump(_prefix: &Path) -> Result<Self, AppError> {
@@ -446,148 +439,336 @@ mod tests {
         fn state_file_in_dump(prefix: &Path) -> PathBuf {
             prefix.join("state")
         }
+        fn from_canonical_state(
+            _state_file: &Path,
+            _l2_tx_count: L2TxCount,
+        ) -> Result<Self, AppError> {
+            unreachable!("not used")
+        }
     }
 
-    fn user_op() -> UserOp {
+    fn user_op(nonce: u32, max_fee: u16) -> UserOp {
         UserOp {
-            nonce: 0,
-            max_fee: 0,
+            nonce,
+            max_fee,
             data: Vec::new().into(),
         }
     }
 
-    fn direct(block_number: u64) -> DirectInput {
-        DirectInput {
+    fn user_tx(nonce: u32) -> L2Tx {
+        L2Tx::UserOp(UserOpTx::new(Address::ZERO, &user_op(nonce, 0), 0, 9))
+    }
+
+    fn direct(block: u64) -> L2Tx {
+        L2Tx::Direct(Direct {
+            input_index: 0,
             sender: Address::ZERO,
-            block_number,
+            block,
+            timestamp: 0,
             payload: Vec::new(),
+        })
+    }
+
+    fn underfunded() -> PolicyRefusal {
+        PolicyRefusal::Underfunded {
+            required: U256::from(10),
+            available: U256::from(3),
         }
     }
 
-    #[test]
-    fn native_progress_defines_receipt_offsets_and_monotonic_clock() {
-        let mut app = ProgressApp::new(0);
-        let ExecutionOutcome::Included(user) =
-            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9).unwrap()
-        else {
-            panic!("user op should be included")
-        };
-        assert_eq!(user.offset, ExecutedInputCount::ZERO);
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(1));
-        assert_eq!(app.last_executed_safe_block(), 9);
-
-        for (offset, block, clock) in [(1, 12, 12), (2, 10, 12)] {
-            let receipt = execute_direct_input(&mut app, &direct(block)).unwrap();
-            assert_eq!(receipt.offset, ExecutedInputCount::new(offset));
-            assert!(
-                receipt.outputs.is_empty(),
-                "included no-ops still advance progress"
-            );
-            assert_eq!(
-                app.executed_input_count(),
-                ExecutedInputCount::new(offset + 1)
-            );
-            assert_eq!(app.last_executed_safe_block(), clock);
-        }
+    fn panic_message(run: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+            .expect_err("the run must panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
     }
 
     #[test]
-    fn rejection_and_fatal_validation_do_not_execute() {
-        let mut app = ProgressApp::new(7);
-        app.reject = true;
-        assert!(matches!(
-            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9).unwrap(),
-            ExecutionOutcome::Invalid(InvalidReason::InvalidNonce { .. })
-        ));
-        app.fail_validation = true;
-        assert!(matches!(
-            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 0, 9),
-            Err(AppError::Internal { reason }) if reason == "validation failed"
-        ));
-        assert_eq!(app.applied, 0);
-        assert_eq!(app.executed_input_count(), ExecutedInputCount::new(7));
-    }
-
-    #[test]
-    fn protocol_max_fee_guard_precedes_application_validation() {
-        let mut app = ProgressApp::new(0);
-        app.fail_validation = true;
-        assert!(matches!(
-            validate_and_execute_user_op(&mut app, Address::ZERO, &user_op(), 1, 9).unwrap(),
-            ExecutionOutcome::Invalid(InvalidReason::InvalidMaxFee {
-                max_fee: 0,
-                base_fee: 1
-            })
-        ));
-        assert_eq!(app.applied, 0);
-    }
-
-    #[test]
-    fn protocol_exhausted_nonce_guard_follows_application_validation() {
-        let mut exhausted = user_op();
-        exhausted.nonce = u32::MAX;
-
-        let mut app = ProgressApp::new(0);
-        app.reject = true;
-        assert!(
-            matches!(
-                validate_and_execute_user_op(&mut app, Address::ZERO, &exhausted, 0, 9).unwrap(),
-                ExecutionOutcome::Invalid(InvalidReason::InvalidNonce { .. })
+    fn refusal_texts_are_byte_identical_to_the_served_422_bodies() {
+        let cases = [
+            (
+                Refusal::Skip(SkipReason::WrongNonce {
+                    expected: 3,
+                    got: 7,
+                }),
+                "bad nonce: expected 3, got 7",
             ),
-            "an app rejection keeps its bad-nonce diagnostics"
+            (
+                Refusal::FeeCapBelowPrice {
+                    max_fee: 5,
+                    price: 9,
+                },
+                "max fee 5 below base fee 9",
+            ),
+            (
+                Refusal::Skip(SkipReason::NonceExhausted),
+                "nonce 4294967295 has no successor",
+            ),
+            (
+                Refusal::Policy(underfunded()),
+                "insufficient balance for fee: required 10, available 3",
+            ),
+            (
+                Refusal::Policy(PolicyRefusal::Other("sponsor quota spent".into())),
+                "sponsor quota spent",
+            ),
+        ];
+        for (refusal, text) in cases {
+            assert_eq!(refusal.to_string(), text);
+        }
+        assert_eq!(
+            SkipReason::NonceExhausted.to_string(),
+            "nonce 4294967295 has no successor"
+        );
+        assert_eq!(
+            underfunded().to_string(),
+            "insufficient balance for fee: required 10, available 3"
+        );
+    }
+
+    #[test]
+    fn the_count_defines_indexes_and_only_user_ops_move_the_nonce() {
+        let mut app = ProgressApp::new(0);
+        let Executed::Done { index, .. } = execute(&mut app, &user_tx(0)).unwrap() else {
+            panic!("a user op at its sender's nonce executes")
+        };
+        assert_eq!(index, L2TxCount::ZERO);
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(1));
+        assert_eq!(app.nonce, 1);
+
+        for expected in [1, 2] {
+            let Executed::Done { index, outputs } = execute(&mut app, &direct(12)).unwrap() else {
+                panic!("a direct always executes")
+            };
+            assert_eq!(index, L2TxCount::new(expected));
+            assert!(
+                outputs.is_empty(),
+                "executed no-ops still advance the count"
+            );
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(expected + 1));
+        }
+        assert_eq!(app.nonce, 1, "a direct never moves a nonce");
+    }
+
+    #[test]
+    fn a_skipped_op_changes_nothing_and_never_applies() {
+        for (app_nonce, op_nonce, reason) in [
+            (
+                1,
+                0,
+                SkipReason::WrongNonce {
+                    expected: 1,
+                    got: 0,
+                },
+            ),
+            (u32::MAX, u32::MAX, SkipReason::NonceExhausted),
+        ] {
+            let mut app = ProgressApp::new(7);
+            app.nonce = app_nonce;
+            assert_eq!(
+                execute(&mut app, &user_tx(op_nonce)).unwrap(),
+                Executed::Skipped(reason)
+            );
+            assert_eq!(app.applied, 0);
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(7));
+            assert_eq!(app.nonce, app_nonce);
+        }
+    }
+
+    #[test]
+    fn a_skip_needs_no_count_successor() {
+        let mut app = ProgressApp::new(u64::MAX);
+        app.nonce = 1;
+        assert!(matches!(
+            execute(&mut app, &user_tx(0)).unwrap(),
+            Executed::Skipped(SkipReason::WrongNonce { .. })
+        ));
+    }
+
+    #[test]
+    fn a_nonce_read_error_propagates_without_executing() {
+        let mut app = ProgressApp::new(7);
+        app.fail_nonce = true;
+        assert!(matches!(
+            execute(&mut app, &user_tx(0)),
+            Err(AppError::Internal { reason }) if reason == "nonce read failed"
+        ));
+        assert!(matches!(
+            check_live_user_op(&app, Address::ZERO, &user_op(0, 0), 0),
+            Err(AppError::Internal { reason }) if reason == "nonce read failed"
+        ));
+        assert_eq!(app.applied, 0);
+        assert_eq!(app.admit_calls.get(), 0);
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(7));
+    }
+
+    #[test]
+    fn mismatch_is_reported_before_exhaustion() {
+        let mut app = ProgressApp::new(0);
+        let stale = SkipReason::WrongNonce {
+            expected: 0,
+            got: u32::MAX,
+        };
+        assert_eq!(
+            execute(&mut app, &user_tx(u32::MAX)).unwrap(),
+            Executed::Skipped(stale),
+            "an op carrying u32::MAX for a fresh sender is a wrong nonce"
+        );
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(u32::MAX, 0), 0).unwrap(),
+            Some(Refusal::Skip(stale))
         );
 
-        let mut app = ProgressApp::new(0);
+        app.nonce = u32::MAX;
         assert_eq!(
-            validate_and_execute_user_op(&mut app, Address::ZERO, &exhausted, 0, 9).unwrap(),
-            ExecutionOutcome::Invalid(InvalidReason::NonceExhausted),
-            "an op the app accepts at u32::MAX is still never included"
+            execute(&mut app, &user_tx(3)).unwrap(),
+            Executed::Skipped(SkipReason::WrongNonce {
+                expected: u32::MAX,
+                got: 3
+            }),
+            "an exhausted sender's stale op still reads as a wrong nonce"
         );
+        assert_eq!(
+            execute(&mut app, &user_tx(u32::MAX)).unwrap(),
+            Executed::Skipped(SkipReason::NonceExhausted)
+        );
+        // The lane refuses what the executor would skip, before admission.
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(u32::MAX, 0), 0).unwrap(),
+            Some(Refusal::Skip(SkipReason::NonceExhausted))
+        );
+        assert_eq!(app.admit_calls.get(), 0);
         assert_eq!(app.applied, 0);
+    }
+
+    #[test]
+    fn the_fee_cap_is_checked_before_the_nonce_and_admission() {
+        let app = ProgressApp {
+            fail_nonce: true,
+            admission: Admission::Refuse(underfunded()),
+            ..ProgressApp::new(0)
+        };
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(5, 0), 1).unwrap(),
+            Some(Refusal::FeeCapBelowPrice {
+                max_fee: 0,
+                price: 1
+            })
+        );
+        assert_eq!(app.admit_calls.get(), 0);
+    }
+
+    #[test]
+    fn the_nonce_is_checked_before_admission() {
+        let app = ProgressApp {
+            nonce: 1,
+            admission: Admission::Refuse(underfunded()),
+            ..ProgressApp::new(0)
+        };
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(0, 1), 1).unwrap(),
+            Some(Refusal::Skip(SkipReason::WrongNonce {
+                expected: 1,
+                got: 0
+            }))
+        );
+        assert_eq!(app.admit_calls.get(), 0);
+    }
+
+    #[test]
+    fn an_admission_refusal_surfaces_without_executing() {
+        let mut app = ProgressApp {
+            admission: Admission::Refuse(underfunded()),
+            ..ProgressApp::new(4)
+        };
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(0, 1), 1).unwrap(),
+            Some(Refusal::Policy(underfunded()))
+        );
+        assert_eq!(app.admit_calls.get(), 1);
+        assert_eq!(app.applied, 0);
+        assert_eq!(app.l2_tx_count(), L2TxCount::new(4));
+        assert_eq!(app.nonce, 0);
+
+        app.admission = Admission::Admit;
+        assert_eq!(
+            check_live_user_op(&app, Address::ZERO, &user_op(0, 1), 1).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn execute_never_consults_admission() {
+        let mut app = ProgressApp {
+            admission: Admission::Refuse(underfunded()),
+            ..ProgressApp::new(0)
+        };
+        assert!(matches!(
+            execute(&mut app, &user_tx(0)).unwrap(),
+            Executed::Done { .. }
+        ));
+        assert_eq!(app.admit_calls.get(), 0);
+        assert_eq!(app.nonce, 1);
     }
 
     #[test]
     fn execution_error_is_propagated_without_reading_the_failed_instance() {
-        let mut app = ProgressApp::new(7);
-        app.fail_apply = true;
-        assert!(matches!(
-            execute_direct_input(&mut app, &direct(12)),
-            Err(AppError::Internal { reason }) if reason == "execution failed"
-        ));
-        assert_eq!(app.applied, 1);
-    }
-
-    #[test]
-    fn count_exhaustion_fails_before_application_mutation() {
-        let mut app = ProgressApp::new(u64::MAX);
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = execute_direct_input(&mut app, &direct(1));
-        }));
-        assert!(panic.is_err());
-        assert_eq!(app.applied, 0, "overflow must preflight the app hook");
-        assert_eq!(
-            app.executed_input_count(),
-            ExecutedInputCount::new(u64::MAX)
-        );
-    }
-
-    #[test]
-    fn successful_hooks_must_report_the_exact_successor() {
-        for (advances, clock_override) in [(0, None), (2, None), (1, Some(99))] {
-            let mut app = ProgressApp::new(1);
-            app.advance_count = advances;
-            app.clock_override = clock_override;
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = execute_direct_input(&mut app, &direct(12));
-            }));
-            assert!(panic.is_err(), "wrong application progress must fail loud");
+        for tx in [direct(12), user_tx(0)] {
+            let mut app = ProgressApp::new(7);
+            app.fail_apply = true;
+            assert!(matches!(
+                execute(&mut app, &tx),
+                Err(AppError::Internal { reason }) if reason == "execution failed"
+            ));
+            assert_eq!(app.applied, 1);
         }
     }
 
     #[test]
-    fn zero_count_rejects_nonzero_safe_block_clock() {
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 1).is_none());
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::ZERO, 0).is_some());
-        assert!(ApplicationProgress::try_new(ExecutedInputCount::new(1), 7).is_some());
+    fn count_exhaustion_fails_before_application_mutation() {
+        for tx in [direct(1), user_tx(0)] {
+            let mut app = ProgressApp::new(u64::MAX);
+            let message = panic_message(|| {
+                let _ = execute(&mut app, &tx);
+            });
+            assert_eq!(message, "L2 tx count overflow: no canonical successor");
+            assert_eq!(app.applied, 0, "overflow must preflight the app hook");
+            assert_eq!(app.l2_tx_count(), L2TxCount::new(u64::MAX));
+        }
+    }
+
+    #[test]
+    fn successful_hooks_must_advance_the_count_exactly_once() {
+        for steps in [0, 2] {
+            for tx in [direct(12), user_tx(0)] {
+                let mut app = ProgressApp::new(1);
+                app.count_steps = steps;
+                let message = panic_message(|| {
+                    let _ = execute(&mut app, &tx);
+                });
+                assert!(
+                    message.contains("must advance the count exactly once"),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn successful_user_ops_must_advance_the_nonce_exactly_once() {
+        for steps in [0, 2] {
+            let mut app = ProgressApp::new(1);
+            app.nonce_steps = steps;
+            let message = panic_message(|| {
+                let _ = execute(&mut app, &user_tx(0));
+            });
+            assert!(
+                message.contains("must advance its sender's nonce exactly once"),
+                "{message}"
+            );
+        }
     }
 }

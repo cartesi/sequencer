@@ -5,21 +5,33 @@
 //! `l1_safe_head`, pin the deployment identity, and serve the safe-head reads.
 
 use alloy_primitives::Address;
-use rusqlite::{OptionalExtension, Result, Transaction, params};
+use rusqlite::{OptionalExtension, Result, Transaction, named_params, params};
+use sequencer_core::scheduler::L1Input;
 
 use super::Storage;
-use super::convert::{
-    external_u64_to_i64, i64_to_u64, now_unix_ms, saturating_query_bound, u64_to_i64,
-};
+use super::acceptance::record_accepted_batches;
+use super::convert::{external_u64_to_i64, i64_to_u64, saturating_query_bound, u64_to_i64};
 use super::queries::{
-    current_safe_block, current_safe_block_timestamp, last_safe_progress_ms,
-    query_latest_safe_input_index_exclusive,
+    DIRECT_EXECUTES_SQL, DirectOperands, current_safe_block, current_safe_block_timestamp,
+    query_latest_safe_input_index_exclusive, safe_input_count_through_block_in,
 };
-use super::safe_accepted_batches::populate_safe_accepted_batches;
-use super::{
-    DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, StoredSafeInput,
-};
-use sequencer_core::protocol::ProtocolTiming;
+use super::{DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange};
+
+/// What a base's export is checked against: the admitted directs above its
+/// clock among the inputs it consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedDirects {
+    pub count: u64,
+    /// The lowest index among them; `None` when there are none.
+    pub first_index: Option<u64>,
+}
+
+/// A batch-submitter input on the InputBox: its index and inclusion block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitterInput {
+    pub safe_input_index: u64,
+    pub block_number: u64,
+}
 
 type FeeOracleIdentitySql = (
     &'static str,
@@ -41,14 +53,16 @@ impl Storage {
         current_safe_block(&self.conn)
     }
 
+    /// L1 timestamp (Unix seconds) of the persisted safe block, or `None`
+    /// before the first sync: the safe head's age.
     pub fn current_safe_block_timestamp(&mut self) -> Result<Option<u64>> {
         current_safe_block_timestamp(&self.conn)
     }
 
     /// First batch-submitter `safe_inputs` row strictly past `after_block`, by
-    /// ascending `safe_input_index` — returns `(safe_input_index, block_number)`
-    /// or `None`. Read-only; `setup`'s detection gate uses it
-    /// to find any previous-instance batch past the checkpoint block.
+    /// ascending `safe_input_index`, or `None`. Read-only; `setup`'s detection
+    /// gate uses it to find any previous-instance batch past the checkpoint
+    /// block.
     ///
     /// Queries the reader-synced `safe_inputs` table rather than issuing its own
     /// `get_logs`, so it inherits the reader's input-completeness witness (a
@@ -65,7 +79,7 @@ impl Storage {
         &mut self,
         batch_submitter: Address,
         after_block: u64,
-    ) -> Result<Option<(u64, u64)>> {
+    ) -> Result<Option<SubmitterInput>> {
         self.conn
             .query_row(
                 "SELECT safe_input_index, block_number FROM safe_inputs \
@@ -76,76 +90,146 @@ impl Storage {
                     saturating_query_bound(after_block)
                 ],
                 |row| {
-                    let index: i64 = row.get(0)?;
-                    let block: i64 = row.get(1)?;
-                    Ok((i64_to_u64(index), i64_to_u64(block)))
+                    Ok(SubmitterInput {
+                        safe_input_index: i64_to_u64(row.get(0)?),
+                        block_number: i64_to_u64(row.get(1)?),
+                    })
                 },
             )
             .optional()
     }
 
-    /// All `safe_inputs` rows whose `block_number` is in `(after_block,
-    /// through_block]`, ordered by `safe_input_index` ascending — i.e. L1
-    /// inclusion order. The recovery fold sources
-    /// its seeds from `(A, B]` and its replay stream from `(B, C]` through this:
-    /// half-open on the lower bound (directs at block `B` belong to the fridge,
-    /// batches at `B` are already in `S` — open-question 1 boundary convention).
-    ///
-    /// Returns both senders and directs; the caller classifies (a batch iff
-    /// `sender == batch_submitter`) and drops batches from the `(A, B]` seed set.
-    /// Read-only; queries the reader-synced table rather than a fresh log scan,
-    /// inheriting the reader's input-completeness witness (see
-    /// [`Storage::first_batch_submitter_input_after_block`]).
-    pub fn safe_inputs_in_block_range(
+    /// Up to `limit` safe inputs with index in `[start, end_exclusive)`, in
+    /// order, as the scheduler takes them: the chain id and application come
+    /// from the pinned deployment identity. Fewer come back only when the
+    /// table holds no more, so a caller that needs the whole range checks the
+    /// length. Pages keep a rebuild's memory bounded.
+    pub fn l1_inputs_page(
         &mut self,
-        after_block: u64,
-        through_block: u64,
-    ) -> Result<Vec<StoredSafeInput>> {
-        const SQL: &str = "SELECT sender, payload, block_number FROM safe_inputs \
-                           WHERE block_number > ?1 AND block_number <= ?2 \
-                           ORDER BY safe_input_index ASC";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(
-            params![
-                saturating_query_bound(after_block),
-                saturating_query_bound(through_block)
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (sender, payload, block_number) = row?;
-            out.push(StoredSafeInput {
-                sender: Address::from_slice(sender.as_slice()),
-                payload,
-                block_number: i64_to_u64(block_number),
-            });
+        start: u64,
+        end_exclusive: u64,
+        limit: usize,
+    ) -> Result<Vec<L1Input>> {
+        let len = end_exclusive
+            .saturating_sub(start)
+            .min(u64::try_from(limit).expect("limit fits u64"));
+        if len == 0 {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        self.read(|tx| {
+            let identity =
+                query_deployment_identity(tx)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let mut statement = tx.prepare_cached(
+                "SELECT safe_input_index, sender, payload, block_number, block_timestamp \
+                 FROM safe_inputs WHERE safe_input_index >= ?1 \
+                 ORDER BY safe_input_index LIMIT ?2",
+            )?;
+            let rows = statement.query_map(
+                params![saturating_query_bound(start), saturating_query_bound(len)],
+                |row| {
+                    Ok(L1Input {
+                        index: i64_to_u64(row.get(0)?),
+                        sender: Address::from_slice(&row.get::<_, Vec<u8>>(1)?),
+                        block: i64_to_u64(row.get(3)?),
+                        timestamp: i64_to_u64(row.get(4)?),
+                        chain_id: identity.chain_id,
+                        app_contract: identity.app_address,
+                        payload: row.get(2)?,
+                    })
+                },
+            )?;
+            let mut inputs = Vec::new();
+            for row in rows {
+                let input = row?;
+                let expected = start
+                    .checked_add(inputs.len() as u64)
+                    .expect("safe input index overflow");
+                assert_eq!(input.index, expected, "safe inputs have an index gap");
+                inputs.push(input);
+            }
+            Ok(inputs)
+        })
+    }
+
+    /// How many safe inputs lie at or below `block`: the L1 input count
+    /// through it.
+    pub fn safe_input_count_through_block(&mut self, block: u64) -> Result<u64> {
+        self.read(|tx| safe_input_count_through_block_in(tx, block))
+    }
+
+    /// The admitted directs among the first `l1_input_count` inputs whose
+    /// block is above `clock`, by the predicate every drain uses: not from
+    /// the batch submitter, payload within the pinned cap. A
+    /// canonical export queues exactly these, from the first of them.
+    pub fn admitted_directs_above_clock(
+        &mut self,
+        l1_input_count: u64,
+        clock: u64,
+    ) -> Result<AdmittedDirects> {
+        self.read(|tx| {
+            let operands = DirectOperands::load(tx)?;
+            tx.prepare_cached(&format!(
+                "SELECT COUNT(*), MIN(safe_input_index) FROM safe_inputs \
+                 WHERE safe_input_index < :count AND block_number > :clock \
+                   AND {DIRECT_EXECUTES_SQL}"
+            ))?
+            .query_row(
+                operands
+                    .bind(named_params! {
+                        ":count": saturating_query_bound(l1_input_count),
+                        ":clock": saturating_query_bound(clock),
+                    })
+                    .as_slice(),
+                |row| {
+                    Ok(AdmittedDirects {
+                        count: i64_to_u64(row.get(0)?),
+                        first_index: row.get::<_, Option<i64>>(1)?.map(i64_to_u64),
+                    })
+                },
+            )
+        })
+    }
+
+    /// How many inputs with an index in `range` execute as directs, by the
+    /// predicate every drain uses. Setup checks its executed directs against it.
+    pub fn admitted_directs_in(&mut self, range: SafeInputRange) -> Result<u64> {
+        self.read(|tx| {
+            let operands = DirectOperands::load(tx)?;
+            tx.prepare_cached(&format!(
+                "SELECT COUNT(*) FROM safe_inputs \
+                 WHERE safe_input_index >= :start AND safe_input_index < :end \
+                   AND {DIRECT_EXECUTES_SQL}"
+            ))?
+            .query_row(
+                operands
+                    .bind(named_params! {
+                        ":start": saturating_query_bound(range.start()),
+                        ":end": saturating_query_bound(range.end()),
+                    })
+                    .as_slice(),
+                |row| Ok(i64_to_u64(row.get(0)?)),
+            )
+        })
     }
 
     /// Production input-reader path — the one write of the safe-input stream.
     ///
     /// Atomically: insert `inputs` (assigned contiguous indexes starting from
     /// the current MAX+1) with their per-input L1 provenance, advance
-    /// `l1_safe_head.block_number` to `safe_block`, stamp `synced_at_ms` as
-    /// the wall-clock time when the safe frontier advanced, and update
-    /// `safe_accepted_batches` via `timing` so the scheduler-accepted
-    /// frontier view stays consistent with the safe head.
+    /// `l1_safe_head` to `safe_block` and its timestamp, and record
+    /// `batches.accepted_input` so the scheduler-accepted frontier stays
+    /// consistent with the safe head.
     ///
-    /// The materialized `safe_accepted_batches` view is an invariant of this
+    /// Once the era exists, the accepted frontier is an invariant of this
     /// operation while no divergence exists: every safe input up to
     /// `safe_block` has been evaluated against the scheduler's acceptance
-    /// rules. A foreign/mismatched accepted landing instead commits the
-    /// `canonical_divergence` fact with this head and freezes the projection;
-    /// later head advances remain paired with that terminal fact. Readers
-    /// (submitter, recovery, danger checks) never populate separately.
+    /// rules for the pinned batch submitter and window. Before the era
+    /// (setup's syncs) nothing is accepted; the first append after it judges
+    /// every input past the stop block. A foreign/mismatched accepted landing
+    /// instead commits the `canonical_divergence` fact with this head and
+    /// freezes the projection; later head advances remain paired with that
+    /// terminal fact. Readers (submitter, landing watch, startup) never
+    /// populate separately.
     ///
     /// Asserts `safe_block` is monotonic and that it strictly advances when
     /// `inputs` is non-empty.
@@ -154,9 +238,6 @@ impl Storage {
         safe_block: u64,
         safe_block_timestamp: u64,
         inputs: &[IngestedSafeInput],
-        batch_submitter: Address,
-        timing: &ProtocolTiming,
-        frontier: FrontierMode,
     ) -> Result<()> {
         self.write(|tx| {
             if let Some(current) = current_safe_block(tx)? {
@@ -174,34 +255,22 @@ impl Storage {
             insert_safe_inputs_batch(tx, next_index, inputs)?;
 
             let changed = tx.execute(
-                "INSERT INTO l1_safe_head \
-                    (singleton_id, block_number, block_timestamp, synced_at_ms) \
-                 VALUES (0, ?1, ?2, ?3) \
+                "INSERT INTO l1_safe_head (singleton_id, block_number, block_timestamp) \
+                 VALUES (0, ?1, ?2) \
                  ON CONFLICT(singleton_id) DO UPDATE SET \
                     block_number = excluded.block_number, \
-                    block_timestamp = excluded.block_timestamp, \
-                    synced_at_ms = excluded.synced_at_ms",
+                    block_timestamp = excluded.block_timestamp",
                 params![
                     external_u64_to_i64(safe_block, "L1 safe block")?,
                     external_u64_to_i64(safe_block_timestamp, "L1 safe block timestamp")?,
-                    now_unix_ms()
                 ],
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
 
-            if matches!(frontier, FrontierMode::Populate) {
-                populate_safe_accepted_batches(tx, batch_submitter, timing)?;
-            }
-            Ok(())
+            record_accepted_batches(tx)
         })
-    }
-
-    /// Wall-clock timestamp (Unix ms) of the last observed safe-head advance,
-    /// or `None` if no real safe-head observation has occurred yet.
-    pub fn last_safe_progress_ms(&self) -> Result<Option<u64>> {
-        last_safe_progress_ms(&self.conn)
     }
 
     /// Read the deployment identity this DB is pinned to. Returns `None` on
@@ -210,33 +279,10 @@ impl Storage {
         query_deployment_identity(&self.conn)
     }
 
-    /// Whether this DB already contains deployment-bound state. Used to avoid
-    /// silently pinning an old, non-empty DB that predates `deployment_identity`
-    /// to whatever config happens to start it next.
-    pub fn has_persisted_deployment_state(&self) -> Result<bool> {
-        let present: i64 = self.conn.query_row(
-            "SELECT \
-                EXISTS(SELECT 1 FROM batches) OR \
-                EXISTS(SELECT 1 FROM safe_inputs) OR \
-                EXISTS(SELECT 1 FROM l1_safe_head)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(present != 0)
-    }
-
-    /// Insert `identity` on first startup, or return the already-persisted
-    /// identity on later startups. The caller compares the returned value with
-    /// its configured/discovered identity and refuses on mismatch.
-    pub fn load_or_insert_deployment_identity(
-        &mut self,
-        identity: DeploymentIdentity,
-    ) -> Result<DeploymentIdentity> {
+    /// Pin the deployment identity. Setup calls it once, on the database it
+    /// just created; the row's key refuses a second identity.
+    pub fn pin_deployment_identity(&mut self, identity: DeploymentIdentity) -> Result<()> {
         self.write(|tx| {
-            if let Some(existing) = query_deployment_identity(tx)? {
-                return Ok(existing);
-            }
-
             let (mode, fixed, weth, fee_token, pool, window): FeeOracleIdentitySql =
                 match identity.fee_oracle {
                     FeeOracleIdentity::Fixed { log_gas_price } => (
@@ -264,10 +310,10 @@ impl Storage {
             let changed = tx.execute(
                 "INSERT INTO deployment_identity \
                     (singleton_id, chain_id, app_address, input_box_address, \
-                     app_deployment_block, batch_submitter_address, fee_oracle_mode, \
-                     fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
-                     fee_oracle_pool, fee_oracle_twap_window_secs) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     app_deployment_block, batch_submitter_address, max_direct_payload_bytes, \
+                     max_wait_blocks, fee_oracle_mode, fixed_log_gas_price, fee_oracle_weth, \
+                     fee_oracle_fee_token, fee_oracle_pool, fee_oracle_twap_window_secs) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     external_u64_to_i64(identity.chain_id, "deployment chain ID")?,
                     identity.app_address.as_slice(),
@@ -277,6 +323,11 @@ impl Storage {
                         "application deployment block"
                     )?,
                     identity.batch_submitter_address.as_slice(),
+                    external_u64_to_i64(
+                        identity.max_direct_payload_bytes,
+                        "maximum direct payload bytes"
+                    )?,
+                    external_u64_to_i64(identity.max_wait_blocks, "staleness window")?,
                     mode,
                     fixed,
                     weth,
@@ -288,20 +339,15 @@ impl Storage {
             if changed != 1 {
                 return Err(rusqlite::Error::StatementChangedRows(changed));
             }
-            Ok(identity)
+            Ok(())
         })
     }
 
-    /// Whether `setup` has completed on this DB. `run` refuses to boot when
-    /// this is `false`: setup either never ran or crashed midway, both of
-    /// which require `setup` (re-)run, not `run`.
+    /// Whether `setup` has completed on this DB: whether its era exists.
+    /// `run` refuses to boot when this is `false`: setup either never ran or
+    /// crashed midway, both of which require `setup` (re-)run, not `run`.
     pub fn is_setup_complete(&self) -> Result<bool> {
-        let present: i64 = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM setup_complete WHERE singleton_id = 0)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(present != 0)
+        super::lifecycle::is_set_up_in(&self.conn)
     }
 }
 
@@ -312,7 +358,8 @@ pub(super) fn query_deployment_identity(
         "SELECT chain_id, app_address, input_box_address, \
                 app_deployment_block, batch_submitter_address, fee_oracle_mode, \
                 fixed_log_gas_price, fee_oracle_weth, fee_oracle_fee_token, \
-                fee_oracle_pool, fee_oracle_twap_window_secs \
+                fee_oracle_pool, fee_oracle_twap_window_secs, max_direct_payload_bytes, \
+                max_wait_blocks \
          FROM deployment_identity WHERE singleton_id = 0",
         [],
         |row| {
@@ -335,6 +382,8 @@ pub(super) fn query_deployment_identity(
                 input_box_address: Address::from_slice(&row.get::<_, Vec<u8>>(2)?),
                 app_deployment_block: i64_to_u64(row.get::<_, i64>(3)?),
                 batch_submitter_address: Address::from_slice(&row.get::<_, Vec<u8>>(4)?),
+                max_direct_payload_bytes: i64_to_u64(row.get::<_, i64>(11)?),
+                max_wait_blocks: i64_to_u64(row.get::<_, i64>(12)?),
                 fee_oracle,
             })
         },
@@ -376,12 +425,13 @@ fn insert_safe_inputs_batch(
 
 #[cfg(test)]
 mod tests {
+    use super::{AdmittedDirects, SubmitterInput};
     use crate::storage::{
-        DeploymentIdentity, FeeOracleIdentity, FrontierMode, IngestedSafeInput, Storage,
+        DeploymentIdentity, FeeOracleIdentity, IngestedSafeInput, SafeInputRange, Storage,
         StoredSafeInput,
-        test_helpers::{SENDER_A, SENDER_B, default_protocol_timing},
+        test_helpers::{SENDER_A, SENDER_B, TEST_MAX_DIRECT_PAYLOAD_BYTES, set_up_storage},
     };
-    use crate::test_support::temp_db;
+    use crate::test_support::{pin_test_deployment_identity, temp_db};
     use alloy_primitives::{Address, B256};
 
     fn identity() -> DeploymentIdentity {
@@ -391,6 +441,8 @@ mod tests {
             input_box_address: Address::repeat_byte(0x22),
             app_deployment_block: 42,
             batch_submitter_address: SENDER_A,
+            max_direct_payload_bytes: 4096,
+            max_wait_blocks: 1200,
             fee_oracle: FeeOracleIdentity::Fixed { log_gas_price: 0 },
         }
     }
@@ -398,8 +450,7 @@ mod tests {
     #[test]
     fn safe_input_end_exclusive_counts_appended_inputs() {
         let db = temp_db("safe-input-api");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_timing();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 0);
 
@@ -416,23 +467,21 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(10, inserted.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(10, inserted.as_slice(), SENDER_A)
             .expect("insert safe directs");
 
         assert_eq!(storage.safe_input_end_exclusive().expect("safe head"), 2);
+        assert_eq!(storage.safe_input_count_through_block(9).expect("count"), 0);
         assert_eq!(
-            storage
-                .safe_inputs_in_block_range(9, 10)
-                .expect("read back"),
-            inserted
+            storage.safe_input_count_through_block(10).expect("count"),
+            2
         );
     }
 
     #[test]
     fn first_batch_submitter_input_after_block_scans_strictly_past() {
         let db = temp_db("first-submitter-input-after");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_timing();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         // index 0: submitter @5; index 1: non-submitter @12; index 2: submitter @18.
         // Payloads are junk (scheduler no-ops on decode) — detection scans the
@@ -456,7 +505,7 @@ mod tests {
             },
         ];
         storage
-            .append_safe_inputs(20, inputs.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(20, inputs.as_slice(), SENDER_A)
             .expect("seed safe inputs");
 
         // From genesis (0): the earliest submitter input is index 0 @5.
@@ -464,7 +513,10 @@ mod tests {
             storage
                 .first_batch_submitter_input_after_block(SENDER_A, 0)
                 .expect("scan"),
-            Some((0, 5))
+            Some(SubmitterInput {
+                safe_input_index: 0,
+                block_number: 5
+            })
         );
         // Strictly past: block 5 is excluded; the non-submitter @12 is skipped;
         // next submitter is index 2 @18.
@@ -472,7 +524,10 @@ mod tests {
             storage
                 .first_batch_submitter_input_after_block(SENDER_A, 5)
                 .expect("scan"),
-            Some((2, 18))
+            Some(SubmitterInput {
+                safe_input_index: 2,
+                block_number: 18
+            })
         );
         // Past the last submitter input: nothing.
         assert_eq!(
@@ -498,117 +553,183 @@ mod tests {
         );
     }
 
-    #[test]
-    fn safe_inputs_in_block_range_is_half_open_lower_and_ordered() {
-        let db = temp_db("safe-inputs-block-range");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_timing();
+    /// Blocks 5 (direct), 10 (batch from SENDER_A, over-cap direct, direct)
+    /// and 15 (direct). SENDER_A is the batch submitter.
+    fn seed_classified_inputs(storage: &mut Storage) {
+        pin_test_deployment_identity(storage, SENDER_A);
+        seed_inputs(storage);
+    }
 
-        // Blocks 5 (direct), 10 (batch from SENDER_A + direct from SENDER_B),
-        // 15 (direct). SENDER_A is the batch submitter (identity above).
-        let inputs = vec![
-            StoredSafeInput {
-                sender: SENDER_B,
-                payload: vec![0x05],
-                block_number: 5,
-            },
-            StoredSafeInput {
-                sender: SENDER_A,
-                payload: vec![0x10],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: SENDER_B,
-                payload: vec![0x11],
-                block_number: 10,
-            },
-            StoredSafeInput {
-                sender: SENDER_B,
-                payload: vec![0x15],
-                block_number: 15,
-            },
-        ];
+    fn seed_inputs(storage: &mut Storage) {
+        let input = |sender, payload: Vec<u8>, block_number| StoredSafeInput {
+            sender,
+            payload,
+            block_number,
+        };
         storage
-            .append_safe_inputs(15, inputs.as_slice(), SENDER_A, &protocol)
+            .append_safe_inputs(
+                15,
+                &[
+                    input(SENDER_B, vec![0x05], 5),
+                    input(SENDER_A, vec![0x10], 10),
+                    input(
+                        SENDER_B,
+                        vec![0; TEST_MAX_DIRECT_PAYLOAD_BYTES as usize + 1],
+                        10,
+                    ),
+                    input(SENDER_B, vec![0x11], 10),
+                    input(SENDER_B, vec![0x15], 15),
+                ],
+                SENDER_A,
+            )
             .expect("seed safe inputs");
+    }
 
-        // (5, 15] excludes block 5, includes block 15 — ordered by index.
-        let mid = storage
-            .safe_inputs_in_block_range(5, 15)
-            .expect("range (5,15]");
-        let blocks: Vec<u64> = mid.iter().map(|i| i.block_number).collect();
-        assert_eq!(blocks, vec![10, 10, 15], "half-open lower bound; ascending");
+    #[test]
+    fn l1_inputs_page_reads_an_index_range_in_bounded_pages() {
+        let db = temp_db("l1-inputs-page");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+        seed_classified_inputs(&mut storage);
+        let identity = storage
+            .deployment_identity()
+            .expect("read")
+            .expect("pinned");
 
-        // Caller classifies: drop sender == batch_submitter to get the directs
-        // of the seed range (the (A,B] fridge reconstruction).
-        let directs: Vec<&[u8]> = mid
-            .iter()
-            .filter(|i| i.sender != SENDER_A)
-            .map(|i| i.payload.as_slice())
-            .collect();
+        let page = storage.l1_inputs_page(1, 5, 2).expect("page");
         assert_eq!(
-            directs,
-            vec![&[0x11u8][..], &[0x15u8][..]],
-            "batch at block 10 dropped"
+            page.iter()
+                .map(|input| (input.index, input.sender, input.block))
+                .collect::<Vec<_>>(),
+            vec![(1, SENDER_A, 10), (2, SENDER_B, 10)]
         );
-
-        // Empty when the lower bound covers everything.
+        assert!(page.iter().all(|input| input.chain_id == identity.chain_id
+            && input.app_contract == identity.app_address));
+        assert_eq!(page[0].payload, vec![0x10]);
+        let rest = storage.l1_inputs_page(3, 5, 10).expect("rest");
+        assert_eq!(
+            rest.iter().map(|input| input.index).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        // Past the table's end it returns what exists, and nothing for an empty range.
+        assert_eq!(storage.l1_inputs_page(4, 9, 10).expect("tail").len(), 1);
+        assert!(storage.l1_inputs_page(3, 3, 10).expect("empty").is_empty());
         assert!(
             storage
-                .safe_inputs_in_block_range(15, 15)
-                .expect("empty")
+                .l1_inputs_page(4, 2, 10)
+                .expect("inverted")
                 .is_empty()
-        );
-        // Full span from genesis.
-        assert_eq!(
-            storage
-                .safe_inputs_in_block_range(0, 100)
-                .expect("all")
-                .len(),
-            4
-        );
-        assert_eq!(
-            storage
-                .safe_inputs_in_block_range(0, u64::MAX)
-                .expect("all through saturated upper bound")
-                .len(),
-            4,
-            "an upper bound above SQLite's range includes every stored row"
-        );
-        assert!(
-            storage
-                .safe_inputs_in_block_range(u64::MAX, u64::MAX)
-                .expect("empty past SQLite range")
-                .is_empty(),
-            "a lower bound above SQLite's range excludes every stored row"
         );
     }
 
     #[test]
-    fn batch_tree_anchor_roundtrips_and_freezes_after_setup() {
-        let db = temp_db("anchor-roundtrip");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        assert_eq!(storage.batch_tree_anchor().expect("default"), 0);
-        storage.set_batch_tree_anchor(1200).expect("set anchor");
-        assert_eq!(storage.batch_tree_anchor().expect("read back"), 1200);
-        storage
-            .conn
-            .execute(
-                "INSERT INTO setup_complete (singleton_id, completed_at_ms) VALUES (0, 1)",
-                [],
-            )
-            .expect("seed setup completion fact");
-        assert!(
-            storage.set_batch_tree_anchor(1300).is_err(),
-            "anchor must be frozen after setup_complete"
+    fn export_check_counts_admitted_directs_above_the_clock() {
+        let db = temp_db("export-check");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+        seed_classified_inputs(&mut storage);
+        let check = |storage: &mut Storage, count, clock| {
+            storage
+                .admitted_directs_above_clock(count, clock)
+                .expect("check")
+        };
+        // Above clock 5 among all five: the submitter input and the over-cap
+        // direct are not admitted, so inputs 3 and 4 remain.
+        assert_eq!(
+            check(&mut storage, 5, 5),
+            AdmittedDirects {
+                count: 2,
+                first_index: Some(3)
+            }
         );
-        assert_eq!(storage.batch_tree_anchor().expect("unchanged"), 1200);
+        assert_eq!(
+            check(&mut storage, 5, 0),
+            AdmittedDirects {
+                count: 3,
+                first_index: Some(0)
+            }
+        );
+        // The base consumed only four inputs.
+        assert_eq!(
+            check(&mut storage, 4, 5),
+            AdmittedDirects {
+                count: 1,
+                first_index: Some(3)
+            }
+        );
+        assert_eq!(
+            check(&mut storage, 5, 15),
+            AdmittedDirects {
+                count: 0,
+                first_index: None
+            }
+        );
+        assert_eq!(check(&mut storage, u64::MAX, 0).count, 3);
+        assert_eq!(storage.safe_input_count_through_block(5).expect("count"), 1);
+        assert_eq!(
+            storage.safe_input_count_through_block(14).expect("count"),
+            4
+        );
+        assert_eq!(
+            storage
+                .safe_input_count_through_block(u64::MAX)
+                .expect("count"),
+            5
+        );
+    }
+
+    #[test]
+    fn counts_the_admitted_directs_in_an_index_range() {
+        let db = temp_db("admitted-in-range");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+        seed_classified_inputs(&mut storage);
+        let count = |storage: &mut Storage, start, end| {
+            storage
+                .admitted_directs_in(SafeInputRange::new(start, end))
+                .expect("count")
+        };
+        // Input 1 is the submitter's and input 2 is over the cap.
+        assert_eq!(count(&mut storage, 0, 5), 3);
+        assert_eq!(count(&mut storage, 1, 3), 0);
+        assert_eq!(count(&mut storage, 1, 4), 1);
+        assert_eq!(count(&mut storage, 4, 4), 0);
+        assert_eq!(count(&mut storage, 0, u64::MAX), 3);
+    }
+
+    /// The predicate's cap is the pinned one: under a cap of zero no
+    /// one-byte direct executes, so nothing in the seeded inputs is admitted.
+    #[test]
+    fn the_pinned_cap_decides_which_directs_execute() {
+        let db = temp_db("pinned-cap");
+        // No identity yet: the test pins its own.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+        storage
+            .pin_deployment_identity(DeploymentIdentity {
+                max_direct_payload_bytes: 0,
+                ..identity()
+            })
+            .expect("pin identity");
+        seed_inputs(&mut storage);
+        assert_eq!(
+            storage
+                .admitted_directs_in(SafeInputRange::new(0, 5))
+                .expect("count"),
+            0
+        );
+        assert_eq!(
+            storage
+                .admitted_directs_above_clock(5, 0)
+                .expect("check")
+                .count,
+            0
+        );
     }
 
     #[test]
     fn new_db_has_no_observed_safe_head() {
         let db = temp_db("new-db-no-safe-head");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -622,44 +743,55 @@ mod tests {
             None,
             "fresh storage should not have a safe block timestamp"
         );
-        assert_eq!(
-            storage
-                .last_safe_progress_ms()
-                .expect("read sync timestamp"),
-            None,
-            "fresh storage should not have a safe-progress timestamp"
-        );
     }
 
     #[test]
     fn external_values_outside_sqlite_integer_range_are_typed_refusals() {
         let db = temp_db("external-integer-range");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_timing();
+        // No identity yet: the test's refused pins must leave none.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
+
+        let identity_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                chain_id: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured chain ID must be refused");
+        assert!(matches!(
+            identity_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let deployment_block_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                app_deployment_block: u64::MAX,
+                ..identity()
+            })
+            .expect_err("unrepresentable configured application deployment block must be refused");
+        assert!(matches!(
+            deployment_block_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        let cap_err = storage
+            .pin_deployment_identity(DeploymentIdentity {
+                max_direct_payload_bytes: u64::MAX,
+                ..identity()
+            })
+            .expect_err("an unrepresentable direct payload cap must be refused");
+        assert!(matches!(
+            cap_err,
+            rusqlite::Error::ToSqlConversionFailure(_)
+        ));
+        assert_eq!(storage.deployment_identity().expect("read identity"), None);
 
         let safe_head_err = storage
-            .append_safe_inputs_with_timestamp(
-                u64::MAX,
-                1,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(u64::MAX, 1, &[], SENDER_A)
             .expect_err("unrepresentable provider safe block must be refused");
         assert!(matches!(
             safe_head_err,
             rusqlite::Error::ToSqlConversionFailure(_)
         ));
         let safe_timestamp_err = storage
-            .append_safe_inputs_with_timestamp(
-                10,
-                u64::MAX,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(10, u64::MAX, &[], SENDER_A)
             .expect_err("unrepresentable provider safe timestamp must be refused");
         assert!(matches!(
             safe_timestamp_err,
@@ -675,7 +807,6 @@ mod tests {
                     block_number: u64::MAX,
                 }],
                 SENDER_A,
-                &protocol,
             )
             .expect_err("unrepresentable provider input block must be refused");
         assert!(matches!(
@@ -693,9 +824,6 @@ mod tests {
                     block_timestamp: u64::MAX,
                     transaction_hash: B256::ZERO,
                 }],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
             )
             .expect_err("unrepresentable provider input timestamp must be refused");
         assert!(matches!(
@@ -711,46 +839,22 @@ mod tests {
             storage.safe_input_end_exclusive().expect("read input head"),
             0
         );
-
-        let identity_err = storage
-            .load_or_insert_deployment_identity(DeploymentIdentity {
-                chain_id: u64::MAX,
-                ..identity()
-            })
-            .expect_err("unrepresentable configured chain ID must be refused");
-        assert!(matches!(
-            identity_err,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
-        let deployment_block_err = storage
-            .load_or_insert_deployment_identity(DeploymentIdentity {
-                app_deployment_block: u64::MAX,
-                ..identity()
-            })
-            .expect_err("unrepresentable configured application deployment block must be refused");
-        assert!(matches!(
-            deployment_block_err,
-            rusqlite::Error::ToSqlConversionFailure(_)
-        ));
-        assert_eq!(storage.deployment_identity().expect("read identity"), None);
     }
 
     #[test]
     fn deployment_identity_is_inserted_once() {
         let db = temp_db("deployment-identity-insert-once");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        // No identity yet: the test pins the first one.
+        let mut storage = Storage::open_with_era(&db.path, &crate::storage::NewEra::EMPTY_GENESIS);
         let first = identity();
 
         assert_eq!(
             storage.deployment_identity().expect("read empty identity"),
             None
         );
-        assert_eq!(
-            storage
-                .load_or_insert_deployment_identity(first)
-                .expect("insert identity"),
-            first
-        );
+        storage
+            .pin_deployment_identity(first)
+            .expect("insert identity");
         assert_eq!(
             storage
                 .deployment_identity()
@@ -762,12 +866,12 @@ mod tests {
             batch_submitter_address: SENDER_B,
             ..first
         };
-        assert_eq!(
-            storage
-                .load_or_insert_deployment_identity(changed)
-                .expect("load existing identity"),
-            first,
-            "identity must be pinned after the first insert"
+        let second = storage
+            .pin_deployment_identity(changed)
+            .expect_err("a second identity must be refused");
+        assert!(
+            crate::storage::is_persistent_storage_error(&second),
+            "a second identity is a constraint violation, got {second:?}"
         );
         assert_eq!(
             storage
@@ -780,28 +884,16 @@ mod tests {
     #[test]
     fn append_safe_inputs_creates_and_advances_safe_head() {
         let db = temp_db("append-safe-inputs-creates-safe-head");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        let protocol = default_protocol_timing();
+        let mut storage = set_up_storage(&db.path, SENDER_A);
 
         storage
-            .append_safe_inputs_with_timestamp(
-                7,
-                1234,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(7, 1234, &[], SENDER_A)
             .expect("record first real safe-head observation");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
             Some(7),
             "append should create the safe-head row"
         );
-        let recorded_sync = storage
-            .last_safe_progress_ms()
-            .expect("read sync timestamp")
-            .expect("first observation should record wall-clock time");
         assert_eq!(
             storage
                 .current_safe_block_timestamp()
@@ -811,14 +903,7 @@ mod tests {
         );
 
         storage
-            .append_safe_inputs_with_timestamp(
-                9,
-                5678,
-                &[],
-                SENDER_A,
-                &protocol,
-                FrontierMode::Populate,
-            )
+            .append_safe_inputs_with_timestamp(9, 5678, &[], SENDER_A)
             .expect("advance safe head");
         assert_eq!(
             storage.current_safe_block().expect("read safe block"),
@@ -831,14 +916,6 @@ mod tests {
                 .expect("read advanced block timestamp"),
             Some(5678),
             "append should record the observed L1 block timestamp"
-        );
-        assert!(
-            storage
-                .last_safe_progress_ms()
-                .expect("read sync timestamp")
-                .expect("advanced observation should record wall-clock time")
-                >= recorded_sync,
-            "safe-progress timestamp should stay monotonic across appends"
         );
     }
 }

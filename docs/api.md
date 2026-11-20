@@ -4,7 +4,7 @@ This document owns the sequencer's wire contract: listeners, routes, message
 shapes, limits, and status codes. [`openapi.yaml`](../openapi.yaml) renders it
 as OpenAPI 3.1 for client generation and documentation tools; change both
 together. The [application history guide](protocol/application-history.md)
-explains the era, generation, and offset coordinates the feed routes use.
+explains the era and offset coordinates the feed routes use.
 
 ## Listeners
 
@@ -30,10 +30,9 @@ and the health probes use their own shapes.
 
 JSON `sender` fields in successful `POST /tx` and `GET /nonce` responses and
 WebSocket messages, and `verifyingContract` in `GET /domain`, use EIP-55
-checksum casing. Address fields in `/history` and `sender` fields in
-`/historical-l1-inputs` use lowercase hex. Clients must compare decoded 20-byte
-addresses and use one normalized encoding for account or projection keys across
-these routes.
+checksum casing. Address fields in `/history` use lowercase hex. Clients must
+compare decoded 20-byte addresses and use one normalized encoding for account or
+projection keys across these routes.
 
 ## `POST /tx`
 
@@ -57,7 +56,7 @@ Notes:
 - `sender` is required and must match the recovered signer.
 - `message.data` is SSZ-encoded method payload bytes.
 - size is bounded at ingress, before the hot path: the raw request body is capped at 4096 bytes (`413 PAYLOAD_TOO_LARGE`), and `message.data` at the application's maximum method payload size (`400 BAD_REQUEST`).
-- the inclusion lane checks nonce, `max_fee`, and fee balance. A rejected op returns `422 EXECUTION_REJECTED` and persists nothing.
+- the inclusion lane checks, in order, `max_fee` against the open-frame fee, the nonce, then the application's admission policy (the wallet refuses a sender that cannot pay the fee). A refused op returns `422 EXECUTION_REJECTED` with the refusal's text and persists nothing.
 - overload is enforced at queue admission: if the inclusion-lane queue is full, `POST /tx` returns HTTP `429` with code `OVERLOADED` and message `queue full`.
 - queue capacity is an internal runtime constant tuned alongside inclusion-lane chunking to absorb short bursts; if this starts triggering persistently, it is a signal to revisit runtime sizing or throughput rather than add another admission layer.
 - Browser wallets can call `POST /tx`, `GET /fee`, `GET /nonce`, and `GET /domain` from any origin with any request headers; preflight permits GET and POST and is cached for one hour. CORS is applied only to ingress. Egress routes remain operator-only and require network access controls.
@@ -85,7 +84,7 @@ Notes:
 - `fee` is frozen for the lifetime of the open frame (the live inclusion check).
 - `recommended_fee` is what the next frame will sample at rotation (currently after five newly-safe L1 blocks, best-effort).
 - `suggested_max_fee` is `max(fee, recommended_fee)` plus 1.5× log-space slack. Wallets can copy this into signed `max_fee`; the user pays the frame fee, not this cap. Clients that want their own policy can ignore it and combine the two facts themselves.
-- `200` while an open frame exists (the admitted runtime always has one). Responses carry `Cache-Control: no-store`.
+- `200` while an open frame exists (a running sequencer always has one). Responses carry `Cache-Control: no-store`.
 - `503` with code `UNAVAILABLE` during shutdown, or if no open frame exists.
 
 ## `GET /nonce?sender=<address>`
@@ -102,8 +101,8 @@ Notes:
 - `next_nonce` is one past the sender's latest included op, or 0 if it has none. It counts soft-confirmed ops: an op acknowledged with `200` before this request is counted. (The `nonce` in a `POST /tx` response or WS message is instead the nonce that op consumed.)
 - Keep one op in flight per sender: sign `next_nonce`, submit, and increment on `200`. Concurrent submits from one sender are unsupported; they can reach the sequencer out of order and be rejected. After a submit times out, a `next_nonce` above the op's nonce means it was included; an unchanged one is inconclusive, since the op may still be queued, so resubmit the same signed op rather than signing a new one at that nonce.
 - `next_nonce` of 4294967295 (`u32::MAX`) means the account is exhausted: that nonce has no successor, so `POST /tx` can include no further op from it.
-- The value is a hint, not a reservation; the application is authoritative. It can go down, because a restart that runs automatic recovery may invalidate soft-confirmed ops. After a `422` bad-nonce rejection, query again rather than incrementing.
-- After an operator rebuild from a checkpoint (`setup --recovery`), a sender with no surviving op since the rebuild reads 0 even when its nonce in the rebuilt baseline is higher; this includes a sender whose post-rebuild ops a later recovery invalidated. A `422` bad-nonce rejection names the expected nonce (`bad nonce: expected N, got M`).
+- The value is a hint, not a reservation; the application is authoritative. It does not go down within an era; a new era starts its own count (below). After a `422` bad-nonce rejection, which names the expected nonce (`bad nonce: expected N, got M`), query again rather than incrementing.
+- It is read from the era's live ops only. After a setup, a sender whose last op lies in the [rebuilt history](protocol/application-history.md#the-rebuilt-history) or below the base count reads 0 until its first live op; sign the nonce the `422` names.
 - Successful responses carry `Cache-Control: no-store`. `503` with code `UNAVAILABLE` during shutdown.
 
 ## `GET /domain`
@@ -116,7 +115,7 @@ The EIP-712 domain `POST /tx` verifies signatures against, keyed as `eth_signTyp
 
 Clients pin their own domain and assert that it matches this one, the way a wallet checks `eth_chainId`. `chainId` is a JSON number, exact in JavaScript below 2^53. That covers every chain browser wallets accept (MetaMask refuses IDs above 4503599627370476); a larger ID fails closed, because a signature over a rounded `chainId` recovers a different sender at `POST /tx`. Do not sign with a served domain unchecked: `chainId` and `verifyingContract` are what keep a signature from replaying on another deployment, and the name and version are the same everywhere.
 
-## `GET /ws/subscribe?era_id=<uuid>&recovery_generation=<u64>&next_input=<u64>`
+## `GET /ws/subscribe?era_id=<uuid>&next_input=<u64>`
 
 WebSocket stream of the current application history, replaying from the inclusive
 `next_input` offset and then following the optimistic tip. Fetch and restore
@@ -124,14 +123,16 @@ WebSocket stream of the current application history, replaying from the inclusiv
 After each successfully applied input at offset `X`, persist the claim with
 `next_input = X + 1` alongside the replica state.
 
-- All three query fields are required. Missing or malformed fields, or missing
-  or invalid WebSocket upgrade headers, return HTTP `400` with a plain-text body.
-- An era or generation mismatch, an unavailable prefix, or a position ahead of
-  the head returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
-  header carry the same typed refusal: `ERA_CHANGED`, `STALE_GENERATION`,
-  `HISTORY_UNAVAILABLE`, or `AHEAD_OF_HEAD`. Rebootstrap on `ERA_CHANGED` or
-  `HISTORY_UNAVAILABLE`. On `STALE_GENERATION`, a compatible saved checkpoint
-  can first be selected through `/history` (below). `AHEAD_OF_HEAD` is an
+- Both query fields are required. Missing, malformed or unknown fields, or
+  missing or invalid WebSocket upgrade headers, return HTTP `400` with a
+  plain-text body.
+- An era mismatch, an unavailable prefix, or a position ahead of the head
+  returns HTTP `409` before upgrade. The JSON body and `X-History-Error`
+  header carry the same typed refusal: `ERA_CHANGED`, `HISTORY_UNAVAILABLE`,
+  or `AHEAD_OF_HEAD`. `ERA_CHANGED` names the server's current era, as in
+  `{"code": "ERA_CHANGED", "era_id": "22222222-2222-4222-8222-222222222222"}`;
+  adopt it at the saved count when `/history` allows it (below), or
+  rebootstrap. Rebootstrap on `HISTORY_UNAVAILABLE`. `AHEAD_OF_HEAD` is an
   invalid claim to correct.
 - A claim exactly at the head waits for the next input. Replay uses bounded
   pages and queues, with no total catch-up limit. The subscriber cap is `64`.
@@ -142,9 +143,13 @@ After each successfully applied input at offset `X`, persist the claim with
 - Messages are JSON text frames; binary fields are `0x`-prefixed hex.
   Direct-input `block_timestamp` values are Unix seconds.
 - Batch envelopes are absent. Offsets count executed application inputs,
-  including business failures and malformed-direct no-ops.
-- Recovery stops the process and disconnects subscribers. A reconnect must
-  present its saved claim; offsets alone cannot distinguish a replaced suffix.
+  including business failures and malformed-direct no-ops. A direct whose
+  payload is over the application's cap never executes and has no offset.
+- The era's history starts at its base count: the rows setup rebuilt from L1
+  up to `baseline.rebuilt_history_end`, then the live rows, in one offset
+  sequence with the same message shapes.
+- A stopped process disconnects subscribers. A reconnect must present its
+  saved claim; offsets alone cannot distinguish another era's history.
 - Shutdown or a feed read/send failure may disconnect without a WebSocket
   Close frame. Resume from the saved claim after an unexpected disconnect;
   a clean close is not required for safe replay.
@@ -159,17 +164,18 @@ Message shapes:
 { "kind": "direct_input", "offset": 11, "sender": "0x...", "block_number": 123, "block_timestamp": 1700000000, "transaction_hash": "0x...", "payload": "0x...", "input_index": 42, "batch_nonce": 4 }
 ```
 
-## History metadata and historical L1 inputs (internal only)
+## History metadata (internal only)
 
-Readers that maintain additional transfer/order history can reconstruct it from
-L1 and then join the application feed. The
-[projection replay contract](protocol/projection-replay.md) describes
-bootstrap, client checkpoints, pending directs, and terminal drain.
+Readers that maintain additional transfer/order history follow the feed from
+the era's base count and keep their own checkpoints, which they restore to
+realign after a recovery
+([the client's playbook](recovery/cockroach.md#the-clients-playbook)).
 
 `GET /history` returns one coherent view of the deployment, current application
 history, immutable era baseline, and latest accepted checkpoint. Optional
 `era_id=<uuid>` requires the selected era; a mismatch returns `409 ERA_CHANGED`.
-Example immediately after a rebuild:
+Any other query parameter returns `400`.
+Example immediately after a setup from a machine stopped at the stop block:
 
 ```json
 {
@@ -181,110 +187,59 @@ Example immediately after a rebuild:
     "batch_submitter_address": "0x3333333333333333333333333333333333333333"
   },
   "history": {
-    "version": {
-      "era_id": "22222222-2222-4222-8222-222222222222",
-      "recovery_generation": 0
-    },
+    "era_id": "22222222-2222-4222-8222-222222222222",
     "available_from": 7,
     "head": 7
   },
   "baseline": {
     "l1_stop_block": 1240,
     "l1_end_input_index": 8,
-    "next_batch_nonce": 2
+    "next_batch_nonce": 2,
+    "rebuilt_history_end": 7
   },
-  "accepted_checkpoint": null,
-  "compatibility": null
+  "accepted_checkpoint": {
+    "inclusion_block": 1240,
+    "executed_input_count": 7,
+    "next_batch_nonce": 2
+  }
 }
 ```
 
-- `history.available_from` is baseline application count `K`; entries `[K,head)`
-  are available through WS. Counts include all executed application inputs.
-- `baseline` describes the fixed L1 stopping block `C`, exclusive InputBox end
-  `R`, and scheduler nonce after recovery's terminal drain. It survives generation
-  changes and baseline artifact GC. It is distinct from the moving safe head.
+- `history.available_from` is the era's base count `K`, the base's L2 tx
+  count (0 for a genesis base); entries `[K,head)` are available through WS.
+  Counts include all executed application inputs.
+- `baseline` describes where setup's rebuild ended: the stop block `C` it
+  pinned after flushing the submitter's wallet, the exclusive InputBox end `R`
+  through `C`, the scheduler's next batch nonce at the end of `C`, and
+  `rebuilt_history_end` `E`, the count at the end of `C`. The rebuilt history
+  covers `[K,E)` and the live rows follow. It survives baseline artifact GC,
+  and it is distinct from the moving safe head.
 - `accepted_checkpoint`, when available, has `inclusion_block`,
-  `executed_input_count`, and `next_batch_nonce`, under `history.version`.
-  Genesis supplies the zero checkpoint; a rebuilt baseline is not itself an
-  accepted checkpoint. The metadata does not lease or download a native artifact
+  `executed_input_count`, and `next_batch_nonce`, under `history.era_id`.
+  Until a batch of the era is accepted, it is the era baseline: block `C`,
+  count `E` and the baseline's nonce, since the canonical machine reaches the
+  same state at the end of `C`. The metadata does not lease or download a native artifact
   and does not certify a client projection. A known divergence returns `503`.
-- `compatibility` is `null` unless `from_generation=<u64>` is supplied together
-  with `era_id`. It then contains `from_generation` and `preserved_input_count`:
-  the prefix that survived every standard recovery since that generation,
-  bounded by the current head. A future generation or missing era returns
-  `400 BAD_REQUEST`; an era mismatch takes precedence over the generation bound.
 
-For example, `GET /history?era_id=<uuid>&from_generation=0` can return
-`"compatibility": {"from_generation": 0, "preserved_input_count": 3}`.
-A saved checkpoint from that era/generation is reusable when its count `X`
-satisfies `K <= X <= 3`. The boundary is inclusive: the checkpoint has executed
-entries before `X`, and resumes at entry `X`. Each checkpoint must be checked
-using its own saved generation. With no intervening recovery, the bound is the
-current head. The [history contract](protocol/application-history.md#checkpoint-compatibility-after-standard-recovery)
-defines the calculation and trust boundary.
+Inside an era the history only appends, so a saved state at any count `X`
+with `K <= X <= head` resumes with the claim it was saved with: its era id and
+`next_input = X`. The [history contract](protocol/application-history.md#identity-and-available-history)
+owns this rule.
 
-Restore an eligible checkpoint, persist the response's current history version
-with it, and subscribe using that version and its actual count. A recovery
-between lookup and subscription still returns `STALE_GENERATION`; repeat the
-lookup using the version associated with the restored state. Compatibility does
-not certify the client's application or projection implementation, and cannot
-cross a cockroach recovery's new era.
+A client of an older era (its claim refused with `ERA_CHANGED`) holding state at
+count `X` adopts the current era when `K <= X <= E`: it subscribes with the
+current `history.era_id` and `next_input = X`. Below `K`, the era's base is
+newer than its state; above `E`, its state holds rows the old instance served
+that never landed by `C`, even when `head` is past `X`. Both need another
+starting state. The check compares counts only: a state that is wrong below
+its count passes it, and only comparing the feed's rows from `K` with its own
+exposes that. The [history contract](protocol/application-history.md#adopting-a-new-era)
+defines the rule; the server adds no check of its own.
 
-`GET /historical-l1-inputs` requires `era_id` and exactly one starting selector:
-
-- `next_input_index=<u64>`: inclusive per-application InputBox index, starting at 0.
-- `after_block=<u64>`: initially seek to the first input strictly after that block;
-  continue using the returned `next_input_index`.
-
-The endpoint serves only `[0,R)` through the selected era's `C`. A response to
-`next_input_index=5&limit=1` can be:
-
-```json
-{
-  "era_id": "22222222-2222-4222-8222-222222222222",
-  "l1_stop_block": 1240,
-  "end_input_index": 8,
-  "next_input_index": 6,
-  "items": [{
-    "input_index": 5,
-    "sender": "0x3333333333333333333333333333333333333333",
-    "payload": "0x00",
-    "block_number": 1230,
-    "block_timestamp": 1700014760,
-    "transaction_hash": "0x4444444444444444444444444444444444444444444444444444444444444444"
-  }]
-}
-```
-
-Records preserve original inner payloads and authenticated senders, including
-malformed/rejected batches; they are not complete `EvmAdvance` envelopes. Indices
-are contiguous and ordered. Binary values are hex; timestamps are Unix seconds.
-Clients must preserve integer precision. A page may split a block.
-
-Optional `limit` defaults to 256 and accepts 1–256. Pages target 1 MiB of raw
-payloads; a larger first input is returned alone, intact. Hex encoding increases
-wire size, so this is not a hard response-size limit. Eight historical responses
-can be in flight; a permit remains held through body delivery or cancellation.
-SQLite read transactions end before network delivery. These limits bound memory
-by the page target or largest single input, not total history length.
-
-Only `next_input_index == end_input_index` means EOF; a short page does not.
-Requesting `next_input_index=R` or `after_block=C` returns an empty completed page.
-Generation changes do not invalidate historical pages; an era change does.
-
-Malformed/unknown query fields, invalid selectors/limits, or positions above
-`R`/`C` return the existing `400 BAD_REQUEST` JSON shape. An era mismatch returns
-the existing `409 ERA_CHANGED` history-policy body before semantic position
-checks. Capacity exhaustion returns `429 OVERLOADED`; shutdown or an operational
-read failure returns `503 UNAVAILABLE`. Interrupted bodies are failed pages.
-Missing durable rows or other storage invariant failures follow the process's
-terminal fault policy, never a successful partial page.
-
-The Rust SDK exposes `history(expected_era, from_generation)` and
-`historical_l1_inputs(era, start, limit)` with typed metadata and era refusals.
-Both use the configured request deadline, including body transfer; callers may
-increase it for large historical inputs. The client owns replay, persistence,
-checkpoint selection, and subscription.
+The Rust SDK exposes `history(expected_era)` and
+`adopt_current_era(count)` with typed metadata, adoption and era refusals.
+Both use the configured request deadline, including body transfer. The client
+owns persistence, checkpoint selection, and subscription.
 
 ## Operator snapshot endpoints (internal only)
 
@@ -302,24 +257,25 @@ they are served only on the internal listener, behind network controls.
   (`application/octet-stream`), with `X-Inclusion-Block`,
   `X-Executed-Input-Count`, and `ETag: "block-<n>"` (`If-None-Match` supports `304`).
   The watchdog downloads it only as divergence evidence.
-- `GET /latest_snapshot` — streams a restorable tar archive of the newest valid
+- `GET /latest_snapshot` — streams a restorable tar archive of the newest
   batch-close snapshot, or the era baseline. Includes immutable `info.toml`
   and the application's opaque `state` file or directory.
 - `GET /finalized_snapshot` — streams the accepted snapshot as a tar archive,
   adding a coherent `checkpoint.toml` receipt with its L1 inclusion block and
-  next batch nonce for trusted recovery.
+  next batch nonce: an operator backup, which no command consumes.
 
-Successful state/archive downloads include `X-History-Era`, `X-Recovery-Generation`,
-and `X-Executed-Input-Count`, selected atomically with the artifact lease.
+Successful state/archive downloads include `X-History-Era` and
+`X-Executed-Input-Count`, selected in the read that takes the artifact lease.
 Streaming holds the lease until the response ends or the client disconnects.
 Bodies stream without `Content-Length`; a failure after the headers aborts the
 transfer, so treat an incomplete body as a failed download.
-The accepted endpoints return `404` until a comparable checkpoint exists:
-genesis is comparable at block zero; a rebuilt baseline is restorable but only
-a later accepted batch establishes a comparison point. Known divergence makes
+A set-up sequencer always has a comparable checkpoint: until a batch of the era
+is accepted, it is the era baseline at the stop block, genesis base included,
+so a `404` from the accepted endpoints means the wrong listener or a database
+setup never completed. Known divergence makes
 all four finalized endpoints return `503 UNAVAILABLE`, including conditional
-state requests. The check shares the checkpoint-selection transaction, before
-any lease or archive is created. See [snapshot lifecycle](snapshots/lifecycle.md).
+state requests. The check shares the checkpoint-selection read, before any
+lease or archive is created. See [snapshot lifecycle](snapshots/lifecycle.md).
 
 ## Health probes (internal only)
 
@@ -327,10 +283,19 @@ any lease or archive is created. See [snapshot lifecycle](snapshots/lifecycle.md
 - `GET /readyz` returns `200` while the inclusion-lane receiver is open and
   shutdown has not been requested; otherwise `503`. Its body is empty.
 - `GET /healthz` uses the same status as `/readyz` and returns JSON:
-  `{ "status": "ok", "inclusion_lane": "ok" }`. `status` becomes `"degraded"`
+  `{ "status": "ok", "inclusion_lane": "ok", "landing_lag_blocks": 40, "max_wait_blocks": 7200, "safe_head_age_seconds": 780 }`.
+  `status` becomes `"degraded"`
   for either failure condition; `inclusion_lane` becomes `"stopped"` once its
   receiver is closed. The lane closes it soon after shutdown is requested, so it
   can still read `"ok"` early in a shutdown.
+- `landing_lag_blocks`, `max_wait_blocks` and `safe_head_age_seconds` are the
+  [landing lag](recovery/README.md#what-the-sequencer-does), the
+  application's window, and the safe block's age by the wall clock.
+  The history is void when `landing_lag_blocks` reaches `max_wait_blocks`.
+  `landing_lag_blocks` and `safe_head_age_seconds` are `null` until the first
+  reading after start, about two seconds. They do not change the status code.
 
-These probes cover process reachability, the lane channel, and shutdown state.
-They do not certify L1 freshness, submitter balance, or canonical agreement.
+These probes cover process reachability, the lane channel, and shutdown state,
+and report the landing lag and the safe head's age for monitoring to alert on;
+they set no threshold of their own. They do not certify submitter balance or
+canonical agreement.

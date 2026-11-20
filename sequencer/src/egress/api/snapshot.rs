@@ -1,8 +1,8 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-//! Operator-only comparison files and complete restore/recovery archives.
-//! Snapshot selection, history metadata, and leases are one SQLite transaction.
+//! Operator-only comparison files and complete restore archives.
+//! Snapshot selection and history metadata are one read, taken under the lease.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -27,37 +27,29 @@ use tokio_util::io::{ReaderStream, SyncIoBridge};
 use crate::http::{ApiError, StorageTaskError, storage_task};
 use crate::runtime::shutdown::{RuntimeScope, abort_terminal};
 use crate::storage::{
-    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, ReleaseScheduler, Storage,
+    FinalizedLease, FinalizedSelectionError, LeaseGuard, LeasedDump, SnapshotLeases, Storage,
 };
 
 type BoxError = StorageTaskError;
 
-/// Wiring for the snapshot endpoints: where the DB is, and how to find the
-/// canonical state file inside a dump. `state_file_in_dump` is threaded as a
-/// fn pointer (`A::state_file_in_dump`) so this layer stays free of an `A`
-/// type parameter.
+/// Wiring for the snapshot endpoints: where the DB is, how to find the
+/// canonical state file inside a dump, and the lease registry the lane's GC
+/// shares. `state_file_in_dump` is threaded as a fn pointer
+/// (`A::state_file_in_dump`) so this layer stays free of an `A` type parameter.
 #[derive(Clone)]
 pub struct SnapshotState {
     pub db_path: String,
     pub state_file_in_dump: fn(&Path) -> PathBuf,
+    pub leases: SnapshotLeases,
 }
 
 struct SnapshotApiState {
     snapshot: SnapshotState,
     shutdown: RuntimeScope,
-    release_scheduler: ReleaseScheduler,
 }
 
-pub(crate) fn router(
-    snapshot: SnapshotState,
-    shutdown: RuntimeScope,
-    release_scheduler: ReleaseScheduler,
-) -> Router {
-    let state = Arc::new(SnapshotApiState {
-        snapshot,
-        shutdown,
-        release_scheduler,
-    });
+pub(crate) fn router(snapshot: SnapshotState, shutdown: RuntimeScope) -> Router {
+    let state = Arc::new(SnapshotApiState { snapshot, shutdown });
     Router::new()
         .route("/finalized_state", get(finalized_state))
         .route(
@@ -89,7 +81,7 @@ async fn finalized_inclusion_block(State(state): State<Arc<SnapshotApiState>>) -
     match result {
         Ok(Some(finalized)) => Json(InclusionBlockResponse {
             inclusion_block: finalized.inclusion_block,
-            executed_input_count: finalized.executed_input_count.get(),
+            executed_input_count: finalized.snapshot.l2_tx_count.get(),
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -117,7 +109,7 @@ async fn finalized_state_digest(State(state): State<Arc<SnapshotApiState>>) -> R
         Err(err) => return finalized_error("acquire finalized lease", err),
     };
     let path = state_file_path(&state.snapshot, &leased.prefix);
-    let executed_input_count = leased.executed_input_count.get();
+    let l2_tx_count = leased.l2_tx_count.get();
     let LeasedDump { guard, .. } = leased;
     let scope = state.shutdown.clone();
     let hashed = tokio::task::spawn_blocking(move || {
@@ -129,7 +121,7 @@ async fn finalized_state_digest(State(state): State<Arc<SnapshotApiState>>) -> R
     match hashed {
         Ok(Ok(digest)) => Json(DigestResponse {
             inclusion_block,
-            executed_input_count,
+            executed_input_count: l2_tx_count,
             sha256: alloy_primitives::hex::encode(digest),
         })
         .into_response(),
@@ -169,8 +161,8 @@ async fn finalized_state(
     }
 
     let path = state_file_path(&state.snapshot, &leased.prefix);
-    let executed_input_count = leased.executed_input_count.get();
-    let history = leased.history_version;
+    let l2_tx_count = leased.l2_tx_count.get();
+    let era_id = leased.era_id;
     let LeasedDump { guard, .. } = leased;
 
     match comparison_io(File::open(&path).await, &path) {
@@ -179,12 +171,8 @@ async fn finalized_state(
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::ETAG, etag)
             .header("X-Inclusion-Block", inclusion_block.to_string())
-            .header("X-Executed-Input-Count", executed_input_count.to_string())
-            .header("X-History-Era", history.era_id.to_string())
-            .header(
-                "X-Recovery-Generation",
-                history.recovery_generation.get().to_string(),
-            )
+            .header("X-Executed-Input-Count", l2_tx_count.to_string())
+            .header("X-History-Era", era_id.to_string())
             .body(stream_body(file, guard, path))
             .expect("snapshot response headers are well-formed"),
         // `guard` is a local here; on this error path it drops → lease released.
@@ -231,8 +219,8 @@ fn archive_response(
 ) -> Response {
     let LeasedDump {
         prefix,
-        executed_input_count,
-        history_version,
+        l2_tx_count,
+        era_id,
         next_batch_nonce,
         guard,
     } = leased;
@@ -276,15 +264,8 @@ fn archive_response(
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-tar")
-        .header("X-History-Era", history_version.era_id.to_string())
-        .header(
-            "X-Recovery-Generation",
-            history_version.recovery_generation.get().to_string(),
-        )
-        .header(
-            "X-Executed-Input-Count",
-            executed_input_count.get().to_string(),
-        );
+        .header("X-History-Era", era_id.to_string())
+        .header("X-Executed-Input-Count", l2_tx_count.get().to_string());
     if let Some(block) = inclusion_block {
         response = response.header("X-Inclusion-Block", block.to_string());
     }
@@ -387,22 +368,18 @@ impl AsyncRead for ArchiveReader {
     }
 }
 
-// ── Lease acquisition (storage returns the dump bundled with its release) ──
+// ── Lease acquisition (storage returns the dump bundled with its guard) ──
 
 async fn acquire_finalized(state: &SnapshotApiState) -> Result<Option<FinalizedLease>, BoxError> {
     let db_path = state.snapshot.db_path.clone();
-    let release_scheduler = state.release_scheduler.clone();
+    let leases = state.snapshot.leases.clone();
     storage_task(
         state.shutdown.clone(),
         "acquire finalized snapshot lease",
-        move |scope| {
-            let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
-                Arc::new(move |cause: &str| {
-                    let _runtime_lifetime = &scope;
-                    abort_terminal(cause)
-                });
-            let mut storage = Storage::open_writer(&db_path)?;
-            Ok(storage.acquire_finalized_lease(release_scheduler, report_persistent_failure)?)
+        move |_scope| {
+            // Opened before the registry lock: only the selection runs under it.
+            let mut storage = Storage::open_read_only(&db_path)?;
+            Ok(storage.acquire_finalized_lease(&leases)?)
         },
     )
     .await
@@ -410,19 +387,13 @@ async fn acquire_finalized(state: &SnapshotApiState) -> Result<Option<FinalizedL
 
 async fn acquire_latest(state: &SnapshotApiState) -> Result<Option<LeasedDump>, BoxError> {
     let db_path = state.snapshot.db_path.clone();
-    let release_scheduler = state.release_scheduler.clone();
+    let leases = state.snapshot.leases.clone();
     storage_task(
         state.shutdown.clone(),
         "acquire latest snapshot lease",
-        move |scope| {
-            let report_persistent_failure: crate::storage::PersistentReleaseFailureReporter =
-                Arc::new(move |cause: &str| {
-                    let _runtime_lifetime = &scope;
-                    abort_terminal(cause)
-                });
-            let mut storage = Storage::open_writer(&db_path)?;
-            Ok(storage
-                .acquire_latest_snapshot_lease(release_scheduler, report_persistent_failure)?)
+        move |_scope| {
+            let mut storage = Storage::open_read_only(&db_path)?;
+            Ok(storage.acquire_latest_snapshot_lease(&leases)?)
         },
     )
     .await
@@ -481,15 +452,15 @@ mod tests {
         let db = temp_db("corrupt-comparison-path");
         let mut storage = Storage::open(&db.path).unwrap();
         storage
-            .insert_baseline_snapshot(path, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(path, crate::storage::L2TxCount::ZERO)
             .unwrap();
         let state = Arc::new(SnapshotApiState {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: Path::to_path_buf,
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         });
         let response = finalized_state(State(state), HeaderMap::new()).await;
         // Unix can open a directory successfully: the structural error first
@@ -558,6 +529,7 @@ mod tests {
         _db: crate::test_support::TestDb,
         _root: tempfile::TempDir,
         state: Arc<SnapshotApiState>,
+        snapshot_id: i64,
     }
 
     fn baseline_state(name: &str, contents: &[u8]) -> BaselineFixture {
@@ -567,22 +539,23 @@ mod tests {
         std::fs::create_dir(&dump_dir).expect("create dump directory");
         std::fs::write(dump_dir.join("state"), contents).expect("write comparison file");
         let mut storage = Storage::open(&db.path).expect("open storage");
-        storage
-            .insert_baseline_snapshot(&dump_dir, crate::storage::ExecutedInputCount::ZERO)
+        let snapshot_id = storage
+            .insert_baseline_snapshot(&dump_dir, crate::storage::L2TxCount::ZERO)
             .expect("insert baseline snapshot");
         drop(storage);
         let state = Arc::new(SnapshotApiState {
             snapshot: SnapshotState {
                 db_path: db.path.clone(),
                 state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         });
         BaselineFixture {
             _db: db,
             _root: root,
             state,
+            snapshot_id,
         }
     }
 
@@ -600,6 +573,8 @@ mod tests {
         let digest: serde_json::Value = serde_json::from_slice(&body).expect("digest JSON");
         assert_eq!(digest["inclusion_block"], 0);
         assert_eq!(digest["executed_input_count"], 0);
+        // The hashing task held the lease and dropped it before responding.
+        assert_eq!(state.snapshot.leases.count(fixture.snapshot_id), Some(0));
 
         let streamed = finalized_state(State(state), HeaderMap::new()).await;
         let bytes = axum::body::to_bytes(streamed.into_body(), contents.len() + 1)
@@ -620,9 +595,9 @@ mod tests {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         });
         let response = finalized_state_digest(State(state)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -641,7 +616,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/panicking-snapshot-path"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert baseline snapshot");
         drop(storage);
@@ -649,9 +624,9 @@ mod tests {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: |_| panic!("application returned no state path"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         });
 
         // Exercise the request-task boundary that would swallow this panic.
@@ -673,16 +648,16 @@ mod tests {
             .expect("write immutable dump metadata");
         let mut storage = Storage::open(&db.path).expect("open storage");
         storage
-            .insert_baseline_snapshot(&dump_dir, crate::storage::ExecutedInputCount::ZERO)
+            .insert_baseline_snapshot(&dump_dir, crate::storage::L2TxCount::ZERO)
             .expect("insert baseline snapshot");
         drop(storage);
         let state = Arc::new(SnapshotApiState {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: |_| panic!("archive must not ask for comparison bytes"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         });
         let response = latest_snapshot(State(state)).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -716,7 +691,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/corrupt-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert finalized snapshot");
         drop(storage);
@@ -727,7 +702,7 @@ mod tests {
         conn.execute_batch("DROP TRIGGER trg_snapshot_immutable")
             .unwrap();
         conn.execute(
-            "UPDATE snapshots SET executed_input_count = -1 WHERE batch_index IS NULL",
+            "UPDATE snapshots SET l2_tx_count = -1 WHERE batch_nonce IS NULL",
             [],
         )
         .expect("corrupt finalized cursor");
@@ -738,13 +713,74 @@ mod tests {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: shutdown.clone(),
-            release_scheduler: Arc::new(|release| release()),
         });
 
         let response = finalized_inclusion_block(State(state)).await;
 
+        panic!(
+            "terminal snapshot fault returned HTTP {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn accepted_batch_without_its_snapshot_trips_terminal_storage_fault() {
+        use crate::storage::test_helpers::{SENDER_A, seed_safe_inputs_with_batch_nonces};
+        if !crate::runtime::shutdown::abort_test_child(
+            "egress::api::snapshot::tests::accepted_batch_without_its_snapshot_trips_terminal_storage_fault",
+        ) {
+            return;
+        }
+        let db = temp_db("missing-accepted-snapshot-endpoint");
+        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
+        crate::test_support::pin_test_deployment_identity(&mut storage, SENDER_A);
+        storage
+            .insert_baseline_snapshot(
+                Path::new("/tmp/missing-accepted/baseline"),
+                crate::storage::L2TxCount::ZERO,
+            )
+            .expect("insert baseline snapshot");
+        let mut head = storage
+            .initialize_open_state(0, crate::storage::SafeInputRange::empty_at(0))
+            .expect("open the genesis tip");
+        let batch_nonce = head.batch_nonce();
+        let count = storage.next_l2_tx_count().expect("next count");
+        storage
+            .close_frame_and_batch_with_snapshot(
+                &mut head,
+                Path::new("/tmp/missing-accepted/batch"),
+                count,
+            )
+            .expect("close the batch with its snapshot");
+        seed_safe_inputs_with_batch_nonces(&mut storage, SENDER_A, 1, &[0]);
+        drop(storage);
+
+        // The accepted batch's snapshot is the only comparison checkpoint:
+        // without its row the endpoint has nothing older to fall back to.
+        let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
+        let deleted = conn
+            .execute(
+                "DELETE FROM snapshots WHERE batch_nonce = ?1",
+                [batch_nonce as i64],
+            )
+            .expect("remove the accepted batch's snapshot row");
+        assert_eq!(deleted, 1);
+        drop(conn);
+
+        let state = Arc::new(SnapshotApiState {
+            snapshot: SnapshotState {
+                db_path: db.path,
+                state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
+            },
+            shutdown: RuntimeScope::default(),
+        });
+
+        let response = finalized_inclusion_block(State(state)).await;
         panic!(
             "terminal snapshot fault returned HTTP {}",
             response.status()
@@ -758,7 +794,7 @@ mod tests {
         storage
             .insert_baseline_snapshot(
                 Path::new("/tmp/gate-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
+                crate::storage::L2TxCount::ZERO,
             )
             .expect("insert finalized snapshot");
         drop(storage);
@@ -768,9 +804,9 @@ mod tests {
             snapshot: SnapshotState {
                 db_path: db.path,
                 state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: shutdown.clone(),
-            release_scheduler: Arc::new(|release| release()),
         });
 
         // Immutable operator reads are not authority-bearing (ADR): an
@@ -778,48 +814,6 @@ mod tests {
         shutdown.request_shutdown();
         let response = finalized_inclusion_block(State(state.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(unix)]
-    async fn dangling_finalized_snapshot_row_trips_terminal_storage_fault() {
-        if !crate::runtime::shutdown::abort_test_child(
-            "egress::api::snapshot::tests::dangling_finalized_snapshot_row_trips_terminal_storage_fault",
-        ) {
-            return;
-        }
-        let db = temp_db("dangling-finalized-endpoint");
-        let mut storage = Storage::open(db.path.as_str()).expect("open storage");
-        storage
-            .insert_baseline_snapshot(
-                Path::new("/tmp/dangling-finalized"),
-                crate::storage::ExecutedInputCount::ZERO,
-            )
-            .expect("insert finalized snapshot");
-        drop(storage);
-
-        let conn = Storage::open_connection(db.path.as_str()).expect("raw connection");
-        conn.pragma_update(None, "foreign_keys", "OFF")
-            .expect("disable foreign keys for corruption fixture");
-        conn.execute("DELETE FROM dumps", [])
-            .expect("remove referenced dump row");
-        drop(conn);
-
-        let shutdown = RuntimeScope::default();
-        let state = Arc::new(SnapshotApiState {
-            snapshot: SnapshotState {
-                db_path: db.path,
-                state_file_in_dump: |prefix| prefix.join("state"),
-            },
-            shutdown: shutdown.clone(),
-            release_scheduler: Arc::new(|release| release()),
-        });
-
-        let response = finalized_inclusion_block(State(state)).await;
-        panic!(
-            "terminal snapshot fault returned HTTP {}",
-            response.status()
-        );
     }
 
     #[test]
@@ -837,45 +831,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
-    async fn missing_lease_row_aborts_through_runtime_reporter() {
-        if !crate::runtime::shutdown::abort_test_child(
-            "egress::api::snapshot::tests::missing_lease_row_aborts_through_runtime_reporter",
-        ) {
-            return;
-        }
-        let db = temp_db("missing-lease-row");
-        let mut storage = Storage::open(&db.path).expect("open storage");
-        storage
-            .insert_baseline_snapshot(
-                Path::new("/tmp/lease-probe"),
-                crate::storage::ExecutedInputCount::ZERO,
-            )
-            .expect("register finalized dump");
-        drop(storage);
-        let state = SnapshotApiState {
-            snapshot: SnapshotState {
-                db_path: db.path.clone(),
-                state_file_in_dump: |prefix| prefix.join("state"),
-            },
-            shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
-        };
-        let lease = acquire_finalized(&state)
-            .await
-            .expect("acquire lease")
-            .expect("finalized dump");
-        let conn = Storage::open_connection(&db.path).expect("raw connection");
-        conn.pragma_update(None, "foreign_keys", "OFF")
-            .expect("corruption fixture");
-        conn.execute("DELETE FROM dumps", [])
-            .expect("remove leased row");
-        drop(conn);
-        drop(lease);
-        panic!("persistent release failure returned instead of aborting");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(unix)]
     async fn cancelled_snapshot_request_cannot_discard_started_storage_fault() {
         if !crate::runtime::shutdown::abort_test_child(
             "egress::api::snapshot::tests::cancelled_snapshot_request_cannot_discard_started_storage_fault",
@@ -886,9 +841,9 @@ mod tests {
             snapshot: SnapshotState {
                 db_path: String::new(),
                 state_file_in_dump: |prefix| prefix.join("state"),
+                leases: SnapshotLeases::default(),
             },
             shutdown: RuntimeScope::default(),
-            release_scheduler: Arc::new(|release| release()),
         };
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

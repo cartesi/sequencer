@@ -35,13 +35,12 @@ estimate: base-fee changes are protocol rules, while tips reflect the fee
 market and builder choices. Clearing within minutes is an operational
 expectation to measure, not a bound this policy establishes.
 
-The danger detector stops normal operation when the configured danger
-threshold is reached. That bounds continued soft-confirmation issuance under
-the detector's assumptions; it does not bound inclusion or recovery duration.
-[Recovery](recovery/README.md#closed-batches-flush-sync-cascade) requires all covered
-wallet slots to resolve at safe depth before a cascade can proceed. The
-flusher's fixed headroom can also fail to replace an unmineable original.
-The sequencer remains offline until recovery succeeds or the operator acts.
+Nothing in the sequencer stops intake while batches wait to land. If no batch
+lands inside the staleness window, the era ends and the sequencer stops for
+good ([batch landing and outages](recovery/README.md#the-void-history)). This
+policy bounds neither the time to inclusion nor that outcome. The flusher's
+fixed headroom can also fail to replace an unmineable original, which keeps a
+flush, and the setup that runs one, waiting until the operator acts.
 
 The poster warns after a nonce has been unresolved for five minutes and at
 most once per further interval. Accepted re-broadcasts do not reset its age.
@@ -59,10 +58,10 @@ funding pressure, and recovery incompatibility. These failures motivate the
 current choice; they do not prove that every bounded replacement policy would
 be unsound.
 
-Revisit with evidence of sustained batch delays, recovery frequency or
-duration, and submission cost. Record the logs and affected L1 block range.
-Any future escalation policy needs an explicit urgency trigger, spending
-budget, and compatible recovery pricing. A rejected replacement alone is
+Revisit with evidence of sustained batch delays, landing lag near the window,
+and submission cost. Record the logs and affected L1 block range.
+Any future escalation policy needs an explicit urgency trigger and a spending
+budget. A rejected replacement alone is
 insufficient motivation.
 
 Fee-policy tests must distinguish [geth's two-component replacement

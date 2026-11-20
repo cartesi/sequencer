@@ -23,7 +23,7 @@ hash, and how a behavior-preserving move is checked, is in
   with `rust-src` in the cross toolchain (see `docs/cartesi-machine.md`). Two
   cold builds of the W3b final commit (`756a8ac`) agreed, and so did builds
   from three checkout paths.
-- Behavior: [`tests/fixtures/consensus_vectors_v1.json`](../../tests/fixtures/consensus_vectors_v1.json),
+- Behavior: [`tests/fixtures/consensus_vectors_v1.json`](https://github.com/cartesi/sequencer/blob/3e92563a3947673b3931a6b43eecc16ec4e0ba48/tests/fixtures/consensus_vectors_v1.json),
   pinned at `6000e3a` before anything moved and byte-identical at the final
   commit. The workspace tests check it natively at every commit, and
   `just canonical-test-guest` (15 cases, 5 golden) checks it in the built image

@@ -7,7 +7,7 @@
 //! `l1_submission`, `recovery`) — each adds its own `impl Storage`.
 
 use rusqlite::{Connection, OpenFlags, Result, Transaction, TransactionBehavior};
-use rusqlite_migration::{HookResult, M, Migrations};
+use rusqlite_migration::{M, Migrations};
 
 use super::{LifecycleCommand, StorageOpenError};
 
@@ -38,15 +38,12 @@ const SYNCHRONOUS_PRAGMA: &str = "FULL";
 /// `Storage` instance opened via [`Storage::open_read_only`].
 pub struct Storage {
     pub(super) conn: Connection,
-    /// The path this connection was opened from. Carried so a lease guard can
-    /// re-open a brief writer connection to release on drop (see
-    /// `snapshot_dumps::LeaseGuard`); the egress snapshot handlers open
-    /// per-op, so the guard can't borrow this `Storage`.
-    pub(super) path: String,
 }
 
 impl Storage {
     /// Production open: runs migrations, uses the canonical synchronous pragma.
+    /// `run` calls it once, before its startup sync; every later open of the
+    /// run is [`Storage::open_writer`] or [`Storage::open_read_only`].
     ///
     /// Refuses a path with no database file (production builds): every
     /// database is created by an owning command through
@@ -54,8 +51,11 @@ impl Storage {
     /// deployment mistake (mistyped `--data-dir`, wrong mount). Creating one
     /// on the fly would create an ownerless schema with no creating command —
     /// database absence means uninitialized, never create-and-proceed.
-    /// Crate tests keep create-on-open as their fixture idiom; the
-    /// command-less baseline in [`baseline_migration`] exists for them.
+    /// On an existing file that was never migrated it creates the schema
+    /// with no era, so the database is not set up. In crate tests it also
+    /// creates a missing file, with the genesis era that
+    /// [`baseline_migration`] inserts only in test builds; a set-up test
+    /// database comes from `test_helpers::set_up_storage`.
     pub(crate) fn open(path: &str) -> Result<Self, StorageOpenError> {
         #[cfg(not(test))]
         if !std::path::Path::new(path).exists() {
@@ -65,14 +65,11 @@ impl Storage {
         }
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn, None)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
-    /// Create the schema for setup or rebuild in one migration transaction.
-    /// The complete history baseline is published later. On
+    /// Create the schema for setup in one migration transaction. The era is
+    /// published later, and its row is setup's completion. On
     /// an already-migrated database the hook does not run; callers must
     /// inspect the existing facts.
     pub(crate) fn initialize_for_command(
@@ -80,39 +77,37 @@ impl Storage {
         command: LifecycleCommand,
     ) -> Result<Self, StorageOpenError> {
         assert!(
-            matches!(command, LifecycleCommand::Setup | LifecycleCommand::Rebuild),
-            "an uninitialized lifecycle may begin only with setup or rebuild"
+            matches!(command, LifecycleCommand::Setup),
+            "an uninitialized lifecycle may begin only with setup"
         );
         let mut conn = open_writer_connection(path)?;
         run_migrations(&mut conn, Some(command))?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
+    }
+
+    /// A private in-memory database with setup's schema, for questions the
+    /// schema answers before setup may create its database file.
+    pub(crate) fn schema_only() -> Result<Self, StorageOpenError> {
+        let mut conn = Connection::open_in_memory()?;
+        set_recursive_triggers(&conn)?;
+        run_migrations(&mut conn, Some(LifecycleCommand::Setup))?;
+        Ok(Self { conn })
     }
 
     /// Read-only handle. Uses a 50ms `busy_timeout` (vs. 5s for writers) so
     /// readers fail fast under write pressure and don't block on hot paths.
     pub fn open_read_only(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_reader_connection(path)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// Read-write handle that does NOT run migrations — for components that
-    /// open the DB *after* startup has already migrated it (e.g. egress
-    /// snapshot handlers doing brief lease writes, and tests that pre-seed
-    /// the schema). Same pragmas as [`Storage::open`] (WAL, `foreign_keys`,
-    /// 5s `busy_timeout`); running migrations is the caller's responsibility
-    /// (the runtime does it once via [`Storage::open`] at startup).
+    /// open the DB *after* `run` has migrated it (recovery, the lane, the
+    /// input reader, and tests that pre-seed the schema). Same pragmas as
+    /// [`Storage::open`] (WAL, `foreign_keys`, 5s `busy_timeout`).
     pub fn open_writer(path: &str) -> Result<Self, StorageOpenError> {
         let conn = open_writer_connection(path)?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
+        Ok(Self { conn })
     }
 
     /// Run `f` inside a Deferred transaction, commit on success. For pure reads.
@@ -121,7 +116,7 @@ impl Storage {
     /// don't hold a write lock and don't block writers. If `f` returns `Err`
     /// the transaction is dropped unsent (auto-rollback); on success the
     /// commit is issued before returning `Ok`.
-    pub fn read<T, F>(&mut self, f: F) -> Result<T>
+    pub(super) fn read<T, F>(&mut self, f: F) -> Result<T>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T>,
     {
@@ -140,7 +135,7 @@ impl Storage {
     /// see `SQLITE_BUSY` immediately rather than mid-transaction — this is
     /// the right cadence under WAL + single-writer discipline. Same commit /
     /// auto-rollback semantics as [`Storage::read`].
-    pub fn write<T, F>(&mut self, f: F) -> Result<T>
+    pub(super) fn write<T, F>(&mut self, f: F) -> Result<T>
     where
         F: FnOnce(&Transaction<'_>) -> Result<T>,
     {
@@ -158,6 +153,7 @@ impl Storage {
 pub(super) fn open_writer_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    set_recursive_triggers(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", SYNCHRONOUS_PRAGMA)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -169,7 +165,16 @@ fn open_reader_connection(path: &str) -> Result<Connection, StorageOpenError> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.pragma_update(None, "query_only", "ON")?;
     conn.pragma_update(None, "busy_timeout", 50)?;
+    set_recursive_triggers(&conn)?;
     Ok(conn)
+}
+
+/// Without `recursive_triggers`, `INSERT OR REPLACE` deletes a conflicting row
+/// without firing its BEFORE DELETE trigger, which bypasses every "never
+/// deleted" trigger. No schema trigger writes a table (each only RAISEs), so
+/// nothing can recurse. Harmless on a read-only connection; set on every one.
+fn set_recursive_triggers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "recursive_triggers", "ON")
 }
 
 /// Apply all migrations. Package-private — callers use [`Storage::open`]
@@ -178,35 +183,28 @@ pub(super) fn run_migrations(
     conn: &mut Connection,
     initial_command: Option<LifecycleCommand>,
 ) -> Result<(), StorageOpenError> {
-    let migration = baseline_migration(initial_command, None);
+    let migration = baseline_migration(initial_command);
     Migrations::from_slice(&[migration]).to_latest(conn)?;
     Ok(())
 }
 
-type PostInitialMetadataHook = fn(&Transaction<'_>) -> HookResult;
+/// The schema migration: the schema alone, so only setup's publish ever
+/// writes an era.
+#[cfg(not(test))]
+fn baseline_migration(_initial_command: Option<LifecycleCommand>) -> M<'static> {
+    M::up(MIGRATION_0001_SCHEMA)
+}
 
-/// Build the exact baseline migration used in production. The optional hook
-/// exists only so the atomicity test can fail *after* observing the
-/// production history insert, without maintaining a shadow migration.
-///
-/// `initial_command: None` is the crate-test fixture path (create-on-open
-/// with genesis history bases); production cannot reach it because
-/// [`Storage::open`] refuses paths with no database file.
-fn baseline_migration(
-    initial_command: Option<LifecycleCommand>,
-    post_initial_metadata: Option<PostInitialMetadataHook>,
-) -> M<'static> {
-    M::up_with_hook(MIGRATION_0001_SCHEMA, move |tx: &Transaction<'_>| {
-        if initial_command.is_none() {
-            super::history::initialize_history_in(
-                tx,
-                sequencer_core::history::ExecutedInputCount::ZERO,
-                0,
-            )?;
-        }
-        if let Some(hook) = post_initial_metadata {
-            hook(tx)?;
-        }
+/// The schema migration in crate tests: [`Storage::open`]'s path
+/// (`initial_command: None`) also inserts the genesis era, in the
+/// migration's transaction, for the create-on-open fixtures.
+#[cfg(test)]
+fn baseline_migration(initial_command: Option<LifecycleCommand>) -> M<'static> {
+    if initial_command.is_some() {
+        return M::up(MIGRATION_0001_SCHEMA);
+    }
+    M::up_with_hook(MIGRATION_0001_SCHEMA, |tx: &Transaction<'_>| {
+        super::history::insert_era_in(tx, &super::NewEra::EMPTY_GENESIS)?;
         Ok(())
     })
 }
@@ -215,38 +213,19 @@ fn baseline_migration(
 mod tests {
     use super::*;
 
-    fn fail_after_observing_initial_metadata(tx: &Transaction<'_>) -> HookResult {
-        let history_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM history_state \
-             WHERE singleton_id = 0 AND recovery_generation = 0 \
-               AND base_executed_input_count = 0 \
-               AND base_safe_block = 0",
-            [],
-            |row| row.get(0),
-        )?;
-        if history_count != 1 {
-            return Err(rusqlite_migration::HookError::Hook(
-                "production initial history insert was not observed".to_string(),
-            ));
-        }
-        Err(rusqlite_migration::HookError::Hook(
-            "injected failure after initial history insert".to_string(),
-        ))
-    }
-
+    /// The schema migration is all or nothing: a failure after its last
+    /// statement leaves no table and the version unset.
     #[test]
-    fn failing_initial_hook_rolls_back_schema_and_history_together() {
+    fn failing_schema_migration_leaves_no_schema() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("atomic-init.sqlite");
         let mut conn = open_writer_connection(path.to_str().expect("utf8")).expect("open");
-        let definitions = [baseline_migration(
-            None,
-            Some(fail_after_observing_initial_metadata),
-        )];
+        let failing = format!("{MIGRATION_0001_SCHEMA}\nCREATE TABLE era (duplicate INTEGER);");
+        let definitions = [M::up(failing.as_str())];
         let migrations = Migrations::from_slice(&definitions);
         migrations
             .to_latest(&mut conn)
-            .expect_err("the injected hook failure must abort migration");
+            .expect_err("the failing last statement must abort the migration");
 
         let table_count: i64 = conn
             .query_row(
@@ -264,49 +243,31 @@ mod tests {
     }
 
     #[test]
-    fn setup_registers_history_only_with_complete_baseline() {
+    fn setup_schema_has_no_era_until_one_is_inserted() {
         let setup_dir = tempfile::tempdir().unwrap();
-        let setup_path = setup_dir.path().join("setup.sqlite");
-        let mut setup =
-            Storage::initialize_for_command(setup_path.to_str().unwrap(), LifecycleCommand::Setup)
+        let mut eras = Vec::new();
+        for (name, era) in [
+            ("genesis.sqlite", super::super::NewEra::EMPTY_GENESIS),
+            ("machine.sqlite", super::super::test_helpers::era(8, 8, 100)),
+        ] {
+            let path = setup_dir.path().join(name);
+            let mut setup =
+                Storage::initialize_for_command(path.to_str().unwrap(), LifecycleCommand::Setup)
+                    .unwrap();
+            assert!(matches!(
+                setup.era(),
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            ));
+            assert!(!setup.is_setup_complete().unwrap());
+            setup
+                .write(|tx| super::super::history::insert_era_in(tx, &era))
                 .unwrap();
-        assert!(matches!(
-            setup.history_state(),
-            Err(rusqlite::Error::QueryReturnedNoRows)
-        ));
-        setup
-            .write(|tx| {
-                super::super::history::initialize_history_in(
-                    tx,
-                    sequencer_core::history::ExecutedInputCount::ZERO,
-                    0,
-                )
-            })
-            .unwrap();
-        let a = setup.history_state().unwrap();
-        let rebuild_path = setup_dir.path().join("rebuild.sqlite");
-        let mut rebuild = Storage::initialize_for_command(
-            rebuild_path.to_str().unwrap(),
-            LifecycleCommand::Rebuild,
-        )
-        .unwrap();
-        assert!(matches!(
-            rebuild.history_state(),
-            Err(rusqlite::Error::QueryReturnedNoRows)
-        ));
-        rebuild
-            .write(|tx| {
-                super::super::history::initialize_history_in(
-                    tx,
-                    sequencer_core::history::ExecutedInputCount::new(8),
-                    100,
-                )
-            })
-            .unwrap();
-        let b = rebuild.history_state().unwrap();
-        assert_ne!(a.version.era_id, b.version.era_id);
-        assert_eq!(b.base_executed_input_count, 8);
-        assert_eq!(b.base_safe_block, 100);
+            eras.push(setup.era().unwrap());
+        }
+        assert_ne!(eras[0].id, eras[1].id);
+        assert_eq!(eras[1].base.get(), 8);
+        assert_eq!(eras[1].stop_block, 100);
+        assert_eq!(eras[1].rebuilt_end.get(), 8);
     }
 }
 

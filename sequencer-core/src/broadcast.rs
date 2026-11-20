@@ -1,7 +1,7 @@
 // (c) Cartesi and individual authors (see AUTHORS)
 // SPDX-License-Identifier: Apache-2.0 (see LICENSE)
 
-use crate::l2_tx::{DirectInput, ValidUserOp};
+use crate::l2_tx::{Direct, UserOpTx};
 use serde::{Deserialize, Serialize};
 
 /// One transaction from the sequencer's replay-then-live feed.
@@ -53,40 +53,36 @@ impl BroadcastTxMessage {
         }
     }
 
-    pub fn from_user_op(
-        offset: u64,
-        user_op: ValidUserOp,
-        nonce: u32,
-        safe_block: u64,
-        batch_nonce: u64,
-    ) -> Self {
+    /// The feed keeps its wire names: the record's `block` is the frame's
+    /// `safe_block` here.
+    pub fn from_user_op(offset: u64, op: &UserOpTx, batch_nonce: u64) -> Self {
         Self::UserOp {
             offset,
-            sender: user_op.sender.to_string(),
-            nonce,
-            fee: user_op.fee,
-            data: alloy_primitives::hex::encode_prefixed(user_op.data.as_slice()),
-            safe_block,
+            sender: op.sender.to_string(),
+            nonce: op.nonce,
+            fee: op.fee,
+            data: alloy_primitives::hex::encode_prefixed(op.data.as_slice()),
+            safe_block: op.block,
             batch_nonce,
         }
     }
 
-    pub fn from_direct_input(
+    /// The feed keeps its wire names: the record's `block` and `timestamp`
+    /// are `block_number` and `block_timestamp` here.
+    pub fn from_direct(
         offset: u64,
-        direct: DirectInput,
-        input_index: u64,
+        direct: &Direct,
         batch_nonce: u64,
-        block_timestamp: u64,
         transaction_hash: alloy_primitives::B256,
     ) -> Self {
         Self::DirectInput {
             offset,
             sender: direct.sender.to_string(),
-            block_number: direct.block_number,
+            block_number: direct.block,
             payload: alloy_primitives::hex::encode_prefixed(direct.payload.as_slice()),
-            input_index,
+            input_index: direct.input_index,
             batch_nonce,
-            block_timestamp,
+            block_timestamp: direct.timestamp,
             transaction_hash: alloy_primitives::hex::encode_prefixed(transaction_hash),
         }
     }

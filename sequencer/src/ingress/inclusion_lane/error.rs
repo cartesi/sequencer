@@ -4,7 +4,7 @@
 //! Lane-level error types. Returned from the lane's join handle; the runtime
 //! logs them and may shut down depending on severity.
 
-use sequencer_core::application::AppError;
+use sequencer_core::application::{AppError, SkipReason};
 use thiserror::Error;
 
 use super::dump_info::CreateDumpDirError;
@@ -36,6 +36,10 @@ pub enum InclusionLaneError {
         #[source]
         source: AppError,
     },
+    /// The executor skipped an op the lane's pre-check had just found at its
+    /// sender's next nonce: the application's nonces are not deterministic.
+    #[error("executor skipped a user op the lane admitted: {reason}")]
+    AdmittedOpSkipped { reason: SkipReason },
     #[error("snapshot at batch close failed: {0}")]
     Snapshot(#[from] TakeDumpError),
     #[error("loading Application from finalized snapshot failed: {0}")]
@@ -43,8 +47,8 @@ pub enum InclusionLaneError {
     #[error("snapshot garbage collection failed: {0}")]
     Gc(#[from] GcError),
     #[error(
-        "no open Tip at lane startup; the runtime must establish it via \
-         guarded startup recovery before starting the lane"
+        "no open Tip at lane startup; run must open one at startup before \
+         starting the lane"
     )]
     NoOpenTip,
 }
@@ -62,7 +66,9 @@ impl InclusionLaneError {
             Self::Gc(GcError::Storage(source)) => {
                 crate::storage::is_persistent_storage_error(source)
             }
-            Self::CanonicalDivergence { .. } | Self::NoOpenTip => true,
+            Self::CanonicalDivergence { .. } | Self::NoOpenTip | Self::AdmittedOpSkipped { .. } => {
+                true
+            }
             Self::ChannelClosed => false,
         }
     }
@@ -112,7 +118,11 @@ pub enum CatchUpError {
         #[source]
         source: AppError,
     },
-    #[error("snapshot executed-input count mismatch: application={application}, storage={storage}")]
+    /// A stored user op that the executor skips on replay: the restored
+    /// application disagrees with the history it once executed.
+    #[error("replay skipped the stored user op at offset {offset}: {reason}")]
+    ReplaySkipped { offset: u64, reason: SkipReason },
+    #[error("snapshot L2 tx count mismatch: application={application}, storage={storage}")]
     SnapshotExecutionCountMismatch { application: u64, storage: u64 },
     #[error(
         "no snapshot registered before lane catch-up; \
@@ -130,9 +140,10 @@ impl CatchUpError {
             Self::ReplayUserOp { source } | Self::ReplayDirectInput { source } => {
                 app_error_is_terminal(source)
             }
-            Self::History(_) | Self::NoSnapshot | Self::SnapshotExecutionCountMismatch { .. } => {
-                true
-            }
+            Self::History(_)
+            | Self::NoSnapshot
+            | Self::SnapshotExecutionCountMismatch { .. }
+            | Self::ReplaySkipped { .. } => true,
         }
     }
 }

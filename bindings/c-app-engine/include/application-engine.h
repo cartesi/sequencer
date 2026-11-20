@@ -8,7 +8,7 @@
 
 /// @file
 /// The C API of an application engine, and the only surface an engine exports. It mirrors the
-/// Cartesi sequencer's Application contract, so the host owning the fold stays application
+/// Cartesi sequencer's Application contract, so the host running the engine stays application
 /// agnostic and an engine is swappable behind this header. Plain C so any host can consume it.
 ///
 /// An application implements these declarations into a static archive, which the `c-app-engine`
@@ -33,6 +33,12 @@
 /// a host is entitled to refuse a value it does not know rather than to have it renumbered
 /// underneath.
 ///
+/// The header is versioned by APPLICATION_ENGINE_ABI_VERSION, and the engine reports the version
+/// it was built against through application_engine_abi_version. A host checks it before any other
+/// call: a function whose meaning changed, or a record that grew, links against an older archive
+/// without complaint, and only the version tells them apart. A header without the version is
+/// version 1.
+///
 /// Widths are fixed, nothing crosses as size_t. A C enum's underlying type is implementation
 /// defined, so an engine must static_assert each one's width against int32_t, which is what lets
 /// a host mirror them as a plain 32-bit integer.
@@ -43,24 +49,33 @@
 /// would hand any caller a process kill, since it is fatal-no-resume.
 ///
 /// No exception may cross. Fallible entry points report errors through status codes; a fatal
-/// validation or execution error defines no successor and the caller must discard the instance.
-/// IO_ERROR is legal from every status-returning entry point. In validation, execution, and
-/// output draining it is fatal for the instance; the host may retry with a fresh instance after
-/// an operational failure. NOT_FOUND and INVALID_DUMP describe lifecycle failures only.
-/// Validation acceptance, state transitions, progress, and outputs must agree with the canonical
-/// application. Rejection diagnostics and error messages need not be identical across builds.
+/// admission, nonce read, or execution error defines no successor and the caller must discard the
+/// instance. IO_ERROR is legal from every status-returning entry point. In admission, nonce reads,
+/// execution, and output draining it is fatal for the instance; the host may retry with a fresh
+/// instance after an operational failure. NOT_FOUND and INVALID_DUMP describe lifecycle failures
+/// only.
 ///
-/// Nonces follow one rule, which the host relies on to serve each sender's next nonce from the
-/// ops it persisted: a genesis state starts every account at 0, validation accepts only the
-/// sender's expected nonce, each executed user op advances its sender's nonce by exactly one, and
-/// nothing else changes a nonce. UINT32_MAX has no successor, so the caller rejects an op carrying
-/// it even when validation accepts it. See docs/protocol/application-contract.md.
+/// Execution is consensus and admission is not. State transitions, nonces, the L2 tx count, and
+/// outputs must agree with the canonical application. Admission is the operator's policy, asked
+/// only by the sequencer before it takes an op in, and the canonical machine never calls it, so a
+/// canonical build need not implement it. Refusal diagnostics and error messages need not be
+/// identical across builds.
+///
+/// Nonces follow one rule, which the caller relies on to decide which user ops run: a genesis
+/// state starts every account at 0, application_engine_user_nonce reports the sender's next nonce,
+/// each executed user op advances its sender's nonce by exactly one, and nothing else changes a
+/// nonce. The engine stores nonces and never compares them. The caller reads the sender's next
+/// nonce, skips an op whose nonce differs from it or equals UINT32_MAX, which has no successor, and
+/// executes every other op, so an engine decides what an op does but never whether it runs. See
+/// docs/protocol/application-contract.md.
 ///
 /// Fees are uint16_t exponents with base 129/128, denominated in the fee token's smallest unit.
 /// The conversion is defined by sequencer-core/src/fee.rs and its build.rs-generated table:
 /// integer fixed-point arithmetic with 64 fractional bits, including its rounding and exponent
-/// bound. Native and canonical implementations must agree on this conversion; the max-fee guard
-/// compares exponents, while balance validation and execution use the converted amount.
+/// bound. Native and canonical implementations must agree on this conversion. The max-fee guard
+/// compares exponents and belongs to the caller. Admission and execution use the converted amount:
+/// admission may refuse an op its sender cannot pay in full, while execution charges what the
+/// sender has, up to the fee, and never fails over it.
 ///
 /// Errors are errno style. A fallible entry point returns a status (or a null pointer for
 /// application_engine_state_file_in_dump) and leaves the reason for
@@ -94,15 +109,46 @@
 /// raw big-endian bytes rather than as a number a host may not be able to spell.
 #define APPLICATION_ENGINE_VALUE_SIZE 32
 
+/// @brief The version of this header, which the engine reports back to the host.
+/// @details Raised whenever a record's layout or a function's meaning changes. Version 2
+/// replaced validation with admission and made user-op execution total. Version 3 added the
+/// staleness window to the scheduler limits.
+#define APPLICATION_ENGINE_ABI_VERSION 3
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/// @brief The header version the engine was built against.
+/// @returns APPLICATION_ENGINE_ABI_VERSION as the engine's build saw it.
+/// @details Pure and infallible. The host calls it before anything else and refuses an engine
+/// reporting another version, since a changed meaning is not a link error.
+APPLICATION_ENGINE_API uint32_t application_engine_abi_version(void) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief The largest user-op method payload, in bytes.
 /// @details Pure, infallible, and constant for the linked engine implementation, independent of
 /// any loaded deployment. Zero permits only empty method payloads. The host uses this value for
 /// ingress admission and batch sizing; it does not bound direct inputs from L1.
 APPLICATION_ENGINE_API uint64_t application_engine_max_method_payload_bytes(void) APPLICATION_ENGINE_NOEXCEPT;
+
+/// @brief The scheduler constants a template compiles in for this application.
+/// @details They belong to the application: the window is how long it lets a sequencer hold a
+/// direct back, and the other two bound what its directs may cost the canonical machine. All
+/// three are consensus values: a template's scheduler and every host must read the same ones.
+typedef struct ApplicationEngineSchedulerLimits {
+    /// The staleness window in L1 blocks, at least 1: a direct queued this long is executed, and
+    /// a batch whose first frame is this old is skipped.
+    uint64_t max_wait_blocks;
+    uint64_t fridge_bound;             ///< How many admitted directs the fridge may hold.
+    uint64_t max_direct_payload_bytes; ///< A direct with a longer payload never executes.
+} ApplicationEngineSchedulerLimits;
+
+/// @brief Read the scheduler constants for this application.
+/// @param out_limits Writable record, written whole before returning.
+/// @details Pure, infallible, and constant for the linked engine implementation, independent of
+/// any loaded deployment, like the method payload bound.
+APPLICATION_ENGINE_API void application_engine_scheduler_limits(
+    ApplicationEngineSchedulerLimits *out_limits) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief An account address, raw bytes and no encoding.
 /// @details A named type rather than a loose buffer, so an address and an amount cannot be
@@ -131,58 +177,66 @@ typedef struct ApplicationEngineByteSpan {
 /// @details Append only. The status is the contract, the accompanying message is a diagnostic.
 typedef enum ApplicationEngineStatus {
     APPLICATION_ENGINE_STATUS_OK = 0,              ///< Call succeeded.
-    APPLICATION_ENGINE_STATUS_INVALID = -1,        ///< Refused by protocol or configuration validation.
+    APPLICATION_ENGINE_STATUS_INVALID = -1,        ///< Refused by admission.
     APPLICATION_ENGINE_STATUS_INTERNAL_ERROR = -2, ///< Internal engine failure, fatal-no-resume.
     APPLICATION_ENGINE_STATUS_IO_ERROR = -3,       ///< An operational filesystem or mapping failure.
     APPLICATION_ENGINE_STATUS_NOT_FOUND = -4,      ///< A required dump artifact is missing.
     APPLICATION_ENGINE_STATUS_INVALID_DUMP = -5,   ///< A dump is malformed or truncated.
 } ApplicationEngineStatus;
 
-/// @brief A user op as its sender signed it.
-/// @details The engine reads the nonce and the data and carries max_fee without checking it,
-/// that guard belongs to the caller, so an op arrives whole.
+/// @brief A user op as its sender signed it, the record admission reads.
+/// @details The engine carries the nonce and max_fee without checking either, those guards
+/// belong to the caller, so an op arrives whole.
 typedef struct ApplicationEngineUserOp {
     uint32_t nonce;                 ///< Sender replay protection nonce.
     uint16_t max_fee;               ///< Highest frame fee exponent the sender accepts, base 129/128.
     ApplicationEngineByteSpan data; ///< Method payload, opaque here and parsed by the engine.
 } ApplicationEngineUserOp;
 
-/// @brief A user op that already passed validation, as the caller sequenced it.
-/// @details Not the signed op: execution consumes the nonce the state expects, advancing it by
-/// exactly one, and the max fee went with the guard the caller already settled, leaving the fee
-/// the frame charges.
-typedef struct ApplicationEngineValidUserOp {
+/// @brief A user op as the scheduler hands it out, the record execution reads.
+/// @details The caller found its nonce equal to the sender's next one before handing it over, so
+/// execution advances that nonce by exactly one without comparing. Its max fee already covered
+/// the frame's price, leaving the fee the frame charges.
+typedef struct ApplicationEngineUserOpTx {
     ApplicationEngineEthereumAddress sender; ///< The recovered signer.
+    uint32_t nonce;                          ///< The nonce the sender signed, the sender's next.
     uint16_t fee;                            ///< The charged frame fee exponent, base 129/128.
+    uint64_t safe_block;                     ///< The safe block of the frame carrying the op.
     ApplicationEngineByteSpan data;          ///< Method payload, opaque here and parsed by the engine.
-} ApplicationEngineValidUserOp;
+} ApplicationEngineUserOpTx;
 
 /// @brief An input taken straight from the L1 input box.
 /// @details Its sender is authenticated by the chain rather than recovered from a signature.
-/// Its payload is still untrusted application input and has no method-payload bound at this ABI.
+/// Its payload is still untrusted application input; the caller never hands over one longer
+/// than the scheduler limits' max_direct_payload_bytes.
 typedef struct ApplicationEngineDirectInput {
     ApplicationEngineEthereumAddress sender; ///< The L1 authenticated sender.
+    uint64_t input_index;                    ///< The application's input box index of the input.
     uint64_t block_number;                   ///< The L1 inclusion block number.
+    uint64_t timestamp;                      ///< The L1 inclusion block's Unix time, in seconds.
     ApplicationEngineByteSpan payload;       ///< The raw input payload.
 } ApplicationEngineDirectInput;
 
-/// @brief Why an engine refused a user op, mirroring the sequencer's rejection reasons.
+/// @brief Why admission refused a user op.
 /// @details Append only. Written only on APPLICATION_ENGINE_STATUS_INVALID, and it selects which
-/// member of ApplicationEngineInvalidValues carries the diagnostics.
+/// member of ApplicationEngineInvalidValues carries the diagnostics. Admission produces only
+/// INSUFFICIENT_FEE_BALANCE and REFUSED_BY_POLICY; the others are retired, since their checks
+/// belong to the caller, and keep their numbers so none is ever reused.
 typedef enum ApplicationEngineInvalidReason {
-    APPLICATION_ENGINE_INVALID_NONCE = 0,            ///< Nonce or account binding, read `nonce`.
-    APPLICATION_ENGINE_INVALID_MAX_FEE = 1,          ///< The caller-owned max fee guard, read `max_fee`.
+    APPLICATION_ENGINE_INVALID_NONCE = 0,            ///< Retired, the caller owns the nonce check.
+    APPLICATION_ENGINE_INVALID_MAX_FEE = 1,          ///< Retired, the caller owns the max fee guard.
     APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE = 2, ///< Cannot cover the frame fee, read `fee_balance`.
-    APPLICATION_ENGINE_NONCE_EXHAUSTED = 3,          ///< The caller-owned UINT32_MAX nonce guard, no values.
+    APPLICATION_ENGINE_NONCE_EXHAUSTED = 3,          ///< Retired, the caller owns the UINT32_MAX guard.
+    APPLICATION_ENGINE_REFUSED_BY_POLICY = 4,        ///< Any other operator policy, no values.
 } ApplicationEngineInvalidReason;
 
-/// @brief Diagnostics for APPLICATION_ENGINE_INVALID_NONCE.
+/// @brief Diagnostics for the retired APPLICATION_ENGINE_INVALID_NONCE.
 typedef struct ApplicationEngineInvalidNonce {
     uint32_t expected; ///< The nonce the account expects next.
     uint32_t got;      ///< The nonce the op carried.
 } ApplicationEngineInvalidNonce;
 
-/// @brief Diagnostics for APPLICATION_ENGINE_INVALID_MAX_FEE.
+/// @brief Diagnostics for the retired APPLICATION_ENGINE_INVALID_MAX_FEE.
 /// @details Both values are log space exponents, base 129/128. No engine produces this reason,
 /// the guard belongs to the caller, it is carried so the reason vocabulary stays whole.
 typedef struct ApplicationEngineInvalidMaxFee {
@@ -200,9 +254,11 @@ typedef struct ApplicationEngineInsufficientFeeBalance {
 } ApplicationEngineInsufficientFeeBalance;
 
 /// @brief The diagnostics of a refusal, read through the member its reason selects.
+/// @details APPLICATION_ENGINE_REFUSED_BY_POLICY has no member: its explanation is text, which
+/// travels in the last error message.
 typedef union ApplicationEngineInvalidValues {
-    ApplicationEngineInvalidNonce nonce;                 ///< APPLICATION_ENGINE_INVALID_NONCE.
-    ApplicationEngineInvalidMaxFee max_fee;              ///< APPLICATION_ENGINE_INVALID_MAX_FEE.
+    ApplicationEngineInvalidNonce nonce;                 ///< The retired APPLICATION_ENGINE_INVALID_NONCE.
+    ApplicationEngineInvalidMaxFee max_fee;              ///< The retired APPLICATION_ENGINE_INVALID_MAX_FEE.
     ApplicationEngineInsufficientFeeBalance fee_balance; ///< APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE.
 } ApplicationEngineInvalidValues;
 
@@ -246,12 +302,6 @@ typedef struct ApplicationEngineOutput {
 /// @brief The engine instance behind the handle, opaque to every caller.
 typedef struct ApplicationEngine ApplicationEngine;
 
-/// @brief Progress embedded in the engine's logical state and every checkpoint.
-typedef struct ApplicationEngineProgress {
-    uint64_t executed_input_count;     ///< Next input offset; included no-ops count, rejections do not.
-    uint64_t last_executed_safe_block; ///< Maximum block carried by any executed input.
-} ApplicationEngineProgress;
-
 /// @brief Get the message describing the most recent failure.
 /// @returns A NUL terminated string, never null, empty when the last fallible call succeeded.
 /// @details Read it after a negative status or a null handle. Every fallible entry point clears
@@ -285,50 +335,80 @@ APPLICATION_ENGINE_API const char *application_engine_get_last_error_message(voi
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_from_dump(const char *prefix,
     ApplicationEngine **out_engine) APPLICATION_ENGINE_NOEXCEPT;
 
+/// @brief Open an engine over a canonical machine's comparison bytes, at the machine's count.
+/// @param state_file The file holding the bytes the canonical machine yields for its state: its
+/// whole labeled state range, or its `state` inspect report.
+/// @param l2_tx_count The canonical machine's L2 tx count, which the new instance starts at
+/// whether or not the bytes hold one.
+/// @param out_engine The engine handle, written only on OK and left untouched otherwise.
+/// @returns OK, NOT_FOUND for a missing file, INVALID_DUMP for bytes that do not decode or that
+/// contradict l2_tx_count, IO_ERROR for other filesystem failures, or INTERNAL_ERROR.
+/// @details How a host starts from a canonical machine rather than from one of its own dumps. A
+/// dump of the result must hold the same comparison bytes in the file
+/// application_engine_state_file_in_dump names. Like application_engine_from_dump it never
+/// changes the source file, and the instance stays usable after the file is deleted.
+APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_from_canonical_state(const char *state_file,
+    uint64_t l2_tx_count, ApplicationEngine **out_engine) APPLICATION_ENGINE_NOEXCEPT;
+
 /// @brief Destroy an engine instance.
 /// @param engine The engine handle.
 APPLICATION_ENGINE_API void application_engine_destroy(ApplicationEngine *engine) APPLICATION_ENGINE_NOEXCEPT;
 
-/// @brief Validate a user op against current state, pure and read-only.
+/// @brief Read a sender's next nonce, pure and read-only.
+/// @param engine The engine handle.
+/// @param sender The account whose nonce to read.
+/// @param out_nonce The nonce the sender's next executed op carries, written only on OK.
+/// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
+/// @details Zero for an address that has sent nothing. The caller compares it with each user op
+/// before executing, and checks after an execution that it advanced by exactly one.
+APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_user_nonce(const ApplicationEngine *engine,
+    const ApplicationEngineEthereumAddress *sender, uint32_t *out_nonce) APPLICATION_ENGINE_NOEXCEPT;
+
+/// @brief Decide whether the operator wants a user op in a frame at this fee, pure and read-only.
 /// @param engine The engine handle.
 /// @param sender The recovered signer.
-/// @param user_op The op to validate, as its sender signed it.
-/// @param current_fee The frame fee exponent, base 129/128.
+/// @param user_op The op to admit, as its sender signed it.
+/// @param fee The frame fee exponent, base 129/128.
 /// @param out_invalid Why the op was refused, written whole and only on INVALID.
-/// @returns OK, INVALID with diagnostics, IO_ERROR, or INTERNAL_ERROR.
-/// @details A rejection reports itself through out_invalid and leaves the last error message
-/// empty; IO_ERROR and INTERNAL_ERROR carry an error message. The max-fee and exhausted-nonce
-/// guards belong to the caller and are never checked here, so APPLICATION_ENGINE_INVALID_MAX_FEE
-/// and APPLICATION_ENGINE_NONCE_EXHAUSTED never come back. Queued
-/// outputs are left alone, only an execution touches them.
-APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_validate_user_op(const ApplicationEngine *engine,
-    const ApplicationEngineEthereumAddress *sender, const ApplicationEngineUserOp *user_op, uint16_t current_fee,
+/// @returns OK to admit, INVALID with a reason, IO_ERROR, or INTERNAL_ERROR.
+/// @details Policy, never consensus: only the sequencer asks, before it takes an op in, and the
+/// answer never changes what an included op does. The nonce, the max-fee and exhausted-nonce
+/// guards belong to the caller and are never checked here, so only
+/// APPLICATION_ENGINE_INSUFFICIENT_FEE_BALANCE and APPLICATION_ENGINE_REFUSED_BY_POLICY come back.
+///
+/// An INSUFFICIENT_FEE_BALANCE refusal reports itself through out_invalid alone and leaves the
+/// last error message empty. A REFUSED_BY_POLICY refusal leaves its explanation in the last error
+/// message, which the sequencer hands to the client verbatim. IO_ERROR and INTERNAL_ERROR carry an
+/// error message. Queued outputs are left alone, only an execution touches them.
+APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_admit_user_op(const ApplicationEngine *engine,
+    const ApplicationEngineEthereumAddress *sender, const ApplicationEngineUserOp *user_op, uint16_t fee,
     ApplicationEngineInvalid *out_invalid) APPLICATION_ENGINE_NOEXCEPT;
 
-/// @brief Execute a validated user op, advancing its sender's expected nonce by exactly one.
+/// @brief Execute a user op the caller found at its sender's next nonce.
 /// @param engine The engine handle.
-/// @param user_op The validated op to execute.
-/// @param safe_block The covering frame safe block, folded into the clock as max(clock, it).
+/// @param user_op The op to execute.
 /// @param out_output_count How many outputs this op left waiting, written only on OK.
 /// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
-/// @details An op the method rejects still executed and still counts, so it reports OK. Only
-/// the resulting state, progress, and outputs cross the seam; the application's business-failure
-/// diagnostics are not returned separately.
+/// @details Total: whatever the op does or pays, it reports OK, advances its sender's nonce by
+/// exactly one, and advances the L2 tx count by exactly one. A fee the sender cannot cover is no
+/// failure: the engine charges what the sender has, up to the fee, and runs the method on what is
+/// left. An op the method rejects still executed and still counts. Only the resulting state,
+/// count, and outputs cross the seam; business-failure diagnostics are not returned separately.
 ///
 /// An execution refuses to run while an earlier execution's outputs are still queued, reporting
 /// INTERNAL_ERROR without executing anything rather than discarding outputs meant to reach the
 /// chain. That refusal is what makes the count reported this op's own.
-APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_valid_user_op(ApplicationEngine *engine,
-    const ApplicationEngineValidUserOp *user_op, uint64_t safe_block,
-    uint64_t *out_output_count) APPLICATION_ENGINE_NOEXCEPT;
+APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_user_op(ApplicationEngine *engine,
+    const ApplicationEngineUserOpTx *user_op, uint64_t *out_output_count) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief Execute a direct input from the L1 input box.
 /// @param engine The engine handle.
-/// @param input The input to execute, its L1 block folded into the clock as max(clock, it).
+/// @param input The input to execute.
 /// @param out_output_count How many outputs this input left waiting, written only on OK.
 /// @returns OK, IO_ERROR, or INTERNAL_ERROR. An error requires discarding the instance.
-/// @details An input the engine rejects is a counted no-op and still reports OK, the same way a
-/// rejected user op does. Outputs behave as they do for a user op. It never changes a nonce.
+/// @details An input the engine ignores or cannot parse is a counted no-op and still reports OK.
+/// It advances the L2 tx count by exactly one and never changes a nonce. Outputs behave as they
+/// do for a user op.
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct_input(ApplicationEngine *engine,
     const ApplicationEngineDirectInput *input, uint64_t *out_output_count) APPLICATION_ENGINE_NOEXCEPT;
 
@@ -345,13 +425,14 @@ APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_execute_direct
 APPLICATION_ENGINE_API ApplicationEngineStatus application_engine_drain_output(ApplicationEngine *engine,
     ApplicationEngineOutput *out_output) APPLICATION_ENGINE_NOEXCEPT;
 
-/// @brief Read the engine's current progress without changing state.
+/// @brief Read the engine's L2 tx count without changing state.
 /// @param engine The engine handle.
-/// @param out_progress Writable record, written whole before returning.
-/// @details Count zero implies clock zero. Every successful execution advances the count once
-/// with checked arithmetic and takes max(previous clock, input block). Both fields survive dumps.
-APPLICATION_ENGINE_API void application_engine_progress(const ApplicationEngine *engine,
-    ApplicationEngineProgress *out_progress) APPLICATION_ENGINE_NOEXCEPT;
+/// @returns How many L2 transactions the state has executed, which is the history offset of the
+/// next one.
+/// @details Infallible. Zero at genesis; every successful execution, a counted no-op included,
+/// advances it by exactly one with checked arithmetic. It survives dumps.
+APPLICATION_ENGINE_API uint64_t application_engine_l2_tx_count(
+    const ApplicationEngine *engine) APPLICATION_ENGINE_NOEXCEPT;
 
 /// @brief Create a crash durable dump of the engine state (write, fsync).
 /// @param engine The engine handle.
@@ -365,7 +446,7 @@ APPLICATION_ENGINE_API void application_engine_progress(const ApplicationEngine 
 /// host to remove with the unreferenced checkpoint directory.
 ///
 /// The dump contains the current state. The engine may change backing files or reopen internal
-/// handles while checkpointing, but application state and progress stay unchanged. Subsequent
+/// handles while checkpointing, but application state and its count stay unchanged. Subsequent
 /// execution must leave the completed dump immutable.
 /// All checkpoint-owned artifacts reside at or beneath prefix as ordinary files/directories.
 /// The host discards a checkpoint by recursive filesystem deletion, with no engine callback.

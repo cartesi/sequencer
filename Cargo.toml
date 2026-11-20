@@ -6,6 +6,7 @@ members = [
   "sdk/rust-client",
   "bindings/c-app-engine",
   "bindings/c-app-sequencer",
+  "bindings/c-scheduler",
   "examples/app-core",
   "examples/canonical-app",
   "examples/canonical-test",

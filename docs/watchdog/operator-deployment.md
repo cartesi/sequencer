@@ -37,9 +37,9 @@ curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/inclusion_block"
 curl -fsS "$CARTESI_WATCHDOG_SEQUENCER_URL/finalized_state/digest"
 ```
 
-Both answer JSON once the sequencer has a comparable checkpoint and 404 before
-that: genesis is comparable at block zero, while a rebuilt baseline waits for
-its next accepted batch
+Both answer JSON once the sequencer has a comparable checkpoint, which a
+completed setup always provides: the era's baseline at its stop block, until
+an accepted batch replaces it
 ([snapshot lifecycle](../snapshots/lifecycle.md#acceptance-and-comparison)).
 They answer 503 while the sequencer's own divergence marker is set.
 
@@ -196,13 +196,11 @@ but checkpoints.
 A retained checkpoint is a trusted machine at a known block. It can bootstrap
 a new state directory ([initialize](#initialize)), serve as the trusted source
 for `replay` in the [runbook](incident-runbook.md#2-find-the-faulty-side), and
-feed the canonical-to-native export of
-[cockroach recovery](../recovery/cockroach.md#incident-playbook). It is not a
-sequencer restore archive; that is `/finalized_snapshot`
+be the base of `setup --base` in a
+[cockroach recovery](../recovery/cockroach.md). Its name counts InputBox
+inputs, not L2 transactions; `setup --base <dir> --dry-run` prints its L2 tx
+count. It is not a sequencer restore archive; that is `/finalized_snapshot`
 ([recovery exports](../snapshots/lifecycle.md#http-and-recovery-exports)).
-Complete the application's
-[recovery readiness drill](../recovery/cockroach.md#recovery-readiness-before-deployment)
-before production.
 
 ## Deployment facts
 
@@ -399,9 +397,9 @@ and failure class, as in
 | `<dir> was initialized for another deployment or state source; wipe it to re-initialize` | The `init` environment names another chain, application, or state source than the directory holds |
 | `no input precedes block <N>, so the machine at <dir> must be the application's template, but its root hash differs from the on-chain template hash` | The image is not this application's template: another chain's image, another build, or another application |
 | `L1 RPC: eth_call: …` during `init` | The RPC has no state at the bootstrap block; use an archive node |
-| `sequencer /finalized_state/inclusion_block: HTTP 404` | No comparable checkpoint yet, or the URL reaches the wrong listener |
+| `sequencer /finalized_state/inclusion_block: HTTP 404` | The URL reaches the wrong listener: a set-up sequencer always has a comparable checkpoint |
 | `sequencer /finalized_state/digest: HTTP 404` while `inclusion_block` answers | A proxy does not forward the digest route, or the sequencer comes from another release |
-| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#incident-playbook) |
+| `sequencer /finalized_state/inclusion_block: HTTP 503`, with `canonical divergence prevents accepted checkpoint selection` | The sequencer's own divergence marker is set: a sequencer incident for [cockroach recovery](../recovery/cockroach.md#the-operators-playbook) |
 | `L1 RPC safe head <N> is behind target block <B>` | The RPC lags the sequencer's L1 view; the next tick retries |
 | `InputBox counts <N> inputs at block <B> but the scan reached index <M>`, or `InputBox index <N> where <M> was expected: the L1 view is incomplete` | The provider returned incomplete logs, so switch providers; if it persists across them, a safe block below the head may have been replaced ([L1 chain semantics](../threat-model/README.md#l1-chain-semantics)), so confirm with `replay` from a trusted machine at a finalized block, then wipe the state directory and `init` from one |
 | `the L1 RPC does not serve chain <N>` | The RPC endpoint belongs to another chain |

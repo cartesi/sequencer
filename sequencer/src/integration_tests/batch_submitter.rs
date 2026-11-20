@@ -14,7 +14,6 @@ use sequencer::l1::watermark::WalletNonceWatermarkSink;
 use sequencer::runtime::shutdown::RuntimeScope;
 use sequencer::storage::{SafeInputRange, Storage};
 use sequencer_core::batch::Batch;
-use sequencer_core::protocol::ProtocolTiming;
 
 use crate::test_support::{TestDb, temp_db};
 
@@ -82,13 +81,13 @@ impl BatchPoster for TestMock {
 
         let mut tx_hashes = Vec::with_capacity(payloads.len());
         for payload in payloads {
-            let batch_index = ssz::Decode::from_ssz_bytes(payload.as_slice())
+            let batch_nonce = ssz::Decode::from_ssz_bytes(payload.as_slice())
                 .map(|b: Batch| b.nonce)
                 .unwrap_or(0);
             self.submissions
                 .lock()
                 .expect("lock")
-                .push((batch_index, payload.len()));
+                .push((batch_nonce, payload.len()));
             tx_hashes.push(TxHash::ZERO);
         }
         Ok(SubmitBatchesOutcome::Submitted(tx_hashes))
@@ -108,15 +107,13 @@ impl BatchPoster for TestMock {
     }
 }
 
-/// Mirrors what the startup recovery procedure establishes in production: persist a real
+/// Mirrors what setup's sync establishes in production: persist a real
 /// safe-head observation so `submitter_frontier` has a row to read. Without
 /// this, the submitter's first tick errors out on `current_safe_block_required`
 /// and the loop exits before submitting anything.
 fn seed_observed_safe_head(storage: &mut Storage) {
-    let timing =
-        ProtocolTiming::try_new(sequencer_core::MAX_WAIT_BLOCKS, 75, 900, 12).expect("test timing");
     storage
-        .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO, &timing)
+        .append_safe_inputs(0, &[], alloy_primitives::Address::ZERO)
         .expect("seed observed safe head");
 }
 
@@ -127,15 +124,14 @@ fn seed_two_closed_batches(db_path: &str) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 0");
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 1");
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 2");
 }
 
@@ -146,9 +142,8 @@ fn seed_one_closed_batch(db_path: &str) {
     let mut head = storage
         .initialize_open_state(0, SafeInputRange::empty_at(0))
         .expect("initialize open state");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close batch 0");
 }
 
@@ -159,9 +154,8 @@ fn close_current_tip(db_path: &str) {
         .open_state()
         .expect("load open state")
         .expect("open Tip exists");
-    let next_safe = head.safe_block;
     storage
-        .close_frame_and_batch(&mut head, next_safe)
+        .close_frame_and_batch(&mut head)
         .expect("close current Tip");
 }
 

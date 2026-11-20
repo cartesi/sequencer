@@ -18,7 +18,7 @@ async fn main() -> std::process::ExitCode {
         )
         .init();
 
-    // `setup` is the only subcommand that constructs a genesis app; the
-    // closure runs only on that path.
+    // Only a setup without `--base` builds the genesis application; a setup
+    // from a stored machine builds it from the machine's state.
     sequencer::run_main(|| Ok(WalletApp::new(WalletConfig::devnet()))).await
 }
